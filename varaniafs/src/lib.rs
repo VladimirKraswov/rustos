@@ -199,7 +199,10 @@ impl Superblock {
         self.magic == MAGIC
             && self.version == VERSION
             && self.block_size == BLOCK_SIZE as u32
-            && self.volume_blocks == actual_blocks
+            // Образ можно безопасно расширить до публикации нового
+            // superblock: старая копия продолжает описывать валидный префикс.
+            // Уменьшение запрещено, потому что могло бы обрезать extent'ы.
+            && self.volume_blocks <= actual_blocks
             && self.volume_blocks >= MIN_VOLUME_BLOCKS
             && self.active_slot < METADATA_SLOTS
             && self.metadata_blocks == METADATA_BLOCKS

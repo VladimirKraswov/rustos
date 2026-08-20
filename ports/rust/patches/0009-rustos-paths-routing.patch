@@ -1,0 +1,11 @@
+--- a/library/std/src/sys/paths/mod.rs
++++ b/library/std/src/sys/paths/mod.rs
+@@ -1,4 +1,8 @@
+ cfg_select! {
++    target_os = "rustos" => {
++        pub(crate) mod rustos;
++        use rustos as imp;
++    }
+     target_os = "hermit" => {
+         mod hermit;
+         #[expect(dead_code)]

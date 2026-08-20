@@ -1,0 +1,18 @@
+[package]
+name = "rustos-sdk-hello"
+description = "Минимальное пользовательское приложение RustOS SDK"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "rustos-sdk-hello"
+path = "src/main.rs"
+
+[target.'cfg(target_os = "rustos")'.dependencies]
+rustos-crt = { path = "../../../userspace/crt" }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("rustos"))'] }

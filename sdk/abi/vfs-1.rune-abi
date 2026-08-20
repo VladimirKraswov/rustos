@@ -1,0 +1,16 @@
+RUNE-ABI 1
+package org.rustos.system.vfs-client
+kind library
+interface org.rustos.vfs/1
+abi 1
+export rustos_vfs_connect connect(*mut_client,u32,u32)->i32 function
+export rustos_vfs_open open(*mut_client,*const_u8,usize,u32,*mut_u64)->i32 function
+export rustos_vfs_close close(*mut_client,u64)->i32 function
+export rustos_vfs_read read(*mut_client,u64,*mut_u8,usize,*mut_usize)->i32 function
+export rustos_vfs_write write(*mut_client,u64,*const_u8,usize,*mut_usize)->i32 function
+export rustos_vfs_seek seek(*mut_client,u64,i64,u32,*mut_u64)->i32 function
+export rustos_vfs_readdir readdir(*mut_client,u64,*mut_dirent)->i32 function
+export rustos_vfs_mkdir mkdir(*mut_client,*const_u8,usize)->i32 function
+export rustos_vfs_unlink unlink(*mut_client,*const_u8,usize)->i32 function
+export rustos_vfs_rename rename(*mut_client,*const_u8,usize,*const_u8,usize)->i32 function
+export rustos_vfs_sync sync(*mut_client)->i32 function

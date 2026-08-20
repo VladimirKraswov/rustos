@@ -1,0 +1,11 @@
+--- a/library/std/src/sys/stdio/mod.rs
++++ b/library/std/src/sys/stdio/mod.rs
+@@ -1,4 +1,8 @@
+ cfg_select! {
++    target_os = "rustos" => {
++        mod rustos;
++        pub use rustos::*;
++    }
+     any(target_family = "unix", target_os = "hermit", target_os = "wasi") => {
+         mod unix;
+         pub use unix::*;

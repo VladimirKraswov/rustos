@@ -4,12 +4,18 @@
 //! PIE, после чего этот инструмент переносит только семантически нужные
 //! regions/relocations/TLS/RELRO в компактный нативный контейнер.
 
+#![cfg_attr(target_os = "rustos", feature(restricted_std))]
+
+#[cfg(target_os = "rustos")]
+use rustos_crt as _;
+
 use std::{env, fs, path::Path, process};
 
 use rustos_rune_format::{
-    architecture, file_flags, record_kind, region_flags, relocation_kind, sha256_with_zeroed_range,
-    Container, CONTENT_HASH_OFFSET, FORMAT_VERSION, HEADER_SIZE, MAGIC, PAGE_SIZE, RELOCATION_SIZE,
-    TOC_ENTRY_SIZE,
+    architecture, dependency_flags, export_flags, file_flags, import_flags, interface_id,
+    record_kind, region_flags, relocation_kind, sha256_with_zeroed_range, symbol_id, Container,
+    InterfaceId, CONTENT_HASH_OFFSET, DEPENDENCY_SIZE, EXPORT_SIZE, FORMAT_VERSION, HEADER_SIZE,
+    IMPORT_SIZE, MAGIC, PAGE_SIZE, RELOCATION_SIZE, TOC_ENTRY_SIZE,
 };
 
 const ELF_HEADER_SIZE: usize = 64;
@@ -27,8 +33,69 @@ const DT_NULL: i64 = 0;
 const DT_RELA: i64 = 7;
 const DT_RELASZ: i64 = 8;
 const DT_RELAENT: i64 = 9;
+const DT_PLTRELSZ: i64 = 2;
+const DT_JMPREL: i64 = 23;
 const R_X86_64_RELATIVE: u32 = 8;
+const R_X86_64_64: u32 = 1;
+const R_X86_64_PC32: u32 = 2;
+const R_X86_64_GLOB_DAT: u32 = 6;
+const R_X86_64_JUMP_SLOT: u32 = 7;
+const R_X86_64_TPOFF64: u32 = 18;
 const R_AARCH64_RELATIVE: u32 = 1027;
+const R_AARCH64_ABS64: u32 = 257;
+const R_AARCH64_GLOB_DAT: u32 = 1025;
+const R_AARCH64_JUMP_SLOT: u32 = 1026;
+const R_AARCH64_TLS_TPREL64: u32 = 1030;
+
+const SHT_DYNSYM: u32 = 11;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ArtifactKind {
+    Application,
+    Library,
+    Service,
+    Driver,
+}
+
+impl ArtifactKind {
+    const fn flags(self) -> u32 {
+        match self {
+            Self::Application => file_flags::APPLICATION,
+            Self::Library => file_flags::LIBRARY,
+            Self::Service => file_flags::SERVICE,
+            Self::Driver => file_flags::DRIVER,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ManifestSymbol {
+    elf_name: String,
+    interface: InterfaceId,
+    signature: String,
+    minimum_abi: u16,
+    maximum_abi: u16,
+    flags: u32,
+}
+
+#[derive(Clone, Debug)]
+struct ManifestDependency {
+    file_name: String,
+    interface: InterfaceId,
+    minimum_abi: u16,
+    maximum_abi: u16,
+}
+
+#[derive(Clone, Debug)]
+struct AbiManifest {
+    package: String,
+    kind: ArtifactKind,
+    interface: Option<InterfaceId>,
+    abi_version: u16,
+    imports: Vec<ManifestSymbol>,
+    exports: Vec<ManifestSymbol>,
+    dependencies: Vec<ManifestDependency>,
+}
 
 #[derive(Clone, Copy)]
 struct ElfSegment {
@@ -39,6 +106,24 @@ struct ElfSegment {
     file_size: u64,
     memory_size: u64,
     alignment: u64,
+}
+
+#[derive(Clone, Copy)]
+struct ElfSymbol<'a> {
+    name: &'a str,
+    info: u8,
+    section: u16,
+    value: u64,
+}
+
+impl ElfSymbol<'_> {
+    const fn is_defined(self) -> bool {
+        self.section != 0
+    }
+
+    const fn kind(self) -> u8 {
+        self.info & 0x0f
+    }
 }
 
 #[derive(Clone)]
@@ -90,21 +175,34 @@ fn run() -> Result<(), String> {
     match args.as_slice() {
         [_, command, input] if command == "verify" => verify(Path::new(input)),
         [_, command, input] if command == "inspect" => inspect(Path::new(input)),
-        [_, input, output] => pack(Path::new(input), Path::new(output), None),
+        [_, input, output] => pack(Path::new(input), Path::new(output), None, None),
         [_, command, input, output, name] if command == "pack" => {
-            pack(Path::new(input), Path::new(output), Some(name))
+            pack(Path::new(input), Path::new(output), Some(name), None)
+        }
+        [_, command, input, output, manifest] if command == "pack-manifest" => {
+            let manifest_path = Path::new(manifest);
+            let source = fs::read_to_string(manifest_path)
+                .map_err(|error| format!("{}: {error}", manifest_path.display()))?;
+            let manifest = parse_manifest(&source)?;
+            pack(Path::new(input), Path::new(output), None, Some(&manifest))
         }
         _ => Err(
-            "usage: rustos-rune <input.elf> <output.rune> | pack <input> <output> <package> | verify|inspect <file>"
+            "usage: rustos-rune <input.elf> <output.rune> | pack <input> <output> <package> | pack-manifest <input> <output> <abi.rune> | verify|inspect <file>"
                 .into(),
         ),
     }
 }
 
-fn pack(input: &Path, output: &Path, explicit_name: Option<&str>) -> Result<(), String> {
+fn pack(
+    input: &Path,
+    output: &Path,
+    explicit_name: Option<&str>,
+    manifest: Option<&AbiManifest>,
+) -> Result<(), String> {
     let elf = fs::read(input).map_err(|error| format!("{}: {error}", input.display()))?;
-    let name = explicit_name
-        .map(str::to_owned)
+    let name = manifest
+        .map(|manifest| manifest.package.clone())
+        .or_else(|| explicit_name.map(str::to_owned))
         .or_else(|| {
             input
                 .file_stem()
@@ -112,7 +210,7 @@ fn pack(input: &Path, output: &Path, explicit_name: Option<&str>) -> Result<(), 
                 .map(str::to_owned)
         })
         .ok_or("input has no UTF-8 file name")?;
-    let bytes = convert_elf(&elf, &name)?;
+    let bytes = convert_elf(&elf, &name, manifest)?;
     if let Some(parent) = output.parent() {
         fs::create_dir_all(parent).map_err(|error| format!("{}: {error}", parent.display()))?;
     }
@@ -127,6 +225,139 @@ fn pack(input: &Path, output: &Path, explicit_name: Option<&str>) -> Result<(), 
         parsed.header().toc_count
     );
     Ok(())
+}
+
+/// Минимальный декларативный ABI-язык намеренно не требует TOML/JSON parser:
+/// этот же код позднее станет маленьким native SDK tool внутри RustOS.
+/// Значения не содержат пробелов, комментарий начинается с `#`.
+fn parse_manifest(source: &str) -> Result<AbiManifest, String> {
+    let mut package = None;
+    let mut kind = None;
+    let mut canonical_interface = None;
+    let mut abi_version = 1u16;
+    let mut imports = Vec::new();
+    let mut exports = Vec::new();
+    let mut dependencies = Vec::new();
+    let mut saw_header = false;
+
+    for (line_index, raw_line) in source.lines().enumerate() {
+        let line = raw_line.split('#').next().unwrap_or("").trim();
+        if line.is_empty() {
+            continue;
+        }
+        let fields: Vec<_> = line.split_ascii_whitespace().collect();
+        let line_number = line_index + 1;
+        if !saw_header {
+            if fields.as_slice() != ["RUNE-ABI", "1"] {
+                return Err(format!(
+                    "manifest line {line_number}: expected `RUNE-ABI 1`"
+                ));
+            }
+            saw_header = true;
+            continue;
+        }
+        match fields.as_slice() {
+            ["package", value] => package = Some((*value).to_owned()),
+            ["kind", value] => {
+                kind = Some(match *value {
+                    "application" => ArtifactKind::Application,
+                    "library" => ArtifactKind::Library,
+                    "service" => ArtifactKind::Service,
+                    "driver" => ArtifactKind::Driver,
+                    _ => {
+                        return Err(format!(
+                            "manifest line {line_number}: unknown artifact kind"
+                        ))
+                    }
+                })
+            }
+            ["interface", value] => canonical_interface = Some(interface_id(value)),
+            ["abi", value] => {
+                abi_version = value
+                    .parse()
+                    .map_err(|_| format!("manifest line {line_number}: invalid ABI version"))?;
+            }
+            ["dependency", file, interface, minimum, maximum] => {
+                dependencies.push(ManifestDependency {
+                    file_name: (*file).to_owned(),
+                    interface: interface_id(interface),
+                    minimum_abi: parse_abi(minimum, line_number)?,
+                    maximum_abi: parse_abi(maximum, line_number)?,
+                });
+            }
+            ["import", name, interface, signature, minimum, maximum, symbol_kind] => {
+                imports.push(ManifestSymbol {
+                    elf_name: (*name).to_owned(),
+                    interface: interface_id(interface),
+                    signature: (*signature).to_owned(),
+                    minimum_abi: parse_abi(minimum, line_number)?,
+                    maximum_abi: parse_abi(maximum, line_number)?,
+                    flags: parse_symbol_kind(symbol_kind, line_number)?,
+                });
+            }
+            ["export", name, signature, symbol_kind] => {
+                let interface = canonical_interface.ok_or_else(|| {
+                    format!("manifest line {line_number}: `interface` must precede exports")
+                })?;
+                exports.push(ManifestSymbol {
+                    elf_name: (*name).to_owned(),
+                    interface,
+                    signature: (*signature).to_owned(),
+                    minimum_abi: abi_version,
+                    maximum_abi: abi_version,
+                    flags: parse_symbol_kind(symbol_kind, line_number)?,
+                });
+            }
+            _ => return Err(format!("manifest line {line_number}: invalid directive")),
+        }
+    }
+    if !saw_header {
+        return Err("manifest is empty".into());
+    }
+    let manifest = AbiManifest {
+        package: package.ok_or("manifest has no package")?,
+        kind: kind.ok_or("manifest has no kind")?,
+        interface: canonical_interface,
+        abi_version,
+        imports,
+        exports,
+        dependencies,
+    };
+    for import in &manifest.imports {
+        if import.minimum_abi == 0
+            || import.minimum_abi > import.maximum_abi
+            || !manifest.dependencies.iter().any(|dependency| {
+                dependency.interface == import.interface
+                    && dependency.minimum_abi <= import.maximum_abi
+                    && dependency.maximum_abi >= import.minimum_abi
+            })
+        {
+            return Err(format!(
+                "import {} has no compatible declared dependency",
+                import.elf_name
+            ));
+        }
+    }
+    Ok(manifest)
+}
+
+fn parse_abi(value: &str, line: usize) -> Result<u16, String> {
+    value
+        .parse::<u16>()
+        .ok()
+        .filter(|value| *value != 0)
+        .ok_or_else(|| format!("manifest line {line}: ABI version must be 1..65535"))
+}
+
+fn parse_symbol_kind(value: &str, line: usize) -> Result<u32, String> {
+    match value {
+        "function" => Ok(import_flags::FUNCTION),
+        "data" => Ok(import_flags::DATA),
+        "tls" => Ok(import_flags::TLS),
+        _ => Err(format!(
+            "manifest line {line}: symbol kind must be function, data or tls"
+        )),
+    }
 }
 
 fn verify(path: &Path) -> Result<(), String> {
@@ -172,7 +403,11 @@ fn inspect(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn convert_elf(elf: &[u8], package_name: &str) -> Result<Vec<u8>, String> {
+fn convert_elf(
+    elf: &[u8],
+    package_name: &str,
+    manifest: Option<&AbiManifest>,
+) -> Result<Vec<u8>, String> {
     if elf.len() < ELF_HEADER_SIZE
         || elf.get(..4) != Some(b"\x7fELF")
         || elf[4] != 2
@@ -233,8 +468,14 @@ fn convert_elf(elf: &[u8], package_name: &str) -> Result<Vec<u8>, String> {
     let mut strings = Vec::new();
     let mut records = Vec::new();
     let (package_name_offset, package_name_length) = add_string(&mut strings, package_name)?;
+    let artifact_flags = manifest
+        .map(|manifest| manifest.kind.flags())
+        .unwrap_or(file_flags::APPLICATION);
+    let symbols = dynamic_symbols(elf)?;
+    validate_manifest_symbols(manifest, &symbols)?;
+
     let mut slice = OutputRecord::metadata(record_kind::SLICE, architecture);
-    slice.flags = file_flags::APPLICATION;
+    slice.flags = artifact_flags;
     slice.virtual_address = entry - min_page;
     slice.alignment = PAGE_SIZE;
     slice.name_offset = package_name_offset;
@@ -280,7 +521,7 @@ fn convert_elf(elf: &[u8], package_name: &str) -> Result<Vec<u8>, String> {
         });
     }
 
-    let relocations = extract_relocations(elf, &segments, machine, min_page)?;
+    let relocations = extract_relocations(elf, &segments, machine, min_page, &symbols, manifest)?;
     if !relocations.is_empty() {
         let (name_offset, name_length) = add_string(&mut strings, "relative-relocations")?;
         let mut record = OutputRecord::metadata(record_kind::RELOCATIONS, architecture);
@@ -337,6 +578,17 @@ fn convert_elf(elf: &[u8], package_name: &str) -> Result<Vec<u8>, String> {
         records.push(record);
     }
 
+    if let Some(manifest) = manifest {
+        append_abi_records(
+            &mut records,
+            &mut strings,
+            manifest,
+            &symbols,
+            min_page,
+            architecture,
+        )?;
+    }
+
     let strings_index = records.len() as u32;
     let mut string_record = OutputRecord::metadata(record_kind::STRINGS, architecture::ANY);
     string_record.alignment = 1;
@@ -345,7 +597,255 @@ fn convert_elf(elf: &[u8], package_name: &str) -> Result<Vec<u8>, String> {
     string_record.payload = strings;
     records.push(string_record);
 
-    encode(records, strings_index, package_name)
+    encode(records, strings_index, package_name, artifact_flags)
+}
+
+fn dynamic_symbols(elf: &[u8]) -> Result<Vec<ElfSymbol<'_>>, String> {
+    let section_offset =
+        usize::try_from(read_u64(elf, 40)?).map_err(|_| "section table offset overflow")?;
+    let section_entry_size = read_u16(elf, 58)? as usize;
+    let section_count = read_u16(elf, 60)? as usize;
+    if section_entry_size < 64 || section_count == 0 {
+        return Err("ELF has no usable section table; keep .dynsym while packing RUNE".into());
+    }
+    let mut dynamic_section = None;
+    for index in 0..section_count {
+        let offset = section_offset
+            .checked_add(
+                index
+                    .checked_mul(section_entry_size)
+                    .ok_or("section overflow")?,
+            )
+            .ok_or("section overflow")?;
+        let section = elf
+            .get(offset..offset + 64)
+            .ok_or("truncated section table")?;
+        if read_u32(section, 4)? == SHT_DYNSYM {
+            if dynamic_section.is_some() {
+                return Err("ELF contains multiple dynamic symbol tables".into());
+            }
+            dynamic_section = Some((
+                read_u64(section, 24)?,
+                read_u64(section, 32)?,
+                read_u32(section, 40)? as usize,
+                read_u64(section, 56)?,
+            ));
+        }
+    }
+    let (symbol_offset, symbol_size, strings_index, symbol_entry_size) =
+        dynamic_section.ok_or("ELF has no .dynsym")?;
+    if symbol_entry_size != 24 || !symbol_size.is_multiple_of(symbol_entry_size) {
+        return Err("invalid .dynsym entry size".into());
+    }
+    let string_header_offset = section_offset
+        .checked_add(
+            strings_index
+                .checked_mul(section_entry_size)
+                .ok_or("section overflow")?,
+        )
+        .ok_or("section overflow")?;
+    let string_header = elf
+        .get(string_header_offset..string_header_offset + 64)
+        .ok_or("invalid .dynsym string-table link")?;
+    let strings_offset = usize::try_from(read_u64(string_header, 24)?)
+        .map_err(|_| "string table offset overflow")?;
+    let strings_size =
+        usize::try_from(read_u64(string_header, 32)?).map_err(|_| "string table size overflow")?;
+    let strings = elf
+        .get(
+            strings_offset
+                ..strings_offset
+                    .checked_add(strings_size)
+                    .ok_or("string overflow")?,
+        )
+        .ok_or("truncated dynamic string table")?;
+    let symbol_offset = usize::try_from(symbol_offset).map_err(|_| "symbol offset overflow")?;
+    let symbol_count =
+        usize::try_from(symbol_size / symbol_entry_size).map_err(|_| "too many dynamic symbols")?;
+    let mut result = Vec::with_capacity(symbol_count);
+    for index in 0..symbol_count {
+        let offset = symbol_offset
+            .checked_add(index.checked_mul(24).ok_or("symbol overflow")?)
+            .ok_or("symbol overflow")?;
+        let symbol = elf.get(offset..offset + 24).ok_or("truncated .dynsym")?;
+        let name_offset = read_u32(symbol, 0)? as usize;
+        let tail = strings
+            .get(name_offset..)
+            .ok_or("invalid dynamic symbol name")?;
+        let length = tail
+            .iter()
+            .position(|byte| *byte == 0)
+            .ok_or("unterminated symbol name")?;
+        let name = core::str::from_utf8(&tail[..length]).map_err(|_| "non-UTF-8 dynamic symbol")?;
+        result.push(ElfSymbol {
+            name,
+            info: symbol[4],
+            section: read_u16(symbol, 6)?,
+            value: read_u64(symbol, 8)?,
+        });
+    }
+    Ok(result)
+}
+
+fn validate_manifest_symbols(
+    manifest: Option<&AbiManifest>,
+    symbols: &[ElfSymbol<'_>],
+) -> Result<(), String> {
+    let undefined: Vec<_> = symbols
+        .iter()
+        .copied()
+        .filter(|symbol| !symbol.is_defined() && !symbol.name.is_empty())
+        .collect();
+    if manifest.is_none() && !undefined.is_empty() {
+        return Err(format!(
+            "ELF imports `{}`; use `pack-manifest` and declare its stable interface ABI",
+            undefined[0].name
+        ));
+    }
+    let Some(manifest) = manifest else {
+        return Ok(());
+    };
+    for import in &manifest.imports {
+        if !undefined
+            .iter()
+            .any(|symbol| symbol.name == import.elf_name)
+        {
+            return Err(format!(
+                "declared import `{}` is not undefined in ELF",
+                import.elf_name
+            ));
+        }
+    }
+    for symbol in undefined {
+        if !manifest
+            .imports
+            .iter()
+            .any(|import| import.elf_name == symbol.name)
+        {
+            return Err(format!(
+                "ELF import `{}` is absent from RUNE ABI manifest",
+                symbol.name
+            ));
+        }
+    }
+    for export in &manifest.exports {
+        let Some(symbol) = symbols
+            .iter()
+            .copied()
+            .find(|symbol| symbol.is_defined() && symbol.name == export.elf_name)
+        else {
+            return Err(format!(
+                "declared export `{}` is absent from ELF",
+                export.elf_name
+            ));
+        };
+        let expected_kind = if export.flags == import_flags::FUNCTION {
+            2
+        } else if export.flags == import_flags::TLS {
+            6
+        } else {
+            1
+        };
+        if symbol.kind() != expected_kind {
+            return Err(format!(
+                "export `{}` has a different ELF symbol kind",
+                export.elf_name
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn append_abi_records(
+    records: &mut Vec<OutputRecord>,
+    strings: &mut Vec<u8>,
+    manifest: &AbiManifest,
+    symbols: &[ElfSymbol<'_>],
+    min_page: u64,
+    architecture: u16,
+) -> Result<(), String> {
+    if !manifest.imports.is_empty() {
+        let mut payload = Vec::with_capacity(manifest.imports.len() * IMPORT_SIZE);
+        for import in &manifest.imports {
+            let (name_offset, name_length) = add_string(strings, &import.elf_name)?;
+            payload.extend_from_slice(&import.interface.0);
+            payload.extend_from_slice(&symbol_id(import.interface, &import.signature).0);
+            payload.extend_from_slice(&import.minimum_abi.to_le_bytes());
+            payload.extend_from_slice(&import.maximum_abi.to_le_bytes());
+            payload.extend_from_slice(&import.flags.to_le_bytes());
+            payload.extend_from_slice(&name_offset.to_le_bytes());
+            payload.extend_from_slice(&name_length.to_le_bytes());
+            payload.extend_from_slice(&0u16.to_le_bytes());
+        }
+        let mut record = OutputRecord::metadata(record_kind::IMPORTS, architecture);
+        record.alignment = 8;
+        record.file_size = payload.len() as u64;
+        record.memory_size = record.file_size;
+        record.payload = payload;
+        records.push(record);
+    }
+    if !manifest.exports.is_empty() {
+        let interface = manifest.interface.ok_or("exports require an interface")?;
+        let mut payload = Vec::with_capacity(manifest.exports.len() * EXPORT_SIZE);
+        for export in &manifest.exports {
+            let symbol = symbols
+                .iter()
+                .copied()
+                .find(|symbol| symbol.is_defined() && symbol.name == export.elf_name)
+                .ok_or_else(|| format!("missing export `{}`", export.elf_name))?;
+            let (name_offset, name_length) = add_string(strings, &export.elf_name)?;
+            payload.extend_from_slice(&interface.0);
+            payload.extend_from_slice(&symbol_id(interface, &export.signature).0);
+            payload.extend_from_slice(
+                &symbol
+                    .value
+                    .checked_sub(min_page)
+                    .ok_or("export lies below image")?
+                    .to_le_bytes(),
+            );
+            payload.extend_from_slice(&manifest.abi_version.to_le_bytes());
+            let flags = match export.flags {
+                import_flags::FUNCTION => export_flags::FUNCTION,
+                import_flags::DATA => export_flags::DATA,
+                import_flags::TLS => export_flags::TLS,
+                _ => return Err("invalid export flags".into()),
+            };
+            payload.extend_from_slice(&flags.to_le_bytes());
+            payload.extend_from_slice(&name_offset.to_le_bytes());
+            payload.extend_from_slice(&name_length.to_le_bytes());
+            payload.extend_from_slice(&0u16.to_le_bytes());
+            payload.extend_from_slice(&0u32.to_le_bytes());
+        }
+        let mut record = OutputRecord::metadata(record_kind::EXPORTS, architecture);
+        record.alignment = 8;
+        record.file_size = payload.len() as u64;
+        record.memory_size = record.file_size;
+        record.payload = payload;
+        records.push(record);
+    }
+    if !manifest.dependencies.is_empty() {
+        let mut payload = Vec::with_capacity(manifest.dependencies.len() * DEPENDENCY_SIZE);
+        for dependency in &manifest.dependencies {
+            let (name_offset, name_length) = add_string(strings, &dependency.file_name)?;
+            payload.extend_from_slice(&dependency.interface.0);
+            payload.extend_from_slice(&[0u8; 16]);
+            payload.extend_from_slice(&dependency.minimum_abi.to_le_bytes());
+            payload.extend_from_slice(&dependency.maximum_abi.to_le_bytes());
+            payload.extend_from_slice(
+                &(dependency_flags::REQUIRED | dependency_flags::SHARE_CODE).to_le_bytes(),
+            );
+            payload.extend_from_slice(&name_offset.to_le_bytes());
+            payload.extend_from_slice(&name_length.to_le_bytes());
+            payload.extend_from_slice(&0u16.to_le_bytes());
+        }
+        let mut record = OutputRecord::metadata(record_kind::DEPENDENCIES, architecture);
+        record.alignment = 8;
+        record.file_size = payload.len() as u64;
+        record.memory_size = record.file_size;
+        record.payload = payload;
+        records.push(record);
+    }
+    Ok(())
 }
 
 fn extract_relocations(
@@ -353,6 +853,8 @@ fn extract_relocations(
     segments: &[ElfSegment],
     machine: u16,
     min_page: u64,
+    symbols: &[ElfSymbol<'_>],
+    manifest: Option<&AbiManifest>,
 ) -> Result<Vec<u8>, String> {
     let Some(dynamic) = segments
         .iter()
@@ -369,6 +871,8 @@ fn extract_relocations(
     let mut rela_address = 0u64;
     let mut rela_size = 0u64;
     let mut rela_entry_size = RELOCATION_SIZE as u64;
+    let mut plt_rela_address = 0u64;
+    let mut plt_rela_size = 0u64;
     for entry in dynamic_bytes.chunks_exact(16) {
         let tag = read_i64(entry, 0)?;
         let value = read_u64(entry, 8)?;
@@ -377,58 +881,155 @@ fn extract_relocations(
             DT_RELA => rela_address = value,
             DT_RELASZ => rela_size = value,
             DT_RELAENT => rela_entry_size = value,
+            DT_JMPREL => plt_rela_address = value,
+            DT_PLTRELSZ => plt_rela_size = value,
             _ => {}
         }
     }
-    if rela_size == 0 {
+    if rela_size == 0 && plt_rela_size == 0 {
         return Ok(Vec::new());
     }
-    if rela_entry_size != 24 || !rela_size.is_multiple_of(rela_entry_size) {
+    if rela_entry_size != 24
+        || !rela_size.is_multiple_of(rela_entry_size)
+        || !plt_rela_size.is_multiple_of(rela_entry_size)
+    {
         return Err("only ELF64 RELA entries are supported".into());
     }
-    let file_offset = virtual_to_file_offset(segments, rela_address)?;
-    let count = rela_size / rela_entry_size;
+    let count = (rela_size + plt_rela_size) / rela_entry_size;
     let mut output = Vec::with_capacity(count as usize * RELOCATION_SIZE);
-    for index in 0..count {
-        let offset = file_offset
-            .checked_add(index * rela_entry_size)
-            .ok_or("RELA offset overflow")? as usize;
-        let rela = elf.get(offset..offset + 24).ok_or("truncated RELA table")?;
-        let target = read_u64(rela, 0)?;
-        let info = read_u64(rela, 8)?;
-        let addend = read_i64(rela, 16)?;
-        let expected = match machine {
-            EM_X86_64 => R_X86_64_RELATIVE,
-            EM_AARCH64 => R_AARCH64_RELATIVE,
-            _ => unreachable!(),
-        };
-        if info as u32 != expected || info >> 32 != 0 {
-            return Err(format!(
-                "ELF relocation type {} references symbol {}; native imports must be declared explicitly",
-                info as u32,
-                info >> 32
-            ));
+    for (address, size) in [(rela_address, rela_size), (plt_rela_address, plt_rela_size)] {
+        if size == 0 {
+            continue;
         }
-        let target = target
-            .checked_sub(min_page)
-            .ok_or("relocation target below image")?;
-        let normalized_addend = i128::from(addend)
+        let file_offset = virtual_to_file_offset(segments, address)?;
+        for index in 0..size / rela_entry_size {
+            let offset = file_offset
+                .checked_add(index * rela_entry_size)
+                .ok_or("RELA offset overflow")? as usize;
+            let rela = elf.get(offset..offset + 24).ok_or("truncated RELA table")?;
+            let target = read_u64(rela, 0)?
+                .checked_sub(min_page)
+                .ok_or("relocation target below image")?;
+            let info = read_u64(rela, 8)?;
+            let elf_kind = info as u32;
+            let elf_symbol = (info >> 32) as u32;
+            let addend = read_i64(rela, 16)?;
+            let (normalized_addend, rune_symbol, rune_kind) = normalize_relocation(
+                machine, elf_kind, elf_symbol, addend, min_page, segments, symbols, manifest,
+            )?;
+            output.extend_from_slice(&target.to_le_bytes());
+            output.extend_from_slice(&normalized_addend.to_le_bytes());
+            output.extend_from_slice(&rune_symbol.to_le_bytes());
+            output.extend_from_slice(&rune_kind.to_le_bytes());
+            output.extend_from_slice(&0u16.to_le_bytes());
+        }
+    }
+    Ok(output)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn normalize_relocation(
+    machine: u16,
+    elf_kind: u32,
+    elf_symbol: u32,
+    addend: i64,
+    min_page: u64,
+    segments: &[ElfSegment],
+    symbols: &[ElfSymbol<'_>],
+    manifest: Option<&AbiManifest>,
+) -> Result<(i64, u32, u16), String> {
+    let relative = matches!(
+        (machine, elf_kind),
+        (EM_X86_64, R_X86_64_RELATIVE) | (EM_AARCH64, R_AARCH64_RELATIVE)
+    );
+    if relative {
+        if elf_symbol != 0 {
+            return Err("RELATIVE relocation references a symbol".into());
+        }
+        let addend = i128::from(addend)
             .checked_sub(i128::from(min_page))
             .and_then(|value| i64::try_from(value).ok())
             .ok_or("relocation addend overflow")?;
-        output.extend_from_slice(&target.to_le_bytes());
-        output.extend_from_slice(&normalized_addend.to_le_bytes());
-        output.extend_from_slice(&0u32.to_le_bytes());
-        output.extend_from_slice(&relocation_kind::RELATIVE64.to_le_bytes());
-        output.extend_from_slice(&0u16.to_le_bytes());
+        return Ok((addend, 0, relocation_kind::RELATIVE64));
     }
-    Ok(output)
+
+    let tls = matches!(
+        (machine, elf_kind),
+        (EM_X86_64, R_X86_64_TPOFF64) | (EM_AARCH64, R_AARCH64_TLS_TPREL64)
+    );
+    // lld кодирует local-exec TLS как STN_UNDEF + addend. Это не импорт:
+    // addend уже является смещением внутри PT_TLS текущего module.
+    if tls && elf_symbol == 0 {
+        return Ok((addend, 0, relocation_kind::TLS_TPOFF64));
+    }
+
+    let symbol = symbols
+        .get(elf_symbol as usize)
+        .copied()
+        .ok_or("relocation references invalid dynamic symbol")?;
+    let is_absolute = matches!(
+        (machine, elf_kind),
+        (
+            EM_X86_64,
+            R_X86_64_64 | R_X86_64_GLOB_DAT | R_X86_64_JUMP_SLOT
+        ) | (
+            EM_AARCH64,
+            R_AARCH64_ABS64 | R_AARCH64_GLOB_DAT | R_AARCH64_JUMP_SLOT
+        )
+    );
+    if is_absolute {
+        if symbol.is_defined() {
+            let addend = i128::from(symbol.value)
+                .checked_sub(i128::from(min_page))
+                .and_then(|value| value.checked_add(i128::from(addend)))
+                .and_then(|value| i64::try_from(value).ok())
+                .ok_or("local symbol relocation overflow")?;
+            return Ok((addend, 0, relocation_kind::RELATIVE64));
+        }
+        let import = manifest
+            .and_then(|manifest| {
+                manifest
+                    .imports
+                    .iter()
+                    .position(|import| import.elf_name == symbol.name)
+            })
+            .ok_or_else(|| format!("relocation import `{}` is not declared", symbol.name))?;
+        return Ok((addend, import as u32, relocation_kind::IMPORT64));
+    }
+    if machine == EM_X86_64 && elf_kind == R_X86_64_PC32 && !symbol.is_defined() {
+        let import = manifest
+            .and_then(|manifest| {
+                manifest
+                    .imports
+                    .iter()
+                    .position(|import| import.elf_name == symbol.name)
+            })
+            .ok_or_else(|| format!("PC32 import `{}` is not declared", symbol.name))?;
+        return Ok((addend, import as u32, relocation_kind::IMPORT_PC32));
+    }
+    if tls && symbol.is_defined() {
+        let template = segments
+            .iter()
+            .find(|segment| segment.kind == PT_TLS)
+            .ok_or("TLS relocation without PT_TLS")?;
+        let addend = i128::from(symbol.value)
+            .checked_sub(i128::from(template.virtual_address))
+            .and_then(|value| value.checked_add(i128::from(addend)))
+            .and_then(|value| i64::try_from(value).ok())
+            .ok_or("TLS relocation overflow")?;
+        return Ok((addend, 0, relocation_kind::TLS_TPOFF64));
+    }
+    Err(format!(
+        "unsupported ELF relocation type {elf_kind} for symbol `{}`",
+        symbol.name
+    ))
 }
 
 fn encode(
     mut records: Vec<OutputRecord>,
     strings_index: u32,
     package_name: &str,
+    artifact_flags: u32,
 ) -> Result<Vec<u8>, String> {
     let toc_offset = HEADER_SIZE as u64;
     let toc_size = records
@@ -453,11 +1054,7 @@ fn encode(
     output[..8].copy_from_slice(&MAGIC);
     put_u16(&mut output, 8, FORMAT_VERSION);
     put_u16(&mut output, 10, HEADER_SIZE as u16);
-    put_u32(
-        &mut output,
-        12,
-        file_flags::APPLICATION | file_flags::REPRODUCIBLE,
-    );
+    put_u32(&mut output, 12, artifact_flags | file_flags::REPRODUCIBLE);
     put_u64(&mut output, 16, file_size as u64);
     put_u64(&mut output, 24, toc_offset);
     put_u32(&mut output, 32, records.len() as u32);

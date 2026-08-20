@@ -16,10 +16,11 @@ use rustos_abi::{
     bootinfo::BootInitramfs,
     ipc::{Message, IPC_MAX_HANDLES},
     memory::{SharedMemoryCreate, SharedMemoryMap, VmFlags, VmMapRequest, MEMORY_ABI_VERSION},
+    pipe::{PipeCreateResult, PIPE_ABI_VERSION},
     process::{
         ProcessSpawnRequest, ProcessSpawnResult, ProcessStartInfo, SpawnCapability,
-        ThreadCreateRequest, ThreadCreateResult, PROCESS_ABI_VERSION,
-        PROCESS_SPAWN_MAX_CAPABILITIES, PROCESS_START_INFO_ADDRESS,
+        StartupCapability, StartupRole, ThreadCreateRequest, ThreadCreateResult,
+        PROCESS_ABI_VERSION, PROCESS_SPAWN_MAX_CAPABILITIES, PROCESS_START_INFO_ADDRESS,
     },
     syscall::{self, status},
     ExitReason, Handle, PriorityClass, ProcessId, Rights, ThreadId, PAGE_SIZE,
@@ -37,8 +38,8 @@ use crate::{
 };
 
 use super::{
-    load_executable, CapabilityEntry, CapabilityKind, ProcessError, EMPTY_CAPABILITY,
-    MAX_CAPABILITIES, VFS_ROOT_SLOT,
+    load_executable, CapabilityEntry, CapabilityKind, InteractiveExit, ProcessError,
+    EMPTY_CAPABILITY, MAX_CAPABILITIES, VFS_ROOT_SLOT,
 };
 
 const MAX_PROCESSES: usize = 12;
@@ -48,10 +49,14 @@ const ENDPOINT_QUEUE_CAPACITY: usize = 8;
 const ENDPOINT_SLOT: usize = 2;
 const MAX_SHARED_OBJECTS: usize = 8;
 const MAX_SHARED_PAGES: usize = 64;
-const MAX_VM_SYSCALL_PAGES: u64 = 256;
+/// Один mapping ограничен 1 GiB: достаточно для compiler arenas, но ошибка в
+/// user-space всё ещё не может одним syscall переполнить арифметику/metadata.
+const MAX_VM_SYSCALL_PAGES: u64 = 256 * 1024;
 const MAX_PATH_BYTES: usize = 255;
 const MAX_ARGUMENT_BYTES: usize = 2048;
 const MAX_ENVIRONMENT_BYTES: usize = 2048;
+const MAX_PIPES: usize = 8;
+const PIPE_BUFFER_BYTES: usize = 4096;
 
 const NO_EXIT: ExitReason = ExitReason {
     status: 0,
@@ -85,11 +90,25 @@ struct PendingJoin {
 }
 
 #[derive(Clone, Copy)]
+struct PendingFutex {
+    address: u64,
+    deadline_ns: u64,
+}
+
+#[derive(Clone, Copy)]
+struct PendingPipe {
+    pipe: u16,
+    write: bool,
+}
+
+#[derive(Clone, Copy)]
 enum PendingOperation {
     None,
     Receive(PendingReceive),
     ProcessWait(PendingWait),
     ThreadJoin(PendingJoin),
+    Futex(PendingFutex),
+    Pipe(PendingPipe),
 }
 
 struct ManagedThread {
@@ -99,10 +118,14 @@ struct ManagedThread {
     pending: PendingOperation,
     exited: bool,
     exit_reason: ExitReason,
+    detached: bool,
+    reclaim_address: u64,
+    reclaim_length: u64,
 }
 
 struct ManagedProcess {
     pid: ProcessId,
+    parent: ProcessId,
     address_space: AddressSpace,
     capabilities: [CapabilityEntry; MAX_CAPABILITIES],
     initramfs: BootInitramfs,
@@ -329,6 +352,137 @@ impl SharedMemoryPool {
     }
 }
 
+struct PipeObject {
+    generation: u8,
+    used: bool,
+    buffer: [u8; PIPE_BUFFER_BYTES],
+    read_offset: usize,
+    length: usize,
+    readers: usize,
+    writers: usize,
+}
+
+impl PipeObject {
+    const EMPTY: Self = Self {
+        generation: 1,
+        used: false,
+        buffer: [0; PIPE_BUFFER_BYTES],
+        read_offset: 0,
+        length: 0,
+        readers: 0,
+        writers: 0,
+    };
+
+    fn read(&mut self, destination: &mut [u8]) -> usize {
+        let count = destination.len().min(self.length);
+        for (index, byte) in destination.iter_mut().take(count).enumerate() {
+            *byte = self.buffer[(self.read_offset + index) % PIPE_BUFFER_BYTES];
+        }
+        self.read_offset = (self.read_offset + count) % PIPE_BUFFER_BYTES;
+        self.length -= count;
+        count
+    }
+
+    fn write(&mut self, source: &[u8]) -> usize {
+        let count = source.len().min(PIPE_BUFFER_BYTES - self.length);
+        let write_offset = (self.read_offset + self.length) % PIPE_BUFFER_BYTES;
+        for (index, byte) in source.iter().take(count).enumerate() {
+            self.buffer[(write_offset + index) % PIPE_BUFFER_BYTES] = *byte;
+        }
+        self.length += count;
+        count
+    }
+}
+
+struct PipePool {
+    objects: [PipeObject; MAX_PIPES],
+}
+
+impl PipePool {
+    const fn new() -> Self {
+        Self {
+            objects: [const { PipeObject::EMPTY }; MAX_PIPES],
+        }
+    }
+
+    fn create(&mut self) -> Result<u16, i64> {
+        let Some(index) = self.objects.iter().position(|object| !object.used) else {
+            return Err(status::LIMIT_REACHED);
+        };
+        let generation = self.objects[index].generation;
+        self.objects[index] = PipeObject {
+            generation,
+            used: true,
+            buffer: [0; PIPE_BUFFER_BYTES],
+            read_offset: 0,
+            length: 0,
+            readers: 1,
+            writers: 1,
+        };
+        Ok(pipe_id(index, generation))
+    }
+
+    fn get_mut(&mut self, id: u16) -> Result<&mut PipeObject, i64> {
+        let object = self
+            .objects
+            .get_mut(pipe_index(id))
+            .ok_or(status::BAD_HANDLE)?;
+        if !object.used || object.generation != pipe_generation(id) {
+            return Err(status::BAD_HANDLE);
+        }
+        Ok(object)
+    }
+
+    fn retain(&mut self, id: u16, rights: Rights) -> Result<(), i64> {
+        let object = self.get_mut(id)?;
+        if rights.contains(Rights::READ) {
+            object.readers = object.readers.saturating_add(1);
+        }
+        if rights.contains(Rights::WRITE) {
+            object.writers = object.writers.saturating_add(1);
+        }
+        Ok(())
+    }
+
+    fn release(&mut self, id: u16, rights: Rights) {
+        let Ok(object) = self.get_mut(id) else { return };
+        if rights.contains(Rights::READ) {
+            object.readers = object.readers.saturating_sub(1);
+        }
+        if rights.contains(Rights::WRITE) {
+            object.writers = object.writers.saturating_sub(1);
+        }
+        self.destroy_if_unused(id);
+    }
+
+    fn destroy_if_unused(&mut self, id: u16) {
+        let index = pipe_index(id);
+        let Some(object) = self.objects.get_mut(index) else {
+            return;
+        };
+        if !object.used
+            || object.generation != pipe_generation(id)
+            || object.readers != 0
+            || object.writers != 0
+        {
+            return;
+        }
+        let generation = next_u8_generation(object.generation);
+        *object = PipeObject::EMPTY;
+        object.generation = generation;
+    }
+
+    fn cleanup(&mut self) {
+        for object in &mut self.objects {
+            if object.used {
+                let generation = next_u8_generation(object.generation);
+                *object = PipeObject::EMPTY;
+                object.generation = generation;
+            }
+        }
+    }
+}
+
 struct SpawnData {
     arguments: [u8; MAX_ARGUMENT_BYTES],
     argument_length: usize,
@@ -336,6 +490,8 @@ struct SpawnData {
     environment: [u8; MAX_ENVIRONMENT_BYTES],
     environment_length: usize,
     environment_count: u32,
+    capabilities: [StartupCapability; PROCESS_SPAWN_MAX_CAPABILITIES],
+    capability_count: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -353,6 +509,7 @@ struct ProcessManager {
     scheduler: Scheduler<MAX_THREADS, 1>,
     endpoints: [Endpoint; MAX_ENDPOINTS],
     shared: SharedMemoryPool,
+    pipes: PipePool,
     current: ThreadId,
     kernel_root: u64,
     initramfs: BootInitramfs,
@@ -374,6 +531,7 @@ impl ProcessManager {
             scheduler: Scheduler::new(),
             endpoints: [Endpoint::EMPTY; MAX_ENDPOINTS],
             shared: SharedMemoryPool::new(),
+            pipes: PipePool::new(),
             current: ThreadId::INVALID,
             kernel_root: 0,
             initramfs: BootInitramfs {
@@ -394,6 +552,7 @@ impl ProcessManager {
         self.process_table = ProcessTable::new();
         self.scheduler = Scheduler::new();
         self.shared = SharedMemoryPool::new();
+        self.pipes = PipePool::new();
         self.initramfs = initramfs;
         self.counter_hz = counter_hz;
         self.begin_phase();
@@ -500,7 +659,7 @@ impl ProcessManager {
         };
         let arguments = if let Some(start) = start {
             if self
-                .install_start_info(&mut address_space, pid, tid, start)
+                .install_start_info(&mut address_space, pid, tid, start, &loaded)
                 .is_err()
             {
                 serial::put_str("[process-manager] spawn failed: start-info mapping\n");
@@ -516,6 +675,7 @@ impl ProcessManager {
         };
         self.processes[process_slot] = Some(ManagedProcess {
             pid,
+            parent: options.parent,
             address_space,
             capabilities,
             initramfs: self.initramfs,
@@ -532,6 +692,9 @@ impl ProcessManager {
             pending: PendingOperation::None,
             exited: false,
             exit_reason: NO_EXIT,
+            detached: false,
+            reclaim_address: 0,
+            reclaim_length: 0,
         });
         for entry in capabilities {
             self.retain_capability(entry);
@@ -552,11 +715,38 @@ impl ProcessManager {
         pid: ProcessId,
         tid: ThreadId,
         start: &SpawnData,
+        loaded: &super::LoadedImage,
     ) -> Result<(), ()> {
         let header_size = size_of::<ProcessStartInfo>();
-        let total = header_size
-            .checked_add(start.argument_length)
-            .and_then(|value| value.checked_add(start.environment_length))
+        let capability_address = align_up_usize(
+            header_size
+                .checked_add(start.argument_length)
+                .and_then(|value| value.checked_add(start.environment_length))
+                .ok_or(())?,
+            core::mem::align_of::<StartupCapability>(),
+        )
+        .ok_or(())?;
+        let capabilities_end = capability_address
+            .checked_add(
+                start
+                    .capability_count
+                    .checked_mul(size_of::<StartupCapability>())
+                    .ok_or(())?,
+            )
+            .ok_or(())?;
+        let tls_alignment = loaded
+            .tls_template
+            .map(|template| usize::try_from(template.alignment).ok())
+            .flatten()
+            .unwrap_or(1);
+        let tls_address_offset = align_up_usize(capabilities_end, tls_alignment).ok_or(())?;
+        let total = tls_address_offset
+            .checked_add(
+                loaded
+                    .tls_template
+                    .map(|template| template.bytes.len())
+                    .unwrap_or(0),
+            )
             .ok_or(())?;
         let pages = (total as u64).div_ceil(PAGE_SIZE);
         for page in 0..pages {
@@ -569,6 +759,11 @@ impl ProcessManager {
         }
         let arguments_address = PROCESS_START_INFO_ADDRESS + header_size as u64;
         let environment_address = arguments_address + start.argument_length as u64;
+        let capabilities_address = PROCESS_START_INFO_ADDRESS + capability_address as u64;
+        let tls_template_address = loaded
+            .tls_template
+            .map(|_| PROCESS_START_INFO_ADDRESS + tls_address_offset as u64)
+            .unwrap_or(0);
         let info = ProcessStartInfo {
             version: PROCESS_ABI_VERSION,
             size: header_size as u32,
@@ -582,6 +777,27 @@ impl ProcessManager {
             environment_address,
             environment_length: start.environment_length as u32,
             environment_count: start.environment_count,
+            capabilities_address,
+            capability_count: start.capability_count as u32,
+            reserved: 0,
+            tls_template_address,
+            tls_file_size: loaded
+                .tls_template
+                .map(|template| template.bytes.len() as u64)
+                .unwrap_or(0),
+            tls_memory_size: loaded
+                .tls_template
+                .map(|template| template.memory_size)
+                .unwrap_or(0),
+            tls_alignment: loaded
+                .tls_template
+                .map(|template| template.alignment as u32)
+                .unwrap_or(0),
+            #[cfg(target_arch = "x86_64")]
+            tls_variant: loaded.tls_template.map(|_| 2).unwrap_or(0),
+            #[cfg(target_arch = "aarch64")]
+            tls_variant: loaded.tls_template.map(|_| 1).unwrap_or(0),
+            tls_reserved: 0,
         };
         address_space
             .copy_into_user(PROCESS_START_INFO_ADDRESS, bytes_of(&info))
@@ -595,6 +811,22 @@ impl ProcessManager {
                 &start.environment[..start.environment_length],
             )
             .map_err(|_| ())?;
+        if start.capability_count != 0 {
+            let capability_bytes = unsafe {
+                slice::from_raw_parts(
+                    start.capabilities.as_ptr().cast::<u8>(),
+                    start.capability_count * size_of::<StartupCapability>(),
+                )
+            };
+            address_space
+                .copy_into_user(capabilities_address, capability_bytes)
+                .map_err(|_| ())?;
+        }
+        if let Some(template) = loaded.tls_template {
+            address_space
+                .copy_into_user(tls_template_address, template.bytes)
+                .map_err(|_| ())?;
+        }
         for page in 0..pages {
             address_space
                 .protect_page(
@@ -689,6 +921,7 @@ impl ProcessManager {
             arch::end_of_interrupt();
             self.timer_ticks = self.timer_ticks.saturating_add(1);
             arch::rearm_scheduler_timer(self.counter_hz);
+            self.wake_expired_futexes();
             return self.schedule_next(frame);
         }
         if kind == TrapKind::Syscall {
@@ -778,6 +1011,11 @@ impl ProcessManager {
                     BlockingResult::Blocked => self.schedule_next(frame),
                 }
             }
+            syscall::number::PROCESS_TRY_WAIT => {
+                let result = self.process_try_wait(process_index, Handle(arg0 as u32), arg1);
+                frame.set_syscall_result(result);
+                0
+            }
             syscall::number::PROCESS_KILL => {
                 let result =
                     self.process_kill(process_index, Handle(arg0 as u32), arg1 as i64 as i32);
@@ -804,6 +1042,11 @@ impl ProcessManager {
                     }
                     BlockingResult::Blocked => self.schedule_next(frame),
                 }
+            }
+            syscall::number::THREAD_DETACH => {
+                let result = self.thread_detach(process_index, Handle(arg0 as u32));
+                frame.set_syscall_result(result);
+                0
             }
             syscall::number::THREAD_SET_TLS => {
                 let result = self.thread_set_tls(thread_index, arg0);
@@ -838,6 +1081,49 @@ impl ProcessManager {
             syscall::number::SHARED_MEMORY_SEAL => {
                 let result =
                     self.shared_memory_seal(process_index, Handle(arg0 as u32), VmFlags(arg1));
+                frame.set_syscall_result(result);
+                0
+            }
+            syscall::number::FUTEX_WAIT => {
+                match self.futex_wait(thread_index, arg0, arg1 as u32, arg2) {
+                    BlockingResult::Return(result) => {
+                        frame.set_syscall_result(result);
+                        0
+                    }
+                    BlockingResult::Blocked => self.schedule_next(frame),
+                }
+            }
+            syscall::number::FUTEX_WAKE => {
+                let result = self.futex_wake(process_index, arg0, arg1);
+                frame.set_syscall_result(result);
+                0
+            }
+            syscall::number::PIPE_CREATE => {
+                let result = self.pipe_create(process_index, arg0);
+                frame.set_syscall_result(result);
+                0
+            }
+            syscall::number::PIPE_READ => {
+                match self.pipe_read(thread_index, Handle(arg0 as u32), arg1, arg2) {
+                    BlockingResult::Return(result) => {
+                        frame.set_syscall_result(result);
+                        0
+                    }
+                    BlockingResult::Blocked => self.schedule_next(frame),
+                }
+            }
+            syscall::number::PIPE_WRITE => {
+                match self.pipe_write(thread_index, Handle(arg0 as u32), arg1, arg2) {
+                    BlockingResult::Return(result) => {
+                        frame.set_syscall_result(result);
+                        0
+                    }
+                    BlockingResult::Blocked => self.schedule_next(frame),
+                }
+            }
+            syscall::number::HANDLE_DUPLICATE => {
+                let result =
+                    self.handle_duplicate(process_index, Handle(arg0 as u32), Rights(arg1));
                 frame.set_syscall_result(result);
                 0
             }
@@ -959,6 +1245,11 @@ impl ProcessManager {
         }
         if woke_waiter {
             self.deferred_thread_reap = Some(tid);
+        } else if self.threads[index]
+            .as_ref()
+            .is_some_and(|thread| thread.detached)
+        {
+            self.deferred_thread_reap = Some(tid);
         }
     }
 
@@ -983,6 +1274,22 @@ impl ProcessManager {
                 thread.exited = true;
                 thread.exit_reason = reason;
                 thread.pending = PendingOperation::None;
+            }
+        }
+        // Pipe endpoints закрываются в момент exit, а не только после wait/reap:
+        // иначе родитель, читающий `Command::output`, никогда не увидит EOF и
+        // не сможет дойти до wait. Остальные capabilities живут до reap.
+        for slot in 1..MAX_CAPABILITIES {
+            let entry = self.processes[process_index]
+                .as_ref()
+                .expect("process")
+                .capabilities[slot];
+            if matches!(entry.kind, CapabilityKind::Pipe(_)) {
+                self.processes[process_index]
+                    .as_mut()
+                    .expect("process")
+                    .capabilities[slot] = EMPTY_CAPABILITY;
+                self.release_capability(entry);
             }
         }
         let process = self.processes[process_index].as_mut().expect("process");
@@ -1085,6 +1392,8 @@ impl ProcessManager {
             environment: [0; MAX_ENVIRONMENT_BYTES],
             environment_length: request.environment_length as usize,
             environment_count: request.environment_count,
+            capabilities: [StartupCapability::EMPTY; PROCESS_SPAWN_MAX_CAPABILITIES],
+            capability_count: 0,
         };
         if start.argument_length > MAX_ARGUMENT_BYTES
             || start.environment_length > MAX_ENVIRONMENT_BYTES
@@ -1120,6 +1429,7 @@ impl ProcessManager {
         let mut transfers = [SpawnCapability {
             source: Handle::INVALID,
             target_slot: 0,
+            role: StartupRole::NONE,
             rights: Rights::NONE,
         }; PROCESS_SPAWN_MAX_CAPABILITIES];
         let transfer_count = request.capability_count as usize;
@@ -1160,6 +1470,21 @@ impl ProcessManager {
                 kind: source.kind,
                 rights,
             };
+            if transfer.role != StartupRole::NONE {
+                if start.capabilities[..start.capability_count]
+                    .iter()
+                    .any(|capability| capability.role == transfer.role)
+                {
+                    return status::INVALID_ARGUMENT;
+                }
+                start.capabilities[start.capability_count] = StartupCapability {
+                    role: transfer.role,
+                    flags: 0,
+                    handle: Handle(transfer.target_slot as u32),
+                    rights,
+                };
+                start.capability_count += 1;
+            }
         }
         let Some(parent_capability_slot) = self.processes[parent_index]
             .as_ref()
@@ -1185,6 +1510,23 @@ impl ProcessManager {
             Err(ProcessError::AddressSpace) => return status::OUT_OF_MEMORY,
             Err(_) => return status::INVALID_ARGUMENT,
         };
+        // RECEIVE endpoint имеет одного активного владельца. При передаче
+        // ребёнку (типичный VFS reply channel) маршрутизация временно следует
+        // за ребёнком; reap восстановит родителя для последовательного spawn.
+        for transfer in transfers.iter().take(transfer_count) {
+            if transfer.rights.contains(Rights::RECEIVE) {
+                if let Ok(CapabilityEntry {
+                    kind: CapabilityKind::Endpoint(endpoint),
+                    ..
+                }) = self.processes[parent_index]
+                    .as_ref()
+                    .expect("parent")
+                    .capability(transfer.source, Rights::TRANSFER)
+                {
+                    self.endpoints[endpoint as usize].receiver = pid;
+                }
+            }
+        }
         self.processes[parent_index]
             .as_mut()
             .expect("parent")
@@ -1291,6 +1633,40 @@ impl ProcessManager {
         status::OK
     }
 
+    fn process_try_wait(&mut self, process_index: usize, handle: Handle, user_reason: u64) -> i64 {
+        if !self.user_writable(process_index, user_reason, size_of::<ExitReason>()) {
+            return status::INVALID_ARGUMENT;
+        }
+        let target = match self.processes[process_index]
+            .as_ref()
+            .expect("caller")
+            .capability(handle, Rights::WAIT)
+        {
+            Ok(CapabilityEntry {
+                kind: CapabilityKind::Process(pid),
+                ..
+            }) => pid,
+            Ok(_) => return status::ACCESS_DENIED,
+            Err(error) => return error,
+        };
+        let Some(target_index) = self.process_index(target) else {
+            return status::BAD_HANDLE;
+        };
+        let target_process = self.processes[target_index].as_ref().expect("target");
+        if !target_process.exited {
+            return status::BUSY;
+        }
+        let reason = target_process.exit_reason;
+        if self
+            .write_struct(process_index, user_reason, &reason)
+            .is_err()
+        {
+            return status::INVALID_ARGUMENT;
+        }
+        self.reap_process(target);
+        status::OK
+    }
+
     fn thread_create(
         &mut self,
         process_index: usize,
@@ -1318,12 +1694,34 @@ impl ProcessManager {
             return status::ACCESS_DENIED;
         };
         let process = self.processes[process_index].as_ref().expect("process");
+        let has_reclaim = request.reclaim_address != 0 || request.reclaim_length != 0;
         if !process.address_space.is_executable(request.entry)
             || !process.address_space.is_writable(request.stack_pointer - 1)
             || (request.thread_pointer != 0
                 && !process
                     .address_space
                     .contains_user_range(request.thread_pointer, 1, false))
+            || (has_reclaim
+                && (request.reclaim_address == 0
+                    || request.reclaim_length == 0
+                    || !request.reclaim_address.is_multiple_of(PAGE_SIZE)
+                    || !request.reclaim_length.is_multiple_of(PAGE_SIZE)
+                    || !process.address_space.contains_user_range(
+                        request.reclaim_address,
+                        request.reclaim_length as usize,
+                        true,
+                    )
+                    || request.stack_pointer <= request.reclaim_address
+                    || request.stack_pointer
+                        > request
+                            .reclaim_address
+                            .saturating_add(request.reclaim_length)
+                    || (request.thread_pointer != 0
+                        && (request.thread_pointer < request.reclaim_address
+                            || request.thread_pointer
+                                >= request
+                                    .reclaim_address
+                                    .saturating_add(request.reclaim_length)))))
         {
             return status::INVALID_ARGUMENT;
         }
@@ -1351,6 +1749,9 @@ impl ProcessManager {
             pending: PendingOperation::None,
             exited: false,
             exit_reason: NO_EXIT,
+            detached: false,
+            reclaim_address: request.reclaim_address,
+            reclaim_length: request.reclaim_length,
         });
         self.processes[process_index]
             .as_mut()
@@ -1436,6 +1837,134 @@ impl ProcessManager {
                 user_reason,
             });
         BlockingResult::Blocked
+    }
+
+    fn thread_detach(&mut self, process_index: usize, handle: Handle) -> i64 {
+        let slot = handle.0 as usize;
+        if slot == 0 || slot >= MAX_CAPABILITIES {
+            return status::BAD_HANDLE;
+        }
+        let target = match self.processes[process_index]
+            .as_ref()
+            .expect("process")
+            .capability(handle, Rights::WAIT)
+        {
+            Ok(CapabilityEntry {
+                kind: CapabilityKind::Thread(tid),
+                ..
+            }) => tid,
+            Ok(_) => return status::ACCESS_DENIED,
+            Err(error) => return error,
+        };
+        self.processes[process_index]
+            .as_mut()
+            .expect("process")
+            .capabilities[slot] = EMPTY_CAPABILITY;
+        let still_joinable = self.processes.iter().flatten().any(|process| {
+            process
+                .capabilities
+                .iter()
+                .any(|entry| entry.kind == CapabilityKind::Thread(target))
+        });
+        if !still_joinable {
+            let Some(thread_index) = self.thread_index(target) else {
+                return status::OK;
+            };
+            let exited = self.threads[thread_index]
+                .as_ref()
+                .is_some_and(|thread| thread.exited);
+            self.threads[thread_index]
+                .as_mut()
+                .expect("thread")
+                .detached = true;
+            if exited {
+                self.reap_thread(target);
+            }
+        }
+        status::OK
+    }
+
+    fn futex_wait(
+        &mut self,
+        thread_index: usize,
+        address: u64,
+        expected: u32,
+        timeout_ns: u64,
+    ) -> BlockingResult {
+        if !address.is_multiple_of(core::mem::align_of::<u32>() as u64) {
+            return BlockingResult::Return(status::INVALID_ARGUMENT);
+        }
+        let pid = self.threads[thread_index].as_ref().expect("thread").pid;
+        let process_index = self.process_index(pid).expect("process");
+        let mut bytes = [0u8; size_of::<u32>()];
+        if self
+            .copy_from_process(process_index, address, &mut bytes)
+            .is_err()
+        {
+            return BlockingResult::Return(status::INVALID_ARGUMENT);
+        }
+        if u32::from_ne_bytes(bytes) != expected {
+            return BlockingResult::Return(status::OK);
+        }
+        if timeout_ns == 0 {
+            return BlockingResult::Return(status::TIMED_OUT);
+        }
+        let now = self.monotonic_nanoseconds().max(0) as u64;
+        let deadline_ns = if timeout_ns == u64::MAX {
+            u64::MAX
+        } else {
+            now.saturating_add(timeout_ns)
+        };
+        let tid = self.threads[thread_index].as_ref().expect("thread").tid;
+        if self.scheduler.block(tid).is_err() {
+            return BlockingResult::Return(status::BUSY);
+        }
+        self.threads[thread_index].as_mut().expect("thread").pending =
+            PendingOperation::Futex(PendingFutex {
+                address,
+                deadline_ns,
+            });
+        BlockingResult::Blocked
+    }
+
+    fn futex_wake(&mut self, process_index: usize, address: u64, count: u64) -> i64 {
+        if !address.is_multiple_of(core::mem::align_of::<u32>() as u64)
+            || count == 0
+            || !self.processes[process_index]
+                .as_ref()
+                .expect("process")
+                .address_space
+                .contains_user_range(address, size_of::<u32>(), false)
+        {
+            return status::INVALID_ARGUMENT;
+        }
+        let pid = self.processes[process_index].as_ref().expect("process").pid;
+        let limit = usize::try_from(count).unwrap_or(usize::MAX);
+        let mut woken = 0usize;
+        for thread in self.threads.iter_mut().flatten() {
+            if woken == limit || thread.pid != pid {
+                continue;
+            }
+            if matches!(thread.pending, PendingOperation::Futex(wait) if wait.address == address) {
+                thread.pending = PendingOperation::None;
+                thread.context.set_syscall_result(status::OK);
+                let _ = self.scheduler.wake(thread.tid);
+                woken += 1;
+            }
+        }
+        i64::try_from(woken).unwrap_or(i64::MAX)
+    }
+
+    fn wake_expired_futexes(&mut self) {
+        let now = self.monotonic_nanoseconds().max(0) as u64;
+        for thread in self.threads.iter_mut().flatten() {
+            if matches!(thread.pending, PendingOperation::Futex(wait) if wait.deadline_ns != u64::MAX && wait.deadline_ns <= now)
+            {
+                thread.pending = PendingOperation::None;
+                thread.context.set_syscall_result(status::TIMED_OUT);
+                let _ = self.scheduler.wake(thread.tid);
+            }
+        }
     }
 
     fn thread_set_tls(&mut self, thread_index: usize, address: u64) -> i64 {
@@ -1796,6 +2325,261 @@ impl ProcessManager {
         status::OK
     }
 
+    fn handle_duplicate(&mut self, process_index: usize, handle: Handle, requested: Rights) -> i64 {
+        let source = match self.processes[process_index]
+            .as_ref()
+            .expect("process")
+            .capability(handle, Rights::NONE)
+        {
+            Ok(source) => source,
+            Err(error) => return error,
+        };
+        let rights = match derive_capability_rights(source.rights, requested) {
+            Ok(rights) => rights,
+            Err(CapabilityTransferError::EmptyRights) => return status::INVALID_ARGUMENT,
+            Err(_) => return status::ACCESS_DENIED,
+        };
+        let Some(slot) = self.processes[process_index]
+            .as_ref()
+            .expect("process")
+            .free_capability_slot()
+        else {
+            return status::LIMIT_REACHED;
+        };
+        let entry = CapabilityEntry {
+            kind: source.kind,
+            rights,
+        };
+        self.processes[process_index]
+            .as_mut()
+            .expect("process")
+            .capabilities[slot] = entry;
+        self.retain_capability(entry);
+        slot as i64
+    }
+
+    fn pipe_create(&mut self, process_index: usize, result_address: u64) -> i64 {
+        if !self.user_writable(process_index, result_address, size_of::<PipeCreateResult>()) {
+            return status::INVALID_ARGUMENT;
+        }
+        let mut slots = [0usize; 2];
+        let mut count = 0usize;
+        for slot in 1..MAX_CAPABILITIES {
+            if self.processes[process_index]
+                .as_ref()
+                .expect("process")
+                .capabilities[slot]
+                .kind
+                == CapabilityKind::Empty
+            {
+                slots[count] = slot;
+                count += 1;
+                if count == slots.len() {
+                    break;
+                }
+            }
+        }
+        if count != slots.len() {
+            return status::LIMIT_REACHED;
+        }
+        let pipe = match self.pipes.create() {
+            Ok(pipe) => pipe,
+            Err(error) => return error,
+        };
+        let reader = CapabilityEntry {
+            kind: CapabilityKind::Pipe(pipe),
+            rights: Rights::READ.union(Rights::TRANSFER),
+        };
+        let writer = CapabilityEntry {
+            kind: CapabilityKind::Pipe(pipe),
+            rights: Rights::WRITE.union(Rights::TRANSFER),
+        };
+        self.processes[process_index]
+            .as_mut()
+            .expect("process")
+            .capabilities[slots[0]] = reader;
+        self.processes[process_index]
+            .as_mut()
+            .expect("process")
+            .capabilities[slots[1]] = writer;
+        let result = PipeCreateResult {
+            reader: Handle(slots[0] as u32),
+            writer: Handle(slots[1] as u32),
+            version: PIPE_ABI_VERSION,
+            reserved: 0,
+        };
+        if self
+            .write_struct(process_index, result_address, &result)
+            .is_err()
+        {
+            self.processes[process_index]
+                .as_mut()
+                .expect("process")
+                .capabilities[slots[0]] = EMPTY_CAPABILITY;
+            self.processes[process_index]
+                .as_mut()
+                .expect("process")
+                .capabilities[slots[1]] = EMPTY_CAPABILITY;
+            self.pipes.release(pipe, reader.rights);
+            self.pipes.release(pipe, writer.rights);
+            return status::INVALID_ARGUMENT;
+        }
+        status::OK
+    }
+
+    fn pipe_read(
+        &mut self,
+        thread_index: usize,
+        handle: Handle,
+        buffer: u64,
+        length: u64,
+    ) -> BlockingResult {
+        let pid = self.threads[thread_index].as_ref().expect("thread").pid;
+        let process_index = self.process_index(pid).expect("process");
+        let pipe = match self.processes[process_index]
+            .as_ref()
+            .expect("process")
+            .capability(handle, Rights::READ)
+        {
+            Ok(CapabilityEntry {
+                kind: CapabilityKind::Pipe(pipe),
+                ..
+            }) => pipe,
+            Ok(_) => {
+                log_pipe_error("read-kind", status::ACCESS_DENIED);
+                return BlockingResult::Return(status::ACCESS_DENIED);
+            }
+            Err(error) => {
+                log_pipe_error("read-capability", error);
+                return BlockingResult::Return(error);
+            }
+        };
+        if length == 0 {
+            return BlockingResult::Return(0);
+        }
+        let count = usize::try_from(length)
+            .unwrap_or(usize::MAX)
+            .min(PIPE_BUFFER_BYTES);
+        if !self.user_writable(process_index, buffer, count) {
+            log_pipe_error("read-buffer", status::INVALID_ARGUMENT);
+            return BlockingResult::Return(status::INVALID_ARGUMENT);
+        }
+        let mut temporary = [0u8; PIPE_BUFFER_BYTES];
+        let read = {
+            let object = match self.pipes.get_mut(pipe) {
+                Ok(object) => object,
+                Err(error) => {
+                    log_pipe_error("read-object", error);
+                    return BlockingResult::Return(error);
+                }
+            };
+            if object.length == 0 {
+                if object.writers == 0 {
+                    return BlockingResult::Return(0);
+                }
+                let tid = self.threads[thread_index].as_ref().expect("thread").tid;
+                if self.scheduler.block(tid).is_err() {
+                    return BlockingResult::Return(status::BUSY);
+                }
+                self.threads[thread_index].as_mut().expect("thread").pending =
+                    PendingOperation::Pipe(PendingPipe { pipe, write: false });
+                return BlockingResult::Blocked;
+            }
+            object.read(&mut temporary[..count])
+        };
+        if self.processes[process_index]
+            .as_ref()
+            .expect("process")
+            .address_space
+            .copy_to_user(buffer, &temporary[..read])
+            .is_err()
+        {
+            log_pipe_error("read-copy", status::INVALID_ARGUMENT);
+            return BlockingResult::Return(status::INVALID_ARGUMENT);
+        }
+        self.wake_pipe_waiters(pipe, true);
+        BlockingResult::Return(read as i64)
+    }
+
+    fn pipe_write(
+        &mut self,
+        thread_index: usize,
+        handle: Handle,
+        buffer: u64,
+        length: u64,
+    ) -> BlockingResult {
+        let pid = self.threads[thread_index].as_ref().expect("thread").pid;
+        let process_index = self.process_index(pid).expect("process");
+        let pipe = match self.processes[process_index]
+            .as_ref()
+            .expect("process")
+            .capability(handle, Rights::WRITE)
+        {
+            Ok(CapabilityEntry {
+                kind: CapabilityKind::Pipe(pipe),
+                ..
+            }) => pipe,
+            Ok(_) => {
+                log_pipe_error("write-kind", status::ACCESS_DENIED);
+                return BlockingResult::Return(status::ACCESS_DENIED);
+            }
+            Err(error) => {
+                log_pipe_error("write-capability", error);
+                return BlockingResult::Return(error);
+            }
+        };
+        if length == 0 {
+            return BlockingResult::Return(0);
+        }
+        let count = usize::try_from(length)
+            .unwrap_or(usize::MAX)
+            .min(PIPE_BUFFER_BYTES);
+        let mut temporary = [0u8; PIPE_BUFFER_BYTES];
+        if self
+            .copy_from_process(process_index, buffer, &mut temporary[..count])
+            .is_err()
+        {
+            log_pipe_error("write-buffer", status::INVALID_ARGUMENT);
+            return BlockingResult::Return(status::INVALID_ARGUMENT);
+        }
+        let written = {
+            let object = match self.pipes.get_mut(pipe) {
+                Ok(object) => object,
+                Err(error) => {
+                    log_pipe_error("write-object", error);
+                    return BlockingResult::Return(error);
+                }
+            };
+            if object.readers == 0 {
+                log_pipe_error("write-no-readers", status::IO_ERROR);
+                return BlockingResult::Return(status::IO_ERROR);
+            }
+            if object.length == PIPE_BUFFER_BYTES {
+                let tid = self.threads[thread_index].as_ref().expect("thread").tid;
+                if self.scheduler.block(tid).is_err() {
+                    return BlockingResult::Return(status::BUSY);
+                }
+                self.threads[thread_index].as_mut().expect("thread").pending =
+                    PendingOperation::Pipe(PendingPipe { pipe, write: true });
+                return BlockingResult::Blocked;
+            }
+            object.write(&temporary[..count])
+        };
+        self.wake_pipe_waiters(pipe, false);
+        BlockingResult::Return(written as i64)
+    }
+
+    fn wake_pipe_waiters(&mut self, pipe: u16, writers: bool) {
+        for thread in self.threads.iter_mut().flatten() {
+            if matches!(thread.pending, PendingOperation::Pipe(wait) if wait.pipe == pipe && wait.write == writers)
+            {
+                thread.pending = PendingOperation::None;
+                thread.context.set_syscall_result(status::BUSY);
+                let _ = self.scheduler.wake(thread.tid);
+            }
+        }
+    }
+
     fn monotonic_nanoseconds(&self) -> i64 {
         if self.counter_hz == 0 {
             return status::NOT_SUPPORTED;
@@ -2119,6 +2903,31 @@ impl ProcessManager {
         {
             return;
         }
+        let parent = self.processes[process_index]
+            .as_ref()
+            .expect("process")
+            .parent;
+        for endpoint in 0..MAX_ENDPOINTS {
+            if self.endpoints[endpoint].receiver != pid {
+                continue;
+            }
+            let parent_can_receive = self.process_index(parent).is_some_and(|parent_index| {
+                self.processes[parent_index]
+                    .as_ref()
+                    .expect("parent")
+                    .capabilities
+                    .iter()
+                    .any(|entry| {
+                        entry.kind == CapabilityKind::Endpoint(endpoint as u8)
+                            && entry.rights.contains(Rights::RECEIVE)
+                    })
+            });
+            self.endpoints[endpoint].receiver = if parent_can_receive {
+                parent
+            } else {
+                ProcessId::KERNEL
+            };
+        }
         for shared_index in 0..MAX_SHARED_OBJECTS {
             let object = shared_id(shared_index, self.shared.objects[shared_index].generation);
             let count = self.processes[process_index]
@@ -2176,6 +2985,15 @@ impl ProcessManager {
         {
             let _ = self.scheduler.reap(tid);
         }
+        let (pid, reclaim_address, reclaim_length) = {
+            let thread = self.threads[index].as_ref().expect("thread");
+            (thread.pid, thread.reclaim_address, thread.reclaim_length)
+        };
+        if reclaim_address != 0 && reclaim_length != 0 {
+            if let Some(process_index) = self.process_index(pid) {
+                let _ = self.vm_unmap(process_index, reclaim_address, reclaim_length);
+            }
+        }
         self.threads[index] = None;
         self.invalidate_capability_kind(CapabilityKind::Thread(tid));
     }
@@ -2191,14 +3009,32 @@ impl ProcessManager {
     }
 
     fn retain_capability(&mut self, entry: CapabilityEntry) {
-        if let CapabilityKind::SharedMemory(object) = entry.kind {
-            let _ = self.shared.retain_capability(object);
+        match entry.kind {
+            CapabilityKind::SharedMemory(object) => {
+                let _ = self.shared.retain_capability(object);
+            }
+            CapabilityKind::Pipe(pipe) => {
+                let _ = self.pipes.retain(pipe, entry.rights);
+            }
+            _ => {}
         }
     }
 
     fn release_capability(&mut self, entry: CapabilityEntry) {
-        if let CapabilityKind::SharedMemory(object) = entry.kind {
-            self.shared.release_capability(object);
+        match entry.kind {
+            CapabilityKind::SharedMemory(object) => self.shared.release_capability(object),
+            CapabilityKind::Pipe(pipe) => {
+                let had_read = entry.rights.contains(Rights::READ);
+                let had_write = entry.rights.contains(Rights::WRITE);
+                self.pipes.release(pipe, entry.rights);
+                if had_write {
+                    self.wake_pipe_waiters(pipe, false);
+                }
+                if had_read {
+                    self.wake_pipe_waiters(pipe, true);
+                }
+            }
+            _ => {}
         }
     }
 
@@ -2325,6 +3161,7 @@ impl ProcessManager {
             }
         }
         self.shared.cleanup();
+        self.pipes.cleanup();
     }
 }
 
@@ -2335,6 +3172,7 @@ enum BlockingResult {
 
 static mut MANAGER: ProcessManager = ProcessManager::empty();
 static mut ACTIVE_MANAGER: *mut ProcessManager = ptr::null_mut();
+static mut INTERACTIVE_SERVICES_READY: bool = false;
 
 pub(super) fn handle_active_trap(frame: &mut TrapFrame) -> Option<u64> {
     let manager = unsafe { ACTIVE_MANAGER.as_mut() }?;
@@ -2465,9 +3303,12 @@ pub(super) fn run_milestone(info: &rustos_abi::BootInfo) -> Result<(), ProcessEr
     serial::put_str("[abi-v4] spawn/wait/kill threads VM shared-memory TLS clock verified\n");
     manager.cleanup();
 
-    run_vfs_phase(manager, "system/bin/std-smoke.rune", false)?;
+    run_std_startup_phase(manager)?;
+    serial::put_str("[std-startup] ordinary fn main argv and process-local environment verified\n");
+
+    run_vfs_phase(manager, "system/bin/std-smoke.rune", true)?;
     serial::put_str(
-        "[std] collections allocator sync time and std::fs over vfsd verified in ring3 RUNE\n",
+        "[std] allocator fs threads futex process pipes stdio native SDK and VFS executable verified in ring3 RUNE\n",
     );
 
     // Настоящий VFS vertical slice: filesystem parser и pathname policy живут
@@ -2481,7 +3322,7 @@ pub(super) fn run_milestone(info: &rustos_abi::BootInfo) -> Result<(), ProcessEr
     serial::put_str("[vfsd] restart recovered committed VaraniaFS metadata and file data\n");
     run_vfs_phase(manager, "system/bin/loader-test.rune", true)?;
     serial::put_str(
-        "[loader] DT_NEEDED symbols RELA TLS RELRO and cross-process shared RX verified\n",
+        "[loader] RUNE interfaces imports ABI TLS RELRO and cross-process shared RX verified\n",
     );
 
     let free_after = memory::stats()
@@ -2492,6 +3333,268 @@ pub(super) fn run_milestone(info: &rustos_abi::BootInfo) -> Result<(), ProcessEr
     }
     serial::put_str("[process-manager] dynamic create/exit/reap reclaimed all frames\n");
     serial::put_str("[process-manager] ABI v4 VM/shared-memory frames reclaimed\n");
+    Ok(())
+}
+
+pub(super) fn start_interactive_services() -> Result<(), ProcessError> {
+    const SERVER_ENDPOINT: u8 = 1;
+    const SERVER_SLOT: usize = 2;
+    const DEVICE_SLOT: usize = 3;
+
+    let manager = unsafe { &mut *ptr::addr_of_mut!(MANAGER) };
+    manager.begin_phase();
+    let mut capabilities = [EMPTY_CAPABILITY; MAX_CAPABILITIES];
+    capabilities[SERVER_SLOT] = CapabilityEntry {
+        kind: CapabilityKind::Endpoint(SERVER_ENDPOINT),
+        rights: Rights::RECEIVE,
+    };
+    capabilities[DEVICE_SLOT] = CapabilityEntry {
+        kind: CapabilityKind::BlockDevice(0),
+        rights: Rights::READ.union(Rights::WRITE),
+    };
+    let server = manager.spawn_internal(
+        "system/bin/vfsd.rune",
+        SpawnOptions {
+            parent: ProcessId::KERNEL,
+            priority: PriorityClass::System,
+            boot_arguments: [SERVER_SLOT as u64, DEVICE_SLOT as u64, syscall::ABI_VERSION],
+            expected: None,
+        },
+        capabilities,
+        None,
+    )?;
+    manager.endpoints[SERVER_ENDPOINT as usize].receiver = server;
+
+    // Сервер доходит до blocking receive; отсутствие runnable threads
+    // возвращает управление GUI kernel loop, не завершая сам процесс.
+    if let Err(error) = manager.run() {
+        manager.cleanup();
+        return Err(error);
+    }
+    unsafe { INTERACTIVE_SERVICES_READY = true };
+    serial::put_str("[services] persistent ring3 vfsd ready for GUI terminal\n");
+    Ok(())
+}
+
+pub(super) fn run_interactive_command(
+    command: &str,
+    output: &mut [u8],
+) -> Result<InteractiveExit, ProcessError> {
+    const SERVER_ENDPOINT: u8 = 1;
+    const REPLY_ENDPOINT: u8 = 2;
+    const SERVER_SLOT: usize = 2;
+    const REPLY_SLOT: usize = 3;
+    const STDOUT_SLOT: usize = 4;
+    const STDERR_SLOT: usize = 5;
+
+    if !unsafe { INTERACTIVE_SERVICES_READY } {
+        return Err(ProcessError::UnexpectedExit);
+    }
+    let mut words = command.split_ascii_whitespace();
+    let target = words.next().ok_or(ProcessError::MissingImage)?;
+    if target.is_empty() || !target.starts_with('/') || target.as_bytes().contains(&0) {
+        return Err(ProcessError::MissingImage);
+    }
+
+    let mut start = SpawnData {
+        arguments: [0; MAX_ARGUMENT_BYTES],
+        argument_length: 0,
+        argument_count: 0,
+        environment: [0; MAX_ENVIRONMENT_BYTES],
+        environment_length: 0,
+        environment_count: 0,
+        capabilities: [StartupCapability::EMPTY; PROCESS_SPAWN_MAX_CAPABILITIES],
+        capability_count: 5,
+    };
+    for argument in core::iter::once("rune-runner")
+        .chain(core::iter::once(target))
+        .chain(words)
+    {
+        let end = start
+            .argument_length
+            .checked_add(argument.len() + 1)
+            .ok_or(ProcessError::AddressSpace)?;
+        if end > start.arguments.len() || argument.as_bytes().contains(&0) {
+            return Err(ProcessError::AddressSpace);
+        }
+        start.arguments[start.argument_length..end - 1].copy_from_slice(argument.as_bytes());
+        start.argument_length = end;
+        start.argument_count += 1;
+    }
+    const ENVIRONMENT: &[u8] = b"PWD=/\0HOME=/home\0TMPDIR=/tmp\0";
+    start.environment[..ENVIRONMENT.len()].copy_from_slice(ENVIRONMENT);
+    start.environment_length = ENVIRONMENT.len();
+    start.environment_count = 3;
+
+    let manager = unsafe { &mut *ptr::addr_of_mut!(MANAGER) };
+    if manager.endpoints[SERVER_ENDPOINT as usize].receiver == ProcessId::KERNEL {
+        return Err(ProcessError::UnexpectedExit);
+    }
+    let pipe = manager
+        .pipes
+        .create()
+        .map_err(|_| ProcessError::AddressSpace)?;
+    let mut capabilities = [EMPTY_CAPABILITY; MAX_CAPABILITIES];
+    capabilities[VFS_ROOT_SLOT] = CapabilityEntry {
+        kind: CapabilityKind::VfsRoot,
+        rights: Rights::READ.union(Rights::EXECUTE).union(Rights::TRANSFER),
+    };
+    capabilities[SERVER_SLOT] = CapabilityEntry {
+        kind: CapabilityKind::Endpoint(SERVER_ENDPOINT),
+        rights: Rights::SEND.union(Rights::TRANSFER),
+    };
+    capabilities[REPLY_SLOT] = CapabilityEntry {
+        kind: CapabilityKind::Endpoint(REPLY_ENDPOINT),
+        rights: Rights::SEND.union(Rights::RECEIVE).union(Rights::TRANSFER),
+    };
+    let writer = CapabilityEntry {
+        kind: CapabilityKind::Pipe(pipe),
+        rights: Rights::WRITE.union(Rights::TRANSFER),
+    };
+    capabilities[STDOUT_SLOT] = writer;
+    capabilities[STDERR_SLOT] = writer;
+    start.capabilities[0] = StartupCapability {
+        role: StartupRole::EXECUTABLE_NAMESPACE,
+        flags: 0,
+        handle: Handle(VFS_ROOT_SLOT as u32),
+        rights: capabilities[VFS_ROOT_SLOT].rights,
+    };
+    start.capabilities[1] = StartupCapability {
+        role: StartupRole::VFS,
+        flags: 0,
+        handle: Handle(SERVER_SLOT as u32),
+        rights: capabilities[SERVER_SLOT].rights,
+    };
+    start.capabilities[2] = StartupCapability {
+        role: StartupRole::VFS_REPLY,
+        flags: 0,
+        handle: Handle(REPLY_SLOT as u32),
+        rights: capabilities[REPLY_SLOT].rights,
+    };
+    start.capabilities[3] = StartupCapability {
+        role: StartupRole::STDOUT,
+        flags: 0,
+        handle: Handle(STDOUT_SLOT as u32),
+        rights: writer.rights,
+    };
+    start.capabilities[4] = StartupCapability {
+        role: StartupRole::STDERR,
+        flags: 0,
+        handle: Handle(STDERR_SLOT as u32),
+        rights: writer.rights,
+    };
+
+    let child = match manager.spawn_internal(
+        "system/bin/rune-runner.rune",
+        SpawnOptions {
+            parent: ProcessId::KERNEL,
+            priority: PriorityClass::Interactive,
+            boot_arguments: [0; 3],
+            expected: None,
+        },
+        capabilities,
+        Some(&start),
+    ) {
+        Ok(child) => child,
+        Err(error) => {
+            manager
+                .pipes
+                .release(pipe, Rights::READ.union(Rights::WRITE));
+            return Err(error);
+        }
+    };
+    // create() резервирует исходную writer reference; две реальные writer
+    // capabilities уже учтены spawn_internal, поэтому исходную закрываем.
+    manager.pipes.release(pipe, Rights::WRITE);
+    manager.endpoints[REPLY_ENDPOINT as usize].receiver = child;
+
+    let mut captured = 0usize;
+    let reason = loop {
+        manager.run()?;
+        let mut chunk = [0u8; PIPE_BUFFER_BYTES];
+        let read = manager
+            .pipes
+            .get_mut(pipe)
+            .map_err(|_| ProcessError::UnexpectedExit)?
+            .read(&mut chunk);
+        let copied = read.min(output.len().saturating_sub(captured));
+        output[captured..captured + copied].copy_from_slice(&chunk[..copied]);
+        captured += copied;
+        if read != 0 {
+            manager.wake_pipe_waiters(pipe, true);
+        }
+        let process = manager
+            .processes
+            .iter()
+            .flatten()
+            .find(|process| process.pid == child)
+            .ok_or(ProcessError::UnexpectedExit)?;
+        if process.exited {
+            break process.exit_reason;
+        }
+        if read == 0 {
+            return Err(ProcessError::UnexpectedExit);
+        }
+    };
+
+    manager.reap_process(child);
+    manager.pipes.release(pipe, Rights::READ);
+    serial::put_str("[terminal-run] path=");
+    serial::put_str(target);
+    serial::put_str(" status=");
+    serial::put_u32(reason.status as u32);
+    serial::put_str(" exception=");
+    serial::put_u32(u32::from(reason.exception));
+    serial::put_str(" output=");
+    serial::put_u32(captured as u32);
+    serial::put_str("\n");
+    Ok(InteractiveExit {
+        output_length: captured,
+        status: reason.status,
+        exception: reason.exception,
+    })
+}
+
+/// Запускает программу тем же путём, которым `process_spawn` создаёт обычное
+/// приложение: с versioned ProcessStartInfo вместо приватных boot-регистров.
+/// Благодаря этому тест защищает всю цепочку kernel -> RustOS CRT -> std::rt.
+fn run_std_startup_phase(manager: &mut ProcessManager) -> Result<(), ProcessError> {
+    const ARGUMENTS: &[u8] = b"std-main\0--self-test\0";
+    const ENVIRONMENT: &[u8] = b"RUSTOS_MODE=developer\0";
+
+    let mut start = SpawnData {
+        arguments: [0; MAX_ARGUMENT_BYTES],
+        argument_length: ARGUMENTS.len(),
+        argument_count: 2,
+        environment: [0; MAX_ENVIRONMENT_BYTES],
+        environment_length: ENVIRONMENT.len(),
+        environment_count: 1,
+        capabilities: [StartupCapability::EMPTY; PROCESS_SPAWN_MAX_CAPABILITIES],
+        capability_count: 0,
+    };
+    start.arguments[..ARGUMENTS.len()].copy_from_slice(ARGUMENTS);
+    start.environment[..ENVIRONMENT.len()].copy_from_slice(ENVIRONMENT);
+
+    manager.begin_phase();
+    manager.spawn_internal(
+        "system/bin/std-main.rune",
+        SpawnOptions {
+            parent: ProcessId::KERNEL,
+            priority: PriorityClass::Interactive,
+            boot_arguments: [0; 3],
+            expected: Some(ExpectedExit {
+                status: 0,
+                exception: 0,
+            }),
+        },
+        [EMPTY_CAPABILITY; MAX_CAPABILITIES],
+        Some(&start),
+    )?;
+    if let Err(error) = manager.run() {
+        manager.cleanup();
+        return Err(error);
+    }
+    manager.cleanup();
     Ok(())
 }
 
@@ -2533,29 +3636,78 @@ fn run_vfs_phase(
     if executable_namespace {
         client_caps[VFS_ROOT_SLOT] = CapabilityEntry {
             kind: CapabilityKind::VfsRoot,
-            rights: Rights::READ.union(Rights::EXECUTE),
+            rights: Rights::READ.union(Rights::EXECUTE).union(Rights::TRANSFER),
         };
     }
     client_caps[SERVER_SLOT] = CapabilityEntry {
         kind: CapabilityKind::Endpoint(SERVER_ENDPOINT),
-        rights: Rights::SEND,
+        rights: Rights::SEND.union(Rights::TRANSFER),
     };
     client_caps[DEVICE_OR_REPLY_SLOT] = CapabilityEntry {
         kind: CapabilityKind::Endpoint(REPLY_ENDPOINT),
         rights: Rights::SEND.union(Rights::RECEIVE).union(Rights::TRANSFER),
     };
-    let client = manager.spawn(
-        client_image,
-        PriorityClass::Interactive,
-        [
-            SERVER_SLOT as u64,
-            DEVICE_OR_REPLY_SLOT as u64,
-            syscall::ABI_VERSION,
-        ],
-        0,
-        0,
-        client_caps,
-    )?;
+    let client = if client_image == "system/bin/std-smoke.rune" {
+        const ARGUMENTS: &[u8] = b"std-smoke\0";
+        let mut start = SpawnData {
+            arguments: [0; MAX_ARGUMENT_BYTES],
+            argument_length: ARGUMENTS.len(),
+            argument_count: 1,
+            environment: [0; MAX_ENVIRONMENT_BYTES],
+            environment_length: 0,
+            environment_count: 0,
+            capabilities: [StartupCapability::EMPTY; PROCESS_SPAWN_MAX_CAPABILITIES],
+            capability_count: if executable_namespace { 3 } else { 2 },
+        };
+        start.arguments[..ARGUMENTS.len()].copy_from_slice(ARGUMENTS);
+        start.capabilities[0] = StartupCapability {
+            role: StartupRole::VFS,
+            flags: 0,
+            handle: Handle(SERVER_SLOT as u32),
+            rights: Rights::SEND.union(Rights::TRANSFER),
+        };
+        start.capabilities[1] = StartupCapability {
+            role: StartupRole::VFS_REPLY,
+            flags: 0,
+            handle: Handle(DEVICE_OR_REPLY_SLOT as u32),
+            rights: Rights::SEND.union(Rights::RECEIVE).union(Rights::TRANSFER),
+        };
+        if executable_namespace {
+            start.capabilities[2] = StartupCapability {
+                role: StartupRole::EXECUTABLE_NAMESPACE,
+                flags: 0,
+                handle: Handle(VFS_ROOT_SLOT as u32),
+                rights: Rights::READ.union(Rights::EXECUTE).union(Rights::TRANSFER),
+            };
+        }
+        manager.spawn_internal(
+            client_image,
+            SpawnOptions {
+                parent: ProcessId::KERNEL,
+                priority: PriorityClass::Interactive,
+                boot_arguments: [0; 3],
+                expected: Some(ExpectedExit {
+                    status: 0,
+                    exception: 0,
+                }),
+            },
+            client_caps,
+            Some(&start),
+        )?
+    } else {
+        manager.spawn(
+            client_image,
+            PriorityClass::Interactive,
+            [
+                SERVER_SLOT as u64,
+                DEVICE_OR_REPLY_SLOT as u64,
+                syscall::ABI_VERSION,
+            ],
+            0,
+            0,
+            client_caps,
+        )?
+    };
     manager.endpoints[REPLY_ENDPOINT as usize].receiver = client;
     if let Err(error) = manager.run() {
         manager.cleanup();
@@ -2625,6 +3777,15 @@ fn run_ipc_phase(
 
 fn bytes_of<T>(value: &T) -> &[u8] {
     unsafe { slice::from_raw_parts((value as *const T).cast::<u8>(), size_of::<T>()) }
+}
+
+fn align_up_usize(value: usize, alignment: usize) -> Option<usize> {
+    if alignment == 0 || !alignment.is_power_of_two() {
+        return None;
+    }
+    value
+        .checked_add(alignment - 1)
+        .map(|value| value & !(alignment - 1))
 }
 
 fn message_bytes(message: &Message) -> &[u8] {
@@ -2735,6 +3896,18 @@ fn shared_generation(id: u16) -> u8 {
     (id >> 8) as u8
 }
 
+fn pipe_id(index: usize, generation: u8) -> u16 {
+    (u16::from(generation) << 8) | index as u16
+}
+
+fn pipe_index(id: u16) -> usize {
+    usize::from(id & 0xff)
+}
+
+fn pipe_generation(id: u16) -> u8 {
+    (id >> 8) as u8
+}
+
 fn next_u8_generation(generation: u8) -> u8 {
     let next = generation.wrapping_add(1);
     if next == 0 {
@@ -2742,6 +3915,16 @@ fn next_u8_generation(generation: u8) -> u8 {
     } else {
         next
     }
+}
+
+/// Ошибки pipe редки и почти всегда означают дефект lifecycle/handle table.
+/// Логируем только error path, поэтому обычный stdio не засоряет serial.
+fn log_pipe_error(operation: &str, status_value: i64) {
+    serial::put_str("[pipe] ");
+    serial::put_str(operation);
+    serial::put_str(" status=");
+    serial::put_u32(status_value as u32);
+    serial::put_str("\n");
 }
 
 fn frame_error_name(error: crate::memory::FrameAllocatorError) -> &'static str {

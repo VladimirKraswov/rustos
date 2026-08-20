@@ -1,0 +1,8 @@
+RUNE-ABI 1
+# Учебная библиотека-provider. Canonical interface не зависит от имени файла.
+package org.rustos.examples.fixture-answer
+kind library
+interface org.rustos.example.answer/1
+abi 1
+export fixture_answer fixture_answer()->u64 function
+export fixture_shared_answer fixture_shared_answer()->u64 function

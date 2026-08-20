@@ -15,7 +15,7 @@ use rustos_abi::{
     memory::MEMORY_ABI_VERSION,
     vfs::{
         self, DirectoryEntry, IoRequest, OpenRequest, PathRequest, RenameRequest, Reply,
-        SeekRequest, VfsObject,
+        ResizeRequest, SeekRequest, VfsObject,
     },
 };
 use rustos_runtime::{
@@ -181,6 +181,9 @@ impl Server {
             vfs::opcode::SEEK => self
                 .payload::<SeekRequest>(message)
                 .and_then(|request| self.seek(sender, request)),
+            vfs::opcode::RESIZE => self
+                .payload::<ResizeRequest>(message)
+                .and_then(|request| self.resize(sender, request)),
             vfs::opcode::READ_DIR => self
                 .payload::<IoRequest>(message)
                 .and_then(|request| self.read_dir(sender, request, shared)),
@@ -428,6 +431,38 @@ impl Server {
             vfs::object_kind::NONE,
             request.file,
             position as u64,
+            0,
+        ))
+    }
+
+    fn resize(&mut self, owner: u64, request: ResizeRequest) -> Result<Reply, i32> {
+        if request.reserved != 0 {
+            return Err(vfs::status::INVALID_ARGUMENT);
+        }
+        let open_index = self.open_index(owner, request.file)?;
+        let open = self.opens[open_index];
+        if open.flags & vfs::open_flags::WRITE == 0 {
+            return Err(vfs::status::READ_ONLY);
+        }
+        let inode_index = usize::from(open.inode);
+        if self.metadata.inodes[inode_index].kind == kind::DIRECTORY {
+            return Err(vfs::status::IS_DIRECTORY);
+        }
+
+        let old_size = self.metadata.inodes[inode_index].size;
+        if request.length < old_size {
+            self.shrink_inode(inode_index, request.length)?;
+        } else {
+            // VaraniaFS является sparse-aware: для увеличения длины не нужно
+            // записывать гигабайты нулей. Неотображённые logical blocks уже
+            // возвращаются read() как нули и займут место при первой записи.
+            self.metadata.inodes[inode_index].size = request.length;
+        }
+        self.commit()?;
+        Ok(ok_reply(
+            vfs::object_kind::FILE,
+            request.file,
+            request.length,
             0,
         ))
     }
@@ -788,6 +823,46 @@ impl Server {
         self.metadata.inodes[index].size = 0;
         self.metadata.inodes[index].extent_count = 0;
         self.metadata.inodes[index].extents = [FileExtent::EMPTY; MAX_EXTENTS_PER_INODE];
+        Ok(())
+    }
+
+    fn shrink_inode(&mut self, index: usize, new_size: u64) -> Result<(), i32> {
+        let keep_blocks = new_size.div_ceil(BLOCK_SIZE as u64);
+        let inode = self.metadata.inodes[index];
+        let mut kept = [FileExtent::EMPTY; MAX_EXTENTS_PER_INODE];
+        let mut kept_count = 0usize;
+
+        // POSIX/Rust гарантируют нули после последовательности shrink→grow.
+        // Поэтому остаток последнего сохранённого блока нельзя оставлять со
+        // старыми данными: иначе другой процесс увидит содержимое за EOF.
+        let tail = (new_size % BLOCK_SIZE as u64) as usize;
+        if tail != 0 {
+            let logical = new_size / BLOCK_SIZE as u64;
+            if let Some(physical) = inode_block(&inode, logical) {
+                self.read_disk_block(physical)?;
+                self.block_buffer[tail..].fill(0);
+                self.write_disk_block(physical)?;
+            }
+        }
+
+        for extent in inode.extents.iter().take(inode.extent_count as usize) {
+            if extent.logical >= keep_blocks {
+                self.release_extent(extent.physical, extent.blocks)?;
+                continue;
+            }
+            let keep = extent.blocks.min(keep_blocks - extent.logical);
+            kept[kept_count] = FileExtent {
+                blocks: keep,
+                ..*extent
+            };
+            kept_count += 1;
+            if keep < extent.blocks {
+                self.release_extent(extent.physical + keep, extent.blocks - keep)?;
+            }
+        }
+        self.metadata.inodes[index].size = new_size;
+        self.metadata.inodes[index].extent_count = kept_count as u16;
+        self.metadata.inodes[index].extents = kept;
         Ok(())
     }
 

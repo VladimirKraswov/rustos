@@ -32,9 +32,20 @@ pub(super) struct LoadedImage {
     pub entry: u64,
     pub stack_pointer: u64,
     pub thread_pointer: u64,
+    pub tls_template: Option<TlsTemplate>,
 }
 
-fn load_executable(space: &mut AddressSpace, image: &[u8]) -> Result<LoadedImage, ProcessError> {
+#[derive(Clone, Copy, Debug)]
+pub(super) struct TlsTemplate {
+    pub bytes: &'static [u8],
+    pub memory_size: u64,
+    pub alignment: u64,
+}
+
+fn load_executable(
+    space: &mut AddressSpace,
+    image: &'static [u8],
+) -> Result<LoadedImage, ProcessError> {
     if image.starts_with(&rustos_rune_format::MAGIC) {
         rune::load(space, image).map_err(|_| ProcessError::InvalidImage)
     } else {
@@ -52,6 +63,8 @@ pub(super) enum CapabilityKind {
     Process(ProcessId),
     Thread(rustos_abi::ThreadId),
     SharedMemory(u16),
+    /// Однонаправленный byte stream; READ/WRITE различаются rights одного object.
+    Pipe(u16),
     /// Raw block device выдаётся только storage service, не приложениям.
     BlockDevice(u8),
 }
@@ -120,6 +133,14 @@ pub enum ProcessError {
     FrameLeak,
 }
 
+/// Результат программы, запущенной из интерактивной GUI-сессии.
+#[derive(Clone, Copy, Debug)]
+pub struct InteractiveExit {
+    pub output_length: usize,
+    pub status: i32,
+    pub exception: u16,
+}
+
 static mut CURRENT_PROCESS: *mut ProcessContext = ptr::null_mut();
 
 /// Запускает два настоящих ring-3 RUNE из initramfs: нормальный VFS client и
@@ -149,6 +170,21 @@ pub fn run_bootstrap_milestone(initramfs: BootInitramfs) -> Result<(), ProcessEr
 /// Запускает preemptive и capability-IPC вертикальные срезы на timer backend.
 pub fn run_preemptive_milestone(info: &rustos_abi::BootInfo) -> Result<(), ProcessError> {
     manager::run_milestone(info)
+}
+
+/// Оставляет ring-3 `vfsd` запущенным после диагностических milestones.
+pub fn start_interactive_services() -> Result<(), ProcessError> {
+    manager::start_interactive_services()
+}
+
+/// Выполняет одну команду из GUI terminal и захватывает объединённый
+/// stdout/stderr. Большой вывод дренируется порциями, поэтому процесс не
+/// зависнет на заполненном pipe.
+pub fn run_interactive_command(
+    command: &str,
+    output: &mut [u8],
+) -> Result<InteractiveExit, ProcessError> {
+    manager::run_interactive_command(command, output)
 }
 
 fn run_one(

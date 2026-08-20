@@ -1,4 +1,4 @@
-//! Сквозной ring-3 тест: VFS -> DT_NEEDED -> symbols/RELA -> RELRO -> call.
+//! Сквозной ring-3 тест нативного resolver'а: VFS -> RUNE dependency -> call.
 
 #![no_std]
 #![no_main]
@@ -6,18 +6,21 @@
 use core::panic::PanicInfo;
 
 use rustos_abi::{
-    process::{ProcessSpawnRequest, ProcessSpawnResult, SpawnCapability, PROCESS_ABI_VERSION},
+    process::{
+        ProcessSpawnRequest, ProcessSpawnResult, SpawnCapability, StartupRole, PROCESS_ABI_VERSION,
+    },
     syscall, ExitReason, Handle, PriorityClass, Rights,
 };
-use rustos_elf_loader::{DynamicLoader, ModuleSource, RuntimeMemory, SearchPolicy};
+use rustos_rune_format::{interface_id, symbol_id};
+use rustos_rune_loader::{DynamicLoader, ModuleSource, RuntimeMemory, SearchPolicy};
 use rustos_runtime::{process_exit, process_spawn, process_wait, thread_set_tls};
 use rustos_vfs::VfsClient;
 
 const NAMESPACE_SLOT: Handle = Handle(1);
-const CHILD_SHARED_SLOT: u32 = 5;
+const CHILD_SHARED_SLOT: u16 = 5;
 const MAX_DLL_BYTES: usize = 64 * 1024;
-const ROOT_PATH: &str = "/apps/loader-test/root.elf";
-const FIXTURE_PATH: &str = "/system/lib/fixture-1.dll";
+const ROOT_PATH: &str = "/apps/loader-test/root.rune";
+const FIXTURE_PATH: &str = "/system/lib/fixture-1.rune";
 const CHILD_PATH: &str = "system/bin/loader-child.rune";
 
 static mut ROOT_IMAGE: [u8; MAX_DLL_BYTES] = [0; MAX_DLL_BYTES];
@@ -85,8 +88,14 @@ pub extern "C" fn _start(server: u64, reply: u64, abi_version: u64) -> ! {
             process_exit(186);
         }
     }
+    let root_interface = interface_id("org.rustos.example.loader-root/1");
     let answer = loader
-        .symbol("linked_answer")
+        .symbol(
+            root_interface,
+            symbol_id(root_interface, "linked_answer()->u64"),
+            1,
+            1,
+        )
         .unwrap_or_else(|_| process_exit(187));
     if program.entry != answer {
         process_exit(187);
@@ -96,11 +105,17 @@ pub extern "C" fn _start(server: u64, reply: u64, abi_version: u64) -> ! {
         process_exit(188);
     }
 
+    let fixture_interface = interface_id("org.rustos.example.answer/1");
     let shared = loader
-        .shared_executable_region("fixture-1.dll")
+        .shared_executable_region(fixture_interface)
         .unwrap_or_else(|| process_exit(189));
     let fixture_answer = loader
-        .symbol("fixture_shared_answer")
+        .symbol(
+            fixture_interface,
+            symbol_id(fixture_interface, "fixture_shared_answer()->u64"),
+            1,
+            1,
+        )
         .unwrap_or_else(|_| process_exit(189));
     let offset = fixture_answer
         .checked_sub(shared.address)
@@ -141,6 +156,7 @@ fn spawn_shared_code_child(handle: Handle, offset: u64, length: u64) -> Result<(
     let transfer = SpawnCapability {
         source: handle,
         target_slot: CHILD_SHARED_SLOT,
+        role: StartupRole::NONE,
         rights: Rights::READ.union(Rights::EXECUTE).union(Rights::MAP),
     };
     let request = ProcessSpawnRequest {

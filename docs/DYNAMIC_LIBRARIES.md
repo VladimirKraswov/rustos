@@ -53,17 +53,15 @@ Unload допускается только после завершения вы�
 реализация не выгружает system DLL до выхода процесса: это проще, быстрее и
 исключает use-after-unload.
 
-## Переходный ELF loader
+## Исполняемый RUNE resolver
 
-Существующий user-space loader уже исполняет ELF64 `ET_DYN`, `DT_NEEDED`,
-GNU symbols, основные AMD64 RELA, initial-exec TLS, RELRO и shared RX. Он
-проверяется fixtures `root.elf` и `fixture-1.dll` из VaraniaFS и остаётся
-эталоном поведения при миграции.
+User-space crate `rustos-rune-loader` уже загружает нативные RUNE libraries:
+dependency discovery, interface/symbol IDs, ABI ranges, eager relocations,
+combined static TLS, RELRO и sealed shared RX выполняются в ring 3. Fixtures
+`loader-root.rune` и `fixture-1.rune` читаются из VaraniaFS; system image не
+содержит их прежние ELF DLL.
 
-Новые запускаемые system applications уже являются `.rune`. Но нативный
-RUNE resolver imports/exports/dependencies ещё не подключён, поэтому ELF DLL
-fixtures временно остаются в образе. Это не финальный публичный ABI. Удаление
-ELF пути разрешено только после эквивалентных тестов RUNE для:
+Boot-test защищает следующие свойства:
 
 - транзитивной зависимости и отсутствующего обязательного symbol;
 - несовместимого ABI range;
@@ -72,12 +70,16 @@ ELF пути разрешено только после эквивалентны
 - одной физической sealed RX страницы у двух процессов;
 - падения loader/service без остановки kernel.
 
+Прежний `rustos-elf-loader` пока сохранён как читаемая migration/reference
+реализация и для импорта сторонних toolchain artifacts. Публичным ABI системы
+являются только RUNE records и SDK manifest, а не `DT_NEEDED`/GNU symbol rules.
+
 Подробности прежнего test loader сохранены в [`ELF_LOADER.md`](ELF_LOADER.md).
 
 ## Пользовательские библиотеки
 
-SDK должен генерировать interface manifest из декларативного ABI-файла,
-проверять layouts, запрещать случайные Rust-mangled exports и вызывать
-`rustos-rune` после linker. Один manifest используется для C header, Rust
-wrapper, import records и ABI compatibility test, чтобы документация и
-бинарный контракт не расходились.
+SDK использует декларативный `RUNE-ABI 1` manifest из `sdk/abi`. Команда
+`rustos-rune pack-manifest` запрещает необъявленные undefined imports,
+проверяет exports против `.dynsym` и формирует import/export/dependency
+records. Следующее расширение генератора создаст из того же manifest C header
+и safe Rust wrapper, чтобы документация и бинарный контракт не расходились.

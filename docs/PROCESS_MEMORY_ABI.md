@@ -23,9 +23,11 @@ capability handle:
 ## Процессы, argv и environment
 
 `process_spawn(request, result)` создаёт отдельные таблицы страниц, загружает
-RUNE image и создаёт начальный поток. Сейчас image читается из read-only
-initramfs namespace. После запуска `vfsd` тот же request будет обслуживаться
-VFS capability без изменения структуры ABI.
+RUNE image и создаёт начальный поток. Kernel напрямую читает только маленькие
+bootstrap-программы из read-only initramfs. Публичный `std::process::Command`
+для пути VaraniaFS автоматически запускает `rune-runner`: уже он в ring 3
+читает target и DLL через VFS capability. Поэтому parser постоянной ФС и граф
+динамических библиотек не попали в ядро, а для приложения механизм прозрачен.
 
 `ProcessSpawnRequest` содержит VFS capability `READ | EXECUTE`, UTF-8 путь,
 NUL-разделённые таблицы argv/environment, пользовательский priority class и
@@ -63,10 +65,13 @@ entry address, ABI-совместимый stack pointer, первый аргум
 отдельной VM arena. Kernel проверяет canonical user range и выполняет TLB
 flush до возврата. Одновременные `WRITE | EXECUTE` запрещены политикой W^X.
 
-Текущая bootstrap-сборка ограничивает одну операцию 256 страницами, один
-address space — 1024 описателями страниц. Это защитные лимиты статических
-таблиц раннего ядра, а не ограничение ABI или 64-битного адреса. Перед портом
-`rustc` metadata будет перенесена в pageable kernel slabs/radix tree.
+Одна операция ограничена 1 ГиБ, чтобы ошибочный размер не исчерпал всю память
+одним syscall. Описатели user pages уже находятся в трёхуровневом sparse
+registry и выделяются страницами по мере надобности; при `unmap` и завершении
+процесса каждый private/shared frame возвращается allocator'у. Временный
+список page-table frames покрывает около 9 ГиБ плотно отображённой памяти
+одного процесса. Это implementation guard developer-профиля, не предел ABI
+или 64-битного виртуального адреса.
 
 ## Shared memory
 
@@ -107,6 +112,10 @@ control message остаётся inline, а исходники, object-файл�
 6. отдельный FS-base/TPIDR TLS потока;
 7. монотонные часы;
 8. возврат private/shared/page-table frames.
+
+Отдельный upstream `std` smoke дополнительно проверяет настоящий allocator со
+slab'ами, `std::thread`, futex contention, `std::process`, capability pipes,
+stdout/stderr без взаимной блокировки и запуск RUNE непосредственно с диска.
 
 ```sh
 make test-boot

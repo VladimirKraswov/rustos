@@ -44,6 +44,12 @@ PS/2 service объединяет накопившиеся движения с �
 - Start menu содержит terminal и shutdown;
 - desktop icon повторно открывает закрытый terminal.
 
+Команда `RUN /apps/examples/hello.rune student` запускает настоящий
+изолированный процесс с VaraniaFS. Persistent `vfsd` обслуживает executable и
+DLL, stdout/stderr идут через capability pipe обратно в окно. Заполнение pipe
+не замораживает GUI: process manager возвращает управление, console bridge
+дренирует буфер, будит writer и продолжает выполнение.
+
 ## Компоненты
 
 SDK-слой содержит `Widget`, `Panel`, `Label`, `Button`, `IconButton`,
@@ -58,4 +64,6 @@ versioned client API без дублирования большого renderer-�
 - PS/2 работает polling-режимом;
 - нет Unicode font shaping;
 - только одно terminal window;
+- parser shell и console bridge ещё находятся в kernel; сами программы и
+  `vfsd` уже исполняются в ring 3;
 - display/input services ещё не изолированы в ring 3.

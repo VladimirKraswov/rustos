@@ -18,8 +18,13 @@ const ADDRESS_MASK: u64 = 0x000f_ffff_ffff_f000;
 const ADDRESS_MASK: u64 = 0x0000_ffff_ffff_f000;
 
 const VALID: u64 = 1 << 0;
-const MAX_OWNED_FRAMES: usize = 1152;
-const MAX_USER_PAGES: usize = 1024;
+/// Только page-table frames (user data учитывает sparse registry отдельно).
+/// 4608 таблиц покрывают примерно 9 ГиБ плотно отображённой памяти — хватает
+/// developer VM с rustc/LLVM, не раздувая каждый из 12 process records до
+/// мегабайт. В ABI лимита нет; следующий шаг заменит и этот список slab'ом.
+const MAX_OWNED_FRAMES: usize = 4608;
+const REGISTRY_ENTRIES: usize = PAGE_SIZE as usize / core::mem::size_of::<u64>();
+const PAGE_RECORDS_PER_CHUNK: usize = PAGE_SIZE as usize / core::mem::size_of::<UserPage>();
 /// Отдельная arena для `vm_map`: она не пересекается с PIE image, bootstrap
 /// block и растущими вниз thread stacks.
 const USER_DYNAMIC_BASE: u64 = 0x0000_5000_0000_0000;
@@ -49,6 +54,7 @@ impl UserPageFlags {
 
 #[derive(Clone, Copy)]
 struct UserPage {
+    used: bool,
     virtual_address: u64,
     physical_address: u64,
     flags: UserPageFlags,
@@ -65,6 +71,7 @@ pub enum UserPageBacking {
 }
 
 const EMPTY_PAGE: UserPage = UserPage {
+    used: false,
     virtual_address: 0,
     physical_address: 0,
     flags: UserPageFlags {
@@ -93,18 +100,22 @@ pub struct AddressSpace {
     root: u64,
     owned: [FrameBlock; MAX_OWNED_FRAMES],
     owned_len: usize,
-    pages: [UserPage; MAX_USER_PAGES],
+    /// Трёхуровневый sparse registry user pages. Каждый уровень — обычный
+    /// identity-mapped physical frame с 512 адресами следующего уровня.
+    page_registry_root: FrameBlock,
     page_len: usize,
 }
 
 impl AddressSpace {
     /// Создаёт новую корневую таблицу и разделяет supervisor-only mappings.
     pub fn new(kernel_root: u64) -> Result<Self, AddressSpaceError> {
+        let page_registry_root = allocate(1, 1).map_err(|_| AddressSpaceError::OutOfMemory)?;
+        unsafe { (page_registry_root.phys as *mut u8).write_bytes(0, PAGE_SIZE as usize) };
         let mut space = Self {
             root: 0,
             owned: [EMPTY_BLOCK; MAX_OWNED_FRAMES],
             owned_len: 0,
-            pages: [EMPTY_PAGE; MAX_USER_PAGES],
+            page_registry_root,
             page_len: 0,
         };
         let root = space.allocate_zeroed_frame()?;
@@ -131,12 +142,15 @@ impl AddressSpace {
             return Err(AddressSpaceError::InvalidAddress);
         }
         if let Some(index) = self.find_page(virtual_address) {
-            let merged = self.pages[index].flags.union(flags);
-            self.pages[index].flags = merged;
+            let page = self.page(index);
+            let merged = page.flags.union(flags);
+            self.page_mut(index).flags = merged;
             self.update_leaf_flags(virtual_address, merged)?;
-            return Ok(self.pages[index].physical_address);
+            return Ok(page.physical_address);
         }
-        let physical_address = self.allocate_zeroed_frame()?;
+        let block = allocate(1, 1).map_err(|_| AddressSpaceError::OutOfMemory)?;
+        unsafe { (block.phys as *mut u8).write_bytes(0, PAGE_SIZE as usize) };
+        let physical_address = block.phys;
         let allowed_flags = UserPageFlags {
             writable: true,
             executable: true,
@@ -148,7 +162,7 @@ impl AddressSpace {
             allowed_flags,
             UserPageBacking::Private,
         ) {
-            self.release_owned_frame(physical_address);
+            let _ = free(block);
             return Err(error);
         }
         Ok(physical_address)
@@ -190,9 +204,7 @@ impl AddressSpace {
         {
             return Err(AddressSpaceError::InvalidAddress);
         }
-        if self.page_len == MAX_USER_PAGES {
-            return Err(AddressSpaceError::TooManyMappings);
-        }
+        let record_index = self.reserve_page_record(virtual_address)?;
         let pml4_index = ((virtual_address >> 39) & 0x1ff) as usize;
         let pdpt_index = ((virtual_address >> 30) & 0x1ff) as usize;
         let pd_index = ((virtual_address >> 21) & 0x1ff) as usize;
@@ -208,14 +220,14 @@ impl AddressSpace {
             return Err(AddressSpaceError::AlreadyMapped);
         }
         unsafe { slot.write(physical_address | leaf_flags(flags)) };
-        self.pages[self.page_len] = UserPage {
+        *self.page_mut(record_index) = UserPage {
+            used: true,
             virtual_address,
             physical_address,
             flags,
             allowed_flags,
             backing,
         };
-        self.page_len += 1;
         Ok(())
     }
 
@@ -272,13 +284,14 @@ impl AddressSpace {
         let index = self
             .find_page(virtual_address)
             .ok_or(AddressSpaceError::InvalidAddress)?;
-        let page = self.pages[index];
+        let page = self.page(index);
         self.clear_leaf(virtual_address)?;
-        self.page_len -= 1;
-        self.pages[index] = self.pages[self.page_len];
-        self.pages[self.page_len] = EMPTY_PAGE;
+        self.page_mut(index).used = false;
         if page.backing == UserPageBacking::Private {
-            self.release_owned_frame(page.physical_address);
+            let _ = free(FrameBlock {
+                phys: page.physical_address,
+                frames: 1,
+            });
         }
         Ok(page.backing)
     }
@@ -293,20 +306,22 @@ impl AddressSpace {
         let index = self
             .find_page(virtual_address)
             .ok_or(AddressSpaceError::InvalidAddress)?;
-        let allowed = self.pages[index].allowed_flags;
+        let allowed = self.page(index).allowed_flags;
         if (flags.writable && !allowed.writable) || (flags.executable && !allowed.executable) {
             return Err(AddressSpaceError::AccessDenied);
         }
-        self.pages[index].flags = flags;
+        self.page_mut(index).flags = flags;
         self.update_leaf_flags(virtual_address, flags)
     }
 
     /// Число страниц, ссылающихся на shared-memory object. Используется при
     /// завершении процесса для корректного refcount без обхода page tables.
     pub fn shared_mapping_pages(&self, object: u16) -> usize {
-        self.pages[..self.page_len]
-            .iter()
-            .filter(|page| page.backing == UserPageBacking::Shared(object))
+        (0..self.page_len)
+            .filter(|index| {
+                let page = self.page(*index);
+                page.used && page.backing == UserPageBacking::Shared(object)
+            })
             .count()
     }
 
@@ -382,12 +397,10 @@ impl AddressSpace {
         let mut page_address = align_down(address, PAGE_SIZE);
         let last = align_down(end, PAGE_SIZE);
         loop {
-            let Some(page) = self.pages[..self.page_len]
-                .iter()
-                .find(|page| page.virtual_address == page_address)
-            else {
+            let Some(index) = self.find_page(page_address) else {
                 return false;
             };
+            let page = self.page(index);
             if write && !page.flags.writable {
                 return false;
             }
@@ -412,16 +425,101 @@ impl AddressSpace {
     }
 
     fn find_page(&self, virtual_address: u64) -> Option<usize> {
-        self.pages[..self.page_len]
-            .iter()
-            .position(|page| page.virtual_address == virtual_address)
+        self.find_record(virtual_address)
+            .filter(|index| self.page(*index).used)
     }
 
-    fn page_for_address(&self, address: u64) -> Option<&UserPage> {
+    fn page_for_address(&self, address: u64) -> Option<UserPage> {
         let page = align_down(address, PAGE_SIZE);
-        self.pages[..self.page_len]
-            .iter()
-            .find(|entry| entry.virtual_address == page)
+        self.find_page(page).map(|index| self.page(index))
+    }
+
+    fn ensure_page_slot(&mut self, page_index: usize) -> Result<(), AddressSpaceError> {
+        let chunk_index = page_index / PAGE_RECORDS_PER_CHUNK;
+        let top = chunk_index / (REGISTRY_ENTRIES * REGISTRY_ENTRIES);
+        let middle = (chunk_index / REGISTRY_ENTRIES) % REGISTRY_ENTRIES;
+        let leaf = chunk_index % REGISTRY_ENTRIES;
+        if top >= REGISTRY_ENTRIES {
+            return Err(AddressSpaceError::TooManyMappings);
+        }
+        let middle_table = ensure_registry_child(self.page_registry_root.phys, top)?;
+        let leaf_table = ensure_registry_child(middle_table, middle)?;
+        let _chunk = ensure_registry_child(leaf_table, leaf)?;
+        Ok(())
+    }
+
+    fn find_record(&self, virtual_address: u64) -> Option<usize> {
+        let mut left = 0usize;
+        let mut right = self.page_len;
+        while left < right {
+            let middle = left + (right - left) / 2;
+            match self.page(middle).virtual_address.cmp(&virtual_address) {
+                core::cmp::Ordering::Less => left = middle + 1,
+                core::cmp::Ordering::Greater => right = middle,
+                core::cmp::Ordering::Equal => return Some(middle),
+            }
+        }
+        None
+    }
+
+    fn reserve_page_record(&mut self, virtual_address: u64) -> Result<usize, AddressSpaceError> {
+        if let Some(index) = self.find_record(virtual_address) {
+            if self.page(index).used {
+                return Err(AddressSpaceError::AlreadyMapped);
+            }
+            return Ok(index);
+        }
+        let mut left = 0usize;
+        let mut right = self.page_len;
+        while left < right {
+            let middle = left + (right - left) / 2;
+            if self.page(middle).virtual_address < virtual_address {
+                left = middle + 1;
+            } else {
+                right = middle;
+            }
+        }
+        let insertion = left;
+        self.ensure_page_slot(self.page_len)?;
+        for index in (insertion..self.page_len).rev() {
+            let page = self.page(index);
+            *self.page_mut(index + 1) = page;
+        }
+        *self.page_mut(insertion) = UserPage {
+            virtual_address,
+            ..EMPTY_PAGE
+        };
+        self.page_len += 1;
+        Ok(insertion)
+    }
+
+    fn registry_chunk(&self, page_index: usize) -> Option<u64> {
+        let chunk_index = page_index / PAGE_RECORDS_PER_CHUNK;
+        let top = chunk_index / (REGISTRY_ENTRIES * REGISTRY_ENTRIES);
+        let middle = (chunk_index / REGISTRY_ENTRIES) % REGISTRY_ENTRIES;
+        let leaf = chunk_index % REGISTRY_ENTRIES;
+        if top >= REGISTRY_ENTRIES {
+            return None;
+        }
+        let middle_table = registry_child(self.page_registry_root.phys, top)?;
+        let leaf_table = registry_child(middle_table, middle)?;
+        registry_child(leaf_table, leaf)
+    }
+
+    fn page(&self, index: usize) -> UserPage {
+        let chunk = self
+            .registry_chunk(index)
+            .expect("page registry slot must exist");
+        let offset = index % PAGE_RECORDS_PER_CHUNK;
+        unsafe { (chunk as *const UserPage).add(offset).read() }
+    }
+
+    fn page_mut(&mut self, index: usize) -> &mut UserPage {
+        let chunk = self
+            .registry_chunk(index)
+            .expect("page registry slot must exist");
+        let offset = index % PAGE_RECORDS_PER_CHUNK;
+        unsafe { &mut *(chunk as *mut UserPage).add(offset) }
     }
 
     fn allocate_zeroed_frame(&mut self) -> Result<u64, AddressSpaceError> {
@@ -486,20 +584,6 @@ impl AddressSpace {
         Ok(())
     }
 
-    fn release_owned_frame(&mut self, physical_address: u64) {
-        let Some(index) = self.owned[..self.owned_len]
-            .iter()
-            .position(|block| block.phys == physical_address && block.frames == 1)
-        else {
-            return;
-        };
-        let block = self.owned[index];
-        self.owned_len -= 1;
-        self.owned[index] = self.owned[self.owned_len];
-        self.owned[self.owned_len] = EMPTY_BLOCK;
-        let _ = free(block);
-    }
-
     fn owns_frame(&self, physical_address: u64) -> bool {
         self.owned[..self.owned_len]
             .iter()
@@ -509,13 +593,61 @@ impl AddressSpace {
 
 impl Drop for AddressSpace {
     fn drop(&mut self) {
-        // Владелец обязан сначала вернуть kernel address-space root. Reverse order удобен
-        // для диагностики: data frames уходят до корневой таблицы.
+        // Private leaf frames больше не лежат в bounded `owned`: sparse
+        // registry позволяет освободить сколь угодно большой address space.
+        for index in 0..self.page_len {
+            let page = self.page(index);
+            if page.used && page.backing == UserPageBacking::Private {
+                let _ = free(FrameBlock {
+                    phys: page.physical_address,
+                    frames: 1,
+                });
+            }
+        }
+        self.page_len = 0;
+
+        // Reverse order освобождает page-table children до root.
         for index in (0..self.owned_len).rev() {
             let _ = free(self.owned[index]);
             self.owned[index] = EMPTY_BLOCK;
         }
         self.owned_len = 0;
+
+        free_registry_children(self.page_registry_root.phys, 3);
+        let _ = free(self.page_registry_root);
+        self.page_registry_root = EMPTY_BLOCK;
+    }
+}
+
+fn ensure_registry_child(table: u64, index: usize) -> Result<u64, AddressSpaceError> {
+    let slot = unsafe { (table as *mut u64).add(index) };
+    let current = unsafe { slot.read() };
+    if current != 0 {
+        return Ok(current);
+    }
+    let block = allocate(1, 1).map_err(|_| AddressSpaceError::OutOfMemory)?;
+    unsafe { (block.phys as *mut u8).write_bytes(0, PAGE_SIZE as usize) };
+    unsafe { slot.write(block.phys) };
+    Ok(block.phys)
+}
+
+fn registry_child(table: u64, index: usize) -> Option<u64> {
+    let child = unsafe { (table as *const u64).add(index).read() };
+    (child != 0).then_some(child)
+}
+
+fn free_registry_children(table: u64, levels: usize) {
+    for index in 0..REGISTRY_ENTRIES {
+        let Some(child) = registry_child(table, index) else {
+            continue;
+        };
+        if levels > 1 {
+            free_registry_children(child, levels - 1);
+        }
+        let _ = free(FrameBlock {
+            phys: child,
+            frames: 1,
+        });
     }
 }
 

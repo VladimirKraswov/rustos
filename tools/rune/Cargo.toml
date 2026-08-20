@@ -7,5 +7,14 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 
+[lints.rust]
+# `rustos` задаётся нашим JSON target spec и ещё не входит в встроенный
+# список rustc. Явная декларация сохраняет полезный check-cfg без шума при
+# host-сборке конвертера.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("rustos"))'] }
+
 [dependencies]
 rustos-rune-format = { path = "../../rune-format" }
+
+[target.'cfg(target_os = "rustos")'.dependencies]
+rustos-crt = { path = "../../userspace/crt" }

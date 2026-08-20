@@ -16,7 +16,7 @@ capability в каждом data-запросе и скрывает формат 
 ```text
 application
     |
-    | open/read/write/seek/readdir/mkdir/unlink/rename/sync
+    | open/read/write/seek/resize/readdir/mkdir/unlink/rename/sync
     v
 vfs-1.dll                 stable C ABI + safe Rust facade
     |
@@ -45,6 +45,7 @@ endpoint, перезапустить `vfsd` и переиздать клиент
 | `open` / `close` | `READ`, `WRITE`, `CREATE`, `EXCLUSIVE`, `TRUNCATE`, `APPEND`, `DIRECTORY` |
 | `read` / `write` | потоковые операции с текущей позицией файла |
 | `seek` | от начала, текущей позиции или конца файла |
+| `resize` | shrink с возвратом блоков или sparse grow с нулевыми holes |
 | `readdir` | по одной 256-байтной записи, без загрузки каталога целиком |
 | `mkdir` | создание каталога после проверки родителя |
 | `unlink` | удаление файла или пустого каталога и возврат extent'ов |
@@ -56,15 +57,18 @@ endpoint, перезапустить `vfsd` и переиздать клиент
 length. `read`/`write` автоматически разбиваются на chunks по 64 КиБ, поэтому
 размер файла не ограничен размером сообщения или окна.
 
-У самостоятельного `VfsClient` один синхронный запрос в полёте. Порт
-upstream `std::fs` временно сериализует вызовы процесса и переиспользует одно
-64-КиБ окно; после готовности thread runtime каждому worker выдаётся отдельный
-reply endpoint/client. Это сохраняет простой wire protocol без request races.
+У самостоятельного `VfsClient` один синхронный запрос в полёте. Порт upstream
+`std::fs` сериализует короткие RPC одного процесса и переиспользует одно
+64-КиБ окно; заблокированный VFS вызов усыпляет только вызывающий thread.
+Wire protocol остаётся пригоден для будущего pool из нескольких клиентов без
+общего mutable server state в приложении.
 
 ## Постоянный том
 
-`scripts/build.sh` один раз создаёт `build/system.vfs` размером 64 МиБ и затем
-сохраняет его между интерактивными запусками. QEMU подключает образ отдельным
+`scripts/build.sh` создаёт `build/system.vfs` размером не менее 1 ГиБ и затем
+сохраняет его между интерактивными запусками. Старый 64-МиБ том расширяется
+транзакционно командой `--grow`; sparse host file занимает только реально
+записанные блоки. QEMU подключает образ отдельным
 legacy virtio-blk устройством в фиксированном PCI slot 5. ESP остаётся
 read-only загрузочным диском и никогда не принимается за системный том.
 
@@ -72,7 +76,8 @@ read-only загрузочным диском и никогда не прини�
 [`docs/VARANIAFS.md`](VARANIAFS.md). Host-команда:
 
 ```bash
-cargo run -p rustos-vfs-image -- build/system.vfs 64
+cargo run -p rustos-vfs-image -- build/system.vfs 1024
+cargo run -p rustos-vfs-image -- --grow build/system.vfs 1024
 cargo run -p rustos-vfs-image -- --verify build/system.vfs
 ```
 
@@ -104,14 +109,15 @@ Boot-test запускает два разных клиента с полным 
 server process.
 
 Дополнительно boot-test запускает RUNE-программу с настоящей upstream `std`.
-Она проходит `File/OpenOptions`, `Read/Write/Seek`, metadata, readdir, rename
-и cleanup через ту же границу `std -> shared memory IPC -> vfsd`.
+Она проверяет CWD и относительные пути, `File::set_len`, sparse нули,
+`Read/Write/Seek`, metadata, canonicalize, readdir, rename и recursive cleanup
+через ту же границу `std -> shared memory IPC -> vfsd`.
 
 ## Честные границы текущего этапа
 
-- `vfs-1.dll` пока является переходным ELF64 `ET_DYN` с unmangled C exports;
-  user-space loader умеет его загружать. Финальный RUNE interface/import ABI
-  описан в [`RUNE.md`](RUNE.md), но нативный resolver ещё не подключён.
+- `vfs-1.rune` уже содержит manifest-backed interface ABI и проверяется
+  нативным resolver'ом. `std::fs` пока компилирует тот же client protocol в
+  PAL статически; перевод PAL на вызовы общей DLL уберёт это дублирование.
 - Legacy virtio-blk transport временно находится в kernel. После появления
   PCI, DMA и IRQ capabilities он переедет в изолированный `virtioblkd`, не
   меняя VFS ABI.
@@ -121,9 +127,15 @@ server process.
 - Две checksummed копии метаданных защищают commit. Данные файла сейчас
   пишутся in-place и не имеют checksum/COW, поэтому torn sector в data block
   пока может испортить содержимое при сохранённых метаданных.
-- ELF dynamic loader читает fixture DLL из VaraniaFS через VFS client;
-  начальный `loader-test.rune` уже запускается из initramfs. После нативного
-  RUNE resolver переходные `root.elf/fixture-1.dll` будут удалены.
+- `std::process::Command` прозрачно направляет небутовый executable path через
+  `rune-runner`; runner и native resolver читают target/DLL из VaraniaFS без
+  parser'а диска в kernel.
+
+В интерактивной сборке `vfsd` не завершается после boot milestones. Команда
+GUI terminal `RUN /apps/examples/hello.rune student` создаёт runner-процесс,
+передаёт ему VFS/stdout/stderr capabilities, дренирует pipe при заполнении и
+показывает exit status. Это переходный console bridge; постоянная policy
+перезапуска и владение сессией должны переехать в user-space supervisor.
 
 ## Направление развития
 

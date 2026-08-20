@@ -9,7 +9,7 @@ use core::panic::PanicInfo;
 use rustos_abi::{
     memory::MEMORY_ABI_VERSION,
     process::{
-        ProcessSpawnRequest, ProcessSpawnResult, SpawnCapability, ThreadCreateRequest,
+        ProcessSpawnRequest, ProcessSpawnResult, SpawnCapability, StartupRole, ThreadCreateRequest,
         ThreadCreateResult, PROCESS_ABI_VERSION,
     },
     ExitReason, PriorityClass,
@@ -93,11 +93,13 @@ pub extern "C" fn _start(vfs_handle: u64, abi_version: u64) -> ! {
         SpawnCapability {
             source: VFS_SLOT,
             target_slot: 1,
+            role: StartupRole::EXECUTABLE_NAMESPACE,
             rights: Rights::READ,
         },
         SpawnCapability {
             source: shared_handle,
             target_slot: 3,
+            role: StartupRole::NONE,
             rights: Rights::READ.union(Rights::WRITE).union(Rights::MAP),
         },
     ];
@@ -206,6 +208,8 @@ fn test_thread(shared_address: u64) {
         stack_pointer: stack as u64 + PAGE_SIZE * 4 - 8,
         argument: shared_address,
         thread_pointer: tls as u64,
+        reclaim_address: 0,
+        reclaim_length: 0,
         priority: PriorityClass::Interactive as u8,
         reserved: [0; 7],
     };

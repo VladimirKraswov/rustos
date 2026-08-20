@@ -44,8 +44,10 @@ commit оборван, предыдущая пара остаётся досту
 потоковая запись обычно добавляет один большой extent и хорошо подходит SSD и
 современным HDD. Удаление возвращает диапазоны в bounded free-extent table;
 новая запись сначала повторно использует их, затем растит линейный cursor.
-Sparse layout уже выражается полем `logical`, хотя публичный API пока не
-создаёт holes.
+`File::set_len` уже использует sparse layout: grow меняет только logical size,
+а чтение hole возвращает нули. Shrink освобождает целые хвостовые extent'ы и
+зануляет неиспользованный хвост последнего блока, поэтому shrink→grow не
+раскрывает старые данные.
 
 Путь inode нормализован и абсолютен. Для учебного v1 это делает lookup и
 проверку rename очень прозрачными. Переименование каталога обновляет пути всех
@@ -73,13 +75,16 @@ optional checksums; allocator — SSD-aware discard и HDD-friendly placement.
 Создать том или проверить существующий:
 
 ```bash
-cargo run -p rustos-vfs-image -- build/system.vfs 64
+cargo run -p rustos-vfs-image -- build/system.vfs 1024
+cargo run -p rustos-vfs-image -- --grow build/system.vfs 1024
 cargo run -p rustos-vfs-image -- --verify build/system.vfs
-cargo run -p rustos-vfs-image -- --put build/system.vfs ./app.dll /system/lib/app.dll
-cargo run -p rustos-vfs-image -- --force build/system.vfs 64
+cargo run -p rustos-vfs-image -- --put build/system.vfs ./app.rune /system/lib/app.rune
+cargo run -p rustos-vfs-image -- --force build/system.vfs 1024
 ```
 
-Последняя команда уничтожает содержимое указанного образа и предназначена
+`--grow` сохраняет содержимое и публикует новый размер тем же COW commit.
+Расширенный файл остаётся sparse на macOS/Linux. Последняя команда уничтожает
+содержимое указанного образа и предназначена
 только для воспроизводимых тестов. `--put` выполняет copy-on-write замену:
 старые extent'ы освобождаются в новой metadata snapshot только после записи
 новых data blocks. `ls/get/fsck` будут следующим расширением этой же утилиты;

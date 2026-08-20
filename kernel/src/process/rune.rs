@@ -12,7 +12,7 @@ use rustos_rune_format::{
 
 use crate::memory::{AddressSpace, UserPageFlags};
 
-use super::LoadedImage;
+use super::{LoadedImage, TlsTemplate};
 
 const USER_IMAGE_BASE: u64 = 0x0000_4000_0000_0000;
 const USER_IMAGE_LIMIT: u64 = 0x0000_0001_0000_0000;
@@ -37,7 +37,7 @@ pub enum RuneError {
     AddressSpace,
 }
 
-pub fn load(space: &mut AddressSpace, image: &[u8]) -> Result<LoadedImage, RuneError> {
+pub fn load(space: &mut AddressSpace, image: &'static [u8]) -> Result<LoadedImage, RuneError> {
     let container = Container::parse(image).map_err(RuneError::Format)?;
     let slice = container
         .slice(CURRENT_ARCHITECTURE)
@@ -55,7 +55,7 @@ pub fn load(space: &mut AddressSpace, image: &[u8]) -> Result<LoadedImage, RuneE
     }
     apply_relocations(space, &container)?;
     apply_relro(space, &container)?;
-    let thread_pointer = initialize_tls(space, &container)?;
+    let (thread_pointer, tls_template) = initialize_tls(space, &container)?;
 
     let stack_bottom = USER_STACK_TOP - USER_STACK_PAGES * PAGE_SIZE;
     for page in 0..USER_STACK_PAGES {
@@ -73,15 +73,19 @@ pub fn load(space: &mut AddressSpace, image: &[u8]) -> Result<LoadedImage, RuneE
         entry,
         stack_pointer: crate::arch::initial_user_stack(USER_STACK_TOP),
         thread_pointer,
+        tls_template,
     })
 }
 
-fn initialize_tls(space: &mut AddressSpace, container: &Container<'_>) -> Result<u64, RuneError> {
+fn initialize_tls(
+    space: &mut AddressSpace,
+    container: &Container<'static>,
+) -> Result<(u64, Option<TlsTemplate>), RuneError> {
     let mut templates = container.entries().filter(|entry| {
         entry.kind == record_kind::TLS && entry.architecture == CURRENT_ARCHITECTURE
     });
     let Some(template) = templates.next() else {
-        return Ok(0);
+        return Ok((0, None));
     };
     if templates.next().is_some()
         || template.memory_size > USER_TLS_LIMIT - 16
@@ -126,7 +130,14 @@ fn initialize_tls(space: &mut AddressSpace, container: &Container<'_>) -> Result
     space
         .copy_into_user(thread_pointer, &thread_pointer.to_le_bytes())
         .map_err(|_| RuneError::AddressSpace)?;
-    Ok(thread_pointer)
+    Ok((
+        thread_pointer,
+        Some(TlsTemplate {
+            bytes: payload,
+            memory_size: template.memory_size,
+            alignment: template.alignment,
+        }),
+    ))
 }
 
 fn validate_container(container: &Container<'_>, _slice: TocEntry) -> Result<(), RuneError> {

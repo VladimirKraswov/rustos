@@ -89,11 +89,67 @@ pub struct ExitReason {
 }
 
 /// Версия структур запуска процесса и потока.
-pub const PROCESS_ABI_VERSION: u32 = 1;
+pub const PROCESS_ABI_VERSION: u32 = 2;
 /// Фиксированный адрес read-only bootstrap-блока в новом процессе.
 pub const PROCESS_START_INFO_ADDRESS: u64 = 0x0000_3fff_ffff_0000;
 /// Максимум capabilities, явно передаваемых одним `process_spawn`.
 pub const PROCESS_SPAWN_MAX_CAPABILITIES: usize = 8;
+
+/// Семантическая роль capability в startup namespace процесса.
+///
+/// Handle остаётся локальным и непредсказуемым, а роль стабильна. Поэтому
+/// приложение не зашивает slot `2` для VFS или slot `4` для stdout и может
+/// одинаково запускаться из shell, supervisor и тестового harness.
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StartupRole(pub u16);
+
+impl StartupRole {
+    /// Capability не публикуется как системная служба startup runtime.
+    pub const NONE: Self = Self(0);
+    /// Namespace, относительно которого loader разрешает путь программы.
+    pub const EXECUTABLE_NAMESPACE: Self = Self(1);
+    /// Endpoint запросов изолированного VFS-сервиса.
+    pub const VFS: Self = Self(2);
+    /// Персональный endpoint ответов VFS-клиента.
+    pub const VFS_REPLY: Self = Self(3);
+    /// Поток стандартного ввода.
+    pub const STDIN: Self = Self(4);
+    /// Поток стандартного вывода.
+    pub const STDOUT: Self = Self(5);
+    /// Поток диагностического вывода.
+    pub const STDERR: Self = Self(6);
+    /// Supervisor, которому процесс сообщает health/lifecycle события.
+    pub const SUPERVISOR: Self = Self(7);
+    /// Display/compositor service.
+    pub const DISPLAY: Self = Self(8);
+    /// Объединённый keyboard/pointer input service.
+    pub const INPUT: Self = Self(9);
+}
+
+/// Элемент read-only capability namespace в [`ProcessStartInfo`].
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct StartupCapability {
+    /// Назначение handle, а не его конкретный kernel object type.
+    pub role: StartupRole,
+    /// Зарезервировано для versioned расширения.
+    pub flags: u16,
+    /// Handle в таблице нового процесса.
+    pub handle: crate::Handle,
+    /// Эффективные права после attenuation родителем.
+    pub rights: crate::Rights,
+}
+
+impl StartupCapability {
+    /// Пустой элемент для статически выделенных bounded-массивов.
+    pub const EMPTY: Self = Self {
+        role: StartupRole::NONE,
+        flags: 0,
+        handle: crate::Handle::INVALID,
+        rights: crate::Rights::NONE,
+    };
+}
 
 /// Описание производного capability для нового процесса.
 #[repr(C)]
@@ -102,7 +158,9 @@ pub struct SpawnCapability {
     /// Handle в таблице родителя.
     pub source: crate::Handle,
     /// Желаемый slot в таблице дочернего процесса; ноль запрещён.
-    pub target_slot: u32,
+    pub target_slot: u16,
+    /// Роль capability в startup namespace ребёнка.
+    pub role: StartupRole,
     /// Права дочернего capability, являющиеся подмножеством исходных.
     pub rights: crate::Rights,
 }
@@ -186,6 +244,24 @@ pub struct ProcessStartInfo {
     pub environment_length: u32,
     /// Количество переменных environment.
     pub environment_count: u32,
+    /// Адрес массива [`StartupCapability`] в этом address space.
+    pub capabilities_address: u64,
+    /// Число типизированных startup capabilities.
+    pub capability_count: u32,
+    /// Зарезервировано, должно быть нулём.
+    pub reserved: u32,
+    /// Адрес неизменяемого initial TLS image внутри startup block.
+    pub tls_template_address: u64,
+    /// Число инициализированных байтов TLS template.
+    pub tls_file_size: u64,
+    /// Полный размер static TLS с zero-filled хвостом.
+    pub tls_memory_size: u64,
+    /// Требуемое выравнивание TLS block.
+    pub tls_alignment: u32,
+    /// 2 = AMD64 variant II, 1 = AArch64 variant I; ноль означает нет TLS.
+    pub tls_variant: u16,
+    /// Зарезервировано, должно быть нулём.
+    pub tls_reserved: u16,
 }
 
 /// Запрос создания потока в текущем address space.
@@ -204,6 +280,11 @@ pub struct ThreadCreateRequest {
     pub argument: u64,
     /// Thread pointer: FS base на AMD64, TPIDR_EL0 на AArch64.
     pub thread_pointer: u64,
+    /// Начало private VM-диапазона, который kernel освободит после join/detach.
+    /// Ноль оставляет управление памятью вызывающей стороне.
+    pub reclaim_address: u64,
+    /// Размер reclaim-диапазона; задаётся только вместе с address.
+    pub reclaim_length: u64,
     /// [`PriorityClass`] потока.
     pub priority: u8,
     /// Зарезервировано, должно быть нулём.
@@ -225,9 +306,10 @@ pub struct ThreadCreateResult {
 const _: () = assert!(core::mem::size_of::<ProcessId>() == 8);
 const _: () = assert!(core::mem::size_of::<ThreadId>() == 8);
 const _: () = assert!(core::mem::size_of::<ExitReason>() == 16);
+const _: () = assert!(core::mem::size_of::<StartupCapability>() == 16);
 const _: () = assert!(core::mem::size_of::<SpawnCapability>() == 16);
 const _: () = assert!(core::mem::size_of::<ProcessSpawnRequest>() == 72);
 const _: () = assert!(core::mem::size_of::<ProcessSpawnResult>() == 16);
-const _: () = assert!(core::mem::size_of::<ProcessStartInfo>() == 72);
-const _: () = assert!(core::mem::size_of::<ThreadCreateRequest>() == 48);
+const _: () = assert!(core::mem::size_of::<ProcessStartInfo>() == 120);
+const _: () = assert!(core::mem::size_of::<ThreadCreateRequest>() == 64);
 const _: () = assert!(core::mem::size_of::<ThreadCreateResult>() == 16);

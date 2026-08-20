@@ -159,6 +159,10 @@ send_command 'write main rust'
 wait_for_serial '[vfs] WRITE path=/src/main value=4'
 send_command 'cat /boot/README.txt'
 wait_for_serial '[vfs] READ path=/boot/README.txt value='
+# Desktop terminal теперь действительно запускает изолированное приложение с
+# persistent VaraniaFS, а не вызывает ещё одну kernel-команду.
+send_command 'run /apps/examples/hello.rune gui'
+wait_for_serial '[terminal-run] path=/apps/examples/hello.rune status=0 exception=0 output='
 # Serial marker появляется непосредственно после обработки события, а QEMU
 # обновляет display surface по таймеру. Небольшая пауза ДО screendump не даёт
 # тесту случайно прочитать предыдущий кадр compositor'а.
@@ -220,4 +224,4 @@ for _ in $(seq 1 20); do
     sleep 0.1
 done
 stop_qemu
-echo "[gui-test] PASS: keyboard, VFS workflow, buffered drag and minimize"
+echo "[gui-test] PASS: keyboard, VFS + ring3 RUN, buffered drag and minimize"

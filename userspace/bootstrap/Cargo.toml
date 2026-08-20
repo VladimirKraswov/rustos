@@ -60,8 +60,22 @@ name = "rustos-loader-child"
 path = "src/loader_child.rs"
 
 [[bin]]
+name = "rustos-rune-runner"
+path = "src/rune_runner.rs"
+
+[[bin]]
 name = "rustos-std-smoke"
 path = "src/std_smoke.rs"
+required-features = ["std-port"]
+
+[[bin]]
+name = "rustos-std-main"
+path = "src/std_main.rs"
+required-features = ["std-port"]
+
+[[bin]]
+name = "rustos-std-child"
+path = "src/std_child.rs"
 required-features = ["std-port"]
 
 [features]
@@ -71,6 +85,9 @@ std-port = []
 [dependencies]
 rustos-abi = { path = "../../abi" }
 rustos-runtime = { path = "../../runtime" }
+rustos-crt = { path = "../crt" }
 rustos-vfs-client = { path = "../../libs/vfs" }
 rustos-elf-loader = { path = "../../libs/elf-loader" }
+rustos-rune-loader = { path = "../../libs/rune-loader" }
+rustos-rune-format = { path = "../../rune-format" }
 varaniafs = { path = "../../varaniafs" }

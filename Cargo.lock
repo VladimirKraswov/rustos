@@ -105,10 +105,21 @@ name = "rustos-bootstrap-apps"
 version = "0.1.0"
 dependencies = [
  "rustos-abi",
+ "rustos-crt",
  "rustos-elf-loader",
+ "rustos-rune-format",
+ "rustos-rune-loader",
  "rustos-runtime",
  "rustos-vfs-client",
  "varaniafs",
+]
+
+[[package]]
+name = "rustos-crt"
+version = "0.1.0"
+dependencies = [
+ "rustos-abi",
+ "rustos-runtime",
 ]
 
 [[package]]
@@ -167,6 +178,7 @@ version = "0.1.0"
 name = "rustos-rune"
 version = "0.1.0"
 dependencies = [
+ "rustos-crt",
  "rustos-rune-format",
 ]
 
@@ -175,10 +187,26 @@ name = "rustos-rune-format"
 version = "0.1.0"
 
 [[package]]
+name = "rustos-rune-loader"
+version = "0.1.0"
+dependencies = [
+ "rustos-abi",
+ "rustos-rune-format",
+ "rustos-runtime",
+]
+
+[[package]]
 name = "rustos-runtime"
 version = "0.1.0"
 dependencies = [
  "rustos-abi",
+]
+
+[[package]]
+name = "rustos-sdk-hello"
+version = "0.1.0"
+dependencies = [
+ "rustos-crt",
 ]
 
 [[package]]

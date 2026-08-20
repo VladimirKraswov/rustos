@@ -12,7 +12,7 @@ use varaniafs::{
     MIN_VOLUME_BLOCKS,
 };
 
-const DEFAULT_SIZE_MIB: u64 = 64;
+const DEFAULT_SIZE_MIB: u64 = 1024;
 
 fn main() -> ExitCode {
     match run() {
@@ -31,11 +31,83 @@ fn run() -> Result<(), String> {
         [path] => create(path, DEFAULT_SIZE_MIB, false),
         [path, size] => create(path, parse_size(size)?, false),
         [flag, path, size] if flag == "--force" => create(path, parse_size(size)?, true),
+        [flag, path, size] if flag == "--grow" => grow(path, parse_size(size)?),
         [flag, image, host, destination] if flag == "--put" => {
             put(image, host, destination)
         }
-        _ => Err("usage: rustos-vfs-image [--force] <image> [size-MiB]\n       rustos-vfs-image --verify <image>\n       rustos-vfs-image --put <image> <host-file> </absolute/path>".into()),
+        _ => Err("usage: rustos-vfs-image [--force] <image> [size-MiB]\n       rustos-vfs-image --grow <image> <minimum-size-MiB>\n       rustos-vfs-image --verify <image>\n       rustos-vfs-image --put <image> <host-file> </absolute/path>".into()),
     }
+}
+
+/// Не разрушая существующий том, доводит его до размера developer profile.
+/// Файл остаётся sparse на host, поэтому 1 ГиБ адресного пространства диска
+/// не означает немедленного расхода 1 ГиБ на SSD.
+fn grow(path: &str, size_mib: u64) -> Result<(), String> {
+    let requested_bytes = size_mib
+        .checked_mul(1024 * 1024)
+        .ok_or("image is too large")?;
+    if requested_bytes % BLOCK_SIZE as u64 != 0
+        || requested_bytes / (BLOCK_SIZE as u64) < MIN_VOLUME_BLOCKS
+    {
+        return Err("image must be aligned and at least 16 MiB".into());
+    }
+
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .map_err(|error| format!("{path}: {error}"))?;
+    let old_bytes = file.metadata().map_err(|error| error.to_string())?.len();
+    if old_bytes % BLOCK_SIZE as u64 != 0 {
+        return Err("unaligned image length".into());
+    }
+    if old_bytes >= requested_bytes {
+        println!(
+            "rustos-vfs-image: keep {path} at {} MiB (minimum {size_mib} MiB)",
+            old_bytes / 1024 / 1024
+        );
+        return verify(path);
+    }
+
+    let old_blocks = old_bytes / BLOCK_SIZE as u64;
+    let (superblock, mut metadata) = load_latest(&mut file, old_blocks)?;
+    file.set_len(requested_bytes)
+        .map_err(|error| format!("grow set_len: {error}"))?;
+    file.sync_all()
+        .map_err(|error| format!("grow data sync: {error}"))?;
+
+    // Публикация использует тот же copy-on-write порядок, что vfsd: новая
+    // metadata snapshot, flush, затем один новый superblock. Благодаря
+    // `Superblock::validate(old <= actual)` старая копия остаётся recovery
+    // point даже при выключении между set_len и последним flush.
+    metadata.sequence = metadata.sequence.wrapping_add(1).max(1);
+    let inactive = 1 - superblock.active_slot;
+    write_at(
+        &mut file,
+        metadata_slot_start(inactive) * BLOCK_SIZE as u64,
+        metadata.bytes(),
+    )?;
+    file.sync_all()
+        .map_err(|error| format!("grow metadata sync: {error}"))?;
+    let new_blocks = requested_bytes / BLOCK_SIZE as u64;
+    let next = Superblock::new(
+        new_blocks,
+        metadata.sequence,
+        inactive,
+        crc32(metadata.bytes()),
+    );
+    write_at(
+        &mut file,
+        (metadata.sequence & 1) * BLOCK_SIZE as u64,
+        next.bytes(),
+    )?;
+    file.sync_all()
+        .map_err(|error| format!("grow superblock sync: {error}"))?;
+    println!(
+        "rustos-vfs-image: grew {path}: {} -> {size_mib} MiB",
+        old_bytes / 1024 / 1024
+    );
+    verify(path)
 }
 
 fn parse_size(value: &str) -> Result<u64, String> {

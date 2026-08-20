@@ -51,6 +51,62 @@ if [[ ! -f "$FS_PATCH_MARKER" ]]; then
     printf '%s\n' "$COMMIT_HASH" > "$FS_PATCH_MARKER"
 fi
 
+STARTUP_PATCH_MARKER="$RUST_SOURCE/.rustos-startup-routing-v1"
+if [[ ! -f "$STARTUP_PATCH_MARKER" ]]; then
+    echo "[std] apply RustOS startup/env routing patch"
+    patch -d "$RUST_SOURCE" -p1 --forward \
+        < "$PORT_ROOT/patches/0003-rustos-startup-routing.patch"
+    printf '%s\n' "$COMMIT_HASH" > "$STARTUP_PATCH_MARKER"
+fi
+
+FS_STARTUP_PATCH_MARKER="$RUST_SOURCE/.rustos-fs-startup-hook-v1"
+if [[ ! -f "$FS_STARTUP_PATCH_MARKER" ]]; then
+    echo "[std] expose RustOS std::fs startup hook to PAL"
+    patch -d "$RUST_SOURCE" -p1 --forward \
+        < "$PORT_ROOT/patches/0004-rustos-fs-startup-hook.patch"
+    printf '%s\n' "$COMMIT_HASH" > "$FS_STARTUP_PATCH_MARKER"
+fi
+
+THREAD_PATCH_MARKER="$RUST_SOURCE/.rustos-thread-routing-v1"
+if [[ ! -f "$THREAD_PATCH_MARKER" ]]; then
+    echo "[std] apply RustOS native thread routing patch"
+    patch -d "$RUST_SOURCE" -p1 --forward \
+        < "$PORT_ROOT/patches/0005-rustos-thread-routing.patch"
+    printf '%s\n' "$COMMIT_HASH" > "$THREAD_PATCH_MARKER"
+fi
+
+PIPE_PATCH_MARKER="$RUST_SOURCE/.rustos-pipe-routing-v1"
+if [[ ! -f "$PIPE_PATCH_MARKER" ]]; then
+    echo "[std] apply RustOS capability pipe routing patch"
+    patch -d "$RUST_SOURCE" -p1 --forward \
+        < "$PORT_ROOT/patches/0006-rustos-pipe-routing.patch"
+    printf '%s\n' "$COMMIT_HASH" > "$PIPE_PATCH_MARKER"
+fi
+
+STDIO_PATCH_MARKER="$RUST_SOURCE/.rustos-stdio-routing-v1"
+if [[ ! -f "$STDIO_PATCH_MARKER" ]]; then
+    echo "[std] apply RustOS stdio routing patch"
+    patch -d "$RUST_SOURCE" -p1 --forward \
+        < "$PORT_ROOT/patches/0007-rustos-stdio-routing.patch"
+    printf '%s\n' "$COMMIT_HASH" > "$STDIO_PATCH_MARKER"
+fi
+
+PROCESS_PATCH_MARKER="$RUST_SOURCE/.rustos-process-routing-v1"
+if [[ ! -f "$PROCESS_PATCH_MARKER" ]]; then
+    echo "[std] apply RustOS process routing patch"
+    patch -d "$RUST_SOURCE" -p1 --forward \
+        < "$PORT_ROOT/patches/0008-rustos-process-routing.patch"
+    printf '%s\n' "$COMMIT_HASH" > "$PROCESS_PATCH_MARKER"
+fi
+
+PATHS_PATCH_MARKER="$RUST_SOURCE/.rustos-paths-routing-v1"
+if [[ ! -f "$PATHS_PATCH_MARKER" ]]; then
+    echo "[std] apply RustOS process-local path routing patch"
+    patch -d "$RUST_SOURCE" -p1 --forward \
+        < "$PORT_ROOT/patches/0009-rustos-paths-routing.patch"
+    printf '%s\n' "$COMMIT_HASH" > "$PATHS_PATCH_MARKER"
+fi
+
 # Обновляем только реально изменившиеся PAL-файлы. Обычный `cp -R` каждый раз
 # менял mtime и заставлял Cargo заново собирать весь upstream std (несколько
 # минут даже при неизменном port source).

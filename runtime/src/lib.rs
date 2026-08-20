@@ -16,8 +16,8 @@ pub use rustos_abi::{
     ipc::Message,
     memory::{SharedMemoryCreate, SharedMemoryMap, VmFlags, VmMapRequest},
     process::{
-        ProcessSpawnRequest, ProcessSpawnResult, ProcessStartInfo, ThreadCreateRequest,
-        ThreadCreateResult,
+        ProcessSpawnRequest, ProcessSpawnResult, ProcessStartInfo, StartupCapability, StartupRole,
+        ThreadCreateRequest, ThreadCreateResult,
     },
     syscall, ExitReason, Handle, Rights,
 };
@@ -126,6 +126,12 @@ pub fn thread_join(thread: Handle, reason: &mut ExitReason) -> i64 {
             0,
         )
     }
+}
+
+/// Освобождает join-право. Если это последний handle, kernel автоматически
+/// удалит thread object и reclaim-диапазон после остановки потока.
+pub fn thread_detach(thread: Handle) -> i64 {
+    unsafe { syscall3(syscall::number::THREAD_DETACH, thread.0 as u64, 0, 0) }
 }
 
 /// Устанавливает thread pointer текущего потока: FS base на AMD64 и
@@ -264,6 +270,36 @@ pub unsafe fn process_start_info(address: u64) -> Option<&'static ProcessStartIn
     (info.version == rustos_abi::process::PROCESS_ABI_VERSION
         && info.size as usize >= core::mem::size_of::<ProcessStartInfo>())
     .then_some(info)
+}
+
+/// Ищет системную службу по стабильной роли, не раскрывая приложению
+/// внутреннюю нумерацию capability slots.
+///
+/// # Safety
+///
+/// `info` должен происходить из проверенного [`process_start_info`].
+pub unsafe fn startup_capability(
+    info: &ProcessStartInfo,
+    role: StartupRole,
+) -> Option<StartupCapability> {
+    if role == StartupRole::NONE
+        || info.capability_count as usize > rustos_abi::process::PROCESS_SPAWN_MAX_CAPABILITIES
+        || info.capabilities_address == 0
+        || !info
+            .capabilities_address
+            .is_multiple_of(core::mem::align_of::<StartupCapability>() as u64)
+    {
+        return None;
+    }
+    // SAFETY: kernel поместил массив в тот же неизменяемый startup mapping;
+    // count ограничен ABI-константой выше.
+    let capabilities = unsafe {
+        core::slice::from_raw_parts(
+            info.capabilities_address as *const StartupCapability,
+            info.capability_count as usize,
+        )
+    };
+    capabilities.iter().copied().find(|item| item.role == role)
 }
 
 /// Отправляет небольшое inline IPC-сообщение. Capability handles внутри

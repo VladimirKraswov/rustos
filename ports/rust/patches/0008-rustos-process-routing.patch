@@ -1,0 +1,11 @@
+--- a/library/std/src/sys/process/mod.rs
++++ b/library/std/src/sys/process/mod.rs
+@@ -1,4 +1,8 @@
+ cfg_select! {
++    target_os = "rustos" => {
++        mod rustos;
++        use rustos as imp;
++    }
+     target_family = "unix" => {
+         mod unix;
+         use unix as imp;

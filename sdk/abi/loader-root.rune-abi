@@ -1,0 +1,9 @@
+RUNE-ABI 1
+# Программа импортирует контракт, а не случайный SONAME из search path.
+package org.rustos.examples.loader-root
+kind application
+interface org.rustos.example.loader-root/1
+abi 1
+dependency fixture-1.rune org.rustos.example.answer/1 1 1
+import fixture_answer org.rustos.example.answer/1 fixture_answer()->u64 1 1 function
+export linked_answer linked_answer()->u64 function

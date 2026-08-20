@@ -98,6 +98,10 @@ pub fn kernel_main(info: &BootInfo) -> ! {
                 print_idle_notice();
                 exit_kernel(0);
             }
+            if process::start_interactive_services().is_err() {
+                serial::put_str("[services] FATAL: cannot start interactive ring3 services\n");
+                exit_kernel(0x53);
+            }
             gui::session::run(info)
         }
         Err(code) => exit_kernel(code),

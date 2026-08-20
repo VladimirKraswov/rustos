@@ -210,6 +210,7 @@ pub struct Relocation {
 }
 
 /// Заимствованный, уже структурно и криптографически проверенный контейнер.
+#[derive(Clone, Copy)]
 pub struct Container<'a> {
     bytes: &'a [u8],
     header: Header,
@@ -276,13 +277,19 @@ impl<'a> Container<'a> {
     }
 
     pub fn name(&self, entry: TocEntry) -> Option<&'a str> {
-        if entry.name_length == 0 {
+        self.string(entry.name_offset, entry.name_length)
+    }
+
+    /// Читает diagnostic name из общей string table. Wire records imports,
+    /// exports и dependencies используют те же offsets, что и TOC.
+    pub fn string(&self, offset: u32, length: u16) -> Option<&'a str> {
+        if length == 0 {
             return Some("");
         }
         let strings = self.entry(self.header.strings_index as usize)?;
         let table = self.payload(strings)?;
-        let start = entry.name_offset as usize;
-        let end = start.checked_add(entry.name_length as usize)?;
+        let start = offset as usize;
+        let end = start.checked_add(length as usize)?;
         core::str::from_utf8(table.get(start..end)?).ok()
     }
 

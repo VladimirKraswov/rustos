@@ -7,29 +7,36 @@
 
 ## Текущая граница реализации
 
-Сейчас репозиторий находится между S1 и S2: target kernel всё ещё
-cross-компилируется на macOS/Linux, но настоящая upstream `core + alloc + std`
-уже собирается для RustOS. Отдельный RUNE-процесс запускается в CPL3 с
-process-local capabilities; fault соседнего процесса не останавливает
-kernel/GUI, а кадры address space освобождаются. Syscall ABI v4 предоставляет
-spawn/wait/kill, несколько потоков, anonymous/shared VM, TLS и monotonic clock.
+Сейчас завершён runtime-фундамент между S1 и S2. Настоящая upstream
+`core + alloc + std` собирается для RustOS; обычный `fn main` получает
+argv/environment, process-local CWD и typed startup capabilities. Syscall ABI
+v4 предоставляет spawn/wait/kill, native threads, blocking futex, anonymous и
+shared VM, TLS, pipes, stdio и monotonic clock. Sparse page registry и slab
+allocator больше не ограничивают процесс несколькими мегабайтами.
 
-Следующий checkpoint тоже исполняется: изолированный ring-3 `vfsd` обслуживает
-open/read/write/seek/readdir/create/delete/rename через capability IPC и
-shared memory. VaraniaFS хранится на отдельном virtio-blk образе; boot-test
-полностью перезапускает сервис и читает сохранённый файл новым процессом.
-Публичный `std::fs` уже работает поверх capability IPC к `vfsd`: boot-test
-создаёт, читает, переименовывает и удаляет persistent VaraniaFS-файл именно
-через upstream `std`. Все запускаемые system applications упакованы в
-нативный формат RUNE. User-space ELF loader продолжает проверять `DT_NEEDED`,
-symbols, AMD64 RELA, initial-exec TLS, RELRO и physically shared RX pages для
-переходных DLL fixtures.
+Изолированный ring-3 `vfsd` обслуживает streaming I/O, seek/readdir,
+create/delete/rename и resize через capability IPC/shared memory. Публичные
+`std::fs`, `std::thread` и `std::process` проходят QEMU stress. RUNE resolver
+в ring 3 разрешает interface imports/exports и ABI ranges, строит TLS, RELRO и
+sealed shared RX. `std::process::Command` прозрачно запускает приложение
+непосредственно с VaraniaFS через `rune-runner`; нативный `rustos-rune` уже
+является системной утилитой. Persistent image автоматически расширяется до
+1 ГиБ без уничтожения пользовательских данных.
 
-Это всё ещё не нативный compiler. Не готовы `std::thread::spawn`, startup
-argc/argv/environment, `std::process`, pipes, networking/offline Cargo host
-workflow и нативный RUNE DLL resolver. Следующая прямая зависимость
-self-hosting — process startup runtime, настоящее блокирование futex и RUNE
-imports/exports; затем можно запускать cross-built native seed `rustc`.
+Это всё ещё не нативный compiler, и документация намеренно не называет этап
+self-hosted. Четыре оставшихся архитектурных барьера:
+
+1. VaraniaFS v2 со scalable inode/directory/extent trees: лимит v1 в 64 inode
+   не позволяет развернуть Rust/Cargo source и vendor store;
+2. user-space `init`/supervisor и console service. После boot milestones уже
+   остаётся persistent `vfsd`, а GUI-команда `RUN` запускает ring-3 RUNE и
+   захватывает pipe; однако orchestration/terminal всё ещё живут в kernel;
+3. RustOS-host `rust-lld`, dynamic loading proc-macro/codegen DLL и затем
+   cross-built seed `rustc_driver`;
+4. offline Cargo + source/vendor bundle и воспроизводимый native rebuild test.
+
+Копирование host `rustc` в образ до этих пунктов запрещено критерием проекта:
+такой файл либо не запустится, либо незаметно продолжит зависеть от macOS/Linux.
 
 ## Три разные платформы Rust bootstrap
 
@@ -73,8 +80,9 @@ Seed лежит в versioned toolchain bundle с SHA-256, исходниками
 Порядок реализации host support:
 
 1. встроенный target spec и cfg `target_os = "rustos"`;
-2. `library/std/src/sys/pal/rustos`: файлы, сеть-заглушка, args/env, time,
-   thread, mutex/condvar, process, pipe, dynamic loading;
+2. `library/std/src/sys/pal/rustos`: files/CWD, args/env, time, allocator,
+   thread/futex, process, pipe и stdio уже работают; остаются unwind/TLS
+   destructors, sockets и host dynamic loading;
 3. crates `libc`/`cc` и RustOS SDK headers/import libraries;
 4. native `rust-lld`, `rustos-rune` и loader RUNE applications/DLL;
 5. `rustc_driver`, `rustdoc`, proc-macro server;
@@ -95,9 +103,9 @@ LLVM остаётся эталонным backend для release. Cranelift-пр�
 /system/bin/cargo
 /system/bin/rustdoc
 /system/bin/rust-lld
-/system/lib/loader-1.dll
-/system/lib/system-1.dll
-/system/lib/vfs-1.dll
+/system/lib/loader-1.rune
+/system/lib/system-1.rune
+/system/lib/vfs-1.rune
 /system/rustlib/x86_64-unknown-rustos/lib/*.rlib
 /system/rustlib/codegen-backends/*.dll
 /system/src/rust/                 # опциональный source bundle

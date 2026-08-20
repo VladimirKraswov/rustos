@@ -1,0 +1,22 @@
+--- a/library/std/src/sys/args/mod.rs
++++ b/library/std/src/sys/args/mod.rs
+@@ -16,4 +16,8 @@
+ cfg_select! {
++    target_os = "rustos" => {
++        mod rustos;
++        pub use rustos::*;
++    }
+     any(
+         all(target_family = "unix", not(any(all(target_family = "wasm", target_os = "linux"), target_os = "espidf", target_os = "vita"))),
+         target_os = "hermit",
+--- a/library/std/src/sys/env/mod.rs
++++ b/library/std/src/sys/env/mod.rs
+@@ -18,4 +18,8 @@
+ cfg_select! {
++    target_os = "rustos" => {
++        mod rustos;
++        pub use rustos::*;
++    }
+     target_family = "unix" => {
+         mod unix;
+         pub use unix::*;

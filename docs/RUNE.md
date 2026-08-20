@@ -180,6 +180,10 @@ capabilities и передаёт их через process startup table. Поэт
 # ELF64 PIE -> RUNE
 cargo run -p rustos-rune -- input.elf output.rune
 
+# DLL с декларативным interface ABI
+cargo run -p rustos-rune -- pack-manifest \
+  input.dll output.rune sdk/abi/my-library.rune-abi
+
 # Структурная и hash-проверка
 cargo run -p rustos-rune -- verify output.rune
 
@@ -197,12 +201,18 @@ initramfs только `.rune`. Kernel UEFI image пока остаётся ELF:
 
 - no-alloc parser + SHA-256;
 - ELF64 PIE conversion для AMD64/AArch64;
-- application regions, `RELATIVE64`, static TLS и RELRO;
+- application/library regions, normalized relative/import/PC32/TLS relocations;
 - kernel dispatch по magic, W^X и frame cleanup;
-- все system ring-3 программы в `.rune`, включая upstream Rust `std` smoke.
+- manifest parser проверяет declared imports/exports против ELF `.dynsym`;
+- ring-3 resolver находит provider по interface ID/ABI range, применяет
+  relocations, строит combined TLS, закрывает RELRO и разделяет sealed RX;
+- `rune-runner` читает application и dependency closure непосредственно из
+  VaraniaFS, затем передаёт target argv/env/capabilities и новый stack;
+- все system ring-3 программы в `.rune`, включая upstream Rust `std` и сам
+  нативный `rustos-rune` verifier.
 
-Форматы imports/exports/dependencies/capabilities и стабильные ID уже
-зафиксированы в crate, но нативный RUNE resolver ещё не заменил действующий
-user-space ELF DLL loader. ELF DLL fixtures остаются только миграционными
-тестами. Удалять fallback следует после теста RUNE `DT_NEEDED`-эквивалента,
-shared RX, TLS и ABI mismatch для двух процессов.
+ELF остаётся build intermediate и migration fallback kernel loader'а, но в
+штатный system image пользовательские ELF/DLL больше не устанавливаются.
+Большая read-only region, не помещающаяся в ранний лимит shared-memory object,
+получает private RX mapping с сохранением W^X; после масштабирования shared
+objects этот fallback можно сделать разделяемым без смены формата.

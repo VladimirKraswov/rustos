@@ -69,6 +69,25 @@ pub mod number {
     /// Необратимо превращает RW shared object в RO/RX объект.
     /// `arg0=handle, arg1=VmFlags`; после seal новые права расширить нельзя.
     pub const SHARED_MEMORY_SEAL: u64 = 23;
+    /// Усыпить поток, пока futex равен expected.
+    /// `arg0=*const AtomicU32, arg1=expected, arg2=timeout_ns|u64::MAX`.
+    pub const FUTEX_WAIT: u64 = 24;
+    /// Разбудить до `count` ожидающих тот же process-local futex.
+    /// `arg0=*const AtomicU32, arg1=count`; результат — число потоков.
+    pub const FUTEX_WAKE: u64 = 25;
+    /// Отказаться от join-capability; последний владелец делает поток detached.
+    /// `arg0=thread handle`.
+    pub const THREAD_DETACH: u64 = 26;
+    /// Создать однонаправленный pipe. `arg0=*mut PipeCreateResult`.
+    pub const PIPE_CREATE: u64 = 27;
+    /// Прочитать pipe. `arg0=handle, arg1=buffer, arg2=length`.
+    pub const PIPE_READ: u64 = 28;
+    /// Записать pipe. `arg0=handle, arg1=buffer, arg2=length`.
+    pub const PIPE_WRITE: u64 = 29;
+    /// Дублировать capability с attenuation прав. `arg0=handle, arg1=Rights`.
+    pub const HANDLE_DUPLICATE: u64 = 30;
+    /// Неблокирующая проверка процесса. `arg0=handle, arg1=*mut ExitReason`.
+    pub const PROCESS_TRY_WAIT: u64 = 31;
 }
 
 /// Отрицательные результаты syscall. Не совпадают с Unix errno намеренно:
@@ -100,4 +119,6 @@ pub mod status {
     pub const BUSY: i64 = -11;
     /// Ошибка ввода-вывода физического устройства.
     pub const IO_ERROR: i64 = -12;
+    /// Время блокирующей операции истекло.
+    pub const TIMED_OUT: i64 = -13;
 }

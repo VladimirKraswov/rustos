@@ -1,38 +1,37 @@
 //! Первый настоящий `std` процесс RustOS.
 //!
-//! Точка входа пока явная: окончательный `lang_start` появится вместе с
-//! process startup ABI для обычного `fn main`. Сам код ниже использует именно
-//! upstream `std`, собранную через `-Zbuild-std`, а не локальный facade.
+//! Это обычная программа с `fn main`: RustOS CRT и std PAL сами принимают
+//! ProcessStartInfo, argv/env и типизированные VFS capabilities.
 
-#![no_main]
 #![feature(restricted_std)]
 
+use rustos_crt as _;
 use std::{
+    cell::Cell,
     collections::{BTreeMap, HashMap},
-    fs::{self, File, OpenOptions},
+    fs::{self, OpenOptions},
     hint,
     io::{Read, Seek, SeekFrom, Write},
+    path::Path,
+    process::{Command, ExitCode},
     string::String,
-    sync::Mutex,
+    sync::{Arc, Barrier, Mutex},
+    thread,
     time::Instant,
     vec::Vec,
 };
 
-const ABI_VERSION: u64 = 4;
-
 unsafe extern "C" {
-    fn __rustos_std_vfs_init(server: u32, reply: u32) -> i32;
     fn __rustos_std_vfs_shutdown() -> i32;
 }
 
-#[no_mangle]
-pub extern "C" fn _start(vfs_server: u64, vfs_reply: u64, abi_version: u64) -> ! {
-    if abi_version != ABI_VERSION {
-        process_exit(1);
-    }
-    if unsafe { __rustos_std_vfs_init(vfs_server as u32, vfs_reply as u32) } != 0 {
-        process_exit(2);
-    }
+thread_local! {
+    /// Ненулевой initial image проверяет, что новый поток копирует TLS template,
+    /// а не просто получает zero-filled область с подходящим FS base.
+    static WORKER_TLS: Cell<u32> = const { Cell::new(7) };
+}
+
+fn main() -> ExitCode {
     let started = Instant::now();
 
     // Vec/String проверяют GlobalAlloc -> vm_map и realloc/dealloc path.
@@ -41,11 +40,11 @@ pub extern "C" fn _start(vfs_server: u64, vfs_reply: u64, abi_version: u64) -> !
         numbers.push(value * value);
     }
     if numbers.iter().sum::<u64>() != 85_344 {
-        finish(3);
+        return finish(3);
     }
     let greeting = String::from("RUNE + Rust std");
     if greeting.len() != 15 || !greeting.starts_with("RUNE") {
-        finish(4);
+        return finish(4);
     }
 
     // Обе коллекции важны: BTreeMap создаёт много небольших allocations,
@@ -57,7 +56,7 @@ pub extern "C" fn _start(vfs_server: u64, vfs_reply: u64, abi_version: u64) -> !
         hashed.insert(index, value);
     }
     if ordered.get(&17) != Some(&289) || hashed.get(&31) != Some(&961) {
-        finish(5);
+        return finish(5);
     }
 
     // Mutex fast path уже проходит RustOS futex backend. Contended path будет
@@ -65,7 +64,7 @@ pub extern "C" fn _start(vfs_server: u64, vfs_reply: u64, abi_version: u64) -> !
     let shared = Mutex::new(40u64);
     *shared.lock().unwrap() += 2;
     if *shared.lock().unwrap() != 42 {
-        finish(6);
+        return finish(6);
     }
 
     // CLOCK_MONOTONIC не обязан измениться за столь короткий интервал, но не
@@ -74,14 +73,133 @@ pub extern "C" fn _start(vfs_server: u64, vfs_reply: u64, abi_version: u64) -> !
     hint::spin_loop();
     let after = started.elapsed();
     if after < before {
-        finish(7);
+        return finish(7);
     }
 
     if !verify_std_fs() {
-        finish(8);
+        return finish(8);
+    }
+    if !verify_threads() {
+        return finish(10);
+    }
+    if !verify_process_and_pipes() {
+        return finish(11);
+    }
+    if !verify_native_sdk_tool() {
+        return finish(12);
+    }
+    if !verify_vfs_executable() {
+        return finish(13);
+    }
+    if !verify_sdk_example() {
+        return finish(14);
     }
 
     finish(0)
+}
+
+fn verify_process_and_pipes() -> bool {
+    // Сначала стресс: так его диагностика не зависит от очистки предыдущего
+    // процесса и отдельно защищает первый lifecycle проход.
+    let Ok(stress) = Command::new("std-child").arg("stress").output() else {
+        return false;
+    };
+    let stdout_prefix = b"child-out:stress\n";
+    let stderr_prefix = b"child-err:ready\n";
+    let stress_ok = stress.status.code() == Some(17)
+        && stress.stdout.len() == stdout_prefix.len() + 12 * 1024
+        && stress.stderr.len() == stderr_prefix.len() + 12 * 1024
+        && stress.stdout.starts_with(stdout_prefix)
+        && stress.stderr.starts_with(stderr_prefix)
+        && stress.stdout[stdout_prefix.len()..]
+            .iter()
+            .all(|byte| *byte == b'O')
+        && stress.stderr[stderr_prefix.len()..]
+            .iter()
+            .all(|byte| *byte == b'E');
+    if !stress_ok {
+        return false;
+    }
+
+    let output = Command::new("/boot/system/bin/std-child.rune")
+        .arg("from-parent")
+        .output();
+    let Ok(output) = output else { return false };
+    output.status.code() == Some(17)
+        && output.stdout == b"child-out:from-parent\n"
+        && output.stderr == b"child-err:ready\n"
+}
+
+/// Запускает уже нативную системную утилиту SDK. Она читает RUNE DLL через
+/// унаследованную VFS capability, проверяет hash/TOC и пишет результат в pipe.
+/// Это тот же build-tool, который позднее будет вызывать native Cargo.
+fn verify_native_sdk_tool() -> bool {
+    let Ok(output) = Command::new("rune")
+        .arg("verify")
+        .arg("/system/lib/fixture-1.rune")
+        .output()
+    else {
+        return false;
+    };
+    output.status.success()
+        && output.stderr.is_empty()
+        && String::from_utf8(output.stdout).is_ok_and(|stdout| stdout.starts_with("RUNE OK:"))
+}
+
+/// Публичный `Command` сам выбирает маленький runner из initramfs и загружает
+/// target непосредственно из VaraniaFS. Приложению не нужно знать о
+/// bootstrap-механизме; argv, stdio и VFS capabilities сохраняются.
+fn verify_vfs_executable() -> bool {
+    let Ok(output) = Command::new("/apps/sdk/std-child.rune")
+        .arg("via-vfs")
+        .output()
+    else {
+        return false;
+    };
+    output.status.code() == Some(17)
+        && output.stdout == b"child-out:via-vfs\n"
+        && output.stderr == b"child-err:ready\n"
+}
+
+fn verify_sdk_example() -> bool {
+    let Ok(output) = Command::new("/apps/examples/hello.rune")
+        .arg("student")
+        .output()
+    else {
+        return false;
+    };
+    output.status.success()
+        && output.stderr.is_empty()
+        && output.stdout == b"Hello, student, from a VaraniaFS RUNE application!\n"
+}
+
+fn verify_threads() -> bool {
+    let value = Arc::new(Mutex::new(0u64));
+    let barrier = Arc::new(Barrier::new(3));
+    let mut workers = Vec::new();
+    for worker in 0..2u32 {
+        let value = Arc::clone(&value);
+        let barrier = Arc::clone(&barrier);
+        workers.push(thread::spawn(move || {
+            let tls_ok = WORKER_TLS.with(|cell| {
+                let initial = cell.get();
+                cell.set(20 + worker);
+                initial == 7 && cell.get() == 20 + worker
+            });
+            barrier.wait();
+            for _ in 0..64 {
+                *value.lock().unwrap() += 1;
+                thread::yield_now();
+            }
+            tls_ok
+        }));
+    }
+    barrier.wait();
+    let tls_ok = workers
+        .into_iter()
+        .all(|worker| worker.join().unwrap_or(false));
+    let final_value = *value.lock().unwrap();
+    tls_ok && final_value == 128
 }
 
 /// Проверяет публичный `std::fs`, а не внутренние IPC helpers. Поэтому этот
@@ -91,19 +209,45 @@ fn verify_std_fs() -> bool {
     const DIRECTORY: &str = "/std-port-smoke";
     const FIRST: &str = "/std-port-smoke/source.txt";
     const SECOND: &str = "/std-port-smoke/result.txt";
+    const NESTED: &str = "/std-port-smoke/nested";
     const CONTENT: &str = "std::fs over capability IPC";
 
     let _ = fs::remove_file(FIRST);
     let _ = fs::remove_file(SECOND);
+    let _ = fs::remove_dir_all(NESTED);
     let _ = fs::remove_dir(DIRECTORY);
     if fs::create_dir(DIRECTORY).is_err() {
         return false;
     }
 
     let result = (|| -> std::io::Result<bool> {
-        let mut file = File::create(FIRST)?;
+        fs::create_dir(NESTED)?;
+        std::env::set_current_dir(DIRECTORY)?;
+        if std::env::current_dir()? != Path::new(DIRECTORY)
+            || std::env::current_exe()?.file_name() != Some(std::ffi::OsStr::new("std-smoke"))
+        {
+            return Ok(false);
+        }
+
+        // Относительный путь проходит через process-local CWD, а не через
+        // состояние kernel или vfsd. Это именно та семантика, которая нужна
+        // Cargo при обходе workspace.
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open("source.txt")?;
         file.write_all(CONTENT.as_bytes())?;
         file.flush()?;
+        file.set_len(8193)?;
+        file.seek(SeekFrom::Start(8192))?;
+        let mut sparse_tail = [1u8; 1];
+        file.read_exact(&mut sparse_tail)?;
+        if sparse_tail != [0] {
+            return Ok(false);
+        }
+        file.set_len(CONTENT.len() as u64)?;
         file.seek(SeekFrom::Start(0))?;
         drop(file);
 
@@ -129,39 +273,23 @@ fn verify_std_fs() -> bool {
                 found = true;
             }
         }
+        if fs::canonicalize("nested/../result.txt")? != Path::new(SECOND) {
+            return Ok(false);
+        }
+        std::env::set_current_dir("/")?;
+        fs::remove_dir_all(NESTED)?;
         Ok(found)
     })();
 
+    let _ = std::env::set_current_dir("/");
+    let _ = fs::remove_dir_all(NESTED);
     let cleanup = fs::remove_file(SECOND).and_then(|_| fs::remove_dir(DIRECTORY));
     matches!(result, Ok(true)) && cleanup.is_ok()
 }
 
-fn finish(status: i32) -> ! {
+fn finish(status: u8) -> ExitCode {
     if unsafe { __rustos_std_vfs_shutdown() } != 0 {
-        process_exit(if status == 0 { 9 } else { status });
+        return ExitCode::from(if status == 0 { 9 } else { status });
     }
-    process_exit(status)
-}
-
-fn process_exit(status: i32) -> ! {
-    unsafe {
-        #[cfg(target_arch = "x86_64")]
-        core::arch::asm!(
-            "int 0x80",
-            in("rax") 1u64,
-            in("rdi") status as i64 as u64,
-            in("rsi") 0u64,
-            in("rdx") 0u64,
-            options(noreturn),
-        );
-        #[cfg(target_arch = "aarch64")]
-        core::arch::asm!(
-            "svc #0",
-            in("x8") 1u64,
-            in("x0") status as i64 as u64,
-            in("x1") 0u64,
-            in("x2") 0u64,
-            options(noreturn),
-        );
-    }
+    ExitCode::from(status)
 }

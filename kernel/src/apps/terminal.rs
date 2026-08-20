@@ -1,8 +1,9 @@
 //! Первый GUI-клиент RustOS: цветной системный terminal.
 //!
-//! До появления ring 3 terminal содержит встроенный shell и вызывает
-//! bootstrap VFS напрямую. Команды и VFS-семантика уже совпадают с будущими
-//! `shell` + `fs` процессами; позже прямой вызов заменит `vfs.dll`/IPC.
+//! Файловые команды раннего shell ещё вызывают bootstrap VFS напрямую, но
+//! `RUN` уже проходит через постоянный process manager, ring-3 `vfsd`, RUNE
+//! loader и capability pipes. Следующий перенос вынесет сам shell/console в
+//! user space, не меняя terminal widget и оконный менеджер.
 
 use crate::{
     arch, font,
@@ -248,6 +249,7 @@ impl Terminal {
             self.print("  APPEND    APPEND RAM FILE\n", WHITE);
             self.print("  TOUCH/RM  CREATE OR REMOVE\n", WHITE);
             self.print("  STAT      FILE INFORMATION\n", WHITE);
+            self.print("  RUN PATH [ARGS]  START A RING3 RUNE PROGRAM\n", WHITE);
             self.print("  FS        FILE COMMAND HELP\n", WHITE);
             self.print("  SHUTDOWN  POWER OFF VM\n", WHITE);
             TerminalAction::None
@@ -277,6 +279,9 @@ impl Terminal {
             self.print(&command[5..], WHITE);
             self.newline();
             TerminalAction::None
+        } else if command.len() > 4 && command[..4].eq_ignore_ascii_case("run ") {
+            self.command_run(command[4..].trim());
+            TerminalAction::None
         } else if self.execute_fs_command(command) {
             TerminalAction::None
         } else {
@@ -292,6 +297,33 @@ impl Terminal {
             TerminalAction::Shutdown
         } else {
             TerminalAction::RedrawAll
+        }
+    }
+
+    fn command_run(&mut self, command: &str) {
+        let mut output = [0u8; 4096];
+        match crate::process::run_interactive_command(command, &mut output) {
+            Ok(result) => {
+                if result.output_length != 0 {
+                    match core::str::from_utf8(&output[..result.output_length]) {
+                        Ok(text) => self.print(text, WHITE),
+                        Err(_) => self.print("[PROGRAM OUTPUT IS NOT UTF-8]\n", RED),
+                    }
+                }
+                self.print("[EXIT status=", MUTED);
+                if result.status < 0 {
+                    self.print("-", RED);
+                    self.print_number(u64::from(result.status.unsigned_abs()));
+                } else {
+                    self.print_number(result.status as u64);
+                }
+                if result.exception != 0 {
+                    self.print(" exception=", RED);
+                    self.print_number(u64::from(result.exception));
+                }
+                self.print("]\n", MUTED);
+            }
+            Err(_) => self.print("RUN FAILED: USE AN ABSOLUTE VARANIAFS PATH\n", RED),
         }
     }
 

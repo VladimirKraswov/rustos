@@ -1,0 +1,8 @@
+--- a/library/std/src/sys/fs/mod.rs
++++ b/library/std/src/sys/fs/mod.rs
+@@ -12,5 +12,5 @@
+     target_os = "rustos" => {
+-        mod rustos;
++        pub(crate) mod rustos;
+         use rustos as imp;
+     }

@@ -135,10 +135,11 @@ per-CPU GDT/TSS/IDT, ring-0 interrupt stack, run queue и TLB shootdown inbox.
 
 Process ABI v4 предоставляет spawn/kill/wait, несколько потоков, anonymous
 VM, sealed shared-memory capabilities, args/env, TLS и monotonic clock.
-Streaming VFS IPC, persistent VaraniaFS и user-space DLL loader уже проходят
-boot-test. Следующий программный milestone — полный `exec` через VFS:
-ring-3 `init` запускает `ld-rustos`, а затем block/filesystem, display/input
-services и desktop по manifests. Подробный контракт описан в
+Streaming VFS IPC, persistent VaraniaFS и user-space RUNE DLL loader уже
+проходят boot-test. `std::process::Command` умеет выполнять RUNE с VFS через
+ring-3 runner. Следующий программный milestone — постоянный supervisor:
+ring-3 `init` запускает filesystem, display/input services и desktop по
+manifests, а не только последовательно проверяет их при boot. Контракт описан в
 [PROCESS_MEMORY_ABI.md](PROCESS_MEMORY_ABI.md) и
 [ELF_LOADER.md](ELF_LOADER.md).
 
@@ -151,7 +152,7 @@ Upstream `std`, dynamic loader и будущий native seed `rustc` опира�
 preemptive threads + IPC
         -> vfsd/blockd/filesystem + persistent files
         -> RUNE loader + system/vfs client ABI
-        -> target std (готовы allocator/file/time/TLS; дальше thread/process/pipe)
+        -> target std (allocator/fs/time/TLS/thread/process/pipe готовы)
         -> rust-lld + native seed rustc/cargo
         -> сборка RustOS внутри RustOS
 ```
@@ -175,9 +176,9 @@ PID/TID, изоляцию process fault и supervisor backoff. `make test-boot` 
 [isolation] concurrent #UD terminated one process; survivor exited=22
 [ipc] queued block/wake and attenuated VFS capability verified
 [abi-v4] spawn/wait/kill threads VM shared-memory TLS clock verified
-[std] collections allocator sync time and std::fs over vfsd verified in ring3 RUNE
+[std] allocator fs threads futex process pipes stdio native SDK and VFS executable verified in ring3 RUNE
 [vfsd] restart recovered committed VaraniaFS metadata and file data
-[loader] DT_NEEDED symbols RELA TLS RELRO and cross-process shared RX verified
+[loader] RUNE interfaces imports ABI TLS RELRO and cross-process shared RX verified
 [process-manager] dynamic create/exit/reap reclaimed all frames
 [microkernel] RING3_MILESTONE_OK
 ```

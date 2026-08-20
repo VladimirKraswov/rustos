@@ -30,6 +30,8 @@ pub mod opcode {
     pub const RENAME: u16 = 9;
     pub const SYNC: u16 = 10;
     pub const SEEK: u16 = 11;
+    /// Изменить логический размер открытого файла (`File::set_len`).
+    pub const RESIZE: u16 = 12;
     /// Test/supervisor control: корректно синхронизировать и завершить vfsd.
     pub const SHUTDOWN: u16 = 0xff;
 }
@@ -112,6 +114,16 @@ pub struct SeekRequest {
     pub reserved: u32,
 }
 
+/// Запрос изменения длины файла. Расширение создаёт sparse-диапазон,
+/// читающийся как нули; уменьшение сразу возвращает лишние блоки allocator'у.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct ResizeRequest {
+    pub file: VfsObject,
+    pub length: u64,
+    pub reserved: u64,
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct RenameRequest {
@@ -174,6 +186,7 @@ const _: () = assert!(core::mem::size_of::<PathRequest>() == 24);
 const _: () = assert!(core::mem::size_of::<OpenRequest>() == 32);
 const _: () = assert!(core::mem::size_of::<IoRequest>() == 32);
 const _: () = assert!(core::mem::size_of::<SeekRequest>() == 24);
+const _: () = assert!(core::mem::size_of::<ResizeRequest>() == 24);
 const _: () = assert!(core::mem::size_of::<RenameRequest>() == 48);
 const _: () = assert!(core::mem::size_of::<Reply>() == 32);
 const _: () = assert!(core::mem::size_of::<DirectoryEntry>() == 256);

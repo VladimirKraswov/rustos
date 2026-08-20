@@ -26,6 +26,7 @@ pub mod handle;
 pub mod ipc;
 pub mod memmap;
 pub mod memory;
+pub mod pipe;
 pub mod process;
 pub mod syscall;
 pub mod vfs;

@@ -56,6 +56,7 @@ const OP_UNLINK: u16 = 8;
 const OP_RENAME: u16 = 9;
 const OP_SYNC: u16 = 10;
 const OP_SEEK: u16 = 11;
+const OP_RESIZE: u16 = 12;
 const OP_SHUTDOWN: u16 = 0xff;
 
 const STATUS_OK: i32 = 0;
@@ -186,6 +187,14 @@ struct SeekRequest {
     offset: i64,
     whence: u32,
     reserved: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ResizeRequest {
+    file: u64,
+    length: u64,
+    reserved: u64,
 }
 
 #[repr(C)]
@@ -424,7 +433,9 @@ fn check_reply(reply: Reply) -> Result<Reply, i32> {
 }
 
 fn put_path(state: &ClientState, offset: usize, path: &Path) -> Result<usize, i32> {
-    let path = path.to_str().ok_or(STATUS_INVALID_ARGUMENT)?.as_bytes();
+    let absolute =
+        crate::sys::paths::rustos::absolute(path).map_err(|_| STATUS_INVALID_ARGUMENT)?;
+    let path = absolute.to_str().ok_or(STATUS_INVALID_ARGUMENT)?.as_bytes();
     let end = offset
         .checked_add(path.len())
         .ok_or(STATUS_INVALID_ARGUMENT)?;
@@ -545,6 +556,22 @@ fn seek_rpc(object: u64, offset: i64, whence: u32) -> Result<u64, i32> {
             false,
         )?)
         .map(|reply| reply.value)
+    })
+}
+
+fn resize_rpc(object: u64, length: u64) -> Result<(), i32> {
+    with_state(|state| {
+        check_reply(call(
+            state,
+            OP_RESIZE,
+            &ResizeRequest {
+                file: object,
+                length,
+                reserved: 0,
+            },
+            false,
+        )?)
+        .map(|_| ())
     })
 }
 
@@ -836,7 +863,8 @@ impl OpenOptions {
 
 impl File {
     pub fn open(path: &Path, options: &OpenOptions) -> io::Result<Self> {
-        let reply = io_result(open_rpc(path, options.flags()?))?;
+        let absolute = crate::sys::paths::rustos::absolute(path)?;
+        let reply = io_result(open_rpc(&absolute, options.flags()?))?;
         if reply.object == INVALID_OBJECT || reply.object_kind == KIND_DIRECTORY {
             if reply.object != INVALID_OBJECT {
                 let _ = close_rpc(reply.object);
@@ -845,7 +873,7 @@ impl File {
         }
         Ok(Self {
             object: reply.object,
-            path: path.to_path_buf(),
+            path: absolute,
             options: options.clone(),
         })
     }
@@ -874,8 +902,8 @@ impl File {
     pub fn unlock(&self) -> io::Result<()> {
         unsupported()
     }
-    pub fn truncate(&self, _size: u64) -> io::Result<()> {
-        unsupported()
+    pub fn truncate(&self, size: u64) -> io::Result<()> {
+        io_result(resize_rpc(self.object, size))
     }
     pub fn read(&self, buffer: &mut [u8]) -> io::Result<usize> {
         io_result(read_rpc(self.object, buffer))
@@ -957,7 +985,8 @@ impl DirBuilder {
 }
 
 pub fn readdir(path: &Path) -> io::Result<ReadDir> {
-    let reply = io_result(open_rpc(path, OPEN_READ | OPEN_DIRECTORY))?;
+    let absolute = crate::sys::paths::rustos::absolute(path)?;
+    let reply = io_result(open_rpc(&absolute, OPEN_READ | OPEN_DIRECTORY))?;
     if reply.object == INVALID_OBJECT || reply.object_kind != KIND_DIRECTORY {
         if reply.object != INVALID_OBJECT {
             let _ = close_rpc(reply.object);
@@ -966,7 +995,7 @@ pub fn readdir(path: &Path) -> io::Result<ReadDir> {
     }
     Ok(ReadDir {
         object: reply.object,
-        base: path.to_path_buf(),
+        base: absolute,
         finished: false,
     })
 }
@@ -1035,8 +1064,9 @@ pub fn set_perm_nofollow(path: &Path, permissions: FilePermissions) -> io::Resul
 }
 
 pub fn canonicalize(path: &Path) -> io::Result<PathBuf> {
-    stat(path)?;
-    Ok(path.to_path_buf())
+    let absolute = crate::sys::paths::rustos::absolute(path)?;
+    stat(&absolute)?;
+    Ok(absolute)
 }
 
 const _: () = assert!(crate::mem::size_of::<MessageHeader>() == 32);

@@ -37,22 +37,28 @@ Wrapper `rustc-rustos-std.sh` подменяет ответ `rustc --print sysro
 | collections/string | `Vec`, `String`, `BTreeMap`, `HashMap` проверены ring 3 |
 | TLS | RUNE TLS template и AMD64 FS thread pointer |
 | time | монотонные nanoseconds, `Instant`; boot-epoch `SystemTime` |
-| synchronization | upstream futex algorithms; fast path `Mutex` проверен |
+| synchronization | blocking futex wait/wake; contended Mutex/Barrier проверены |
+| threads | native create/join/detach, отдельные stack и TLS image |
+| process | spawn/wait/try_wait/kill, argv/env/CWD, capability inheritance |
+| pipes/stdio | blocking streams; одновременный drain stdout/stderr без deadlock |
 | `std::fs` | capability IPC к отдельному `vfsd`, 64-КиБ shared I/O window |
+| execution | `Command` запускает RUNE с VaraniaFS через ring-3 runner |
 
 `std::fs` поддерживает `File/OpenOptions`, read/write, vectored fallback,
 seek/tell, flush/sync, metadata, create/remove directory, readdir, rename,
-exists и copy. Permissions намеренно не являются security boundary: RustOS
+exists, copy, recursive remove, canonicalize, process-local CWD и `set_len`
+со sparse grow/shrink. Permissions намеренно не являются security boundary: RustOS
 авторизует доступ capabilities, поэтому `set_permissions` совместимо
-принимается, но не создаёт Unix uid/mode policy. Symlinks, file timestamps,
-file locks и arbitrary truncate пока возвращают `Unsupported`.
+принимается, но не создаёт Unix uid/mode policy. Symlinks, file timestamps и
+file locks пока возвращают `Unsupported`.
 
-Boot smoke создаёт persistent VaraniaFS-каталог, пишет и читает файл через
-публичные `std::fs`/`std::io`, проверяет seek/metadata/readdir/rename, удаляет
-его, синхронизирует и завершает `vfsd`. Ожидаемый serial marker:
+Boot smoke проверяет эти операции через публичные `std::fs`/`std::io`, затем
+создаёт конкурирующие threads и дочерние процессы, которые одновременно
+заполняют stdout/stderr сильнее размера pipe. Нативный `rustos-rune` также
+запускается как системная программа и проверяет DLL с диска. Serial marker:
 
 ```text
-[std] collections allocator sync time and std::fs over vfsd verified in ring3 RUNE
+[std] allocator fs threads futex process pipes stdio native SDK and VFS executable verified in ring3 RUNE
 ```
 
 ## Почему `std::fs` не является драйвером
@@ -80,22 +86,23 @@ IPC payload: передаются только handle, offset и length shared w
 
 ## Граница текущего порта
 
-Порт достаточен для collections, allocator, clocks и базового filesystem
-кода, но ещё не для native `rustc`. Следующие обязательные части:
+Process/thread/memory/VFS/RUNE prerequisites для первого seed compiler уже
+исполняются, но это ещё не готовый native `rustc`. Остаются host-tool части:
 
-1. настоящий `std::thread::spawn/join` и blocking futex wait/wake вместо
-   cooperative polling;
-2. startup runtime с `argc/argv`, environment и TLS destructors;
-3. `std::process`, pipes и stdio handles;
-4. RUNE dynamic loader и загрузка RustOS DLL по interface ID;
-5. sockets/DNS для Cargo либо полностью offline vendor workflow;
-6. unwinding или документированная host-tool policy `panic=abort`;
-7. allocator с sub-page arenas и alignment больше 4096.
+1. TLS destructors и выбранная политика unwind (`panic=abort` допустим для
+   seed, но не должен молча считаться полным портом);
+2. dynamic loading proc-macro server и codegen backend через RUNE DLL;
+3. native `rust-lld`, затем cross-built RustOS-host `rustc_driver`;
+4. offline Cargo vendor/index и запуск build scripts/proc macros;
+5. масштабируемая VaraniaFS v2: v1 с 64 inode не вмещает исходники toolchain;
+6. user-space supervisor и console IPC: GUI `RUN` уже создаёт настоящий
+   ring-3 процесс и захватывает pipe, но terminal orchestration пока остаётся
+   bootstrap-кодом ядра.
 
 HashMap seed сейчас годится для защиты от обычных collision patterns, но не
 является криптографическим RNG. `SystemTime` использует эпоху загрузки, пока
-нет RTC/time service. Эти ограничения явно не маскируются под готовую POSIX
-семантику.
+нет RTC/time service. Sockets/DNS не нужны обязательному offline профилю, но
+понадобятся сетевому Cargo. Эти ограничения не маскируются под готовый порт.
 
 ## Рекомендации для переноса Linux/Rust ПО
 

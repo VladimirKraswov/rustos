@@ -1,0 +1,11 @@
+--- a/library/std/src/sys/pipe/mod.rs
++++ b/library/std/src/sys/pipe/mod.rs
+@@ -3,3 +3,7 @@
+ cfg_select! {
++    target_os = "rustos" => {
++        mod rustos;
++        pub use rustos::{Pipe, pipe};
++    }
+     unix => {
+         mod unix;
+         pub use unix::{Pipe, pipe};

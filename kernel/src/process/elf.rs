@@ -172,6 +172,7 @@ pub fn load(space: &mut AddressSpace, image: &[u8]) -> Result<LoadedImage, ElfEr
         entry,
         stack_pointer: crate::arch::initial_user_stack(USER_STACK_TOP),
         thread_pointer: 0,
+        tls_template: None,
     })
 }
 

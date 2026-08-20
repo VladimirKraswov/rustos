@@ -73,11 +73,13 @@ MADT перечисляет CPU, BSP последовательно выполн
 5. **bootstrap готов:** AP startup; дальше per-CPU TSS/IDT, timer queues,
    TLB shootdown и work stealing;
 6. **готово:** shared-memory IPC и process create/kill/wait syscalls;
-7. **готово:** изолированный `vfsd`, persistent VaraniaFS и user-space
-   dynamic loader (`DT_NEEDED`, symbols, TLS, RELRO, shared RX);
-8. **частично:** upstream target `std` и `std::fs`; дальше startup runtime,
-   RUNE DLL resolver, native Rust toolchain и package/build services;
-9. `inputd`, `displayd`, compositor и terminal как отдельные процессы;
+7. **готово:** изолированный `vfsd`, persistent VaraniaFS и native RUNE
+   resolver (interface ABI, imports, TLS, RELRO, shared RX);
+8. **готов runtime S1:** upstream target `std`, CRT, threads/futex,
+   process/pipes/stdio и запуск RUNE с VFS; дальше scalable VaraniaFS v2,
+   постоянный supervisor, native Rust toolchain и package/build services;
+9. **переходно:** persistent ring-3 `vfsd` и GUI `RUN` bridge готовы;
+   дальше `inputd`, `displayd`, compositor и terminal как отдельные процессы;
 10. supervisor применяет restart policy к реальным service manifests.
 
 UI API уже отделён от framebuffer ownership, поэтому widget logic не должна

@@ -1,0 +1,11 @@
+--- a/library/std/src/sys/thread/mod.rs
++++ b/library/std/src/sys/thread/mod.rs
+@@ -1,4 +1,8 @@
+ cfg_select! {
++    target_os = "rustos" => {
++        mod rustos;
++        pub use rustos::*;
++    }
+     target_os = "hermit" => {
+         mod hermit;
+         pub use hermit::{Thread, available_parallelism, sleep, yield_now, DEFAULT_MIN_STACK_SIZE};
