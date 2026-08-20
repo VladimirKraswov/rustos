@@ -773,12 +773,14 @@ pub(super) fn run_milestone(info: &rustos_abi::BootInfo) -> Result<(), ProcessEr
         serial::put_str("[apic] initialization failed: ");
         serial::put_str(match error {
             arch::apic::ApicError::MissingApic => "APIC unavailable",
-            arch::apic::ApicError::MissingX2Apic => "x2APIC unavailable",
+            arch::apic::ApicError::UnsupportedMmioBase => "unsupported xAPIC MMIO base",
         });
         serial::put_str("\n");
         ProcessError::UnexpectedExit
     })?;
-    serial::put_str("[apic] x2APIC BSP id=");
+    serial::put_str("[apic] local APIC mode=");
+    serial::put_str(if apic.uses_x2apic { "x2APIC" } else { "xAPIC" });
+    serial::put_str(" BSP id=");
     serial::put_u32(apic.id);
     serial::put_str(" TSC MHz=");
     serial::put_u32((apic.tsc_hz / 1_000_000) as u32);

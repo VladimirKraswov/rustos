@@ -42,3 +42,5 @@ Boot-тест использует два vCPU и дополнительно т�
 ненулевые APIC timer/context-switch counters, конкурентную fault isolation и
 IPC capability transfer. Число CPU переопределяется через `BOOT_CPUS`; тест
 требует, чтобы все заявленные QEMU CPU стали online. Штатный CI-профиль — два.
+CPU-модель boot-теста можно переопределить через `BOOT_CPU_MODEL`; например,
+`BOOT_CPU_MODEL=max,-x2apic make test-boot` отдельно проверяет MMIO fallback.

@@ -98,8 +98,9 @@ manager.
 
 ## Рабочее вытеснение и граница SMP
 
-CPU0 уже использует x2APIC timer. На CPU с TSC-deadline применяется deadline
-mode; QEMU без этой возможности калибрует periodic decrement counter по TSC.
+CPU0 уже использует local APIC timer: x2APIC/MSR на современных CPU и
+xAPIC/MMIO fallback на старом TCG. На CPU с TSC-deadline применяется deadline
+mode; без этой возможности калибруется periodic decrement counter по TSC.
 Каждый IRQ сохраняет все GPR, user RIP/RFLAGS/RSP, scheduler переводит текущий
 TID обратно в Ready, выбирает следующий, kernel загружает его CR3 и меняет
 trap frame. Два CPU-bound ELF не вызывают `yield`, поэтому ненулевой счётчик
@@ -114,7 +115,8 @@ Process manager динамически создаёт address spaces и generati
 ACPI parser проверяет RSDP/XSDT/MADT checksums и enabled flags. BSP по одному
 посылает AP INIT–SIPI–SIPI. Копируемый код ниже 1 MiB проходит real mode,
 protected mode и long mode, устанавливает kernel CR3/отдельный stack, затем AP
-включает свой x2APIC и подтверждает ID. В штатном тесте `discovered=2 online=2`.
+включает свой local APIC и подтверждает ID. В штатном тесте
+`discovered=2 online=2`.
 
 При этом AP пока **parked**, а не является scheduler CPU: у него ещё нет
 per-CPU GDT/TSS/IDT, ring-0 interrupt stack, run queue и TLB shootdown inbox.

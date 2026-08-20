@@ -1,8 +1,8 @@
 //! Ранние identity page tables, передаваемые UEFI-загрузчиком ядру.
 //!
 //! Это bootstrap-карта, а не окончательное адресное пространство ядра.
-//! Она отображает реальные RAM-дескрипторы UEFI, резерв ядра, RSDP и GOP
-//! framebuffer. Физические дыры между ними намеренно остаются unmapped.
+//! Она отображает реальные RAM-дескрипторы UEFI, резерв ядра, RSDP, local
+//! APIC MMIO и GOP framebuffer. Остальные физические дыры остаются unmapped.
 //!
 //! Иерархия x86-64 (LA57=0): PML4 -> PDPT -> PD -> PT. Полностью
 //! выровненные куски отображаются страницами 2 MiB, края — 4 KiB.
@@ -20,6 +20,9 @@ const PAGE_SIZE: u64 = 1 << 7;
 const ADDRESS_MASK: u64 = 0x000f_ffff_ffff_f000;
 const PAGE_4K: u64 = 4096;
 const PAGE_2M: u64 = 2 * 1024 * 1024;
+/// Архитектурный physical base legacy xAPIC. Нужен как fallback на QEMU TCG
+/// и CPU без x2APIC; x2APIC backend эту страницу не трогает.
+const LOCAL_APIC_MMIO: u64 = 0xfee0_0000;
 /// Флаги для записей-указателей на таблицы.
 const TABLE_FLAGS: u64 = PRESENT | WRITABLE;
 /// Флаги для записей-листьев (самых страниц).
@@ -132,6 +135,7 @@ pub unsafe fn build_identity_map(
     if rsdp != 0 {
         map_range(&mut allocator, pml4, align_down(rsdp, PAGE_4K), PAGE_4K)?;
     }
+    map_range(&mut allocator, pml4, LOCAL_APIC_MMIO, PAGE_4K)?;
     if framebuffer.phys_addr != 0 {
         let bytes = (framebuffer.stride as u64)
             .checked_mul(framebuffer.height as u64)

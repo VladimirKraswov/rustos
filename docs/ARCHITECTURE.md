@@ -21,7 +21,7 @@ rustos-boot --> BootInfo v2 --> kernel
                                   |-- physical frame allocator
                                   |-- ELF64 CPL3 bootstrap runner
                                   |-- process-local VFS capability
-                                  |-- x2APIC preemptive process manager
+                                  |-- local-APIC preemptive process manager
                                   |-- endpoint IPC + capability transfer
                                   |-- MADT + AP long-mode trampoline
                                   |-- GOP renderer
@@ -47,7 +47,8 @@ timer trap сохраняет регистры/RSP, выбирает TID, мен
 
 MADT перечисляет CPU, BSP последовательно выполняет INIT–SIPI–SIPI. AP
 проходит 16 -> 32 -> 64 bit trampoline, получает отдельный stack, включает
-свой x2APIC и публикует ID. До per-CPU TSS/IDT он остаётся parked с
+свой local APIC и публикует ID. Предпочтителен x2APIC/MSR, а старый TCG
+использует совместимый xAPIC/MMIO backend. До per-CPU TSS/IDT AP parked с
 выключенными interrupts и не участвует в scheduling.
 
 ## Путь к микроядру

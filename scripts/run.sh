@@ -23,7 +23,7 @@ fi
 echo "[run] qemu accel=$ACCEL, graphical GOP, serial=console"
 
 exec qemu-system-x86_64 \
-    -machine q35 -cpu max,+x2apic -smp 2 -m 512 \
+    -machine q35 -cpu max -smp 2 -m 512 \
     -accel "$ACCEL" \
     -drive if=pflash,format=raw,readonly=on,file=build/ovmf/OVMF_CODE.fd \
     -drive if=pflash,format=raw,file=build/ovmf/OVMF_VARS_RUNTIME.fd \

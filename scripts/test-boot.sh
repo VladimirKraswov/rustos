@@ -22,6 +22,7 @@ fi
 TIMEOUT="${BOOT_TEST_TIMEOUT:-$DEFAULT_TIMEOUT}"
 MEMORY_MB="${BOOT_MEMORY_MB:-128}"
 CPUS="${BOOT_CPUS:-2}"
+CPU_MODEL="${BOOT_CPU_MODEL:-max}"
 [[ "$MEMORY_MB" =~ ^[1-9][0-9]*$ ]] || {
     echo "BOOT_MEMORY_MB должен быть положительным числом MiB" >&2
     exit 2
@@ -64,9 +65,9 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM HUP
 
-echo "[test] qemu accel=$ACCEL, cpus=$CPUS, memory=${MEMORY_MB}MiB, timeout=${TIMEOUT}s"
+echo "[test] qemu accel=$ACCEL, cpu=$CPU_MODEL, cpus=$CPUS, memory=${MEMORY_MB}MiB, timeout=${TIMEOUT}s"
 qemu-system-x86_64 \
-    -machine q35 -cpu max,+x2apic -smp "$CPUS" -m "$MEMORY_MB" \
+    -machine q35 -cpu "$CPU_MODEL" -smp "$CPUS" -m "$MEMORY_MB" \
     -accel "$ACCEL" \
     -drive if=pflash,format=raw,readonly=on,file=build/ovmf/OVMF_CODE.fd \
     -drive if=pflash,format=raw,file="$VARS" \
@@ -117,7 +118,7 @@ patterns=(
     "\[process\] init.elf exited cleanly; VFS capability verified"
     "\[isolation\] user #UD contained; kernel and GUI continue"
     "\[memory\] user address spaces reclaimed"
-    "\[apic\] x2APIC BSP id=[0-9]+ TSC MHz=[1-9][0-9]* timer=(periodic|tsc-deadline)"
+    "\[apic\] local APIC mode=(xAPIC|x2APIC) BSP id=[0-9]+ TSC MHz=[1-9][0-9]* timer=(periodic|tsc-deadline)"
     "\[smp\] MADT discovered=${CPUS} online=${CPUS} APs parked safely"
     "\[preempt\] APIC timer ticks=[1-9][0-9]* context-switches=[1-9][0-9]*"
     "\[isolation\] concurrent #UD terminated one process; survivor exited=22"

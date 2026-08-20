@@ -17,6 +17,7 @@ cp -f build/ovmf/OVMF_VARS.fd "$RUN_DIR/VARS.fd"
 QPID=""
 GUI_TIMEOUT="${GUI_TEST_TIMEOUT:-360}"
 MEMORY_MB="${GUI_MEMORY_MB:-128}"
+CPU_MODEL="${GUI_CPU_MODEL:-max}"
 [[ "$MEMORY_MB" =~ ^[1-9][0-9]*$ ]] || {
     echo "GUI_MEMORY_MB должен быть положительным числом MiB" >&2
     exit 2
@@ -99,7 +100,7 @@ cleanup() {
 trap cleanup EXIT INT TERM HUP
 
 qemu-system-x86_64 \
-    -machine q35 -cpu max,+x2apic -smp 2 -m "$MEMORY_MB" -accel tcg \
+    -machine q35 -cpu "$CPU_MODEL" -smp 2 -m "$MEMORY_MB" -accel tcg \
     -drive if=pflash,format=raw,readonly=on,file=build/ovmf/OVMF_CODE.fd \
     -drive if=pflash,format=raw,file="$RUN_DIR/VARS.fd" \
     -drive if=virtio,format=raw,readonly=on,file=build/esp.img \
