@@ -182,6 +182,22 @@ impl<const N: usize, const C: usize, const D: usize> Runtime<N, C, D> {
         Ok(())
     }
 
+    /// Повреждает bounds узла, содержимое внешнего ресурса которого изменилось
+    /// без смены `ResourceId`. Это штатный путь для terminal lines, часов и
+    /// других динамических provider'ов: display list остаётся пригодным, layout
+    /// не запускается, а backend повторно читает ресурс только внутри damage.
+    /// Если новая версия меняет геометрию, caller обязан отдельно обновить
+    /// layout/content через соответствующий typed setter.
+    pub fn invalidate_content(&mut self, id: NodeId) -> Result<(), RuntimeError> {
+        let rect = self
+            .tree
+            .get(id)
+            .ok_or(RuntimeError::Tree(TreeError::InvalidNode))?
+            .rect;
+        self.damage.add(rect);
+        Ok(())
+    }
+
     /// Единый dispatch мыши/клавиатуры. Pointer capture гарантирует, что Up
     /// попадёт тому же component даже после выхода указателя за его bounds.
     pub fn dispatch(&mut self, input: InputEvent) -> DispatchResult {
@@ -285,6 +301,41 @@ mod tests {
         assert_eq!(frame.damage().len(), 1);
         assert!(frame.damage()[0].area() < viewport.area() / 4);
         assert_eq!(runtime.counters().layout_passes, layout_passes);
+    }
+
+    #[test]
+    fn dynamic_resource_invalidates_only_its_existing_bounds() {
+        let viewport = Rect::new(0, 0, 800, 600);
+        let mut runtime = Runtime::<8, 32, 8>::new(viewport, Theme::dark());
+        let text = {
+            let root = runtime.tree().root();
+            let mut builder = runtime.builder();
+            let mut layout = LayoutSpec::default();
+            layout.width = Length::Px(320);
+            layout.height = Length::Px(24);
+            builder.text(root, ResourceId(7), layout).unwrap()
+        };
+        let mut backend = Headless::default();
+        runtime.render(&mut backend).unwrap();
+        let expected = runtime.tree().get(text).unwrap().rect;
+        let counters = runtime.counters();
+
+        // Provider обновил bytes за тем же ResourceId: дерево и display list
+        // не перестраиваются, но backend обязан перечитать только эту строку.
+        runtime.invalidate_content(text).unwrap();
+        let frame = runtime.render(&mut backend).unwrap();
+
+        assert_eq!(frame.damage(), &[expected]);
+        assert!(expected.area() < viewport.area() / 4);
+        assert_eq!(runtime.counters().layout_passes, counters.layout_passes);
+        assert_eq!(
+            runtime.counters().display_list_builds,
+            counters.display_list_builds
+        );
+        assert_eq!(
+            runtime.invalidate_content(NodeId::NONE),
+            Err(RuntimeError::Tree(TreeError::InvalidNode))
+        );
     }
 
     #[test]

@@ -138,7 +138,10 @@ Behavior не меняется при смене темы.
 ## Properties, state и bindings
 
 В v1 работают typed properties через `NodeSpec`, `set_state` и `set_content`.
-Каждое изменение имеет явную invalidation category:
+`invalidate_content(NodeId)` отдельно покрывает динамический ресурс, bytes
+которого изменились без смены стабильного `ResourceId`: runtime повреждает
+только bounds узла и не перестраивает layout/display list. Каждое изменение
+имеет явную invalidation category:
 
 - цвет/state — paint и при необходимости semantics;
 - содержимое — paint/semantics, а после text measurement также layout;

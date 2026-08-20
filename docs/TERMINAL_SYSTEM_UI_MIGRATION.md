@@ -57,6 +57,8 @@ DesktopSession
 ## Invalidation и производительность
 
 - Ввод обычной буквы повреждает только текущую строку, не весь viewport.
+- Для этого используй готовый `Runtime::invalidate_content(NodeId)`: resource
+  строки сохраняет стабильный ID, а backend перечитывает изменившиеся клетки.
 - Newline/scroll/clear/resize могут инвалидировать все видимые строки.
 - Resize вызывает `Runtime::resize` и пересчитывает число видимых строк без
   выхода за `ROWS`/`COLS`.
