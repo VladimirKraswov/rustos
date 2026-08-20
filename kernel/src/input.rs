@@ -32,6 +32,9 @@ pub struct MouseEvent {
     pub left: bool,
     pub right: bool,
     pub middle: bool,
+    /// Сколько последовательных PS/2-пакетов с одинаковыми кнопками было
+    /// объединено. GUI рисует один свежий кадр вместо очереди устаревших.
+    pub packets: u16,
 }
 
 /// Нормализованное событие ввода, которое понимает GUI-сеанс.
@@ -50,6 +53,8 @@ pub struct Ps2Input {
     extended: bool,
     mouse_packet: [u8; 3],
     mouse_index: usize,
+    pending: Option<Event>,
+    reported_mouse_buttons: u8,
 }
 
 impl Ps2Input {
@@ -63,23 +68,74 @@ impl Ps2Input {
             extended: false,
             mouse_packet: [0; 3],
             mouse_index: 0,
+            pending: None,
+            reported_mouse_buttons: 0,
         };
         input.initialize_mouse();
         input
     }
 
     /// Возвращает не более одного высокоуровневого события за вызов.
+    ///
+    /// Последовательные движения мыши с неизменными кнопками объединяются.
+    /// Это критично для software compositor: пока он публикует кадр, 8042
+    /// успевает накопить новые пакеты. Рисовать каждый старый пакет означало
+    /// бы постоянно отставать от реального курсора. Изменения кнопок никогда
+    /// не объединяются, поэтому mouse-down/up сохраняют точную семантику.
     pub fn poll(&mut self) -> Option<Event> {
-        let status = unsafe { arch::inb(STATUS_COMMAND) };
-        if status & 1 == 0 {
-            return None;
+        if let Some(event) = self.pending.take() {
+            self.remember_buttons(event);
+            return Some(event);
         }
-        let byte = unsafe { arch::inb(DATA) };
-        if status & (1 << 5) != 0 {
-            self.feed_mouse(byte)
-        } else {
-            self.feed_keyboard(byte).map(Event::Key)
+
+        let mut mouse: Option<MouseEvent> = None;
+        // Bounded drain не позволяет потоку мыши навсегда вытеснить остальную
+        // работу GUI, но за один кадр поглощает до 32 полных PS/2-пакетов.
+        for _ in 0..96 {
+            let status = unsafe { arch::inb(STATUS_COMMAND) };
+            if status & 1 == 0 {
+                break;
+            }
+            let byte = unsafe { arch::inb(DATA) };
+            let event = if status & (1 << 5) != 0 {
+                self.feed_mouse(byte)
+            } else {
+                self.feed_keyboard(byte).map(Event::Key)
+            };
+            let Some(event) = event else {
+                continue;
+            };
+            match event {
+                Event::Mouse(next) => {
+                    let next_buttons = mouse_buttons(next);
+                    if mouse.is_none() && next_buttons != self.reported_mouse_buttons {
+                        self.reported_mouse_buttons = next_buttons;
+                        return Some(Event::Mouse(next));
+                    }
+                    if let Some(accumulated) = mouse.as_mut() {
+                        if mouse_buttons(*accumulated) != next_buttons {
+                            self.pending = Some(Event::Mouse(next));
+                            break;
+                        }
+                        accumulated.dx = accumulated.dx.saturating_add(next.dx);
+                        accumulated.dy = accumulated.dy.saturating_add(next.dy);
+                        accumulated.packets = accumulated.packets.saturating_add(next.packets);
+                    } else {
+                        mouse = Some(next);
+                    }
+                }
+                Event::Key(key) => {
+                    if mouse.is_some() {
+                        self.pending = Some(Event::Key(key));
+                        break;
+                    }
+                    return Some(Event::Key(key));
+                }
+            }
         }
+        let event = Event::Mouse(mouse?);
+        self.remember_buttons(event);
+        Some(event)
     }
 
     fn initialize_mouse(&mut self) {
@@ -161,8 +217,19 @@ impl Ps2Input {
             left: flags & 1 != 0,
             right: flags & 2 != 0,
             middle: flags & 4 != 0,
+            packets: 1,
         }))
     }
+
+    fn remember_buttons(&mut self, event: Event) {
+        if let Event::Mouse(mouse) = event {
+            self.reported_mouse_buttons = mouse_buttons(mouse);
+        }
+    }
+}
+
+fn mouse_buttons(event: MouseEvent) -> u8 {
+    u8::from(event.left) | (u8::from(event.right) << 1) | (u8::from(event.middle) << 2)
 }
 
 /// US QWERTY-раскладка: scancode → ASCII с учётом Shift и CapsLock.

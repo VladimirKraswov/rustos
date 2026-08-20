@@ -98,7 +98,7 @@ work stealing, затем `vfsd`, display/input и desktop переносятс�
 изолированные процессы. Нативный `rustc` ещё не заявлен готовым.
 
 Подробнее: [архитектура](docs/ARCHITECTURE.md),
-[графическая подсистема](docs/GUI.md), [VFS](docs/VFS.md),
+[графическая подсистема](docs/GUI.md), [видеосистема](docs/VIDEO.md), [VFS](docs/VFS.md),
 [микроядро](docs/MICROKERNEL.md), [DLL](docs/DYNAMIC_LIBRARIES.md),
 [IPC](docs/IPC.md), [self-hosting Rust](docs/SELF_HOSTING.md),
 [сборка](docs/BUILDING.md).

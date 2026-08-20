@@ -12,6 +12,7 @@ resolver = "2"
 members = [
     "abi",
     "microkernel",
+    "video",
     "runtime",
     "userspace/bootstrap",
     "kernel",

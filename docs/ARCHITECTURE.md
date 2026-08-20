@@ -24,7 +24,8 @@ rustos-boot --> BootInfo v2 --> kernel
                                   |-- local-APIC preemptive process manager
                                   |-- endpoint IPC + capability transfer
                                   |-- MADT + AP long-mode trampoline
-                                  |-- GOP renderer
+                                  |-- GOP scanout + rustos-video surfaces
+                                  |-- damage/layer CPU compositor
                                   |-- PS/2 input
                                   |-- bootstrap RIFS + RAM overlay
                                   |-- UI components
@@ -44,6 +45,11 @@ bounded endpoint queue, capability attenuation и supervisor backoff. Он
 `no_std`, но тестируется на host без QEMU. x86 runner подключён к local APIC:
 timer trap сохраняет регистры/RSP, выбирает TID, меняет CR3 и возвращается
 через `iretq` в другой CPL3 context.
+
+Platform-independent `rustos-video` задаёт безопасные pixel surfaces,
+RGB/BGR/ARGB formats, span fill, blit, alpha composition, bounded damage и
+неограниченный slice layers. Kernel desktop уже использует его raster/damage
+часть поверх GOP; тот же контракт предназначен будущему ring-3 `displayd`.
 
 MADT перечисляет CPU, BSP последовательно выполняет INIT–SIPI–SIPI. AP
 проходит 16 -> 32 -> 64 bit trampoline, получает отдельный stack, включает

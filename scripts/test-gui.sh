@@ -124,6 +124,8 @@ done
     exit 1
 }
 grep -q '\[microkernel\] RING3_MILESTONE_OK' "$RUN_DIR/serial.log"
+grep -Eq '\[video\] scanout=gop mode=[1-9][0-9]*x[1-9][0-9]* format=(rgb888|bgr888) present=immediate page-flip=no' \
+    "$RUN_DIR/serial.log"
 grep -q '\[isolation\] user #UD contained; kernel and GUI continue' "$RUN_DIR/serial.log"
 grep -q '\[memory\] user address spaces reclaimed' "$RUN_DIR/serial.log"
 grep -Eq '\[smp\] MADT discovered=2 online=2 APs parked safely' "$RUN_DIR/serial.log"
@@ -169,7 +171,14 @@ for _ in $(seq 1 40); do
     sleep 0.1
 done
 grep -q '\[wm\] terminal drag started' "$RUN_DIR/serial.log"
-printf 'mouse_move 120 80\n' | hmp
+# Не один большой скачок, а серия движений: это regression для preview path.
+# Пауза не даёт искусственному HMP producer переполнить одно-byte 8042 быстрее,
+# чем это вообще способна сделать физическая PS/2-мышь.
+drag_commands=""
+for _ in $(seq 1 4); do
+    drag_commands="${drag_commands}mouse_move 30 20\n"
+done
+printf '%b' "$drag_commands" | hmp 30
 sleep 0.2
 printf 'mouse_button 0\n' | hmp
 for _ in $(seq 1 40); do
@@ -177,12 +186,14 @@ for _ in $(seq 1 40); do
     sleep 0.1
 done
 grep -q '\[wm\] terminal drag finished' "$RUN_DIR/serial.log"
+grep -Eq '\[wm\] terminal drag finished frames=[1-9][0-9]* packets=[1-9][0-9]* present-kpx=[1-9][0-9]* compositor=preview' \
+    "$RUN_DIR/serial.log"
 sleep 0.25
 printf 'screendump %s/dragged.ppm\n' "$RUN_DIR" | hmp
 
 # После drag курсор находится около (760,155), а окно упёрлось в правую
-# границу. Перемещаемся к его новой minimize-кнопке.
-printf 'mouse_move 435 -10\n' | hmp
+# границу и целиком осталось над taskbar. Перемещаемся к minimize-кнопке.
+printf 'mouse_move 435 -20\n' | hmp
 sleep 0.2
 printf 'mouse_button 1\nmouse_button 0\n' | hmp
 for _ in $(seq 1 40); do
@@ -190,7 +201,7 @@ for _ in $(seq 1 40); do
     sleep 0.1
 done
 grep -q '\[wm\] terminal minimized' "$RUN_DIR/serial.log"
-sleep 0.25
+wait_for_serial '[wm] frame committed minimized=1'
 printf 'screendump %s/minimized.ppm\n' "$RUN_DIR" \
     | hmp
 
