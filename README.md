@@ -11,7 +11,7 @@ x86-64 компьютеров. Она загружается через UEFI, п
 - 64-битная карта памяти без ограничения 4 ГиБ;
 - реальное резервирование kernel pages через UEFI `AllocatePages`;
 - разрежённые четырёхуровневые page tables;
-- GOP 1280×800×32 и software rendering на CPU;
+- GOP 1280×800×32, CPU rendering и RAM back buffer без мерцания сцены;
 - PS/2 keyboard и mouse;
 - desktop, taskbar, Start menu и icons;
 - window manager: drag, minimize, maximize, restore и close;
@@ -55,8 +55,8 @@ make test
 `make test` выполняет два разных сценария:
 
 1. UEFI boot-test завершается настоящим `isa-debug-exit`.
-2. GUI-тест вводит `help` через PS/2, сворачивает terminal мышью, получает
-   QEMU screendump и проверяет изменения пикселей.
+2. GUI-тест вводит `help` через PS/2, перетаскивает и сворачивает terminal
+   мышью, получает QEMU screendump и проверяет геометрию и пиксели.
 
 Диагностика сохраняется в `build/test-results/`.
 

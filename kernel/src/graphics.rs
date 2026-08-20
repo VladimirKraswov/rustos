@@ -1,10 +1,20 @@
 //! Безопасная оболочка над UEFI GOP linear framebuffer.
 //!
-//! GPU-драйвера пока нет: все примитивы рисуются CPU. В одном месте
-//! сосредоточены unsafe-доступы к MMIO framebuffer, clipping и упаковка
-//! RGB/BGR — остальная GUI-подсистема работает обычным безопасным Rust.
+//! GPU-драйвера пока нет: все примитивы рисуются CPU в обычный RAM back
+//! buffer. Видимый GOP framebuffer обновляется только методом [`present`],
+//! когда кадр уже полностью готов. Благодаря этому пользователь не видит,
+//! как compositor по частям стирает старое и рисует новое положение окна.
+//!
+//! В одном месте сосредоточены unsafe-доступы к framebuffer, выбор памяти,
+//! clipping и упаковка RGB/BGR — остальная GUI-подсистема работает обычным
+//! безопасным Rust.
 
-use rustos_abi::bootinfo::{BootFramebuffer, FRAMEBUFFER_FORMAT_BGR, FRAMEBUFFER_FORMAT_RGB};
+use core::sync::atomic::{compiler_fence, Ordering};
+
+use rustos_abi::{
+    bootinfo::{FRAMEBUFFER_FORMAT_BGR, FRAMEBUFFER_FORMAT_RGB},
+    BootInfo, MemRegionKind, PAGE_SIZE,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Color {
@@ -56,7 +66,12 @@ impl Rect {
 }
 
 pub struct Framebuffer {
-    base: *mut u8,
+    /// Видимый linear framebuffer GOP. В него пишет только `present*`.
+    front: *mut u8,
+    /// Невидимый программный кадр в обычной usable RAM.
+    back: *mut u32,
+    back_phys: u64,
+    back_bytes: u64,
     width: u32,
     height: u32,
     stride: u32,
@@ -64,19 +79,35 @@ pub struct Framebuffer {
 }
 
 impl Framebuffer {
-    /// Создаёт renderer после проверки BootInfo.
-    pub fn from_boot(info: &BootFramebuffer) -> Option<Self> {
+    /// Создаёт double-buffered renderer после проверки [`BootInfo`].
+    ///
+    /// Back buffer берётся с конца подходящего `Usable`-региона. Сейчас в
+    /// ядре ещё нет общего frame allocator, поэтому это и есть единственный
+    /// владелец выбранного диапазона. При появлении allocator диапазон нужно
+    /// передать ему как раннюю reservation, а API renderer менять не придётся.
+    pub fn from_boot(boot: &BootInfo) -> Option<Self> {
+        let info = &boot.framebuffer;
         if info.phys_addr == 0
             || info.width == 0
             || info.height == 0
             || info.bpp != 32
-            || info.stride < info.width.saturating_mul(4)
+            || !info.stride.is_multiple_of(4)
+            || info.stride < info.width.checked_mul(4)?
             || !matches!(info.format, FRAMEBUFFER_FORMAT_RGB | FRAMEBUFFER_FORMAT_BGR)
         {
             return None;
         }
+
+        let back_bytes = u64::from(info.width)
+            .checked_mul(u64::from(info.height))?
+            .checked_mul(4)?;
+        let back_phys = reserve_back_buffer(boot, back_bytes)?;
+
         Some(Self {
-            base: info.phys_addr as *mut u8,
+            front: info.phys_addr as *mut u8,
+            back: back_phys as *mut u32,
+            back_phys,
+            back_bytes,
             width: info.width,
             height: info.height,
             stride: info.stride,
@@ -90,6 +121,14 @@ impl Framebuffer {
 
     pub const fn height(&self) -> u32 {
         self.height
+    }
+
+    pub const fn backbuffer_phys(&self) -> u64 {
+        self.back_phys
+    }
+
+    pub const fn backbuffer_bytes(&self) -> u64 {
+        self.back_bytes
     }
 
     pub fn pack(&self, color: Color) -> u32 {
@@ -177,19 +216,85 @@ impl Framebuffer {
         if x >= self.width || y >= self.height {
             return 0;
         }
-        let offset = y as usize * self.stride as usize + x as usize * 4;
-        // SAFETY: clipping выше гарантирует, что offset лежит в GOP buffer.
-        unsafe { self.base.add(offset).cast::<u32>().read_volatile() }
+        let index = y as usize * self.width as usize + x as usize;
+        // SAFETY: clipping выше гарантирует index < width * height, а back
+        // buffer выделен ровно под это число u32-пикселей.
+        unsafe { self.back.add(index).read() }
     }
 
     pub fn write_raw(&mut self, x: u32, y: u32, value: u32) {
         if x >= self.width || y >= self.height {
             return;
         }
-        let offset = y as usize * self.stride as usize + x as usize * 4;
-        // SAFETY: clipping выше гарантирует, что offset лежит в GOP buffer.
-        unsafe { self.base.add(offset).cast::<u32>().write_volatile(value) };
+        let index = y as usize * self.width as usize + x as usize;
+        // SAFETY: clipping выше гарантирует index < width * height, а back
+        // buffer выделен ровно под это число u32-пикселей.
+        unsafe { self.back.add(index).write(value) };
     }
+
+    /// Публикует целиком уже готовый кадр в GOP.
+    pub fn present(&mut self) {
+        self.present_rect(Rect::new(0, 0, self.width, self.height));
+    }
+
+    /// Публикует прямоугольную dirty-область готового кадра.
+    ///
+    /// GOP — linear framebuffer с обычной x86 memory semantics. Поэтому
+    /// построчный `copy_nonoverlapping` существенно быстрее миллионов
+    /// отдельных volatile store и минимизирует время, когда scanout может
+    /// пересечь копируемый кадр. Рисование компонентов никогда не происходит
+    /// в видимой памяти.
+    pub fn present_rect(&mut self, rect: Rect) {
+        let x0 = rect.x.max(0) as u32;
+        let y0 = rect.y.max(0) as u32;
+        let x1 = rect
+            .x
+            .saturating_add(rect.width as i32)
+            .clamp(0, self.width as i32) as u32;
+        let y1 = rect
+            .y
+            .saturating_add(rect.height as i32)
+            .clamp(0, self.height as i32) as u32;
+        if x0 >= x1 || y0 >= y1 {
+            return;
+        }
+
+        let count = (x1 - x0) as usize;
+        for y in y0..y1 {
+            let back_index = y as usize * self.width as usize + x0 as usize;
+            let front_offset = y as usize * self.stride as usize + x0 as usize * 4;
+            // SAFETY: оба диапазона проверены clipping'ом. Back и GOP не
+            // пересекаются: первый выбран из Usable RAM, второй отмечен MMIO.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    self.back.add(back_index),
+                    self.front.add(front_offset).cast::<u32>(),
+                    count,
+                );
+            }
+        }
+        compiler_fence(Ordering::Release);
+    }
+}
+
+/// Выбирает page-aligned диапазон RAM под кадр, не вводя фиксированного
+/// ограничения на разрешение. Для 4K потребуется около 32 MiB, для
+/// 1280x800 — около 4 MiB; размер автоматически следует GOP mode.
+fn reserve_back_buffer(boot: &BootInfo, bytes: u64) -> Option<u64> {
+    let reserved_size = bytes.checked_add(PAGE_SIZE - 1)? & !(PAGE_SIZE - 1);
+    for index in (0..boot.memmap_count as usize).rev() {
+        let region = &boot.memmap[index];
+        if region.kind != MemRegionKind::Usable as u32 || region.size < reserved_size {
+            continue;
+        }
+        let candidate = region.phys_end().checked_sub(reserved_size)? & !(PAGE_SIZE - 1);
+        if candidate >= region.phys_start
+            && candidate.checked_add(reserved_size)? <= region.phys_end()
+        {
+            return Some(candidate);
+        }
+    }
+    None
 }
 
 // MMIO framebuffer принадлежит одному GUI-сеансу CPU0; между потоками этот

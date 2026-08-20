@@ -32,7 +32,7 @@ cleanup() {
         kill -TERM "$QPID" 2>/dev/null || true
         wait "$QPID" 2>/dev/null || true
     fi
-    for file in serial.log qemu-stderr.log terminal.ppm minimized.ppm; do
+    for file in serial.log qemu-stderr.log terminal.ppm dragged.ppm minimized.ppm; do
         [[ -f "$RUN_DIR/$file" ]] && cp -f "$RUN_DIR/$file" "$RESULT_DIR/$file"
     done
 }
@@ -71,12 +71,37 @@ for _ in $(seq 1 40); do
     sleep 0.1
 done
 grep -q '\[terminal\] command: help' "$RUN_DIR/serial.log"
+# Serial marker появляется непосредственно после обработки события, а QEMU
+# обновляет display surface по таймеру. Небольшая пауза ДО screendump не даёт
+# тесту случайно прочитать предыдущий кадр compositor'а.
+sleep 0.25
 printf 'screendump %s/terminal.ppm\n' "$RUN_DIR" \
     | hmp
-sleep 0.5
 
-# Курсор стартует в центре 1280x800; перемещаем его к minimize-кнопке.
-printf 'mouse_move 435 -325\n' | hmp
+# Настоящий drag: курсор стартует в центре 1280x800. Перемещаемся на
+# заголовок, удерживаем левую кнопку и сдвигаем окно вправо-вниз.
+printf 'mouse_move 0 -325\n' | hmp
+sleep 0.1
+printf 'mouse_button 1\n' | hmp
+for _ in $(seq 1 40); do
+    grep -q '\[wm\] terminal drag started' "$RUN_DIR/serial.log" && break
+    sleep 0.1
+done
+grep -q '\[wm\] terminal drag started' "$RUN_DIR/serial.log"
+printf 'mouse_move 120 80\n' | hmp
+sleep 0.2
+printf 'mouse_button 0\n' | hmp
+for _ in $(seq 1 40); do
+    grep -q '\[wm\] terminal drag finished' "$RUN_DIR/serial.log" && break
+    sleep 0.1
+done
+grep -q '\[wm\] terminal drag finished' "$RUN_DIR/serial.log"
+sleep 0.25
+printf 'screendump %s/dragged.ppm\n' "$RUN_DIR" | hmp
+
+# После drag курсор находится около (760,155), а окно упёрлось в правую
+# границу. Перемещаемся к его новой minimize-кнопке.
+printf 'mouse_move 435 -10\n' | hmp
 sleep 0.2
 printf 'mouse_button 1\nmouse_button 0\n' | hmp
 for _ in $(seq 1 40); do
@@ -84,12 +109,13 @@ for _ in $(seq 1 40); do
     sleep 0.1
 done
 grep -q '\[wm\] terminal minimized' "$RUN_DIR/serial.log"
+sleep 0.25
 printf 'screendump %s/minimized.ppm\n' "$RUN_DIR" \
     | hmp
-sleep 0.5
 
-cargo run -q -p rustos-gui-check -- "$RUN_DIR/terminal.ppm" "$RUN_DIR/minimized.ppm"
+cargo run -q -p rustos-gui-check -- \
+    "$RUN_DIR/terminal.ppm" "$RUN_DIR/dragged.ppm" "$RUN_DIR/minimized.ppm"
 printf 'quit\n' | hmp || true
 wait "$QPID" 2>/dev/null || true
 QPID=""
-echo "[gui-test] PASS: keyboard, terminal, mouse and minimize"
+echo "[gui-test] PASS: keyboard, terminal, buffered drag and minimize"

@@ -20,12 +20,17 @@ const CURSOR_WIDTH: usize = 14;
 const CURSOR_HEIGHT: usize = 20;
 
 pub fn run(info: &BootInfo) -> ! {
-    let Some(framebuffer) = Framebuffer::from_boot(&info.framebuffer) else {
-        serial::put_str("[gui] no supported framebuffer; system halted\n");
+    let Some(framebuffer) = Framebuffer::from_boot(info) else {
+        serial::put_str("[gui] no supported framebuffer/back buffer; system halted\n");
         loop {
             arch::halt();
         }
     };
+    serial::put_str("[gui] back buffer @ 0x");
+    serial::put_hex(framebuffer.backbuffer_phys());
+    serial::put_str(" size=");
+    serial::put_u32((framebuffer.backbuffer_bytes() / 1024) as u32);
+    serial::put_str(" KiB\n");
     let mut session = DesktopSession::new(framebuffer, info.total_usable_ram() / (1024 * 1024));
     session.render_all();
     serial::put_str("[gui] GUI_READY desktop=1 terminal=1 mouse=ps2\n");
@@ -100,6 +105,7 @@ impl DesktopSession {
     fn event_loop(&mut self) -> ! {
         loop {
             if let Some(event) = self.input.poll() {
+                let old_cursor = self.cursor.rect();
                 self.cursor.restore(&mut self.framebuffer);
                 let redraw = match event {
                     Event::Key(key) => self.handle_key(key),
@@ -116,6 +122,15 @@ impl DesktopSession {
                 }
                 self.cursor
                     .draw(&mut self.framebuffer, self.mouse_x, self.mouse_y);
+                if redraw == Redraw::None {
+                    // Обычное движение мыши меняет только две маленькие
+                    // области — прежний и новый курсор. При изменении окна
+                    // публикуем весь уже готовый кадр одним быстрым blit.
+                    self.framebuffer.present_rect(old_cursor);
+                    self.framebuffer.present_rect(self.cursor.rect());
+                } else {
+                    self.framebuffer.present();
+                }
             } else {
                 core::hint::spin_loop();
             }
@@ -160,6 +175,7 @@ impl DesktopSession {
         }
         if self.window.dragging && !event.left {
             self.window.dragging = false;
+            serial::put_str("[wm] terminal drag finished\n");
         }
 
         let pressed = event.left && !self.previous_left;
@@ -225,6 +241,7 @@ impl DesktopSession {
             self.window.dragging = true;
             self.window.drag_dx = x - self.window.rect.x;
             self.window.drag_dy = y - self.window.rect.y;
+            serial::put_str("[wm] terminal drag started\n");
         }
         Redraw::None
     }
@@ -256,6 +273,7 @@ impl DesktopSession {
         self.render_scene();
         self.cursor
             .draw(&mut self.framebuffer, self.mouse_x, self.mouse_y);
+        self.framebuffer.present();
     }
 
     fn render_scene(&mut self) {
@@ -585,6 +603,10 @@ impl Cursor {
             y: 0,
             valid: false,
         }
+    }
+
+    fn rect(&self) -> Rect {
+        Rect::new(self.x, self.y, CURSOR_WIDTH as u32, CURSOR_HEIGHT as u32)
     }
 
     fn restore(&mut self, fb: &mut Framebuffer) {

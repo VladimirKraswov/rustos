@@ -1,4 +1,4 @@
-//! Проверка PPM screendump до и после действия window manager.
+//! Проверка PPM screendump до, во время и после действий window manager.
 
 use std::{env, fs, path::Path};
 
@@ -94,11 +94,15 @@ fn parse_number(token: &[u8]) -> Result<usize, String> {
 fn main() {
     let mut args = env::args_os().skip(1);
     let before_path = args.next().unwrap_or_else(|| {
-        eprintln!("usage: rustos-gui-check <terminal.ppm> <minimized.ppm>");
+        usage();
+        std::process::exit(2);
+    });
+    let dragged_path = args.next().unwrap_or_else(|| {
+        usage();
         std::process::exit(2);
     });
     let after_path = args.next().unwrap_or_else(|| {
-        eprintln!("usage: rustos-gui-check <terminal.ppm> <minimized.ppm>");
+        usage();
         std::process::exit(2);
     });
     let before = match Image::read(Path::new(&before_path)) {
@@ -109,8 +113,34 @@ fn main() {
         Ok(image) => image,
         Err(error) => fatal(error),
     };
-    if before.width != after.width || before.height != after.height {
+    let dragged = match Image::read(Path::new(&dragged_path)) {
+        Ok(image) => image,
+        Err(error) => fatal(error),
+    };
+    if before.width != dragged.width
+        || before.height != dragged.height
+        || before.width != after.width
+        || before.height != after.height
+    {
         fatal("screenshots have different dimensions".into());
+    }
+
+    // Окно стартует с x=120,y=57 и после тестового drag смещается вправо-
+    // вниз. Старый левый участок должен стать обоями, а новый правый —
+    // тёмной областью terminal. Это проверяет именно изменение геометрии,
+    // а не только получение mouse packet.
+    let old_only_before = before.rgb(130, 110);
+    let old_only_dragged = dragged.rgb(130, 110);
+    let new_only_before = before.rgb(before.width - 80, 200);
+    let new_only_dragged = dragged.rgb(before.width - 80, 200);
+    if old_only_before == old_only_dragged
+        || old_only_dragged[2] < 30
+        || new_only_dragged.iter().any(|channel| *channel > 45)
+        || new_only_before == new_only_dragged
+    {
+        fatal(format!(
+            "drag geometry did not move the window: old={old_only_before:?}->{old_only_dragged:?}, new={new_only_before:?}->{new_only_dragged:?}"
+        ));
     }
 
     let center = (before.width / 2, before.height / 2);
@@ -142,9 +172,13 @@ fn main() {
         ));
     }
     println!(
-        "GUI verify OK: {}x{}, terminal input + minimize changed {} sampled pixels",
+        "GUI verify OK: {}x{}, terminal input + drag + minimize changed {} sampled pixels",
         before.width, before.height, changed
     );
+}
+
+fn usage() {
+    eprintln!("usage: rustos-gui-check <terminal.ppm> <dragged.ppm> <minimized.ppm>");
 }
 
 fn fatal(message: String) -> ! {
