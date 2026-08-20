@@ -25,7 +25,8 @@ jobs:
       - name: Установить зафиксированный Rust toolchain
         run: |
           rustup toolchain install nightly-2026-08-18 \
-            --profile minimal --component rust-src,rustfmt,clippy
+            --profile minimal --component rust-src,rustfmt,clippy \
+            --target x86_64-unknown-uefi
           rustup override set nightly-2026-08-18
 
       - name: Форматирование и Clippy
