@@ -44,9 +44,10 @@ pub const FRAMEBUFFER_SOURCE_UEFI_GOP: u32 = 0;
 /// Framebuffer и выбранный видеорежим переданы GRUB по Multiboot2.
 pub const FRAMEBUFFER_SOURCE_GRUB: u32 = 1;
 
-/// Размер boot-стека CPU0 (128 KiB — с запасом на ранний вызов прерываний
-/// до появления полноценного стека ядра).
-pub const KERNEL_STACK_SIZE: u64 = 128 * 1024;
+/// Размер boot-стека CPU0. 512 KiB позволяют безопасно конструировать bounded
+/// no-heap GUI/session state и обрабатывать ранние прерывания до перехода на
+/// отдельные scheduler stacks. При минимальных 128 MiB RAM это менее 0,4%.
+pub const KERNEL_STACK_SIZE: u64 = 512 * 1024;
 
 /// Бюджет физической памяти под page tables в резерве загрузчика (16 MiB).
 ///

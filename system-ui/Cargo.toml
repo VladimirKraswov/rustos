@@ -1,0 +1,15 @@
+[package]
+name = "rustos-system-ui"
+description = "Декларативное no_std UI-ядро, layout, events и display list RustOS"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+rustos-abi = { path = "../abi" }
+rustos-video = { path = "../video" }

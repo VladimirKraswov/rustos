@@ -1,5 +1,10 @@
 # GUI RustOS
 
+Архитектура декларативной системной библиотеки, stable ABI, `.rui`,
+layout/event/display-list pipeline и UI Gallery описаны в
+[`SYSTEM_UI.md`](SYSTEM_UI.md). Этот файл документирует bootstrap desktop и
+его прямую интеграцию с текущим compositor.
+
 ## Слои
 
 - `graphics.rs` — clipping, RGB/BGR packing, RAM back buffer и scanout present;

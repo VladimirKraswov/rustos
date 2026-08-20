@@ -1,0 +1,16 @@
+[package]
+name = "rustos-rui"
+description = "Ahead-of-time compiler декларативных RustOS UI файлов в типизированный .rui IR"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "rustos-rui"
+path = "src/main.rs"
+
+[dependencies]
+rustos-abi = { path = "../../abi" }
+rustos-system-ui = { path = "../../system-ui" }

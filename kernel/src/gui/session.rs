@@ -5,7 +5,10 @@
 //! эти вызовы станут IPC-сообщениями без переписывания визуальных компонентов.
 
 use crate::{
-    apps::terminal::{Terminal, TerminalAction},
+    apps::{
+        terminal::{Terminal, TerminalAction},
+        ui_showcase::UiShowcase,
+    },
     arch, font,
     graphics::{Color, Framebuffer, Rect},
     gui::components::{self, Button, Label, Panel, Theme, Widget},
@@ -19,6 +22,7 @@ use rustos_abi::{
     },
     BootInfo,
 };
+use rustos_system_ui::{Key as UiKey, PointerKind as UiPointerKind};
 use rustos_video::{
     hit_test_resize, resize_from_edges, DamageRegion, DisplayDriver, DisplayMode, ManagedWindow,
     PixelFormat, ResizeEdges, Scanout, WindowEventQueue,
@@ -80,12 +84,15 @@ pub fn run(info: &BootInfo) -> ! {
     serial::put_str(
         "[font] families=console,sans scripts=latin,cyrillic styles=regular,bold,italic sizes=10..48\n",
     );
+    serial::put_str("[ui] constructing bootstrap UI sessions\n");
     let mut session = DesktopSession::new(
         framebuffer,
         info.total_usable_ram() / (1024 * 1024),
         info.initramfs,
     );
+    serial::put_str("[ui] bootstrap UI sessions ready\n");
     session.render_all();
+    serial::put_str("[ui] first component frame rendered\n");
     serial::put_str("[gui] GUI_READY desktop=1 terminal=1 mouse=");
     serial::put_str(input::backend_name());
     serial::put_str("\n");
@@ -109,12 +116,23 @@ enum WindowInteraction {
     },
 }
 
+/// В bootstrap-сессии приложения пока делят одно тестовое окно. Их UI уже
+/// независим от window manager; переход на отдельные ring-3 surfaces изменит
+/// только таблицу окон, а не component runtime.
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum ActiveApplication {
+    Terminal,
+    UiShowcase,
+}
+
 /// Desktop-сессия: владеет framebuffer'ом, input'ом, окном терминала и
 /// курсором; отвечает и за event loop, и за отрисовку (см. модуль).
 struct DesktopSession {
     framebuffer: Framebuffer,
     input: PlatformInput,
     terminal: Terminal,
+    ui_showcase: UiShowcase,
+    active_application: ActiveApplication,
     window: ManagedWindow,
     window_events: WindowEventQueue<32>,
     interaction: WindowInteraction,
@@ -145,12 +163,23 @@ impl DesktopSession {
         };
         let y = ((screen_height.saturating_sub(TASKBAR_HEIGHT) - height) / 2) as i32;
         let rect = Rect::new(x, y, width, height);
+        let content = Rect::new(
+            rect.x + 4,
+            rect.y + TITLE_HEIGHT as i32,
+            rect.width.saturating_sub(8),
+            rect.height.saturating_sub(TITLE_HEIGHT + 4),
+        );
+        serial::put_str("[ui] constructing Gallery tree\n");
+        let ui_showcase = UiShowcase::new(content);
+        serial::put_str("[ui] Gallery tree ready\n");
         Self {
             mouse_x: (screen_width / 2) as i32,
             mouse_y: (screen_height / 2) as i32,
             framebuffer,
             input: PlatformInput::new(),
             terminal: Terminal::new(usable_ram_mib, initramfs),
+            ui_showcase,
+            active_application: ActiveApplication::Terminal,
             window: ManagedWindow::new(
                 TERMINAL_WINDOW_ID,
                 window_rect(rect),
@@ -183,6 +212,7 @@ impl DesktopSession {
                     Event::Mouse(mouse) => self.handle_mouse(mouse),
                 };
                 let mut terminal_line = None;
+                let mut ui_frame = None;
                 let mut drag_cached = false;
                 match redraw {
                     Redraw::All => self.render_scene(),
@@ -198,6 +228,9 @@ impl DesktopSession {
                         terminal_line = self
                             .terminal
                             .draw_input_line(&mut self.framebuffer, content);
+                    }
+                    Redraw::Ui => {
+                        ui_frame = Some(self.ui_showcase.draw(&mut self.framebuffer, false));
                     }
                     Redraw::DragMove { previous, first } => {
                         drag_cached = self.render_drag_preview(previous, first);
@@ -222,6 +255,15 @@ impl DesktopSession {
                         self.framebuffer.present_rect(old_cursor);
                         if let Some(line) = terminal_line {
                             self.framebuffer.present_rect(line);
+                        }
+                        self.framebuffer.present_rect(self.cursor.rect());
+                    }
+                    Redraw::Ui => {
+                        self.framebuffer.present_rect(old_cursor);
+                        if let Some(frame) = ui_frame {
+                            for rect in frame.damage() {
+                                self.framebuffer.present_rect(*rect);
+                            }
                         }
                         self.framebuffer.present_rect(self.cursor.rect());
                     }
@@ -278,6 +320,21 @@ impl DesktopSession {
         }
         if self.window.is_closed() || self.window.is_minimized() {
             return Redraw::None;
+        }
+        if self.active_application == ActiveApplication::UiShowcase {
+            let key = match key {
+                Key::Tab => UiKey::Tab,
+                Key::Enter => UiKey::Enter,
+                Key::Escape => UiKey::Escape,
+                Key::Character(b' ') => UiKey::Space,
+                Key::Character(byte) if byte.is_ascii() => UiKey::Character(char::from(byte)),
+                Key::Backspace | Key::Character(_) => return Redraw::None,
+            };
+            return if self.ui_showcase.key(key, false) {
+                Redraw::Ui
+            } else {
+                Redraw::None
+            };
         }
         match self.terminal.handle_key(key) {
             TerminalAction::None => Redraw::None,
@@ -355,6 +412,10 @@ impl DesktopSession {
                 self.terminal.report_color_mode(mode);
                 Redraw::All
             }
+            TerminalAction::OpenUiShowcase => {
+                self.open_ui_showcase();
+                Redraw::Window
+            }
             TerminalAction::Shutdown => shutdown(),
         }
     }
@@ -419,9 +480,30 @@ impl DesktopSession {
             };
         }
 
-        let pressed = event.left && !self.previous_left;
+        let was_left = self.previous_left;
+        let pressed = event.left && !was_left;
+        let released = !event.left && was_left;
         self.previous_left = event.left;
         if !pressed {
+            if self.active_application == ActiveApplication::UiShowcase
+                && self.window.is_visible()
+                && (self
+                    .window_content_rect()
+                    .contains(self.mouse_x, self.mouse_y)
+                    || released)
+            {
+                let kind = if released {
+                    UiPointerKind::Up
+                } else {
+                    UiPointerKind::Move
+                };
+                if self
+                    .ui_showcase
+                    .pointer(kind, self.mouse_x, self.mouse_y, 0)
+                {
+                    return Redraw::Ui;
+                }
+            }
             return Redraw::None;
         }
 
@@ -435,6 +517,11 @@ impl DesktopSession {
         if self.start_open {
             if self.start_terminal_item().contains(x, y) {
                 self.open_terminal();
+                self.start_open = false;
+                return Redraw::All;
+            }
+            if self.start_ui_item().contains(x, y) {
+                self.open_ui_showcase();
                 self.start_open = false;
                 return Redraw::All;
             }
@@ -499,6 +586,14 @@ impl DesktopSession {
             serial::put_str("[wm] terminal resize started\n");
             return Redraw::None;
         }
+        if self.active_application == ActiveApplication::UiShowcase
+            && self.window_content_rect().contains(x, y)
+        {
+            if self.ui_showcase.pointer(UiPointerKind::Down, x, y, 0) {
+                return Redraw::Ui;
+            }
+            return Redraw::None;
+        }
         let rect = self.window_rect();
         let title = Rect::new(rect.x, rect.y, rect.width.saturating_sub(100), TITLE_HEIGHT);
         if self.window.style().contains(WindowStyle::TITLE_BAR)
@@ -517,6 +612,7 @@ impl DesktopSession {
     }
 
     fn open_terminal(&mut self) {
+        self.active_application = ActiveApplication::Terminal;
         let command = if self.window.is_closed() {
             WindowCommand::show(TERMINAL_WINDOW_ID)
         } else if self.window.is_minimized() {
@@ -525,6 +621,22 @@ impl DesktopSession {
             return;
         };
         let _ = self.apply_window_command(command);
+    }
+
+    fn open_ui_showcase(&mut self) {
+        self.active_application = ActiveApplication::UiShowcase;
+        self.ui_showcase.resize(self.window_content_rect());
+        serial::put_str("[ui] Gallery opened runtime=system-ui-v1\n");
+        let command = if self.window.is_closed() {
+            Some(WindowCommand::show(TERMINAL_WINDOW_ID))
+        } else if self.window.is_minimized() {
+            Some(WindowCommand::restore(TERMINAL_WINDOW_ID))
+        } else {
+            None
+        };
+        if let Some(command) = command {
+            let _ = self.apply_window_command(command);
+        }
     }
 
     fn window_rect(&self) -> Rect {
@@ -697,6 +809,7 @@ impl DesktopSession {
     }
 
     fn draw_drag_preview(&mut self, rect: Rect) {
+        let title = self.active_title();
         self.framebuffer.fill_rect(
             Rect::new(rect.x, rect.y, rect.width, TITLE_HEIGHT),
             Color::rgb(28, 43, 62),
@@ -706,7 +819,7 @@ impl DesktopSession {
             &mut self.framebuffer,
             rect.x + 12,
             rect.y + 11,
-            "RUSTOS · ТЕРМИНАЛ",
+            title,
             Theme::TEXT,
             font::UI_TITLE,
         );
@@ -863,13 +976,17 @@ impl DesktopSession {
                 Color::rgb(32, 48, 68),
                 Color::rgb(22, 32, 48),
             );
-            components::terminal_icon(
-                &mut self.framebuffer,
-                Rect::new(rect.x + 8, rect.y + 6, 22, 22),
-            );
+            if self.active_application == ActiveApplication::Terminal {
+                components::terminal_icon(
+                    &mut self.framebuffer,
+                    Rect::new(rect.x + 8, rect.y + 6, 22, 22),
+                );
+            } else {
+                components::start_icon(&mut self.framebuffer, rect.x + 8, rect.y + 6);
+            }
             Label {
                 rect: Rect::new(rect.x + 38, rect.y + 8, 260, 22),
-                text: "RUSTOS · ТЕРМИНАЛ",
+                text: self.active_title(),
                 color: Theme::TEXT,
                 style: font::UI_TITLE,
             }
@@ -928,7 +1045,13 @@ impl DesktopSession {
             }
         }
         let content = self.window_content_rect();
-        self.terminal.draw(&mut self.framebuffer, content);
+        match self.active_application {
+            ActiveApplication::Terminal => self.terminal.draw(&mut self.framebuffer, content),
+            ActiveApplication::UiShowcase => {
+                self.ui_showcase.resize(content);
+                let _ = self.ui_showcase.draw(&mut self.framebuffer, true);
+            }
+        }
     }
 
     fn render_taskbar(&mut self) {
@@ -958,6 +1081,7 @@ impl DesktopSession {
             font::UI_NORMAL,
         );
         if !self.window.is_closed() {
+            let task_label = self.active_task_label();
             let task = self.task_terminal_button();
             self.framebuffer.fill_rect(
                 task,
@@ -967,15 +1091,19 @@ impl DesktopSession {
                     Theme::PANEL_LIGHT
                 },
             );
-            components::terminal_icon(
-                &mut self.framebuffer,
-                Rect::new(task.x + 7, task.y + 7, 28, 28),
-            );
+            if self.active_application == ActiveApplication::Terminal {
+                components::terminal_icon(
+                    &mut self.framebuffer,
+                    Rect::new(task.x + 7, task.y + 7, 28, 28),
+                );
+            } else {
+                components::start_icon(&mut self.framebuffer, task.x + 8, task.y + 9);
+            }
             font::draw_text(
                 &mut self.framebuffer,
                 task.x + 43,
                 task.y + 17,
-                "TERMINAL",
+                task_label,
                 Theme::TEXT,
                 font::UI_NORMAL,
             );
@@ -1021,6 +1149,17 @@ impl DesktopSession {
             Theme::TEXT,
             font::UI_NORMAL,
         );
+        let ui = self.start_ui_item();
+        self.framebuffer.fill_rect(ui, Theme::PANEL_LIGHT);
+        components::start_icon(&mut self.framebuffer, ui.x + 12, ui.y + 12);
+        font::draw_text(
+            &mut self.framebuffer,
+            ui.x + 58,
+            ui.y + 20,
+            "UI GALLERY",
+            Theme::TEXT,
+            font::UI_NORMAL,
+        );
         let shutdown = self.start_shutdown_item();
         self.framebuffer.fill_rect(shutdown, Color::rgb(45, 31, 39));
         font::draw_text(
@@ -1058,9 +1197,9 @@ impl DesktopSession {
     fn start_menu(&self) -> Rect {
         Rect::new(
             6,
-            self.framebuffer.height() as i32 - TASKBAR_HEIGHT as i32 - 230,
+            self.framebuffer.height() as i32 - TASKBAR_HEIGHT as i32 - 288,
             300,
-            224,
+            282,
         )
     }
 
@@ -1077,6 +1216,25 @@ impl DesktopSession {
             menu.width - 24,
             44,
         )
+    }
+
+    fn start_ui_item(&self) -> Rect {
+        let menu = self.start_menu();
+        Rect::new(menu.x + 12, menu.y + 123, menu.width - 24, 52)
+    }
+
+    fn active_title(&self) -> &'static str {
+        match self.active_application {
+            ActiveApplication::Terminal => "RUSTOS · ТЕРМИНАЛ",
+            ActiveApplication::UiShowcase => "RUSTOS · SYSTEM UI GALLERY",
+        }
+    }
+
+    fn active_task_label(&self) -> &'static str {
+        match self.active_application {
+            ActiveApplication::Terminal => "TERMINAL",
+            ActiveApplication::UiShowcase => "UI GALLERY",
+        }
     }
 
     fn window_controls(&self) -> (Option<Rect>, Option<Rect>, Option<Rect>) {
@@ -1103,6 +1261,7 @@ impl DesktopSession {
 enum Redraw {
     None,
     TerminalLine,
+    Ui,
     Window,
     All,
     DragMove {

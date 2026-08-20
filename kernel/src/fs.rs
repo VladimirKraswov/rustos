@@ -214,7 +214,7 @@ impl OverlayStorage {
     };
 }
 
-// 32 * ~4 KiB живут в kernel BSS, а не на 128-KiB boot stack. До scheduler
+// 32 * ~4 KiB живут в kernel BSS, а не на boot stack. До scheduler
 // существует ровно один DesktopSession, поэтому facade BootstrapFs является
 // единственным владельцем storage. После процессов storage исчезнет вместе с
 // этим bootstrap backend.

@@ -107,6 +107,8 @@ pub enum TerminalAction {
     },
     /// Переключить software-renderer между 24-bit, RGB565 и grayscale.
     DisplayColor(ColorMode),
+    /// Открыть системное демонстрационное приложение UI Gallery.
+    OpenUiShowcase,
     Shutdown,
 }
 
@@ -315,6 +317,7 @@ impl Terminal {
             self.print("  ABOUT     SYSTEM INFORMATION\n", WHITE);
             self.print("  MEM       USABLE MEMORY\n", WHITE);
             self.print("  GUI       GUI SERVER STATUS\n", WHITE);
+            self.print("  UIDEMO    OPEN SYSTEM UI GALLERY\n", WHITE);
             self.print("  DISPLAY   MONITOR/MODE/COLOR SETTINGS\n", WHITE);
             self.print("  FONT      FAMILY/SIZE/STYLE SETTINGS\n", WHITE);
             self.print("  ECHO TEXT PRINT TEXT\n", WHITE);
@@ -348,6 +351,8 @@ impl Terminal {
             self.print("COMPOSITOR: SOFTWARE / ALIGNED 32-BIT SURFACES\n", WHITE);
             self.print("WINDOW MANAGER: ONLINE\n", GREEN);
             TerminalAction::None
+        } else if command.eq_ignore_ascii_case("uidemo") {
+            TerminalAction::OpenUiShowcase
         } else if command.eq_ignore_ascii_case("display")
             || command
                 .get(..8)
@@ -384,7 +389,8 @@ impl Terminal {
             | TerminalAction::DisplayInfo
             | TerminalAction::DisplayModes
             | TerminalAction::DisplayMode { .. }
-            | TerminalAction::DisplayColor(_) => action,
+            | TerminalAction::DisplayColor(_)
+            | TerminalAction::OpenUiShowcase => action,
             _ => {
                 self.prompt();
                 TerminalAction::RedrawAll

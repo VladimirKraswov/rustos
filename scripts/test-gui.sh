@@ -99,7 +99,7 @@ stop_qemu() {
 cleanup() {
     trap - EXIT INT TERM HUP
     stop_qemu
-    for file in serial.log qemu-stderr.log mode-720.ppm fonts.ppm terminal.ppm dragged.ppm resized.ppm minimized.ppm; do
+    for file in serial.log qemu-stderr.log mode-720.ppm fonts.ppm terminal.ppm ui-gallery.ppm dragged.ppm resized.ppm minimized.ppm; do
         [[ -f "$RUN_DIR/$file" ]] && cp -f "$RUN_DIR/$file" "$RESULT_DIR/$file"
     done
 }
@@ -213,6 +213,17 @@ sleep 0.25
 printf 'screendump %s/terminal.ppm\n' "$RUN_DIR" \
     | hmp
 
+# Новый System UI проходит тот же keyboard/window path. Проверяем запуск
+# декларативного component tree и сохраняем отдельный screenshot artifact.
+send_command 'uidemo'
+wait_for_serial '[ui] Gallery opened runtime=system-ui-v1'
+sleep 0.25
+printf 'screendump %s/ui-gallery.ppm\n' "$RUN_DIR" | hmp
+[[ -s "$RUN_DIR/ui-gallery.ppm" ]] || {
+    echo "[gui-test] UI Gallery screenshot is empty" >&2
+    exit 1
+}
+
 # Настоящий drag: курсор стартует в центре 1280x800. После round-trip через
 # режим 1280x720 window reflow оставляет верх окна на y=26, поэтому целимся в
 # середину title bar около y=43 и сдвигаем окно вправо-вниз.
@@ -287,4 +298,4 @@ for _ in $(seq 1 20); do
     sleep 0.1
 done
 stop_qemu
-echo "[gui-test] PASS: keyboard, VFS + ring3 RUN, buffered drag/resize and minimize"
+echo "[gui-test] PASS: keyboard, VFS + ring3 RUN, System UI Gallery, buffered drag/resize and minimize"

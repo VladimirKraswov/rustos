@@ -2,3 +2,4 @@
 //! компилируются в него; после IPC-milestone станут отдельными ELF-образами
 //! (docs/ARCHITECTURE.md, «Путь к микроядру»).
 pub mod terminal;
+pub mod ui_showcase;

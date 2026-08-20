@@ -28,7 +28,7 @@ virtio block device.
 2. устанавливает собственную GDT;
 3. временно отображает первые 4 GiB страницами по 2 MiB;
 4. включает AMD64 long mode;
-5. переходит на 128-KiB boot stack и вызывает Rust.
+5. переходит на 512-KiB boot stack и вызывает Rust.
 
 Разборщик проверяет границы каждого тега и переводит modules, memory map,
 framebuffer и ACPI RSDP в общий `BootInfo`. Диапазоны kernel, initramfs и

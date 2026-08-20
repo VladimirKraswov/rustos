@@ -29,6 +29,7 @@ pub mod memory;
 pub mod pipe;
 pub mod process;
 pub mod syscall;
+pub mod ui;
 pub mod vfs;
 pub mod window;
 

@@ -9,7 +9,7 @@
 //!    виртуального адреса GOP-framebuffer'а.
 //! 3. Резерв ядра: верхний conventional-регион ниже 4 GiB.
 //!    Раскладка блока:
-//!    `[kernel ELF][initramfs][page tables (16 MiB)][BootInfo][scratch (1 MiB)][boot stack (128 KiB)]`.
+//!    `[kernel ELF][initramfs][page tables (16 MiB)][BootInfo][scratch (1 MiB)][boot stack (512 KiB)]`.
 //! 4. Загрузка ядра (ELF64 PIE, `R_X86_64_RELATIVE`) и initramfs.
 //! 5. ACPI RSDP: EFI config table (канонический способ), fallback — legacy scan.
 //! 6. Identity page tables (PGD) — ядро стартует в identity-маппинге.

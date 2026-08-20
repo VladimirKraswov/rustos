@@ -13,6 +13,7 @@ members = [
     "abi",
     "microkernel",
     "video",
+    "system-ui",
     "runtime",
     "userspace/crt",
     "sdk/examples/hello",
@@ -33,6 +34,7 @@ members = [
     "tools/hmp",
     "tools/vfs-image",
     "tools/rune",
+    "tools/rui",
 ]
 
 [workspace.package]

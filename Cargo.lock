@@ -354,6 +354,7 @@ dependencies = [
  "rustos-abi",
  "rustos-microkernel",
  "rustos-rune-format",
+ "rustos-system-ui",
  "rustos-video",
  "u8g2-fonts",
 ]
@@ -376,6 +377,14 @@ dependencies = [
 [[package]]
 name = "rustos-pack"
 version = "0.1.0"
+
+[[package]]
+name = "rustos-rui"
+version = "0.1.0"
+dependencies = [
+ "rustos-abi",
+ "rustos-system-ui",
+]
 
 [[package]]
 name = "rustos-rune"
@@ -410,6 +419,14 @@ name = "rustos-sdk-hello"
 version = "0.1.0"
 dependencies = [
  "rustos-crt",
+]
+
+[[package]]
+name = "rustos-system-ui"
+version = "0.1.0"
+dependencies = [
+ "rustos-abi",
+ "rustos-video",
 ]
 
 [[package]]

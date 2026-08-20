@@ -1,0 +1,15 @@
+# Минимальный пример декларативного RUI source.
+# Значения text/accessibility — ID в ресурсах RUNE package.
+rui 1
+Column id=page width=fill height=fill padding=18 gap=12
+Text id=title parent=page text=1 width=fill height=px:34 role=heading
+Row id=body parent=page width=fill height=fill gap=12 breakpoint=720
+Column id=settings parent=body width=fill height=fill padding=14 gap=10 role=group
+Switch id=theme parent=settings text=4 command=1 width=fill height=px:32
+CheckBox id=diagnostics parent=settings text=5 command=3 width=fill height=px:32 state=16
+TextField id=name parent=settings text=6 accessible=7 width=fill height=px:38
+Button id=progress parent=settings text=8 command=2 width=fill height=px:38 style=1
+ProgressBar id=build-progress parent=settings value=350 width=fill height=px:30
+Column id=collection parent=body width=fill:2 height=fill padding=14 gap=6 role=group
+Text id=list-title parent=collection text=9 width=fill height=px:30 role=heading
+ListView id=list parent=collection width=fill height=fill padding=8 gap=4 role=list
