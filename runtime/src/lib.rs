@@ -133,6 +133,18 @@ pub fn thread_set_tls(address: u64) -> i64 {
     unsafe { syscall3(syscall::number::THREAD_SET_TLS, address, 0, 0) }
 }
 
+/// Читает первое `u64` по текущему thread pointer. Это низкоуровневый helper
+/// для проверки TLS bootstrap; обычный Rust-код обращается к TLS через
+/// сгенерированную компилятором модель и не вызывает эту функцию напрямую.
+///
+/// # Safety
+///
+/// Thread pointer должен ссылаться хотя бы на восемь доступных для чтения
+/// байт в address space вызывающего потока.
+pub unsafe fn read_thread_pointer_u64() -> u64 {
+    unsafe { arch::read_thread_pointer_u64() }
+}
+
 /// Отображает анонимные zero-filled страницы и возвращает virtual address.
 pub fn vm_map(request: &VmMapRequest) -> i64 {
     unsafe {

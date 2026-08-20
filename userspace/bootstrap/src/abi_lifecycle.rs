@@ -16,9 +16,9 @@ use rustos_abi::{
 };
 use rustos_runtime::{
     handle_close, monotonic_time_ns, process_exit, process_kill, process_spawn, process_wait,
-    shared_memory_create, shared_memory_map, syscall, thread_create, thread_exit, thread_join,
-    thread_set_tls, vm_map, vm_protect, vm_unmap, Handle, Rights, SharedMemoryCreate,
-    SharedMemoryMap, VmFlags, VmMapRequest,
+    read_thread_pointer_u64, shared_memory_create, shared_memory_map, syscall, thread_create,
+    thread_exit, thread_join, thread_set_tls, vm_map, vm_protect, vm_unmap, Handle, Rights,
+    SharedMemoryCreate, SharedMemoryMap, VmFlags, VmMapRequest,
 };
 
 const PAGE_SIZE: u64 = 4096;
@@ -194,7 +194,8 @@ fn test_thread(shared_address: u64) {
         process_exit(221);
     }
     unsafe { (tls as *mut u64).write_volatile(0x544c_5300_0000_0001) };
-    if thread_set_tls(tls as u64) != syscall::status::OK || read_tls_word() != 0x544c_5300_0000_0001
+    if thread_set_tls(tls as u64) != syscall::status::OK
+        || unsafe { read_thread_pointer_u64() } != 0x544c_5300_0000_0001
     {
         process_exit(222);
     }
@@ -228,29 +229,11 @@ fn test_thread(shared_address: u64) {
 }
 
 extern "C" fn thread_worker(shared_address: u64) -> ! {
-    if read_tls_word() != 0x544c_5300_0000_0001 {
+    if unsafe { read_thread_pointer_u64() } != 0x544c_5300_0000_0001 {
         thread_exit(31);
     }
     unsafe { (shared_address as *mut u64).write_volatile(0x5255_5354_4f53_0003) };
     thread_exit(33)
-}
-
-#[cfg(target_arch = "x86_64")]
-fn read_tls_word() -> u64 {
-    let value: u64;
-    unsafe {
-        core::arch::asm!("mov {}, fs:[0]", out(reg) value, options(nostack, readonly));
-    }
-    value
-}
-
-#[cfg(target_arch = "aarch64")]
-fn read_tls_word() -> u64 {
-    let address: u64;
-    unsafe {
-        core::arch::asm!("mrs {value}, tpidr_el0", value = out(reg) address, options(nostack));
-    }
-    unsafe { (address as *const u64).read_volatile() }
 }
 
 const fn empty_reason() -> ExitReason {

@@ -61,6 +61,32 @@ pub fn monotonic_counter() -> u64 {
 }
 
 #[cfg(target_arch = "x86_64")]
+pub unsafe fn read_thread_pointer_u64() -> u64 {
+    let value: u64;
+    unsafe {
+        core::arch::asm!(
+            "mov {}, fs:[0]",
+            out(reg) value,
+            options(nostack, readonly),
+        );
+    }
+    value
+}
+
+#[cfg(target_arch = "aarch64")]
+pub unsafe fn read_thread_pointer_u64() -> u64 {
+    let address: u64;
+    unsafe {
+        core::arch::asm!(
+            "mrs {value}, tpidr_el0",
+            value = out(reg) address,
+            options(nostack),
+        );
+        (address as *const u64).read_volatile()
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
 pub fn trigger_test_fault() -> ! {
     unsafe { core::arch::asm!("ud2", options(noreturn)) }
 }
