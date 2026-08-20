@@ -30,6 +30,7 @@ pub mod pipe;
 pub mod process;
 pub mod syscall;
 pub mod vfs;
+pub mod window;
 
 pub use bootinfo::{BootInfo, BOOT_INFO_MAGIC, BOOT_INFO_VERSION};
 pub use handle::{Handle, Rights};

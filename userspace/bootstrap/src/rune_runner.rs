@@ -11,7 +11,7 @@
 extern crate alloc;
 
 use alloc::{format, string::String, vec, vec::Vec};
-use core::{alloc::GlobalAlloc, arch::asm, panic::PanicInfo, ptr, slice, str};
+use core::{alloc::GlobalAlloc, panic::PanicInfo, ptr, slice, str};
 
 use rustos_abi::vfs::VfsObject;
 use rustos_abi::{
@@ -24,7 +24,7 @@ use rustos_abi::{
 };
 use rustos_rune_format::{architecture, parse_dependency, record_kind, Container, DEPENDENCY_SIZE};
 use rustos_rune_loader::{DynamicLoader, ModuleSource, RuntimeMemory, SearchPolicy};
-use rustos_runtime::{process_exit, thread_set_tls, vm_map, VmMapRequest};
+use rustos_runtime::{jump_to_image, process_exit, thread_set_tls, vm_map, VmMapRequest};
 use rustos_vfs::VfsClient;
 
 const MAX_IMAGE_BYTES: usize = 32 * 1024 * 1024;
@@ -132,7 +132,16 @@ pub extern "C" fn _start(start_address: u64, abi_version: u64, _reserved: u64) -
 
     // С этого момента loader state намеренно не уничтожается: target вызывает
     // process_exit, после чего kernel освобождает весь address space разом.
-    jump_to_target(loaded.entry, stack_top, target_info as u64)
+    // SAFETY: loader проверил executable entry, vm_map создал stack,
+    // а target_info лежит в зафиксированном startup mapping до process exit.
+    unsafe {
+        jump_to_image(
+            loaded.entry,
+            stack_top,
+            target_info as u64,
+            syscall::ABI_VERSION,
+        )
+    }
 }
 
 fn validate_start_info(address: u64, abi_version: u64) -> Option<&'static ProcessStartInfo> {
@@ -248,7 +257,7 @@ fn dependency_names(image: &[u8]) -> Option<Vec<String>> {
         if !bytes.len().is_multiple_of(DEPENDENCY_SIZE) {
             return None;
         }
-        for raw in bytes.chunks_exact(DEPENDENCY_SIZE) {
+        for raw in bytes.as_chunks::<DEPENDENCY_SIZE>().0 {
             let dependency = parse_dependency(raw)?;
             names.push(String::from(
                 container.string(dependency.name_offset, dependency.name_length)?,
@@ -377,30 +386,6 @@ fn allocate_target_stack() -> Option<u64> {
         flags: VmFlags::READ.union(VmFlags::WRITE),
     });
     (address > 0).then_some(address as u64 + TARGET_STACK_BYTES - 8)
-}
-
-#[cfg(target_arch = "x86_64")]
-fn jump_to_target(entry: u64, stack: u64, start_info: u64) -> ! {
-    unsafe {
-        asm!(
-            "mov rsp, {stack}",
-            "xor rbp, rbp",
-            "mov rdi, {start_info}",
-            "mov rsi, {abi}",
-            "xor rdx, rdx",
-            "jmp {entry}",
-            stack = in(reg) stack,
-            start_info = in(reg) start_info,
-            abi = in(reg) syscall::ABI_VERSION,
-            entry = in(reg) entry,
-            options(noreturn)
-        )
-    }
-}
-
-#[cfg(target_arch = "aarch64")]
-fn jump_to_target(_entry: u64, _stack: u64, _start_info: u64) -> ! {
-    process_exit(134)
 }
 
 fn parent_directory(path: &str) -> Option<String> {

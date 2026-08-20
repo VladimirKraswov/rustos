@@ -65,6 +65,8 @@ pub struct ConnectorInfo {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ModeSetError {
     UnsupportedMode,
+    /// Для нового scanout и software surfaces не удалось выделить память.
+    OutOfMemory,
     /// Bootstrap framebuffer не имеет runtime mode-set API. Режим доступен
     /// через меню загрузчика и будет применён после перезапуска.
     RequiresReboot,

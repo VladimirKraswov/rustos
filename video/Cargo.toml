@@ -9,3 +9,6 @@ authors.workspace = true
 
 [lib]
 path = "src/lib.rs"
+
+[dependencies]
+rustos-abi = { path = "../abi" }

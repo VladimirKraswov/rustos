@@ -407,7 +407,7 @@ unsafe fn build_identity_map(max_phys: u64) -> Result<u64, BootError> {
                     unsafe {
                         directory
                             .add(index as usize)
-                            .write(gigabyte + index * PAGE_2M | PTE_PRESENT_WRITE | PTE_HUGE)
+                            .write((gigabyte + index * PAGE_2M) | PTE_PRESENT_WRITE | PTE_HUGE)
                     };
                 }
             }

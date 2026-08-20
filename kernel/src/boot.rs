@@ -78,9 +78,11 @@ pub fn kernel_main(info: &BootInfo) -> ! {
     match self_test(info) {
         Ok(()) => {
             serial::early_put_str("K4: selftest ok\n");
-            if process::run_bootstrap_milestone(info.initramfs).is_err() {
-                serial::put_str("[process] FATAL: ring3 bootstrap milestone failed\n");
-                exit_kernel(0x50);
+            if let Err(error) = process::run_bootstrap_milestone(info.initramfs) {
+                serial::put_str("[process] FATAL: ring3 bootstrap milestone failed: ");
+                serial::put_str(error.label());
+                serial::put_str("\n");
+                exit_kernel(error.diagnostic_code());
             }
             if process::run_preemptive_milestone(info).is_err() {
                 serial::put_str("[process] FATAL: preemption/IPC milestone failed\n");

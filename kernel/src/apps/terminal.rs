@@ -13,7 +13,7 @@ use crate::{
     serial,
 };
 use rustos_abi::bootinfo::BootInitramfs;
-use rustos_video::ColorMode;
+use rustos_video::{ColorMode, DisplayMode, ModeSetError};
 
 /// Размер буфера терминала: подогнан под дефолтное окно desktop
 /// (шире/выше окна буфер просто не умещается целиком).
@@ -53,6 +53,8 @@ pub enum TerminalAction {
     RedrawAll,
     /// Запросить текущий monitor/scanout mode у display driver'а.
     DisplayInfo,
+    /// Показать все режимы, доступные monitor/display driver'у.
+    DisplayModes,
     /// Запросить физический mode-set. Firmware framebuffer может вернуть,
     /// что режим применяется только через меню GRUB после перезапуска.
     DisplayMode {
@@ -311,6 +313,7 @@ impl Terminal {
         match action {
             TerminalAction::Shutdown
             | TerminalAction::DisplayInfo
+            | TerminalAction::DisplayModes
             | TerminalAction::DisplayMode { .. }
             | TerminalAction::DisplayColor(_) => action,
             _ => {
@@ -324,6 +327,9 @@ impl Terminal {
         let arguments = command.get(7..).unwrap_or("").trim();
         if arguments.is_empty() || arguments.eq_ignore_ascii_case("info") {
             return TerminalAction::DisplayInfo;
+        }
+        if arguments.eq_ignore_ascii_case("modes") {
+            return TerminalAction::DisplayModes;
         }
         if let Some(value) = strip_prefix_ascii_case(arguments, "mode ") {
             if let Some((width, height)) = parse_resolution(value.trim()) {
@@ -352,12 +358,21 @@ impl Terminal {
             return TerminalAction::None;
         }
         self.print("DISPLAY [INFO]\n", YELLOW);
+        self.print("DISPLAY MODES\n", WHITE);
         self.print("DISPLAY MODE WIDTHxHEIGHT\n", WHITE);
         self.print("DISPLAY COLOR TRUECOLOR|RGB565|GRAY8\n", WHITE);
         TerminalAction::None
     }
 
-    pub fn report_display_info(&mut self, driver: &str, width: u32, height: u32, color: ColorMode) {
+    pub fn report_display_info(
+        &mut self,
+        driver: &str,
+        width: u32,
+        height: u32,
+        width_mm: u16,
+        height_mm: u16,
+        color: ColorMode,
+    ) {
         self.print("DISPLAY DRIVER: ", GREEN);
         self.print(driver, WHITE);
         self.print("\nPHYSICAL MODE: ", GREEN);
@@ -366,20 +381,53 @@ impl Terminal {
         self.print_number(u64::from(height));
         self.print("x32 (24 COLOR BITS)\nRENDER COLOR: ", WHITE);
         self.print_color_mode(color);
-        self.print("\nMODE SWITCH: GRUB MENU / NATIVE DRIVER API\n", MUTED);
+        if width_mm != 0 && height_mm != 0 {
+            self.print("\nMONITOR SIZE: ", GREEN);
+            self.print_number(u64::from(width_mm));
+            self.print("x", WHITE);
+            self.print_number(u64::from(height_mm));
+            self.print(" MM", WHITE);
+        }
+        self.print("\nMODE SWITCH: NATIVE DISPLAY DRIVER API\n", MUTED);
         self.prompt();
     }
 
-    pub fn report_display_mode(&mut self, width: u32, height: u32, applied: bool) {
-        if applied {
-            self.print("DISPLAY MODE ALREADY ACTIVE: ", GREEN);
-        } else {
-            self.print("FIRMWARE FRAMEBUFFER CANNOT MODE-SET AFTER BOOT: ", YELLOW);
+    pub fn report_display_modes(&mut self, modes: &[DisplayMode]) {
+        self.print("AVAILABLE DISPLAY MODES:\n", GREEN);
+        for mode in modes {
+            self.print("  ", WHITE);
+            self.print_number(u64::from(mode.width));
+            self.print("x", WHITE);
+            self.print_number(u64::from(mode.height));
+            if mode.refresh_millihertz != 0 {
+                self.print(" @ ", MUTED);
+                self.print_number(u64::from(mode.refresh_millihertz / 1000));
+                self.print(" HZ", MUTED);
+            }
+            self.newline();
+        }
+        self.prompt();
+    }
+
+    pub fn report_display_mode(
+        &mut self,
+        width: u32,
+        height: u32,
+        result: Result<DisplayMode, ModeSetError>,
+    ) {
+        match result {
+            Ok(_) => self.print("DISPLAY MODE ACTIVE: ", GREEN),
+            Err(ModeSetError::RequiresReboot) => {
+                self.print("FIRMWARE FRAMEBUFFER REQUIRES GRUB RESTART: ", YELLOW)
+            }
+            Err(ModeSetError::UnsupportedMode) => self.print("UNSUPPORTED DISPLAY MODE: ", RED),
+            Err(ModeSetError::OutOfMemory) => self.print("NOT ENOUGH RAM FOR DISPLAY MODE: ", RED),
+            Err(ModeSetError::DeviceLost) => self.print("DISPLAY DEVICE LOST: ", RED),
         }
         self.print_number(u64::from(width));
         self.print("x", WHITE);
         self.print_number(u64::from(height));
-        if !applied {
+        if matches!(result, Err(ModeSetError::RequiresReboot)) {
             self.print("\nSELECT THE MODE IN GRUB AND RESTART.\n", MUTED);
         } else {
             self.newline();

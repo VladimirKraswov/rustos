@@ -874,7 +874,7 @@ fn import_at(container: Container<'_>, requested: usize) -> Result<Import, LoadE
         if !bytes.len().is_multiple_of(IMPORT_SIZE) {
             return Err(LoadError::InvalidRecord);
         }
-        for raw in bytes.chunks_exact(IMPORT_SIZE) {
+        for raw in bytes.as_chunks::<IMPORT_SIZE>().0 {
             if index == requested {
                 return parse_import(raw).ok_or(LoadError::InvalidRecord);
             }

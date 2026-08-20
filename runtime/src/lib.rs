@@ -152,6 +152,17 @@ pub unsafe fn read_thread_pointer_u64() -> u64 {
     unsafe { arch::read_thread_pointer_u64() }
 }
 
+/// Безвозвратно передаёт управление уже загруженному user image.
+/// Это единственная ISA-зависимая часть user-space RUNE loader'а.
+///
+/// # Safety
+///
+/// `entry` должен ссылаться на executable mapping, `stack` — на вершину
+/// writable user stack, а `start_info` — на проверенный `ProcessStartInfo`.
+pub unsafe fn jump_to_image(entry: u64, stack: u64, start_info: u64, abi: u64) -> ! {
+    unsafe { arch::jump_to_image(entry, stack, start_info, abi) }
+}
+
 /// Отображает анонимные zero-filled страницы и возвращает virtual address.
 pub fn vm_map(request: &VmMapRequest) -> i64 {
     unsafe {

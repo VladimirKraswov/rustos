@@ -56,10 +56,11 @@ Multiboot2 framebuffer tag; ядро никогда не предполагае�
 меню не обещает режим, которого нет у firmware/монитора.
 
 После Multiboot hand-off firmware framebuffer не предоставляет mode-set или
-VSync API. Команда `DISPLAY MODE WxH` поэтому сообщает, что для bootstrap
-driver нужен restart и выбор пункта GRUB. Контракт `DisplayDriver` уже
-содержит enumeration/mode-set; будущий virtio-gpu или аппаратный driver
-реализует runtime-переключение без изменения compositor'а.
+VSync API. Поэтому без подходящего display device смена физического
+режима по-прежнему требует restart и выбора пункта GRUB. В QEMU после
+загрузки этот fallback заменяется native `virtio-gpu` scanout: он читает
+EDID и применяет `DISPLAY MODE WxH` без перезапуска. Compositor при этом
+не зависит ни от GRUB, ни от конкретного scanout backend.
 
 ## Сборка на Linux и macOS M1
 

@@ -69,9 +69,9 @@ impl PixelFormat {
                     | value.b as u32
             }
             Self::Rgb565 => {
-                ((value.r as u32 * 31 + 127) / 255) << 11
-                    | ((value.g as u32 * 63 + 127) / 255) << 5
-                    | (value.b as u32 * 31 + 127) / 255
+                (((value.r as u32 * 31 + 127) / 255) << 11)
+                    | (((value.g as u32 * 63 + 127) / 255) << 5)
+                    | ((value.b as u32 * 31 + 127) / 255)
             }
             Self::Grayscale8 => {
                 // Integer BT.601 luminance; сумма коэффициентов равна 256.

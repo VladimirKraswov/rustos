@@ -10,12 +10,13 @@
 - `gui/session.rs` — compositor, desktop, taskbar и window manager;
 - `apps/terminal.rs` — первый графический клиент.
 
-Разрешение берётся из Multiboot2 framebuffer tag. GRUB сначала пробует
-широкоформатные 1600×900/1920×1080/1366×768/1280×720 и откатывается к
-доступному firmware mode; используемая тестовая OVMF публикует 1280×800×32.
-Rendering полностью выполняется CPU, закрытые GPU-драйверы не требуются.
+На QEMU ядро после GRUB hand-off подключает modern PCI virtio-gpu,
+читает EDID и переводит scanout на выбранный wide mode. GRUB framebuffer
+остаётся fallback для машин без поддерживаемого display device. Rendering
+полностью выполняется CPU, закрытые GPU-драйверы не требуются.
 Подробный контракт scanout/surfaces/compositor и путь к software OpenGL описан
-в [VIDEO.md](VIDEO.md).
+в [VIDEO.md](VIDEO.md). Команды, события, style-флаги и state machine окон
+описаны отдельно в [WINDOWS.md](WINDOWS.md).
 
 Компоненты никогда не рисуют непосредственно в видимый framebuffer.
 Compositor сначала формирует кадр в back buffer из обычной RAM и только потом
@@ -42,15 +43,20 @@ PS/2 service объединяет накопившиеся движения с �
 - ввод с клавиатуры направляется в активный terminal;
 - кнопки `-`, `+` и `X` сворачивают, разворачивают и закрывают окно;
 - заголовок окна можно перетаскивать;
+- рамка и углы меняют размер окна с соблюдением minimum size;
 - taskbar восстанавливает свёрнутый terminal;
 - Start menu содержит terminal и shutdown;
 - desktop icon повторно открывает закрытый terminal.
 
-Команда `DISPLAY` показывает display driver, реальное разрешение и цветовой
-профиль. `DISPLAY COLOR TRUECOLOR|RGB565|GRAY8` меняет цветность renderer'а
-без невыравненных framebuffer writes. `DISPLAY MODE WxH` проходит через общий
-mode-set API; bootstrap `grub-fb` просит выбрать режим в меню GRUB и
-перезапуститься, тогда как будущий native driver сможет применить его сразу.
+Команда `DISPLAY` показывает display driver, реальное разрешение,
+физический размер монитора и цветовой профиль. `DISPLAY MODES` выводит EDID
+и дополнительные wide modes. `DISPLAY COLOR TRUECOLOR|RGB565|GRAY8` меняет
+цветность renderer'а без невыравненных framebuffer writes.
+
+`DISPLAY MODE WxH` проходит через общий mode-set API. `virtio-gpu` применяет
+режим сразу, после чего GUI перевыделяет слои и пересчитывает geometry.
+Bootstrap `grub-fb` не умеет mode-set после hand-off и предлагает выбрать
+режим в GRUB и перезапуститься.
 
 Команда `RUN /apps/examples/hello.rune student` запускает настоящий
 изолированный процесс с VaraniaFS. Persistent `vfsd` обслуживает executable и

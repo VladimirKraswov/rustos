@@ -9,11 +9,55 @@
 2. **surfaces/raster** хранят пиксели приложений и выполняют CPU-операции;
 3. **compositor** собирает произвольное число окон и overlays только в damage.
 
-Сейчас scanout предоставляет GRUB Multiboot2 framebuffer: firmware/GRUB
-выбирает режим и передаёт linear 32-bit framebuffer, но не VSync, page flip
-или аппаратное ускорение. Это bootstrap-драйвер, а не заявление о поддержке
-конкретной GPU. В дальнейшем backend можно заменить virtio-gpu или
-DRM-подобным драйвером, не меняя surfaces и оконный протокол.
+Сейчас основной scanout — собственный драйвер **virtio-gpu 2D** поверх
+modern virtio-pci. Он получает EDID, перечисляет широкоформатные
+режимы, создаёт 32-bit BGRX resource и меняет scanout без
+перезапуска. Закрытые GPU API, VirGL и host OpenGL не нужны:
+вся отрисовка по-прежнему выполняется CPU.
+
+GRUB Multiboot2 framebuffer остался надёжным fallback. Если virtio-gpu нет
+или transport не прошёл negotiation, kernel продолжает работу с
+firmware linear framebuffer. В этом режиме смена разрешения честно
+возвращает `RequiresReboot`: уже переданный firmware framebuffer не
+имеет runtime mode-set API.
+
+## Virtio-gpu 2D
+
+Драйвер разделён на независимые уровни:
+
+- `display/pci.rs` находит PCI function `1af4:1050`, BAR и vendor
+  capabilities common/notify/ISR/device;
+- `display/virtqueue.rs` выполняет Virtio 1.x feature negotiation и
+  обслуживает bounded split control queue. На bootstrap-этапе в очереди
+  не больше одной команды, completion ожидается polling'ом с
+  timeout;
+- `display/edid.rs` проверяет signature/checksum EDID 1.x и извлекает
+  preferred/standard timings и физический размер монитора;
+- `display/virtio_gpu.rs` реализует `GET_DISPLAY_INFO`, `GET_EDID`,
+  `RESOURCE_CREATE_2D`, `ATTACH_BACKING`, `SET_SCANOUT`,
+  `TRANSFER_TO_HOST_2D`, `RESOURCE_FLUSH`, `DETACH_BACKING` и `UNREF`.
+
+При present драйвер копирует из software surface только damage rectangles,
+после чего отправляет transfer + flush для тех же областей.
+Гостевой backing сейчас физически непрерывен: это упрощает учебный DMA
+путь, хотя protocol уже допускает scatter/gather entries.
+
+### Атомарная смена режима
+
+`DISPLAY MODE WxH` не меняет часть состояния. Операция идёт
+как транзакция:
+
+1. проверяется, что режим есть в bounded mode list;
+2. выделяются новые back buffer и, если хватает памяти, desktop cache;
+3. создаётся и привязывается новый virtio resource;
+4. только после подтверждённого `SET_SCANOUT` старые backing и RAM-слои
+   освобождаются;
+5. window manager сбрасывает cursor snapshot, пересчитывает geometry и
+   целиком перерисовывает сцену.
+
+При ошибке памяти или устройства старый режим остаётся активным.
+Минимальные 128 МиБ достаточны для тестовых 1280×800/1280×720; для 4K
+нужен запас под несколько 32-МиБ буферов.
 
 ## `rustos-video`
 
@@ -94,11 +138,20 @@ damage и fence, а сами пиксели остаются в shared memory.
 - frame pacing и monotonic presentation clock;
 - front/back/triple-buffer protocol с generation и fences;
 - SSE2/AVX2 dispatch для blend, scale и RGB/YUV conversion;
-- virtio-gpu 2D scanout/page flip как первая независимая display-служба;
-- native EDID/mode enumeration и несколько мониторов;
+- IRQ-driven virtqueue, page flip/fences и hardware cursor virtio-gpu;
+- PCI bridge enumeration, IOMMU/DMA isolation и несколько мониторов;
+- native KMS-подобные драйверы для конкретного железа;
 - перенос compositor/input/terminal из kernel bootstrap в ring 3;
 - software OpenGL compatibility layer, затем порт Mesa по частям.
 
-Текущих гарантий пока недостаточно для плавного видео: firmware framebuffer не имеет VSync, а
-compositor синхронный. Но surfaces, alpha, damage и layer ABI уже отделены от
-этого ограничения и не потребуют переписывания при появлении нового драйвера.
+Текущих гарантий пока недостаточно для плавного видео: virtio-gpu backend
+синхронно ожидает transfer/flush и не имеет VSync event. Но surfaces,
+alpha, damage и layer ABI уже отделены от этого ограничения и не потребуют
+переписывания при появлении asynchronous или native backend.
+
+## Спецификации
+
+- [OASIS Virtio 1.2, GPU Device](https://docs.oasis-open.org/virtio/virtio/v1.2/virtio-v1.2.html#x1-3720007)
+  — normative transport, control queue, 2D resources, EDID и scanout commands;
+- [QEMU virtio-gpu](https://www.qemu.org/docs/master/system/devices/virtio-gpu.html)
+  — доступные QEMU backends и соотношение 2D/virgl/rutabaga.

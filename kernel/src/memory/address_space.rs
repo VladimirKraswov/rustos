@@ -2,8 +2,11 @@
 //!
 //! Kernel identity mappings копируются на верхнем уровне как supervisor-only;
 //! пользовательская половина создаётся в отдельном root-table slot. Каждая
-//! выделенная data/page-table page записывается в `owned`, поэтому Drop
-//! возвращает все кадры даже при частичной ошибке ELF loader'а.
+//! выделенная data/page-table page записывается в разреженные
+//! списки владения, поэтому Drop возвращает все кадры даже при
+//! частичной ошибке loader'а. Сам `AddressSpace` остаётся маленьким:
+//! его можно безопасно передавать между process manager и loader'ом, не
+//! резервируя десятки килобайт на kernel stack.
 
 use core::ptr;
 
@@ -18,19 +21,28 @@ const ADDRESS_MASK: u64 = 0x000f_ffff_ffff_f000;
 const ADDRESS_MASK: u64 = 0x0000_ffff_ffff_f000;
 
 const VALID: u64 = 1 << 0;
-/// Только page-table frames (user data учитывает sparse registry отдельно).
-/// 4608 таблиц покрывают примерно 9 ГиБ плотно отображённой памяти — хватает
-/// developer VM с rustc/LLVM, не раздувая каждый из 12 process records до
-/// мегабайт. В ABI лимита нет; следующий шаг заменит и этот список slab'ом.
-const MAX_OWNED_FRAMES: usize = 4608;
 const REGISTRY_ENTRIES: usize = PAGE_SIZE as usize / core::mem::size_of::<u64>();
 const PAGE_RECORDS_PER_CHUNK: usize = PAGE_SIZE as usize / core::mem::size_of::<UserPage>();
+const OWNED_FRAMES_PER_CHUNK: usize =
+    (PAGE_SIZE as usize - 2 * core::mem::size_of::<u64>()) / core::mem::size_of::<FrameBlock>();
 /// Отдельная arena для `vm_map`: она не пересекается с PIE image, bootstrap
 /// block и растущими вниз thread stacks.
 const USER_DYNAMIC_BASE: u64 = 0x0000_5000_0000_0000;
 const USER_DYNAMIC_END: u64 = 0x0000_7000_0000_0000;
 
 const EMPTY_BLOCK: FrameBlock = FrameBlock { phys: 0, frames: 0 };
+
+/// Один физический кадр метаданных описывает page-table frames,
+/// которыми владеет address space. Сам chunk в список не входит:
+/// иначе для его учёта потребовался бы ещё один chunk.
+#[repr(C)]
+struct OwnedFrameChunk {
+    next: u64,
+    len: u64,
+    blocks: [FrameBlock; OWNED_FRAMES_PER_CHUNK],
+}
+
+const _: () = assert!(core::mem::size_of::<OwnedFrameChunk>() == PAGE_SIZE as usize);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct UserPageFlags {
@@ -98,13 +110,17 @@ pub enum AddressSpaceError {
 
 pub struct AddressSpace {
     root: u64,
-    owned: [FrameBlock; MAX_OWNED_FRAMES],
-    owned_len: usize,
+    owned_head: FrameBlock,
+    owned_tail: FrameBlock,
     /// Трёхуровневый sparse registry user pages. Каждый уровень — обычный
     /// identity-mapped physical frame с 512 адресами следующего уровня.
     page_registry_root: FrameBlock,
     page_len: usize,
 }
+
+// AddressSpace часто перемещается по значению. Эта проверка не даст
+// случайно вернуть большой inline-array и снова переполнить kernel stack.
+const _: () = assert!(core::mem::size_of::<AddressSpace>() <= 128);
 
 impl AddressSpace {
     /// Создаёт новую корневую таблицу и разделяет supervisor-only mappings.
@@ -113,8 +129,8 @@ impl AddressSpace {
         unsafe { (page_registry_root.phys as *mut u8).write_bytes(0, PAGE_SIZE as usize) };
         let mut space = Self {
             root: 0,
-            owned: [EMPTY_BLOCK; MAX_OWNED_FRAMES],
-            owned_len: 0,
+            owned_head: EMPTY_BLOCK,
+            owned_tail: EMPTY_BLOCK,
             page_registry_root,
             page_len: 0,
         };
@@ -523,15 +539,41 @@ impl AddressSpace {
     }
 
     fn allocate_zeroed_frame(&mut self) -> Result<u64, AddressSpaceError> {
-        if self.owned_len == MAX_OWNED_FRAMES {
-            return Err(AddressSpaceError::TooManyMappings);
-        }
         let block = allocate(1, 1).map_err(|_| AddressSpaceError::OutOfMemory)?;
         // SAFETY: новый frame identity-mapped и эксклюзивно принадлежит space.
         unsafe { (block.phys as *mut u8).write_bytes(0, PAGE_SIZE as usize) };
-        self.owned[self.owned_len] = block;
-        self.owned_len += 1;
+        if let Err(error) = self.record_owned_frame(block) {
+            let _ = free(block);
+            return Err(error);
+        }
         Ok(block.phys)
+    }
+
+    fn record_owned_frame(&mut self, block: FrameBlock) -> Result<(), AddressSpaceError> {
+        let needs_chunk = self.owned_tail.phys == 0
+            || unsafe {
+                (*(self.owned_tail.phys as *const OwnedFrameChunk)).len as usize
+                    == OWNED_FRAMES_PER_CHUNK
+            };
+        if needs_chunk {
+            let chunk = allocate(1, 1).map_err(|_| AddressSpaceError::OutOfMemory)?;
+            unsafe { (chunk.phys as *mut u8).write_bytes(0, PAGE_SIZE as usize) };
+            if self.owned_tail.phys == 0 {
+                self.owned_head = chunk;
+            } else {
+                // SAFETY: tail — живой эксклюзивный metadata frame.
+                unsafe {
+                    (*(self.owned_tail.phys as *mut OwnedFrameChunk)).next = chunk.phys;
+                }
+            }
+            self.owned_tail = chunk;
+        }
+
+        // SAFETY: tail существует и в нём есть место, что проверено выше.
+        let tail = unsafe { &mut *(self.owned_tail.phys as *mut OwnedFrameChunk) };
+        tail.blocks[tail.len as usize] = block;
+        tail.len += 1;
+        Ok(())
     }
 
     fn ensure_user_table(&mut self, table: u64, index: usize) -> Result<u64, AddressSpaceError> {
@@ -585,9 +627,19 @@ impl AddressSpace {
     }
 
     fn owns_frame(&self, physical_address: u64) -> bool {
-        self.owned[..self.owned_len]
-            .iter()
-            .any(|block| block.phys == physical_address && block.frames == 1)
+        let mut chunk_phys = self.owned_head.phys;
+        while chunk_phys != 0 {
+            // SAFETY: цепочка создана record_owned_frame и жива до Drop.
+            let chunk = unsafe { &*(chunk_phys as *const OwnedFrameChunk) };
+            if chunk.blocks[..chunk.len as usize]
+                .iter()
+                .any(|block| block.phys == physical_address && block.frames == 1)
+            {
+                return true;
+            }
+            chunk_phys = chunk.next;
+        }
+        false
     }
 }
 
@@ -606,12 +658,24 @@ impl Drop for AddressSpace {
         }
         self.page_len = 0;
 
-        // Reverse order освобождает page-table children до root.
-        for index in (0..self.owned_len).rev() {
-            let _ = free(self.owned[index]);
-            self.owned[index] = EMPTY_BLOCK;
+        // Address space уже не активен, поэтому page-table frames можно
+        // освобождать в порядке цепочки. `next` считываем до возврата
+        // metadata frame аллокатору.
+        let mut chunk_phys = self.owned_head.phys;
+        while chunk_phys != 0 {
+            let chunk = unsafe { &*(chunk_phys as *const OwnedFrameChunk) };
+            let next = chunk.next;
+            for block in &chunk.blocks[..chunk.len as usize] {
+                let _ = free(*block);
+            }
+            let _ = free(FrameBlock {
+                phys: chunk_phys,
+                frames: 1,
+            });
+            chunk_phys = next;
         }
-        self.owned_len = 0;
+        self.owned_head = EMPTY_BLOCK;
+        self.owned_tail = EMPTY_BLOCK;
 
         free_registry_children(self.page_registry_root.phys, 3);
         let _ = free(self.page_registry_root);

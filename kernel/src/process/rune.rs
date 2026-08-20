@@ -164,11 +164,10 @@ fn validate_container(container: &Container<'_>, _slice: TocEntry) -> Result<(),
                     return Err(RuneError::InvalidRegion);
                 }
             }
-            record_kind::IMPORTS | record_kind::DEPENDENCIES => {
-                if entry.file_size != 0 {
-                    return Err(RuneError::UnsupportedImports);
-                }
+            record_kind::IMPORTS | record_kind::DEPENDENCIES if entry.file_size != 0 => {
+                return Err(RuneError::UnsupportedImports);
             }
+            record_kind::IMPORTS | record_kind::DEPENDENCIES => {}
             _ => {}
         }
     }
@@ -245,7 +244,7 @@ fn apply_relocations(space: &AddressSpace, container: &Container<'_>) -> Result<
         if !bytes.len().is_multiple_of(RELOCATION_SIZE) {
             return Err(RuneError::InvalidRelocation);
         }
-        for raw in bytes.chunks_exact(RELOCATION_SIZE) {
+        for raw in bytes.as_chunks::<RELOCATION_SIZE>().0 {
             let relocation = parse_relocation(raw).ok_or(RuneError::InvalidRelocation)?;
             if relocation.kind != relocation_kind::RELATIVE64 || relocation.symbol != 0 {
                 return Err(RuneError::UnsupportedRelocation);

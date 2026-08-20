@@ -1,9 +1,9 @@
-//! Безопасная оболочка над GRUB/firmware linear framebuffer.
+//! Software renderer поверх virtio-gpu либо GRUB/firmware framebuffer.
 //!
-//! GPU-драйвера пока нет: все примитивы рисуются CPU в обычный RAM back
-//! buffer. Видимый scanout framebuffer обновляется только методом [`present`],
-//! когда кадр уже полностью готов. Благодаря этому пользователь не видит,
-//! как compositor по частям стирает старое и рисует новое положение окна.
+//! Все примитивы рисуются CPU в обычный RAM back buffer. Virtio-gpu получает
+//! только damage через 2D transfer/flush; firmware fallback — готовые строки
+//! scanout. Благодаря этому пользователь не видит промежуточные стадии кадра,
+//! а mode-set не связан с rasterizer'ом или оконными компонентами.
 //!
 //! В одном месте сосредоточены unsafe-доступы к framebuffer, выбор памяти,
 //! clipping и упаковка RGB/BGR — остальная GUI-подсистема работает обычным
@@ -22,7 +22,11 @@ use rustos_video::{
     SurfaceMut,
 };
 
-use crate::memory;
+use crate::{
+    display::VirtioGpu,
+    memory::{self, FrameBlock},
+    serial,
+};
 
 /// Double-buffered renderer кадра (см. модуль и docs/GUI.md).
 ///
@@ -31,15 +35,19 @@ use crate::memory;
 pub struct Framebuffer {
     /// Видимый linear framebuffer. В него пишет только `present*`.
     front: *mut u8,
+    /// Native virtio scanout. `None` означает firmware framebuffer fallback.
+    gpu: Option<VirtioGpu>,
     /// Невидимый программный кадр в обычной usable RAM. Плотно упакован
     /// (stride = width), в отличие от scanout со своим stride.
     back: *mut u32,
+    back_block: FrameBlock,
     back_phys: u64,
     back_bytes: u64,
     /// Снимок статического desktop-слоя без окон и курсора. Он позволяет
     /// при drag восстановить только старое место окна, не перерисовывая
     /// миллион пикселей обоев на каждый пакет мыши.
     background: *mut u32,
+    background_block: Option<FrameBlock>,
     width: u32,
     height: u32,
     stride: u32,
@@ -60,44 +68,94 @@ impl Framebuffer {
     /// те же физические страницы.
     pub fn from_boot(boot: &BootInfo) -> Option<Self> {
         let info = &boot.framebuffer;
-        if info.phys_addr == 0
-            || info.width == 0
-            || info.height == 0
-            || info.bpp != 32
-            || !info.stride.is_multiple_of(4)
-            || info.stride < info.width.checked_mul(4)?
-            || !matches!(info.format, FRAMEBUFFER_FORMAT_RGB | FRAMEBUFFER_FORMAT_BGR)
-        {
+        let firmware_format = match info.format {
+            FRAMEBUFFER_FORMAT_RGB => Some(PixelFormat::Rgb888),
+            FRAMEBUFFER_FORMAT_BGR => Some(PixelFormat::Bgr888),
+            _ => None,
+        };
+        let firmware_valid = info.phys_addr != 0
+            && info.width != 0
+            && info.height != 0
+            && info.bpp == 32
+            && info.stride.is_multiple_of(4)
+            && info.stride >= info.width.checked_mul(4)?
+            && firmware_format.is_some();
+        let fallback = DisplayMode {
+            width: if firmware_valid { info.width } else { 1280 },
+            height: if firmware_valid { info.height } else { 720 },
+            stride_pixels: if firmware_valid {
+                info.stride / 4
+            } else {
+                1280
+            },
+            format: firmware_format.unwrap_or(PixelFormat::Bgr888),
+            refresh_millihertz: 0,
+        };
+        let gpu = match VirtioGpu::initialize(fallback) {
+            Ok(gpu) => {
+                serial::put_str("[video] virtio-gpu modern PCI controlq ready\n");
+                Some(gpu)
+            }
+            Err(_) => {
+                serial::put_str("[video] virtio-gpu unavailable; using firmware framebuffer\n");
+                None
+            }
+        };
+        if gpu.is_none() && !firmware_valid {
             return None;
         }
-        let format = match info.format {
-            FRAMEBUFFER_FORMAT_RGB => PixelFormat::Rgb888,
-            FRAMEBUFFER_FORMAT_BGR => PixelFormat::Bgr888,
-            _ => return None,
+        let selected = gpu.as_ref().map_or(fallback, VirtioGpu::mode);
+        let width = selected.width;
+        let height = selected.height;
+        let scanout_format = if gpu.is_some() {
+            PixelFormat::Bgr888
+        } else {
+            firmware_format?
         };
-
-        let back_bytes = u64::from(info.width)
-            .checked_mul(u64::from(info.height))?
-            .checked_mul(4)?;
-        let back_phys = reserve_back_buffer(back_bytes)?;
+        let stride = if gpu.is_some() {
+            width.checked_mul(4)?
+        } else {
+            info.stride
+        };
+        let back_bytes = frame_bytes(width, height)?;
+        let back_block = reserve_back_buffer(back_bytes)?;
+        let back = back_block.phys as *mut u32;
         // Кэш — оптимизация, а не условие работоспособности. На очень
         // большом framebuffer при минимуме RAM compositor корректно откатится к
         // полному redraw, если второй непрерывный диапазон получить нельзя.
-        let background = reserve_back_buffer(back_bytes)
-            .map(|block| block as *mut u32)
+        let background_block = reserve_back_buffer(back_bytes);
+        let background = background_block
+            .map(|block| block.phys as *mut u32)
             .unwrap_or_default();
+        unsafe {
+            core::ptr::write_bytes(
+                back.cast::<u8>(),
+                0,
+                (back_block.frames * PAGE_SIZE) as usize,
+            );
+            if let Some(block) = background_block {
+                core::ptr::write_bytes(
+                    block.phys as *mut u8,
+                    0,
+                    (block.frames * PAGE_SIZE) as usize,
+                );
+            }
+        }
 
         Some(Self {
             front: info.phys_addr as *mut u8,
-            back: back_phys as *mut u32,
-            back_phys,
+            gpu,
+            back,
+            back_block,
+            back_phys: back_block.phys,
             back_bytes,
             background,
-            width: info.width,
-            height: info.height,
-            stride: info.stride,
-            scanout_format: format,
-            render_format: format,
+            background_block,
+            width,
+            height,
+            stride,
+            scanout_format,
+            render_format: scanout_format,
             source: info._reserved,
             present_sequence: 0,
         })
@@ -130,7 +188,9 @@ impl Framebuffer {
 
     /// Имя bootstrap display driver'а для диагностики и GUI.
     pub const fn driver_name(&self) -> &'static str {
-        if self.source == FRAMEBUFFER_SOURCE_GRUB {
+        if self.gpu.is_some() {
+            "virtio-gpu"
+        } else if self.source == FRAMEBUFFER_SOURCE_GRUB {
             "grub-fb"
         } else {
             "uefi-gop"
@@ -367,12 +427,15 @@ impl Scanout for Framebuffer {
     }
 
     fn capabilities(&self) -> ScanoutCapabilities {
-        ScanoutCapabilities {
-            page_flip: false,
-            vsync_event: false,
-            hardware_cursor: false,
-            multiple_outputs: false,
-        }
+        self.gpu.as_ref().map_or(
+            ScanoutCapabilities {
+                page_flip: false,
+                vsync_event: false,
+                hardware_cursor: false,
+                multiple_outputs: false,
+            },
+            VirtioGpu::capabilities,
+        )
     }
 
     fn present(
@@ -383,6 +446,9 @@ impl Scanout for Framebuffer {
     ) -> Result<PresentStats, ScanoutError> {
         if source.width() != self.width || source.height() != self.height {
             return Err(ScanoutError::InvalidSurface);
+        }
+        if let Some(gpu) = self.gpu.as_mut() {
+            return gpu.present(source, damage, sequence);
         }
         let bounds = Rect::new(0, 0, self.width, self.height);
         if damage.len() == 1
@@ -456,6 +522,9 @@ impl Scanout for Framebuffer {
 
 impl DisplayDriver for Framebuffer {
     fn connector(&self) -> ConnectorInfo {
+        if let Some(gpu) = self.gpu.as_ref() {
+            return gpu.connector();
+        }
         ConnectorInfo {
             kind: ConnectorKind::FirmwareFramebuffer,
             connected: true,
@@ -466,6 +535,9 @@ impl DisplayDriver for Framebuffer {
     }
 
     fn modes(&self, output: &mut [DisplayMode]) -> usize {
+        if let Some(gpu) = self.gpu.as_ref() {
+            return gpu.modes(output);
+        }
         if let Some(first) = output.first_mut() {
             *first = self.mode();
             1
@@ -480,19 +552,90 @@ impl DisplayDriver for Framebuffer {
             && requested.height == current.height
             && requested.format == current.format
         {
-            Ok(current)
-        } else {
-            Err(ModeSetError::RequiresReboot)
+            return Ok(current);
         }
+        let Some(gpu) = self.gpu.as_mut() else {
+            return Err(ModeSetError::RequiresReboot);
+        };
+        let bytes =
+            frame_bytes(requested.width, requested.height).ok_or(ModeSetError::UnsupportedMode)?;
+        let new_back = reserve_back_buffer(bytes).ok_or(ModeSetError::OutOfMemory)?;
+        let new_background = reserve_back_buffer(bytes);
+        if let Err(error) = gpu.set_mode(requested) {
+            let _ = memory::free(new_back);
+            if let Some(block) = new_background {
+                let _ = memory::free(block);
+            }
+            return Err(error);
+        }
+        unsafe {
+            core::ptr::write_bytes(
+                new_back.phys as *mut u8,
+                0,
+                (new_back.frames * PAGE_SIZE) as usize,
+            );
+            if let Some(block) = new_background {
+                core::ptr::write_bytes(
+                    block.phys as *mut u8,
+                    0,
+                    (block.frames * PAGE_SIZE) as usize,
+                );
+            }
+        }
+        let old_back = self.back_block;
+        let old_background = self.background_block;
+        self.back_block = new_back;
+        self.back = new_back.phys as *mut u32;
+        self.back_phys = new_back.phys;
+        self.back_bytes = bytes;
+        self.background_block = new_background;
+        self.background = new_background
+            .map(|block| block.phys as *mut u32)
+            .unwrap_or_default();
+        self.width = requested.width;
+        self.height = requested.height;
+        self.stride = requested.width * 4;
+        self.scanout_format = PixelFormat::Bgr888;
+        if matches!(
+            self.render_format,
+            PixelFormat::Rgb888 | PixelFormat::Bgr888
+        ) {
+            self.render_format = PixelFormat::Bgr888;
+        }
+        let _ = memory::free(old_back);
+        if let Some(block) = old_background {
+            let _ = memory::free(block);
+        }
+        Ok(self.mode())
+    }
+}
+
+impl Drop for Framebuffer {
+    fn drop(&mut self) {
+        // GUI session обычно живёт до shutdown, но владение должно
+        // оставаться корректным и для будущего перезапуска displayd.
+        let _ = memory::free(self.back_block);
+        self.back_block = FrameBlock { phys: 0, frames: 0 };
+        if let Some(block) = self.background_block.take() {
+            let _ = memory::free(block);
+        }
+        self.back = core::ptr::null_mut();
+        self.background = core::ptr::null_mut();
     }
 }
 
 /// Выбирает page-aligned диапазон RAM под кадр, не вводя фиксированного
 /// ограничения на разрешение. Для 4K потребуется около 32 MiB, для
 /// 1280x800 — около 4 MiB; размер автоматически следует monitor mode.
-fn reserve_back_buffer(bytes: u64) -> Option<u64> {
+fn reserve_back_buffer(bytes: u64) -> Option<FrameBlock> {
     let frames = bytes.checked_add(PAGE_SIZE - 1)? / PAGE_SIZE;
-    memory::allocate(frames, 1).ok().map(|block| block.phys)
+    memory::allocate(frames, 1).ok()
+}
+
+fn frame_bytes(width: u32, height: u32) -> Option<u64> {
+    u64::from(width)
+        .checked_mul(u64::from(height))?
+        .checked_mul(4)
 }
 
 // MMIO framebuffer принадлежит одному GUI-сеансу CPU0; между потоками этот

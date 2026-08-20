@@ -736,8 +736,7 @@ impl ProcessManager {
             .ok_or(())?;
         let tls_alignment = loaded
             .tls_template
-            .map(|template| usize::try_from(template.alignment).ok())
-            .flatten()
+            .and_then(|template| usize::try_from(template.alignment).ok())
             .unwrap_or(1);
         let tls_address_offset = align_up_usize(capabilities_end, tls_alignment).ok_or(())?;
         let total = tls_address_offset
@@ -1243,11 +1242,10 @@ impl ProcessManager {
                 }
             }
         }
-        if woke_waiter {
-            self.deferred_thread_reap = Some(tid);
-        } else if self.threads[index]
-            .as_ref()
-            .is_some_and(|thread| thread.detached)
+        if woke_waiter
+            || self.threads[index]
+                .as_ref()
+                .is_some_and(|thread| thread.detached)
         {
             self.deferred_thread_reap = Some(tid);
         }

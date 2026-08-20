@@ -13,6 +13,7 @@ mod geometry;
 mod pixel;
 mod scanout;
 mod surface;
+mod window;
 
 pub use compositor::{composite, Layer};
 pub use damage::DamageRegion;
@@ -23,3 +24,6 @@ pub use scanout::{
     PresentStats, Scanout, ScanoutCapabilities, ScanoutError,
 };
 pub use surface::{Surface, SurfaceError, SurfaceMut};
+pub use window::{
+    hit_test_resize, resize_from_edges, ManagedWindow, ResizeEdges, WindowError, WindowEventQueue,
+};

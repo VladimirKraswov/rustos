@@ -56,8 +56,7 @@ pub extern "C" fn _start(start_address: u64, abi_version: u64, _reserved: u64) -
 
 fn validate_start_info(address: u64, abi_version: u64) -> Option<&'static ProcessStartInfo> {
     if abi_version != rustos_abi::syscall::ABI_VERSION
-        || address < 0x1_0000
-        || address >= 0x0000_8000_0000_0000
+        || !(0x1_0000..0x0000_8000_0000_0000).contains(&address)
         || !address.is_multiple_of(core::mem::align_of::<ProcessStartInfo>() as u64)
     {
         return None;

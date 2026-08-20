@@ -24,7 +24,9 @@ echo "[arch-check] assembler boundary: OK"
 for arch in x86_64 aarch64; do
     target="targets/${arch}-unknown-rustos.json"
     echo "[arch-check] ${arch}: kernel + runtime + bootstrap applications"
-    cargo -Zjson-target-spec -Zbuild-std=core build \
+    # rune-runner и vfsd используют `alloc`, поэтому architecture
+    # gate должен собирать тот же freestanding sysroot, что и build.sh.
+    cargo -Zjson-target-spec -Zbuild-std=core,alloc build \
         -p rustos-kernel -p rustos-runtime -p rustos-bootstrap-apps \
         --target "$target"
 done

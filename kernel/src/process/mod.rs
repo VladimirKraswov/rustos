@@ -133,6 +133,28 @@ pub enum ProcessError {
     FrameLeak,
 }
 
+impl ProcessError {
+    pub const fn label(&self) -> &'static str {
+        match self {
+            Self::MissingImage => "missing-image",
+            Self::AddressSpace => "address-space",
+            Self::InvalidImage => "invalid-image",
+            Self::UnexpectedExit => "unexpected-exit",
+            Self::FrameLeak => "frame-leak",
+        }
+    }
+
+    pub const fn diagnostic_code(&self) -> u8 {
+        match self {
+            Self::MissingImage => 0x54,
+            Self::AddressSpace => 0x55,
+            Self::InvalidImage => 0x56,
+            Self::UnexpectedExit => 0x57,
+            Self::FrameLeak => 0x58,
+        }
+    }
+}
+
 /// Результат программы, запущенной из интерактивной GUI-сессии.
 #[derive(Clone, Copy, Debug)]
 pub struct InteractiveExit {

@@ -235,6 +235,9 @@ dependencies = [
 [[package]]
 name = "rustos-video"
 version = "0.1.0"
+dependencies = [
+ "rustos-abi",
+]
 
 [[package]]
 name = "syn"

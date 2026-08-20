@@ -95,3 +95,36 @@ pub fn trigger_test_fault() -> ! {
 pub fn trigger_test_fault() -> ! {
     unsafe { core::arch::asm!("brk #0", options(noreturn)) }
 }
+
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn jump_to_image(entry: u64, stack: u64, start_info: u64, abi: u64) -> ! {
+    unsafe {
+        core::arch::asm!(
+            "mov rsp, {stack}",
+            "xor rbp, rbp",
+            "jmp {entry}",
+            stack = in(reg) stack,
+            entry = in(reg) entry,
+            in("rdi") start_info,
+            in("rsi") abi,
+            in("rdx") 0u64,
+            options(noreturn)
+        )
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+pub unsafe fn jump_to_image(entry: u64, stack: u64, start_info: u64, abi: u64) -> ! {
+    unsafe {
+        core::arch::asm!(
+            "mov sp, {stack}",
+            "br {entry}",
+            stack = in(reg) stack,
+            entry = in(reg) entry,
+            in("x0") start_info,
+            in("x1") abi,
+            in("x2") 0u64,
+            options(noreturn)
+        )
+    }
+}

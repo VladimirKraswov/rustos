@@ -13,6 +13,7 @@ mod apps;
 mod arch;
 mod block;
 mod boot;
+mod display;
 mod font;
 mod fs;
 mod graphics;

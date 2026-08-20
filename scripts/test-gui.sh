@@ -96,7 +96,7 @@ stop_qemu() {
 cleanup() {
     trap - EXIT INT TERM HUP
     stop_qemu
-    for file in serial.log qemu-stderr.log terminal.ppm dragged.ppm minimized.ppm; do
+    for file in serial.log qemu-stderr.log mode-720.ppm terminal.ppm dragged.ppm resized.ppm minimized.ppm; do
         [[ -f "$RUN_DIR/$file" ]] && cp -f "$RUN_DIR/$file" "$RESULT_DIR/$file"
     done
 }
@@ -130,7 +130,7 @@ done
     exit 1
 }
 grep -q '\[microkernel\] RING3_MILESTONE_OK' "$RUN_DIR/serial.log"
-grep -Eq '\[video\] scanout=grub-fb mode=[1-9][0-9]*x[1-9][0-9]* format=(rgb888|bgr888) present=immediate page-flip=no' \
+grep -Eq '\[video\] scanout=virtio-gpu mode=1280x800 format=bgr888 present=immediate page-flip=no' \
     "$RUN_DIR/serial.log"
 grep -q '\[isolation\] user #UD contained; kernel and GUI continue' "$RUN_DIR/serial.log"
 grep -q '\[memory\] user address spaces reclaimed' "$RUN_DIR/serial.log"
@@ -148,13 +148,23 @@ wait_for_serial '[terminal] command: help'
 # Display manager: monitor info, runtime software color profile and honest
 # firmware mode-set boundary. Возвращаем truecolor до screenshot-проверок.
 send_command 'display'
-wait_for_serial '[display] info driver=grub-fb mode='
+wait_for_serial '[display] info driver=virtio-gpu mode=1280x800'
+send_command 'display modes'
+wait_for_serial '[display] modes count='
 send_command 'display color gray8'
 wait_for_serial '[display] color=gray8'
 send_command 'display color truecolor'
 wait_for_serial '[display] color=truecolor24'
 send_command 'display mode 1280x720'
-wait_for_serial '[display] mode request=1280x720 result=reboot-required'
+wait_for_serial '[display] mode request=1280x720 result=active'
+sleep 0.25
+printf 'screendump %s/mode-720.ppm\n' "$RUN_DIR" | hmp
+[[ "$(sed -n '2p' "$RUN_DIR/mode-720.ppm")" == "1280 720" ]] || {
+    echo "[gui-test] native mode-set did not resize QEMU surface to 1280x720" >&2
+    exit 1
+}
+send_command 'display mode 1280x800'
+wait_for_serial '[display] mode request=1280x800 result=active'
 
 # Полный bootstrap filesystem workflow: initramfs listing, RAM-file write,
 # read и cwd-relative source directory. Проверяем не только shell parser, но
@@ -182,9 +192,10 @@ sleep 0.25
 printf 'screendump %s/terminal.ppm\n' "$RUN_DIR" \
     | hmp
 
-# Настоящий drag: курсор стартует в центре 1280x800. Перемещаемся на
-# заголовок, удерживаем левую кнопку и сдвигаем окно вправо-вниз.
-printf 'mouse_move 0 -325\n' | hmp
+# Настоящий drag: курсор стартует в центре 1280x800. После round-trip через
+# режим 1280x720 window reflow оставляет верх окна на y=26, поэтому целимся в
+# середину title bar около y=43 и сдвигаем окно вправо-вниз.
+printf 'mouse_move 0 -357\n' | hmp
 sleep 0.1
 printf 'mouse_button 1\n' | hmp
 for _ in $(seq 1 40); do
@@ -212,9 +223,28 @@ grep -Eq '\[wm\] terminal drag finished frames=[1-9][0-9]* packets=[1-9][0-9]* p
 sleep 0.25
 printf 'screendump %s/dragged.ppm\n' "$RUN_DIR" | hmp
 
-# После drag курсор находится около (760,155), а окно упёрлось в правую
-# границу и целиком осталось над taskbar. Перемещаемся к minimize-кнопке.
-printf 'mouse_move 435 -20\n' | hmp
+# Resize за правый верхний угол проверяет обе оси и тот же bounded preview
+# compositor. Курсор после drag около (760,123), corner — около (1279,106).
+printf 'mouse_move 519 -17\n' | hmp
+sleep 0.1
+printf 'mouse_button 1\n' | hmp
+wait_for_serial '[wm] terminal resize started'
+resize_commands=""
+for _ in $(seq 1 4); do
+    resize_commands="${resize_commands}mouse_move -10 8\n"
+done
+printf '%b' "$resize_commands" | hmp 30
+sleep 0.2
+printf 'mouse_button 0\n' | hmp
+wait_for_serial '[wm] terminal resize finished'
+grep -Eq '\[wm\] terminal resize finished frames=[1-9][0-9]* packets=[1-9][0-9]* present-kpx=[1-9][0-9]* compositor=preview' \
+    "$RUN_DIR/serial.log"
+sleep 0.25
+printf 'screendump %s/resized.ppm\n' "$RUN_DIR" | hmp
+
+# После corner resize окно имеет приблизительно x=240, y=138, width=1000.
+# Курсор около (1239,138); перемещаемся к новой позиции minimize-кнопки.
+printf 'mouse_move -80 16\n' | hmp
 sleep 0.2
 printf 'mouse_button 1\nmouse_button 0\n' | hmp
 for _ in $(seq 1 40); do
@@ -236,4 +266,4 @@ for _ in $(seq 1 20); do
     sleep 0.1
 done
 stop_qemu
-echo "[gui-test] PASS: keyboard, VFS + ring3 RUN, buffered drag and minimize"
+echo "[gui-test] PASS: keyboard, VFS + ring3 RUN, buffered drag/resize and minimize"
