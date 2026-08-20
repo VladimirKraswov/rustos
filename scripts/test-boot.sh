@@ -71,6 +71,8 @@ qemu-system-x86_64 \
     -accel "$ACCEL" \
     -drive if=pflash,format=raw,readonly=on,file=build/ovmf/OVMF_CODE.fd \
     -drive if=pflash,format=raw,file="$VARS" \
+    -drive if=none,id=systemdisk,format=raw,file=build/system.vfs \
+    -device virtio-blk-pci,drive=systemdisk,disable-modern=on,addr=0x5 \
     -drive if=virtio,format=raw,readonly=on,file=build/esp.img \
     -device isa-debug-exit,iobase=0xf4,iosize=0x04 \
     -serial file:"$LOG" -display none -no-reboot \
@@ -123,7 +125,10 @@ patterns=(
     "\[preempt\] timer ticks=[1-9][0-9]* context-switches=[1-9][0-9]*"
     "\[isolation\] concurrent #UD terminated one process; survivor exited=22"
     "\[ipc\] queued block/wake and attenuated VFS capability verified"
-    "\[abi-v2\] spawn/wait/kill threads VM shared-memory TLS clock verified"
+    "\[abi-v4\] spawn/wait/kill threads VM shared-memory TLS clock verified"
+    "\[vfsd\] open/read/write/seek/readdir/create/rename over shared memory verified"
+    "\[vfsd\] restart recovered committed VaraniaFS metadata and file data"
+    "\[loader\] DT_NEEDED symbols RELA TLS RELRO and cross-process shared RX verified"
     "\[process-manager\] dynamic create/exit/reap reclaimed all frames"
     "\[scheduler\] priority, affinity and fault-containment policy verified"
     "\[microkernel\] RING3_MILESTONE_OK"

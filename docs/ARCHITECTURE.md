@@ -72,9 +72,11 @@ MADT перечисляет CPU, BSP последовательно выполн
    capability transfer;
 5. **bootstrap готов:** AP startup; дальше per-CPU TSS/IDT, timer queues,
    TLB shootdown и work stealing;
-6. shared-memory IPC, process create/kill/wait syscalls и supervisor manifests;
-7. `vfsd`, persistent filesystem и dynamic loader;
-8. target `std`, native Rust toolchain и package/build services;
+6. **готово:** shared-memory IPC и process create/kill/wait syscalls;
+7. **готово:** изолированный `vfsd`, persistent VaraniaFS и user-space
+   dynamic loader (`DT_NEEDED`, symbols, TLS, RELRO, shared RX);
+8. полный `exec` через VFS, target `std`, native Rust toolchain и
+   package/build services;
 9. `inputd`, `displayd`, compositor и terminal как отдельные процессы;
 10. supervisor применяет restart policy к реальным service manifests.
 

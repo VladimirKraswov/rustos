@@ -1,0 +1,18 @@
+[package]
+name = "rustos-vfs-dll"
+description = "ELF64 ET_DYN system client library vfs-1.dll"
+build = "build.rs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lib]
+name = "vfs_1"
+path = "src/lib.rs"
+crate-type = ["cdylib"]
+
+[dependencies]
+rustos-abi = { path = "../../abi" }
+rustos-vfs-client = { path = "../vfs" }

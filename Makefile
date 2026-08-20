@@ -25,7 +25,7 @@ boot: run
 test: test-host test-arch test-boot test-gui
 
 test-host:
-	cargo test -p rustos-abi -p rustos-microkernel -p rustos-video -p rustos-pack -p rustos-image -p rustos-gui-check -p rustos-hmp
+	cargo test -p rustos-abi -p rustos-microkernel -p rustos-video -p rustos-pack -p rustos-image -p rustos-gui-check -p rustos-hmp -p varaniafs -p rustos-vfs-image
 
 test-arch:
 	bash scripts/check-architectures.sh
@@ -42,9 +42,9 @@ format:
 
 lint:
 	cargo fmt --all -- --check
-	cargo clippy -p rustos-abi -p rustos-microkernel -p rustos-video -p rustos-pack -p rustos-image -p rustos-gui-check -p rustos-hmp --all-targets -- -D warnings
-	cargo clippy -Zjson-target-spec -Zbuild-std=core -p rustos-kernel -p rustos-runtime -p rustos-bootstrap-apps --target targets/x86_64-unknown-rustos.json -- -D warnings
-	cargo clippy -Zjson-target-spec -Zbuild-std=core -p rustos-kernel -p rustos-runtime -p rustos-bootstrap-apps --target targets/aarch64-unknown-rustos.json -- -D warnings
+	cargo clippy -p rustos-abi -p rustos-microkernel -p rustos-video -p rustos-pack -p rustos-image -p rustos-gui-check -p rustos-hmp -p varaniafs -p rustos-vfs-image --all-targets -- -D warnings
+	cargo clippy -Zjson-target-spec -Zbuild-std=core -p rustos-kernel -p rustos-runtime -p rustos-bootstrap-apps -p rustos-vfs-client -p rustos-vfs-dll -p rustos-elf-loader --target targets/x86_64-unknown-rustos.json -- -D warnings
+	cargo clippy -Zjson-target-spec -Zbuild-std=core -p rustos-kernel -p rustos-runtime -p rustos-bootstrap-apps -p rustos-vfs-client -p rustos-vfs-dll -p rustos-elf-loader --target targets/aarch64-unknown-rustos.json -- -D warnings
 	cargo clippy -p rustos-boot --target x86_64-unknown-uefi -- -D warnings
 
 clean:

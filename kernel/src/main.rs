@@ -11,6 +11,7 @@
 
 mod apps;
 mod arch;
+mod block;
 mod boot;
 mod font;
 mod fs;

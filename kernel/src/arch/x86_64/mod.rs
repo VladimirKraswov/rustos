@@ -322,6 +322,26 @@ pub unsafe fn inb(port: u16) -> u8 {
     val
 }
 
+/// Чтение 16-битного I/O-регистра PCI/virtio устройства.
+#[inline]
+pub unsafe fn inw(port: u16) -> u16 {
+    let value: u16;
+    unsafe {
+        core::arch::asm!("in ax, dx", out("ax") value, in("dx") port, options(nomem, nostack))
+    };
+    value
+}
+
+/// Чтение 32-битного I/O-регистра PCI/virtio устройства.
+#[inline]
+pub unsafe fn inl(port: u16) -> u32 {
+    let value: u32;
+    unsafe {
+        core::arch::asm!("in eax, dx", out("eax") value, in("dx") port, options(nomem, nostack))
+    };
+    value
+}
+
 /// Запись 8-битного значения в IO-порт.
 ///
 /// # Safety
@@ -355,4 +375,12 @@ pub unsafe fn outw(port: u16, val: u16) {
             options(nomem, nostack)
         );
     }
+}
+
+/// Запись 32-битного I/O-регистра PCI/virtio устройства.
+#[inline]
+pub unsafe fn outl(port: u16, val: u32) {
+    unsafe {
+        core::arch::asm!("out dx, eax", in("eax") val, in("dx") port, options(nomem, nostack))
+    };
 }

@@ -14,6 +14,12 @@ members = [
     "microkernel",
     "video",
     "runtime",
+    "varaniafs",
+    "libs/vfs",
+    "libs/vfs-dll",
+    "libs/elf-loader",
+    "libs/loader-fixture",
+    "libs/loader-root",
     "userspace/bootstrap",
     "kernel",
     "boot/uefi",
@@ -21,6 +27,7 @@ members = [
     "tools/pack",
     "tools/gui-check",
     "tools/hmp",
+    "tools/vfs-image",
 ]
 
 [workspace.package]

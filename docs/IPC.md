@@ -41,18 +41,24 @@ FIFO и attenuation находятся в platform-independent crate
 `rustos-microkernel`, поэтому проходят host unit tests. Pointer validation,
 CR3, block/wake и физическая доставка проверяются QEMU boot-тестом.
 
-## Следующее расширение
+## Shared-memory data plane
 
-Inline IPC предназначен для control plane. Файлы, framebuffer damage regions
-и compiler artifacts не должны копироваться по 64 байта. Следующая версия
-добавит shared-memory object capabilities:
+Inline IPC предназначен для control plane. Shared-memory object capabilities
+уже используются VFS: `vfs-1.dll` создаёт и отображает reusable окно 64 КиБ,
+а в сообщении передаёт производный `READ | WRITE | MAP` handle, offset и
+length. `vfsd` отображает окно только на время запроса, выполняет потоковый
+I/O и закрывает переданную capability на всех путях, включая ошибки. Файл
+70 000 байт в boot-test гарантированно проходит несколькими chunks.
+
+Та же схема предназначена для framebuffer damage regions и compiler
+artifacts:
 
 ```text
 sender maps RW -> seals/attenuates -> sends MAP|READ handle
 receiver maps RO -> processes bytes -> reply/release
 ```
 
-Также нужны endpoint create/destroy syscalls, multi-wait, cancellation,
-timeouts, priority inheritance для synchronous call/reply и revoke tree.
-Текущий bootstrap endpoint создаёт process manager; user-facing factory будет
-capability-защищённым API supervisor'а.
+Следующие расширения IPC — user-facing endpoint factory, multi-wait,
+cancellation/timeouts, priority inheritance для synchronous call/reply и
+полное revoke tree. Текущие bootstrap endpoints для `vfsd` создаёт process
+manager; supervisor должен будет переиздавать их после restart сервиса.

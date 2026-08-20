@@ -1,122 +1,179 @@
-//! Версионированный протокол между `vfs.dll` и user-space сервером `vfsd`.
+//! Версионированный RPC-протокол `vfs.dll <-> vfsd`.
 //!
-//! Пути и file payload не встраиваются в IPC-сообщение. Клиент передаёт
-//! capability на shared buffer и диапазон внутри него. Это одинаково хорошо
-//! работает для коротких имён и многомегабайтных файлов компилятора.
+//! IPC остаётся control plane: пути и file payload находятся в shared memory.
+//! `VfsObject` является непрозрачным server-side file description, а не
+//! kernel handle; `vfsd` связывает его с PID, поэтому чужой token бесполезен.
 
-use crate::Handle;
+#![allow(missing_docs)] // Полная таблица операций приведена в docs/VFS.md.
 
 /// Версия VFS service protocol.
-pub const VFS_ABI_VERSION: u32 = 1;
+pub const VFS_ABI_VERSION: u16 = 2;
 
-/// Коды операций VFS protocol.
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VfsObject(pub u64);
+
+impl VfsObject {
+    pub const ROOT: Self = Self(0);
+    pub const INVALID: Self = Self(u64::MAX);
+}
+
 pub mod opcode {
-    /// Открыть файл или каталог относительно directory capability.
     pub const OPEN: u16 = 1;
-    /// Закрыть file description; сам handle также можно закрыть syscall'ом.
     pub const CLOSE: u16 = 2;
-    /// Прочитать данные в shared buffer.
     pub const READ: u16 = 3;
-    /// Записать данные из shared buffer.
     pub const WRITE: u16 = 4;
-    /// Получить метаданные объекта.
     pub const STAT: u16 = 5;
-    /// Прочитать следующую порцию directory entries.
     pub const READ_DIR: u16 = 6;
-    /// Создать каталог.
     pub const MAKE_DIR: u16 = 7;
-    /// Удалить имя из каталога.
     pub const UNLINK: u16 = 8;
-    /// Атомарно переименовать или переместить объект.
     pub const RENAME: u16 = 9;
-    /// Синхронизировать файл или весь mount с устройством.
     pub const SYNC: u16 = 10;
+    pub const SEEK: u16 = 11;
+    /// Test/supervisor control: корректно синхронизировать и завершить vfsd.
+    pub const SHUTDOWN: u16 = 0xff;
 }
 
-/// Ссылка на UTF-8 путь внутри shared-memory buffer.
-#[repr(C)]
-#[derive(Clone, Copy, Debug)]
-pub struct PathRef {
-    /// Shared-memory capability.
-    pub buffer: Handle,
-    /// Зарезервировано для выравнивания, должно быть нулём.
-    pub reserved: u32,
-    /// Смещение первого байта пути в buffer.
-    pub offset: u64,
-    /// Длина пути без завершающего NUL.
-    pub length: u32,
-    /// Флаги кодировки; в v1 должно быть нулём (UTF-8).
-    pub flags: u32,
+pub mod status {
+    pub const OK: i32 = 0;
+    pub const INVALID_ARGUMENT: i32 = -100;
+    pub const NOT_FOUND: i32 = -101;
+    pub const ALREADY_EXISTS: i32 = -102;
+    pub const NOT_DIRECTORY: i32 = -103;
+    pub const IS_DIRECTORY: i32 = -104;
+    pub const NOT_EMPTY: i32 = -105;
+    pub const READ_ONLY: i32 = -106;
+    pub const NO_SPACE: i32 = -107;
+    pub const BAD_OBJECT: i32 = -108;
+    pub const IO: i32 = -109;
+    pub const LIMIT_REACHED: i32 = -110;
+    pub const PROTOCOL: i32 = -111;
 }
 
-/// Запрос открытия пути.
-#[repr(C)]
-#[derive(Clone, Copy, Debug)]
-pub struct OpenRequest {
-    /// Directory capability или [`Handle::INVALID`] для process root.
-    pub directory: Handle,
-    /// Флаги из модуля [`open_flags`].
-    pub open_flags: u32,
-    /// Путь относительно `directory`.
-    pub path: PathRef,
-    /// Желаемые права нового file capability.
-    pub requested_rights: u64,
+pub mod object_kind {
+    pub const NONE: u32 = 0;
+    pub const FILE: u32 = 1;
+    pub const DIRECTORY: u32 = 2;
 }
 
-/// Запрос потокового чтения или записи.
-#[repr(C)]
-#[derive(Clone, Copy, Debug)]
-pub struct IoRequest {
-    /// Capability открытого файла.
-    pub file: Handle,
-    /// Shared-memory capability для данных.
-    pub buffer: Handle,
-    /// Смещение в shared buffer.
-    pub buffer_offset: u64,
-    /// Максимальное число байт операции.
-    pub length: u64,
-    /// Смещение в файле или `u64::MAX` для текущей позиции description.
-    pub file_offset: u64,
-}
-
-/// Унифицированный ответ VFS.
-#[repr(C)]
-#[derive(Clone, Copy, Debug)]
-pub struct Reply {
-    /// Ноль при успехе, отрицательный код ошибки при отказе.
-    pub status: i32,
-    /// Тип возвращаемого объекта; 0 — объект не возвращается. Набор
-    /// значений определяется протоколом VFS (см. docs/VFS.md).
-    pub object_kind: u32,
-    /// Новый file/directory capability либо [`Handle::INVALID`].
-    pub handle: Handle,
-    /// Зарезервировано, должно быть нулём.
-    pub reserved: u32,
-    /// Число обработанных байт или размер объекта.
-    pub value: u64,
-    /// Дополнительное versioned значение операции.
-    pub auxiliary: u64,
-}
-
-/// Флаги [`OpenRequest::open_flags`].
 pub mod open_flags {
-    /// Открыть для чтения.
     pub const READ: u32 = 1 << 0;
-    /// Открыть для записи.
     pub const WRITE: u32 = 1 << 1;
-    /// Создать отсутствующий файл.
     pub const CREATE: u32 = 1 << 2;
-    /// Требовать отсутствия файла при CREATE.
     pub const EXCLUSIVE: u32 = 1 << 3;
-    /// Обрезать существующий файл до нулевой длины.
     pub const TRUNCATE: u32 = 1 << 4;
-    /// Позиционировать каждую запись в конец файла.
     pub const APPEND: u32 = 1 << 5;
-    /// Требовать каталог, а не обычный файл.
     pub const DIRECTORY: u32 = 1 << 6;
 }
 
-const _: () = assert!(core::mem::size_of::<PathRef>() == 24);
-const _: () = assert!(core::mem::size_of::<OpenRequest>() == 40);
+pub mod seek_from {
+    pub const START: u32 = 0;
+    pub const CURRENT: u32 = 1;
+    pub const END: u32 = 2;
+}
+
+/// Путь лежит в переданном shared-memory object. Capability самого объекта —
+/// `message.handles[1]`; slot 0 зарезервирован reply endpoint'у.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct PathRequest {
+    pub directory: VfsObject,
+    pub path_offset: u64,
+    pub path_length: u32,
+    pub flags: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct OpenRequest {
+    pub directory: VfsObject,
+    pub path_offset: u64,
+    pub path_length: u32,
+    pub open_flags: u32,
+    pub reserved: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct IoRequest {
+    pub file: VfsObject,
+    pub buffer_offset: u64,
+    pub length: u64,
+    /// `u64::MAX` использует и обновляет текущую позицию description.
+    pub file_offset: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct SeekRequest {
+    pub file: VfsObject,
+    pub offset: i64,
+    pub whence: u32,
+    pub reserved: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct RenameRequest {
+    pub old_directory: VfsObject,
+    pub new_directory: VfsObject,
+    pub old_offset: u64,
+    pub new_offset: u64,
+    pub old_length: u32,
+    pub new_length: u32,
+    pub flags: u32,
+    pub reserved: u32,
+}
+
+/// Унифицированный inline-ответ.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct Reply {
+    pub status: i32,
+    pub object_kind: u32,
+    pub object: VfsObject,
+    /// Bytes processed, size, position либо число directory records.
+    pub value: u64,
+    pub auxiliary: u64,
+}
+
+impl Reply {
+    pub const EMPTY: Self = Self {
+        status: status::PROTOCOL,
+        object_kind: object_kind::NONE,
+        object: VfsObject::INVALID,
+        value: 0,
+        auxiliary: 0,
+    };
+}
+
+/// Один `readdir` record в shared memory. Имя не NUL-terminated.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct DirectoryEntry {
+    pub object: VfsObject,
+    pub size: u64,
+    pub kind: u32,
+    pub name_length: u16,
+    pub reserved: u16,
+    pub name: [u8; 232],
+}
+
+impl DirectoryEntry {
+    pub const EMPTY: Self = Self {
+        object: VfsObject::INVALID,
+        size: 0,
+        kind: object_kind::NONE,
+        name_length: 0,
+        reserved: 0,
+        name: [0; 232],
+    };
+}
+
+const _: () = assert!(core::mem::size_of::<PathRequest>() == 24);
+const _: () = assert!(core::mem::size_of::<OpenRequest>() == 32);
 const _: () = assert!(core::mem::size_of::<IoRequest>() == 32);
+const _: () = assert!(core::mem::size_of::<SeekRequest>() == 24);
+const _: () = assert!(core::mem::size_of::<RenameRequest>() == 48);
 const _: () = assert!(core::mem::size_of::<Reply>() == 32);
+const _: () = assert!(core::mem::size_of::<DirectoryEntry>() == 256);

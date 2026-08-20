@@ -1,0 +1,17 @@
+[package]
+name = "rustos-vfs-client"
+description = "vfs-1.dll client facade hiding capability IPC and shared-memory streaming"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lib]
+name = "rustos_vfs"
+path = "src/lib.rs"
+crate-type = ["rlib"]
+
+[dependencies]
+rustos-abi = { path = "../../abi" }
+rustos-runtime = { path = "../../runtime" }

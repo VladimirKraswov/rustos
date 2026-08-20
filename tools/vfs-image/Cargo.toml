@@ -1,0 +1,15 @@
+[package]
+name = "rustos-vfs-image"
+description = "Create and verify persistent VaraniaFS images"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+varaniafs = { path = "../../varaniafs" }
+
+[[bin]]
+name = "rustos-vfs-image"
+path = "src/main.rs"

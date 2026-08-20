@@ -32,6 +32,8 @@ pub(super) enum CapabilityKind {
     Process(ProcessId),
     Thread(rustos_abi::ThreadId),
     SharedMemory(u16),
+    /// Raw block device выдаётся только storage service, не приложениям.
+    BlockDevice(u8),
 }
 
 #[derive(Clone, Copy)]

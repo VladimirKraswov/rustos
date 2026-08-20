@@ -1,4 +1,4 @@
-# Процессы, потоки и память: syscall ABI v2
+# Процессы, потоки и память: syscall ABI v4
 
 Этот документ описывает первый исполняемый ABI RustOS, достаточный для
 построения `std::process`, `std::thread`, allocator и zero-copy IPC. Общие
@@ -74,6 +74,12 @@ Shared memory — отдельный kernel object с собственными �
 `shared_memory_map` одновременно проверяет права capability, максимальные
 права объекта, offset/length, свободный user range и W^X.
 
+`shared_memory_seal(handle, READ [| EXECUTE])` поддерживает безопасный DLL
+page cache. Object создаётся RW, заполняется ровно одним владельцем, его RW
+mapping снимается, после чего seal необратимо убирает WRITE. Операция требует
+один capability reference и ноль mappings; kernel заменяет authority handle
+на R/RX. Добавить WRITE обратно или одновременно держать W и X невозможно.
+
 Capability references и mapping references считаются раздельно. Поэтому
 `handle_close` не освобождает кадр, пока он отображён, а завершение процесса
 снимает mapping references даже у приложения, забывшего `vm_unmap`. Последние
@@ -109,6 +115,6 @@ make test-boot
 Критерий прохождения в serial log:
 
 ```text
-[abi-v2] spawn/wait/kill threads VM shared-memory TLS clock verified
-[process-manager] ABI v2 VM/shared-memory frames reclaimed
+[abi-v4] spawn/wait/kill threads VM shared-memory TLS clock verified
+[process-manager] ABI v4 VM/shared-memory frames reclaimed
 ```

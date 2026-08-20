@@ -19,6 +19,7 @@
 #![warn(missing_docs)]
 #![deny(unsafe_op_in_unsafe_fn)]
 
+pub mod block;
 pub mod bootinfo;
 pub mod dll;
 pub mod handle;

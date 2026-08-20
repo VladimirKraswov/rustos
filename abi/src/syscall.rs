@@ -8,7 +8,7 @@
 /// инструкции `svc` равно нулю.
 pub const INTERRUPT_VECTOR: u8 = 0x80;
 /// Версия syscall ABI, передаваемая вторым bootstrap-аргументом.
-pub const ABI_VERSION: u64 = 2;
+pub const ABI_VERSION: u64 = 4;
 
 /// Номера операций (`RAX`).
 pub mod number {
@@ -58,6 +58,17 @@ pub mod number {
     pub const HANDLE_CLOSE: u64 = 17;
     /// Монотонное время в наносекундах от аппаратной эпохи.
     pub const CLOCK_MONOTONIC: u64 = 18;
+    /// Размер block device в логических 4-KiB блоках (`arg0=handle`).
+    pub const BLOCK_GET_SIZE: u64 = 19;
+    /// Прочитать один или несколько блоков (`arg0=handle, arg1=*BlockIoRequest`).
+    pub const BLOCK_READ: u64 = 20;
+    /// Записать блоки (`arg0=handle, arg1=*BlockIoRequest`).
+    pub const BLOCK_WRITE: u64 = 21;
+    /// Принудительно завершить данные на носителе (`arg0=handle`).
+    pub const BLOCK_FLUSH: u64 = 22;
+    /// Необратимо превращает RW shared object в RO/RX объект.
+    /// `arg0=handle, arg1=VmFlags`; после seal новые права расширить нельзя.
+    pub const SHARED_MEMORY_SEAL: u64 = 23;
 }
 
 /// Отрицательные результаты syscall. Не совпадают с Unix errno намеренно:
@@ -87,4 +98,6 @@ pub mod status {
     pub const LIMIT_REACHED: i64 = -10;
     /// Объект существует, но находится в несовместимом состоянии.
     pub const BUSY: i64 = -11;
+    /// Ошибка ввода-вывода физического устройства.
+    pub const IO_ERROR: i64 = -12;
 }

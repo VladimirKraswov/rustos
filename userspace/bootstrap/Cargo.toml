@@ -39,6 +39,29 @@ path = "src/abi_lifecycle.rs"
 name = "rustos-abi-child"
 path = "src/abi_child.rs"
 
+[[bin]]
+name = "rustos-vfsd"
+path = "src/vfsd.rs"
+
+[[bin]]
+name = "rustos-vfs-test"
+path = "src/vfs_test.rs"
+
+[[bin]]
+name = "rustos-vfs-persistence"
+path = "src/vfs_persistence.rs"
+
+[[bin]]
+name = "rustos-loader-test"
+path = "src/loader_test.rs"
+
+[[bin]]
+name = "rustos-loader-child"
+path = "src/loader_child.rs"
+
 [dependencies]
 rustos-abi = { path = "../../abi" }
 rustos-runtime = { path = "../../runtime" }
+rustos-vfs-client = { path = "../../libs/vfs" }
+rustos-elf-loader = { path = "../../libs/elf-loader" }
+varaniafs = { path = "../../varaniafs" }

@@ -1,4 +1,4 @@
-//! CPU0 process manager ABI v2: процессы, несколько потоков, VM, shared
+//! CPU0 process manager ABI v4: процессы, несколько потоков, VM, shared
 //! memory, capability IPC и монотонные часы.
 //!
 //! Здесь сознательно используются ограниченные статические таблицы: раннее
@@ -12,6 +12,7 @@ use core::{
 };
 
 use rustos_abi::{
+    block::{BlockIoRequest, BLOCK_ABI_VERSION},
     bootinfo::BootInitramfs,
     ipc::{Message, IPC_MAX_HANDLES},
     memory::{SharedMemoryCreate, SharedMemoryMap, VmFlags, VmMapRequest, MEMORY_ABI_VERSION},
@@ -30,7 +31,7 @@ use rustos_microkernel::{
 
 use crate::{
     arch::{self, TrapFrame, TrapKind, UserContext},
-    fs,
+    block, fs,
     memory::{self, AddressSpace, FrameBlock, UserPageBacking, UserPageFlags},
     serial,
 };
@@ -247,6 +248,28 @@ impl SharedMemoryPool {
             return Err(status::BAD_HANDLE);
         }
         object.capability_refs = object.capability_refs.saturating_add(1);
+        Ok(())
+    }
+
+    /// Однонаправленный переход `RW -> R/RX`. Пока объект writable, его
+    /// нельзя исполнять; после seal физические кадры уже нельзя менять ни
+    /// через один capability. Это сохраняет W^X при совместном RX mapping.
+    fn seal(&mut self, id: u16, flags: VmFlags) -> Result<(), i64> {
+        let index = shared_index(id);
+        let object = self.objects.get_mut(index).ok_or(status::BAD_HANDLE)?;
+        if !object.used || object.generation != shared_generation(id) {
+            return Err(status::BAD_HANDLE);
+        }
+        if object.capability_refs != 1 || object.mapping_refs != 0 {
+            return Err(status::BUSY);
+        }
+        if !object.maximum_flags.contains(VmFlags::WRITE)
+            || !flags.contains(VmFlags::READ)
+            || flags.contains(VmFlags::WRITE)
+        {
+            return Err(status::INVALID_ARGUMENT);
+        }
+        object.maximum_flags = flags;
         Ok(())
     }
 
@@ -810,6 +833,12 @@ impl ProcessManager {
                 frame.set_syscall_result(result);
                 0
             }
+            syscall::number::SHARED_MEMORY_SEAL => {
+                let result =
+                    self.shared_memory_seal(process_index, Handle(arg0 as u32), VmFlags(arg1));
+                frame.set_syscall_result(result);
+                0
+            }
             syscall::number::HANDLE_CLOSE => {
                 let result = self.handle_close(process_index, Handle(arg0 as u32));
                 frame.set_syscall_result(result);
@@ -817,6 +846,32 @@ impl ProcessManager {
             }
             syscall::number::CLOCK_MONOTONIC => {
                 frame.set_syscall_result(self.monotonic_nanoseconds());
+                0
+            }
+            syscall::number::BLOCK_GET_SIZE => {
+                frame.set_syscall_result(self.block_get_size(process_index, Handle(arg0 as u32)));
+                0
+            }
+            syscall::number::BLOCK_READ => {
+                frame.set_syscall_result(self.block_io(
+                    process_index,
+                    Handle(arg0 as u32),
+                    arg1,
+                    false,
+                ));
+                0
+            }
+            syscall::number::BLOCK_WRITE => {
+                frame.set_syscall_result(self.block_io(
+                    process_index,
+                    Handle(arg0 as u32),
+                    arg1,
+                    true,
+                ));
+                0
+            }
+            syscall::number::BLOCK_FLUSH => {
+                frame.set_syscall_result(self.block_flush(process_index, Handle(arg0 as u32)));
                 0
             }
             _ => {
@@ -1678,6 +1733,47 @@ impl ProcessManager {
         address as i64
     }
 
+    fn shared_memory_seal(
+        &mut self,
+        process_index: usize,
+        handle: Handle,
+        requested: VmFlags,
+    ) -> i64 {
+        let Some(flags) = valid_vm_flags(requested) else {
+            return status::INVALID_ARGUMENT;
+        };
+        if flags.contains(VmFlags::WRITE) {
+            return status::INVALID_ARGUMENT;
+        }
+        let entry = match self.processes[process_index]
+            .as_ref()
+            .expect("process")
+            .capability(handle, Rights::WRITE.union(Rights::MAP))
+        {
+            Ok(entry) => entry,
+            Err(error) => return error,
+        };
+        let CapabilityKind::SharedMemory(object) = entry.kind else {
+            return status::ACCESS_DENIED;
+        };
+        if let Err(error) = self.shared.seal(object, flags) {
+            return error;
+        }
+
+        // `capability_refs == 1` гарантирует, что это единственный handle на
+        // объект. Меняем его authority атомарно вместе с object policy.
+        let mut rights = Rights::MAP.union(Rights::TRANSFER).union(Rights::READ);
+        if flags.contains(VmFlags::EXECUTE) {
+            rights = rights.union(Rights::EXECUTE);
+        }
+        self.processes[process_index]
+            .as_mut()
+            .expect("process")
+            .capabilities[handle.0 as usize]
+            .rights = rights;
+        status::OK
+    }
+
     fn handle_close(&mut self, process_index: usize, handle: Handle) -> i64 {
         let slot = handle.0 as usize;
         if slot == 0 || slot >= MAX_CAPABILITIES {
@@ -1709,6 +1805,87 @@ impl ProcessManager {
             .saturating_mul(1_000_000_000)
             .saturating_add(remainder.saturating_mul(1_000_000_000) / self.counter_hz);
         i64::try_from(nanoseconds).unwrap_or(i64::MAX)
+    }
+
+    fn block_get_size(&self, process_index: usize, handle: Handle) -> i64 {
+        if let Err(error) = self.processes[process_index]
+            .as_ref()
+            .expect("process")
+            .resolve(handle, CapabilityKind::BlockDevice(0), Rights::READ)
+        {
+            return error;
+        }
+        block::info()
+            .ok()
+            .and_then(|info| i64::try_from(info.blocks).ok())
+            .unwrap_or(status::IO_ERROR)
+    }
+
+    /// Единственная страница за вызов держит kernel stack и DMA latency
+    /// ограниченными. `vfsd` строит streaming поверх последовательности этих
+    /// операций, а обычные приложения вообще не видят block capability.
+    fn block_io(
+        &self,
+        process_index: usize,
+        handle: Handle,
+        request_address: u64,
+        write: bool,
+    ) -> i64 {
+        let required = if write { Rights::WRITE } else { Rights::READ };
+        if let Err(error) = self.processes[process_index]
+            .as_ref()
+            .expect("process")
+            .resolve(handle, CapabilityKind::BlockDevice(0), required)
+        {
+            return error;
+        }
+        let request = match self.read_struct::<BlockIoRequest>(process_index, request_address) {
+            Ok(request) => request,
+            Err(error) => return error,
+        };
+        if request.version != BLOCK_ABI_VERSION
+            || request.flags != 0
+            || request.block_count != 1
+            || request.reserved != 0
+        {
+            return status::INVALID_ARGUMENT;
+        }
+        let mut page = [0u8; PAGE_SIZE as usize];
+        if write {
+            if self
+                .copy_from_process(process_index, request.buffer_address, &mut page)
+                .is_err()
+            {
+                return status::INVALID_ARGUMENT;
+            }
+            block::write_block(request.block, &page)
+                .map(|_| status::OK)
+                .unwrap_or(status::IO_ERROR)
+        } else {
+            if block::read_block(request.block, &mut page).is_err() {
+                return status::IO_ERROR;
+            }
+            self.processes[process_index]
+                .as_ref()
+                .expect("process")
+                .address_space
+                .copy_to_user(request.buffer_address, &page)
+                .map(|_| status::OK)
+                .unwrap_or(status::INVALID_ARGUMENT)
+        }
+    }
+
+    fn block_flush(&self, process_index: usize, handle: Handle) -> i64 {
+        if let Err(error) = self.processes[process_index]
+            .as_ref()
+            .expect("process")
+            .resolve(handle, CapabilityKind::BlockDevice(0), Rights::WRITE)
+        {
+            return error;
+        }
+        block::flush()
+            .map(|_| status::OK)
+            .unwrap_or(status::IO_ERROR)
     }
 
     fn vfs_stat(&self, process_index: usize, handle: Handle, path: u64, length: u64) -> i64 {
@@ -2315,8 +2492,22 @@ pub(super) fn run_milestone(info: &rustos_abi::BootInfo) -> Result<(), ProcessEr
         manager.cleanup();
         return Err(error);
     }
-    serial::put_str("[abi-v2] spawn/wait/kill threads VM shared-memory TLS clock verified\n");
+    serial::put_str("[abi-v4] spawn/wait/kill threads VM shared-memory TLS clock verified\n");
     manager.cleanup();
+
+    // Настоящий VFS vertical slice: filesystem parser и pathname policy живут
+    // в ring 3. Только vfsd получает raw block capability, клиент видит лишь
+    // endpoint и `vfs.dll` API. Второй запуск server доказывает persistence.
+    run_vfs_phase(manager, "system/bin/vfs-test.elf", false)?;
+    serial::put_str(
+        "[vfsd] open/read/write/seek/readdir/create/rename over shared memory verified\n",
+    );
+    run_vfs_phase(manager, "system/bin/vfs-persistence.elf", false)?;
+    serial::put_str("[vfsd] restart recovered committed VaraniaFS metadata and file data\n");
+    run_vfs_phase(manager, "system/bin/loader-test.elf", true)?;
+    serial::put_str(
+        "[loader] DT_NEEDED symbols RELA TLS RELRO and cross-process shared RX verified\n",
+    );
 
     let free_after = memory::stats()
         .map_err(|_| ProcessError::AddressSpace)?
@@ -2325,7 +2516,77 @@ pub(super) fn run_milestone(info: &rustos_abi::BootInfo) -> Result<(), ProcessEr
         return Err(ProcessError::FrameLeak);
     }
     serial::put_str("[process-manager] dynamic create/exit/reap reclaimed all frames\n");
-    serial::put_str("[process-manager] ABI v2 VM/shared-memory frames reclaimed\n");
+    serial::put_str("[process-manager] ABI v4 VM/shared-memory frames reclaimed\n");
+    Ok(())
+}
+
+fn run_vfs_phase(
+    manager: &mut ProcessManager,
+    client_image: &str,
+    executable_namespace: bool,
+) -> Result<(), ProcessError> {
+    const SERVER_ENDPOINT: u8 = 1;
+    const REPLY_ENDPOINT: u8 = 2;
+    const SERVER_SLOT: usize = 2;
+    const DEVICE_OR_REPLY_SLOT: usize = 3;
+
+    manager.begin_phase();
+    let mut server_caps = [EMPTY_CAPABILITY; MAX_CAPABILITIES];
+    server_caps[SERVER_SLOT] = CapabilityEntry {
+        kind: CapabilityKind::Endpoint(SERVER_ENDPOINT),
+        rights: Rights::RECEIVE,
+    };
+    server_caps[DEVICE_OR_REPLY_SLOT] = CapabilityEntry {
+        kind: CapabilityKind::BlockDevice(0),
+        rights: Rights::READ.union(Rights::WRITE),
+    };
+    let server = manager.spawn(
+        "system/bin/vfsd.elf",
+        PriorityClass::System,
+        [
+            SERVER_SLOT as u64,
+            DEVICE_OR_REPLY_SLOT as u64,
+            syscall::ABI_VERSION,
+        ],
+        0,
+        0,
+        server_caps,
+    )?;
+    manager.endpoints[SERVER_ENDPOINT as usize].receiver = server;
+
+    let mut client_caps = [EMPTY_CAPABILITY; MAX_CAPABILITIES];
+    if executable_namespace {
+        client_caps[VFS_ROOT_SLOT] = CapabilityEntry {
+            kind: CapabilityKind::VfsRoot,
+            rights: Rights::READ.union(Rights::EXECUTE),
+        };
+    }
+    client_caps[SERVER_SLOT] = CapabilityEntry {
+        kind: CapabilityKind::Endpoint(SERVER_ENDPOINT),
+        rights: Rights::SEND,
+    };
+    client_caps[DEVICE_OR_REPLY_SLOT] = CapabilityEntry {
+        kind: CapabilityKind::Endpoint(REPLY_ENDPOINT),
+        rights: Rights::SEND.union(Rights::RECEIVE).union(Rights::TRANSFER),
+    };
+    let client = manager.spawn(
+        client_image,
+        PriorityClass::Interactive,
+        [
+            SERVER_SLOT as u64,
+            DEVICE_OR_REPLY_SLOT as u64,
+            syscall::ABI_VERSION,
+        ],
+        0,
+        0,
+        client_caps,
+    )?;
+    manager.endpoints[REPLY_ENDPOINT as usize].receiver = client;
+    if let Err(error) = manager.run() {
+        manager.cleanup();
+        return Err(error);
+    }
+    manager.cleanup();
     Ok(())
 }
 

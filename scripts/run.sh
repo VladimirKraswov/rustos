@@ -27,5 +27,7 @@ exec qemu-system-x86_64 \
     -accel "$ACCEL" \
     -drive if=pflash,format=raw,readonly=on,file=build/ovmf/OVMF_CODE.fd \
     -drive if=pflash,format=raw,file=build/ovmf/OVMF_VARS_RUNTIME.fd \
+    -drive if=none,id=systemdisk,format=raw,file=build/system.vfs \
+    -device virtio-blk-pci,drive=systemdisk,disable-modern=on,addr=0x5 \
     -drive if=virtio,format=raw,readonly=on,file=build/esp.img \
     -serial mon:stdio "${DISPLAY_ARGS[@]}" -no-reboot

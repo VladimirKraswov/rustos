@@ -12,6 +12,7 @@ use core::ffi::c_void;
 mod arch;
 
 pub use rustos_abi::{
+    block::BlockIoRequest,
     ipc::Message,
     memory::{SharedMemoryCreate, SharedMemoryMap, VmFlags, VmMapRequest},
     process::{
@@ -191,6 +192,20 @@ pub fn shared_memory_map(handle: Handle, request: &SharedMemoryMap) -> i64 {
     }
 }
 
+/// Необратимо запечатывает shared object после заполнения. Основной сценарий
+/// loader'а: создать RW, записать страницу DLL, убрать RW mapping, seal в RX
+/// и передавать полученный capability другим процессам.
+pub fn shared_memory_seal(handle: Handle, flags: VmFlags) -> i64 {
+    unsafe {
+        syscall3(
+            syscall::number::SHARED_MEMORY_SEAL,
+            handle.0 as u64,
+            flags.0,
+            0,
+        )
+    }
+}
+
 /// Закрывает capability. Shared object освобождается после исчезновения
 /// последнего capability и последнего mapping reference.
 pub fn handle_close(handle: Handle) -> i64 {
@@ -200,6 +215,40 @@ pub fn handle_close(handle: Handle) -> i64 {
 /// Возвращает монотонное время в наносекундах.
 pub fn monotonic_time_ns() -> i64 {
     unsafe { syscall3(syscall::number::CLOCK_MONOTONIC, 0, 0, 0) }
+}
+
+/// Размер block capability в логических 4-KiB блоках.
+pub fn block_get_size(device: Handle) -> i64 {
+    unsafe { syscall3(syscall::number::BLOCK_GET_SIZE, device.0 as u64, 0, 0) }
+}
+
+/// Читает один логический блок в user buffer запроса.
+pub fn block_read(device: Handle, request: &BlockIoRequest) -> i64 {
+    unsafe {
+        syscall3(
+            syscall::number::BLOCK_READ,
+            device.0 as u64,
+            request as *const BlockIoRequest as u64,
+            0,
+        )
+    }
+}
+
+/// Записывает один логический блок из user buffer запроса.
+pub fn block_write(device: Handle, request: &BlockIoRequest) -> i64 {
+    unsafe {
+        syscall3(
+            syscall::number::BLOCK_WRITE,
+            device.0 as u64,
+            request as *const BlockIoRequest as u64,
+            0,
+        )
+    }
+}
+
+/// Просит устройство завершить все ранее подтверждённые записи.
+pub fn block_flush(device: Handle) -> i64 {
+    unsafe { syscall3(syscall::number::BLOCK_FLUSH, device.0 as u64, 0, 0) }
 }
 
 /// Проверяет read-only bootstrap block нового процесса.

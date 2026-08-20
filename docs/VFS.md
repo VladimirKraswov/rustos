@@ -1,104 +1,144 @@
-# VFS и файловые утилиты RustOS
+# VFS как изолированный сервис
 
-## Статус
+## Что уже исполняется
 
-Уже работает ранний вертикальный срез: kernel монтирует RIFS initramfs
-read-only в `/boot`, создаёт volatile RAM overlay для `/system`, `/home`,
-`/src` и `/build`, а terminal выполняет основные файловые команды. Кроме
-kernel GUI, настоящий ring-3 `init.elf` получает read-only VFS root handle и
-через проверяемый syscall делает `stat /boot/README.txt`; произвольный handle
-отклоняется. Финальная граница ниже — `vfsd` и драйверы как отдельные
-процессы; bootstrap parser будет удалён из kernel после их запуска.
+Файловая система больше не является RAM overlay ядра. При загрузке process
+manager создаёт отдельный ring-3 процесс `vfsd.elf` и передаёт только ему:
 
-Capability transfer также выполняется настоящими CPL3-процессами: receiver
-блокируется на endpoint, sender сначала пытается незаконно добавить WRITE к
-READ capability и получает `ACCESS_DENIED`, затем передаёт допустимый
-READ-only производный handle. Receiver просыпается и использует новый handle
-для `stat`. Это проверяет будущую границу `vfs-1.dll -> IPC -> vfsd`, хотя сам
-RIFS parser пока остаётся bootstrap-кодом kernel.
+- `RECEIVE` capability на служебный IPC endpoint;
+- `READ | WRITE` capability на системное блочное устройство.
 
-## Слои
+Приложение получает `SEND` endpoint `vfsd` и собственный reply endpoint. У
+него нет block capability и доступа к метаданным диска. `vfs-1.dll` создаёт
+одно переиспользуемое 64-КиБ shared-memory окно, передаёт производную
+capability в каждом data-запросе и скрывает формат IPC от приложения.
 
 ```text
-shell / editor / rustc / applications
-             |
-          vfs-1.dll
-             |
-     capability IPC + shared buffers
-             |
-            vfsd                 namespace, cwd/root, mounts, cache policy
-          /      \
-  varaniafsd   initramfsd        filesystem format, journal, directories
-       |
-    blockd                     queues, flush/FUA, TRIM, partitions
-       |
- virtio-blk / NVMe / AHCI      user-space drivers with device capabilities
+application
+    |
+    | open/read/write/seek/readdir/mkdir/unlink/rename/sync
+    v
+vfs-1.dll                 stable C ABI + safe Rust facade
+    |
+    | bounded capability IPC; file data in shared memory
+    v
+vfsd.elf (ring 3)         paths, open descriptions, VaraniaFS allocator
+    |
+    | 4-KiB block syscalls; capability checked by kernel
+    v
+virtio-blk bootstrap      build/system.vfs, persistent between boots
 ```
 
-Kernel не знает каталогов, имён и filesystem format. Он предоставляет
-процессы, memory mapping, IPC, IRQ и capabilities на MMIO/ports/DMA. Поэтому
-падение parser'а файловой системы не останавливает scheduler или GUI, а
-supervisor может перезапустить сервис.
+`vfsd` связывает каждый непрозрачный `VfsObject` с настоящим `sender_pid`,
+который заполняет kernel. Число, украденное у другого процесса, нельзя
+использовать как открытый файл. После падения сервиса kernel и остальные
+процессы продолжают работать; следующий шаг supervisor — создать новый
+endpoint, перезапустить `vfsd` и переиздать клиентские capabilities.
 
-## Единый API
+## API версии 2
 
-Terminal и Rust-программа используют один и тот же ABI из
-[`abi/src/vfs.rs`](../abi/src/vfs.rs). Shell не вызывает код драйвера и не
-имеет скрытого «особого» пути. `vfs.dll` предоставляет функции наподобие:
+Исполняемый wire ABI находится в [`abi/src/vfs.rs`](../abi/src/vfs.rs), а
+клиент — в [`libs/vfs/src/lib.rs`](../libs/vfs/src/lib.rs). Реализованы:
+
+| Операция | Семантика |
+|---|---|
+| `open` / `close` | `READ`, `WRITE`, `CREATE`, `EXCLUSIVE`, `TRUNCATE`, `APPEND`, `DIRECTORY` |
+| `read` / `write` | потоковые операции с текущей позицией файла |
+| `seek` | от начала, текущей позиции или конца файла |
+| `readdir` | по одной 256-байтной записи, без загрузки каталога целиком |
+| `mkdir` | создание каталога после проверки родителя |
+| `unlink` | удаление файла или пустого каталога и возврат extent'ов |
+| `rename` | переименование файла; для каталога также меняются пути потомков |
+| `sync` | flush данных и committed metadata |
+
+Пути и содержимое файлов не помещаются в 64-байтный inline payload IPC.
+Клиент кладёт их в shared window; control message передаёт только offset и
+length. `read`/`write` автоматически разбиваются на chunks по 64 КиБ, поэтому
+размер файла не ограничен размером сообщения или окна.
+
+У `VfsClient` один синхронный запрос в полёте. Для независимых потоков нужно
+отдельное соединение/reply endpoint; это сохраняет простой учебный протокол и
+не требует скрытой блокировки внутри DLL.
+
+## Постоянный том
+
+`scripts/build.sh` один раз создаёт `build/system.vfs` размером 64 МиБ и затем
+сохраняет его между интерактивными запусками. QEMU подключает образ отдельным
+legacy virtio-blk устройством в фиксированном PCI slot 5. ESP остаётся
+read-only загрузочным диском и никогда не принимается за системный том.
+
+Формат диска и протокол восстановления описаны в
+[`docs/VARANIAFS.md`](VARANIAFS.md). Host-команда:
+
+```bash
+cargo run -p rustos-vfs-image -- build/system.vfs 64
+cargo run -p rustos-vfs-image -- --verify build/system.vfs
+```
+
+Первая команда не перезаписывает существующий образ. Для заведомо чистого
+тестового тома используется явный `--force`.
+
+## Проверяемый сценарий загрузки
+
+Boot-test запускает два разных клиента с полным завершением `vfsd` между
+ними:
+
+1. первый клиент создаёт `/tmp/vfsd-test`, потоково пишет файл 70 000 байт,
+   делает `seek`, читает и сравнивает данные, переименовывает файл и находит
+   его через `readdir`;
+2. `sync` фиксирует том, после чего процесс `vfsd` завершается и его address
+   space освобождается;
+3. новый `vfsd` заново читает superblock и metadata с virtio-blk;
+4. второй клиент открывает переименованный файл, проверяет размер и последний
+   байт, удаляет файл и каталог, выполняет `sync`.
+
+Успех отмечается строками serial log:
 
 ```text
-vfs_open_at(directory, path, flags) -> file handle
-vfs_read(file, shared_buffer, offset) -> bytes
-vfs_write(file, shared_buffer, offset) -> bytes
-vfs_read_dir(directory, cookie, buffer) -> entries
-vfs_mkdir_at(directory, path)
-vfs_unlink_at(directory, path)
-vfs_rename_at(old_directory, old_path, new_directory, new_path)
-vfs_sync(file_or_mount)
+[vfsd] open/read/write/seek/readdir/create/rename over shared memory verified
+[vfsd] restart recovered committed VaraniaFS metadata and file data
 ```
 
-Current directory — handle каталога в runtime процесса, а не строка в kernel.
-Это убирает race между `chdir` и path lookup. Отдельный process root handle
-позволит позже делать sandboxes, даже если система не вводит Unix uid/sudo.
+Это тестирует не только API, но и отсутствие зависимости от памяти первого
+server process.
 
-## Команды
+## Честные границы текущего этапа
 
-Лучший компромисс для учебной системы — multicall-программа `/system/bin/fs`,
-а не большой shell с копией VFS и не десятки крошечных бинарников на первом
-этапе:
+- `vfs-1.dll` является настоящим ELF64 `ET_DYN` с `DT_SONAME` и unmangled C
+  exports; user-space loader уже умеет загрузить такие модули. Переход всех
+  приложений с bootstrap static client на import table остаётся следующим
+  интеграционным шагом.
+- Legacy virtio-blk transport временно находится в kernel. После появления
+  PCI, DMA и IRQ capabilities он переедет в изолированный `virtioblkd`, не
+  меняя VFS ABI.
+- VaraniaFS v1 имеет 64-битные номера блоков, но bounded таблицы v1 рассчитаны
+  на 64 inode, 32 extent'а на inode и 64 свободных extent'а. Масштабируемые
+  B-деревья/extent trees относятся к формату v2.
+- Две checksummed копии метаданных защищают commit. Данные файла сейчас
+  пишутся in-place и не имеют checksum/COW, поэтому torn sector в data block
+  пока может испортить содержимое при сохранённых метаданных.
+- Сам dynamic loader читает DLL из VaraniaFS через `vfs-1.dll`; начальный
+  маленький `loader-test.elf` всё ещё запускается kernel из initramfs. Полный
+  exec path должен передать ему путь/namespace и убрать parsing ELF из kernel.
+
+## Направление развития
+
+`vfsd` останется namespace/cache service, а конкретные filesystem и block
+драйверы будут отдельными процессами:
 
 ```text
-fs ls [path]          fs cat <file>       fs stat <path>
-fs mkdir <path>       fs touch <file>     fs write <file> [text]
-fs cp <src> <dst>     fs mv <src> <dst>   fs rm <path>
-fs find <path>        fs sync [path]
+shell / editor / rustc
+          |
+       vfs-1.dll
+          |
+         vfsd
+       /      \
+varaniafsd   initramfsd
+     |
+   blockd
+  /     \
+NVMe   AHCI/virtio
 ```
 
-Имена-апплеты `ls`, `cat`, `mkdir` могут быть маленькими links/manifests на
-тот же ELF, поэтому привычные команды работают без дублирования кода. `cd`
-обязан оставаться builtin shell: отдельный процесс не может поменять cwd
-родителя. Полноэкранный editor является отдельным приложением и использует
-тот же `vfs.dll`.
-
-## Потоковая запись и надёжность
-
-API не требует держать файл целиком в RAM. `rustc`, editor и copy utility
-читают/пишут окнами, а `vfsd` применяет backpressure. Семантика durability:
-
-- обычный write может оставаться в cache;
-- `vfs_sync(file)` фиксирует данные и метаданные файла;
-- atomic replace: write temporary -> sync -> rename -> sync directory;
-- blockd реализует flush/FUA и не сообщает commit раньше устройства;
-- discard/TRIM передаётся только после того, как блоки больше не нужны
-  recovery.
-
-VaraniaFS будет copy-on-write/checksummed с transaction commit, но VFS ABI от
-конкретного on-disk format не зависит. Initramfs и RAM overlay реализуют тот
-же protocol и служат ранним bootstrap.
-
-## Обмен с macOS/Linux
-
-Основной способ — `rustos-disk`, host tool с тем же parser'ом VaraniaFS:
-`ls/get/put/mkdir/fsck`, работающий с выключенным образом. Для живой VM будет
-отдельный virtio-serial file-transfer service; host никогда не изменяет
-mounted image за спиной filesystem driver.
+Так terminal, editor и будущий `std::fs` используют один API, а парсер
+файловой системы и аппаратный драйвер можно перезапускать независимо.

@@ -106,6 +106,8 @@ qemu-system-x86_64 \
     -machine q35 -cpu "$CPU_MODEL" -smp 2 -m "$MEMORY_MB" -accel tcg \
     -drive if=pflash,format=raw,readonly=on,file=build/ovmf/OVMF_CODE.fd \
     -drive if=pflash,format=raw,file="$RUN_DIR/VARS.fd" \
+    -drive if=none,id=systemdisk,format=raw,file=build/system.vfs \
+    -device virtio-blk-pci,drive=systemdisk,disable-modern=on,addr=0x5 \
     -drive if=virtio,format=raw,readonly=on,file=build/esp.img \
     -serial file:"$RUN_DIR/serial.log" \
     -monitor unix:"$RUN_DIR/monitor.sock",server=on,wait=off \

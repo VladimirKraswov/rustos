@@ -8,20 +8,26 @@
 ## Текущая граница реализации
 
 Сейчас репозиторий находится на S0: target kernel cross-компилируется на
-macOS/Linux. Обязательный процессный checkpoint уже пройден: отдельный ELF64
-PIE запускается в CPL3 с process-local VFS capability, выполняет syscall и
-завершается; fault второго ELF не останавливает kernel/GUI, а все кадры его
-address space освобождаются. Это исполняемый фундамент, но ещё не нативный
-compiler: host `std`, dynamic loader, persistent filesystem и полноценный SMP
-runtime пока отсутствуют. ABI v2 уже предоставляет user-facing
-spawn/wait/kill, несколько потоков, anonymous VM, shared memory, args/env, TLS
-и monotonic clock.
+macOS/Linux. Обязательный процессный checkpoint пройден: отдельный ELF64 PIE
+запускается в CPL3 с process-local capabilities; fault второго ELF не
+останавливает kernel/GUI, а кадры его address space освобождаются. ABI v3
+предоставляет spawn/wait/kill, несколько потоков, anonymous VM, shared
+memory, args/env, TLS и monotonic clock.
 
-Local APIC preemption, bounded capability IPC и shared-memory objects уже
-работают на CPU0. Следующая прямая зависимость self-hosting — streaming VFS
-service и перевод process image loader с initramfs на VFS. После неё имеет
-смысл портировать `std::thread`, `std::process`, файлы, pipes и dynamic
-loading, а затем native seed toolchain.
+Следующий checkpoint тоже исполняется: изолированный ring-3 `vfsd` обслуживает
+open/read/write/seek/readdir/create/delete/rename через capability IPC и
+shared memory. VaraniaFS хранится на отдельном virtio-blk образе; boot-test
+полностью перезапускает сервис и читает сохранённый файл новым процессом.
+Первая `vfs-1.dll` собирается как ELF64 `ET_DYN`. User-space loader уже
+обрабатывает `DT_NEEDED`, symbols, основные x86-64 RELA, initial-exec TLS,
+RELRO и physically shared RX pages; это проверяется вызовом двух настоящих
+DLL из VaraniaFS.
+
+Это всё ещё не нативный compiler: target `std`, полный `exec` через VFS,
+pipes, general-dynamic TLS/`dlopen` и полноценный SMP runtime пока отсутствуют.
+Следующая прямая зависимость self-hosting — сделать `ld-rustos` начальным
+образом нового процесса и передавать ему executable VFS capability, затем
+реализовать `std::fs`, `std::thread`, `std::process` и `std::sys::dynamic_loading`.
 
 ## Три разные платформы Rust bootstrap
 

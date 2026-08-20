@@ -133,11 +133,14 @@ per-CPU GDT/TSS/IDT, ring-0 interrupt stack, run queue и TLB shootdown inbox.
 5. TLB shootdown и PCID optimization;
 6. тест параллельной записи разных user pages двумя CPU с fault/GUI heartbeat.
 
-Process ABI v2 уже предоставляет spawn/kill/wait, несколько потоков,
-shared-memory capabilities, anonymous VM, args/env, TLS и monotonic clock.
-Следующий программный milestone — streaming VFS IPC: ring-3 `init` запускает
-`vfsd`, block/filesystem drivers, display/input services и desktop по
-manifests. Подробный контракт описан в [PROCESS_MEMORY_ABI.md](PROCESS_MEMORY_ABI.md).
+Process ABI v4 предоставляет spawn/kill/wait, несколько потоков, anonymous
+VM, sealed shared-memory capabilities, args/env, TLS и monotonic clock.
+Streaming VFS IPC, persistent VaraniaFS и user-space DLL loader уже проходят
+boot-test. Следующий программный milestone — полный `exec` через VFS:
+ring-3 `init` запускает `ld-rustos`, а затем block/filesystem, display/input
+services и desktop по manifests. Подробный контракт описан в
+[PROCESS_MEMORY_ABI.md](PROCESS_MEMORY_ABI.md) и
+[ELF_LOADER.md](ELF_LOADER.md).
 
 ## Почему это база для self-hosting
 
@@ -153,9 +156,9 @@ preemptive threads + IPC
         -> сборка RustOS внутри RustOS
 ```
 
-Текущий ring-3 VFS syscall — узкий bootstrap proof. Он будет заменён вызовом
-тонкого `vfs-1.dll` client stub и capability IPC к `vfsd`; filesystem parser
-не останется в kernel.
+Новый VFS path уже использует тонкий `vfs-1.dll` client stub и capability IPC
+к `vfsd`; старый `vfs_stat` остаётся только bootstrap proof для раннего
+`init.elf` и будет удалён вместе с kernel-side initramfs spawn.
 
 ## Автоматические критерии
 
@@ -171,7 +174,9 @@ PID/TID, изоляцию process fault и supervisor backoff. `make test-boot` 
 [preempt] timer ticks=... context-switches=...
 [isolation] concurrent #UD terminated one process; survivor exited=22
 [ipc] queued block/wake and attenuated VFS capability verified
-[abi-v2] spawn/wait/kill threads VM shared-memory TLS clock verified
+[abi-v4] spawn/wait/kill threads VM shared-memory TLS clock verified
+[vfsd] restart recovered committed VaraniaFS metadata and file data
+[loader] DT_NEEDED symbols RELA TLS RELRO and cross-process shared RX verified
 [process-manager] dynamic create/exit/reap reclaimed all frames
 [microkernel] RING3_MILESTONE_OK
 ```

@@ -8,11 +8,25 @@ RustOS использует расширение `.dll`, но не изобре�
 ## Статус
 
 Формат `ModuleDescriptor`, правила ABI, именования и relocations уже
-зафиксированы. Kernel process loader уже отображает ELF64 `ET_DYN` PIE,
+зафиксированы. Kernel process loader отображает ELF64 `ET_DYN` PIE,
 обрабатывает `R_X86_64_RELATIVE` и запускает entry в отдельном CPL3 address
-space. Полный user-space dynamic loader ещё должен добавить symbols,
-`DT_NEEDED`, TLS, RELRO и разделяемые RX pages; файлы `*.dll` из manifest пока
-являются планом, а не ложными заглушками.
+space. Первая системная библиотека
+[`libs/vfs-dll`](../libs/vfs-dll/src/lib.rs) действительно собирается как
+`/system/lib/vfs-1.dll`: это ELF64 `ET_DYN` с `DT_SONAME=vfs-1.dll` и
+unmangled `rustos_vfs_*` C exports, а не текстовый manifest или заглушка.
+
+User-space loader [`rustos-elf-loader`](../libs/elf-loader/src/lib.rs) уже
+разрешает `.dynsym`, транзитивные `DT_NEEDED`, eager RELA/PLT, static TLS и
+GNU RELRO. Неизменяемые сегменты создаются как shared objects: временный RW
+mapping заполняется, снимается, object необратимо запечатывается в R/RX и
+после этого может отображаться в несколько процессов.
+
+Boot-test загружает `/apps/loader-test/root.elf` из VaraniaFS. Его настоящий
+`DT_NEEDED=fixture-1.dll` находится по system search path, импорт
+`fixture_answer` разрешается, TLS template получает отдельный экземпляр,
+GOT становится read-only, а вызов возвращает 42. Второй процесс получает
+только capability sealed RX-сегмента dependency и исполняет ту же физическую
+страницу. Подробный контракт — в [`docs/ELF_LOADER.md`](ELF_LOADER.md).
 
 ## Быстрый локальный вызов
 
@@ -66,17 +80,19 @@ Loader ищет зависимости в следующем порядке:
 одновременно. Поиск «любой DLL с подходящим именем» из текущего каталога
 запрещён: зависимости фиксирует manifest, иначе сборка невоспроизводима.
 
-Минимально поддерживаются relocations x86-64:
+Поддерживаются основные x86-64 RELA relocations:
 
 - `R_X86_64_RELATIVE`;
 - `R_X86_64_64`;
+- `R_X86_64_PC32`, `R_X86_64_32`, `R_X86_64_32S`;
 - `R_X86_64_GLOB_DAT`;
 - `R_X86_64_JUMP_SLOT`;
-- TLS relocations выбранной initial-exec/general-dynamic модели.
+- `R_X86_64_DTPMOD64`, `R_X86_64_DTPOFF64`, `R_X86_64_TPOFF64`.
 
-Сначала используется eager binding: он проще, детерминированнее и переносит
-ошибку отсутствующего symbol на запуск. Lazy PLT можно включить позже только
-после thread-safe resolver.
+Используется eager binding: он проще, детерминированнее и переносит ошибку
+отсутствующего symbol на запуск. TLS fixture собирается в initial-exec модели;
+general-dynamic `__tls_get_addr` и lazy PLT будут добавлены после
+thread-safe resolver/DTV ABI.
 
 ## Пользовательские DLL
 

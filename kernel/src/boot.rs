@@ -1,6 +1,6 @@
 //! Ранняя инициализация ядра: banner, разбор BootInfo, self-test.
 
-use crate::{arch, gui, memory, process, serial};
+use crate::{arch, block, gui, memory, process, serial};
 use rustos_abi::{BootInfo, MemRegion, MemRegionKind, BOOT_INFO_MAGIC, BOOT_INFO_VERSION};
 
 /// Главная функция ядра: serial → валидация BootInfo → banner → self-test,
@@ -52,6 +52,28 @@ pub fn kernel_main(info: &BootInfo) -> ! {
     serial::put_str(" MiB extents=");
     serial::put_u32(allocator.extents as u32);
     serial::put_str("\n");
+
+    match block::initialize() {
+        Ok(device) => {
+            serial::put_str("[block] backend=");
+            serial::put_str(device.transport);
+            serial::put_str(" blocks=");
+            serial::put_hex(device.blocks);
+            serial::put_str(" block-size=4096\n");
+            let mut first_block = [0u8; 4096];
+            match block::read_block(0, &mut first_block) {
+                Ok(()) => {
+                    serial::put_str("[block] volume-magic=");
+                    for byte in &first_block[..8] {
+                        serial::put_hex(u64::from(*byte));
+                    }
+                    serial::put_str("\n");
+                }
+                Err(_) => serial::put_str("[block] initial read failed\n"),
+            }
+        }
+        Err(_) => serial::put_str("[block] no persistent system disk; vfsd unavailable\n"),
+    }
 
     match self_test(info) {
         Ok(()) => {

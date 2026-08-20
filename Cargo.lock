@@ -105,6 +105,17 @@ name = "rustos-bootstrap-apps"
 version = "0.1.0"
 dependencies = [
  "rustos-abi",
+ "rustos-elf-loader",
+ "rustos-runtime",
+ "rustos-vfs-client",
+ "varaniafs",
+]
+
+[[package]]
+name = "rustos-elf-loader"
+version = "0.1.0"
+dependencies = [
+ "rustos-abi",
  "rustos-runtime",
 ]
 
@@ -133,6 +144,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustos-loader-fixture"
+version = "0.1.0"
+
+[[package]]
+name = "rustos-loader-root"
+version = "0.1.0"
+
+[[package]]
 name = "rustos-microkernel"
 version = "0.1.0"
 dependencies = [
@@ -148,6 +167,29 @@ name = "rustos-runtime"
 version = "0.1.0"
 dependencies = [
  "rustos-abi",
+]
+
+[[package]]
+name = "rustos-vfs-client"
+version = "0.1.0"
+dependencies = [
+ "rustos-abi",
+ "rustos-runtime",
+]
+
+[[package]]
+name = "rustos-vfs-dll"
+version = "0.1.0"
+dependencies = [
+ "rustos-abi",
+ "rustos-vfs-client",
+]
+
+[[package]]
+name = "rustos-vfs-image"
+version = "0.1.0"
+dependencies = [
+ "varaniafs",
 ]
 
 [[package]]
@@ -233,3 +275,7 @@ name = "unicode-ident"
 version = "1.0.24"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
+
+[[package]]
+name = "varaniafs"
+version = "0.1.0"
