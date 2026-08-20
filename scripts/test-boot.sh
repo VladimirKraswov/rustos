@@ -66,7 +66,7 @@ trap cleanup EXIT INT TERM HUP
 
 echo "[test] qemu accel=$ACCEL, cpus=$CPUS, memory=${MEMORY_MB}MiB, timeout=${TIMEOUT}s"
 qemu-system-x86_64 \
-    -machine q35 -cpu max -smp "$CPUS" -m "$MEMORY_MB" \
+    -machine q35 -cpu max,+x2apic -smp "$CPUS" -m "$MEMORY_MB" \
     -accel "$ACCEL" \
     -drive if=pflash,format=raw,readonly=on,file=build/ovmf/OVMF_CODE.fd \
     -drive if=pflash,format=raw,file="$VARS" \

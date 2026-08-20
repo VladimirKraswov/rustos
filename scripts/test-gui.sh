@@ -99,7 +99,7 @@ cleanup() {
 trap cleanup EXIT INT TERM HUP
 
 qemu-system-x86_64 \
-    -machine q35 -cpu max -smp 2 -m "$MEMORY_MB" -accel tcg \
+    -machine q35 -cpu max,+x2apic -smp 2 -m "$MEMORY_MB" -accel tcg \
     -drive if=pflash,format=raw,readonly=on,file=build/ovmf/OVMF_CODE.fd \
     -drive if=pflash,format=raw,file="$RUN_DIR/VARS.fd" \
     -drive if=virtio,format=raw,readonly=on,file=build/esp.img \
