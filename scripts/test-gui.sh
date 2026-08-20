@@ -66,12 +66,27 @@ wait_for_serial() {
     return 1
 }
 
+stop_qemu() {
+    if [[ -z "$QPID" ]]; then
+        return
+    fi
+    if kill -0 "$QPID" 2>/dev/null; then
+        kill -TERM "$QPID" 2>/dev/null || true
+        for _ in $(seq 1 50); do
+            kill -0 "$QPID" 2>/dev/null || break
+            sleep 0.1
+        done
+        # Убиваем только конкретный QEMU этого теста. Эта ветка нужна, чтобы
+        # CI никогда не зависал навсегда на неисправном monitor shutdown.
+        kill -KILL "$QPID" 2>/dev/null || true
+    fi
+    wait "$QPID" 2>/dev/null || true
+    QPID=""
+}
+
 cleanup() {
     trap - EXIT INT TERM HUP
-    if [[ -n "$QPID" ]] && kill -0 "$QPID" 2>/dev/null; then
-        kill -TERM "$QPID" 2>/dev/null || true
-        wait "$QPID" 2>/dev/null || true
-    fi
+    stop_qemu
     for file in serial.log qemu-stderr.log terminal.ppm dragged.ppm minimized.ppm; do
         [[ -f "$RUN_DIR/$file" ]] && cp -f "$RUN_DIR/$file" "$RESULT_DIR/$file"
     done
@@ -167,6 +182,11 @@ printf 'screendump %s/minimized.ppm\n' "$RUN_DIR" \
 cargo run -q -p rustos-gui-check -- \
     "$RUN_DIR/terminal.ppm" "$RUN_DIR/dragged.ppm" "$RUN_DIR/minimized.ppm"
 printf 'quit\n' | hmp || true
-wait "$QPID" 2>/dev/null || true
-QPID=""
+# HMP `quit` обычно завершает QEMU сразу, но закрытие Unix socket и обработка
+# команды могут состязаться. Bounded shutdown исключает вечный `wait` в CI.
+for _ in $(seq 1 20); do
+    kill -0 "$QPID" 2>/dev/null || break
+    sleep 0.1
+done
+stop_qemu
 echo "[gui-test] PASS: keyboard, VFS workflow, buffered drag and minimize"
