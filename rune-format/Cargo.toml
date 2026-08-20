@@ -1,0 +1,11 @@
+[package]
+name = "rustos-rune-format"
+description = "Проверяемый no_std parser нативного формата программ RUNE"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lib]
+doctest = false

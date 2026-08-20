@@ -10,10 +10,10 @@ CI действительно переходят в CPL3, вызывают kerne
 RIFS initramfs
       |
       v
-ELF64 ET_DYN loader -- создаёт отдельный address-space root
-      |              RX code, RW+NX data/stack, W^X
+RUNE loader --------- создаёт отдельный address-space root
+      |               RX code, RW+NX data/stack/TLS, W^X + RELRO
       v
-iretq -> CPL3 init.elf -> int 0x80 -> VFS handle check -> RIFS stat
+iretq -> CPL3 init.rune -> int 0x80 -> VFS handle check -> RIFS stat
       |                                   |
       +---- process_exit / exception -----+
                          |
@@ -26,16 +26,16 @@ iretq -> CPL3 init.elf -> int 0x80 -> VFS handle check -> RIFS stat
 
 Kernel устанавливает собственные GDT, TSS и IDT. TSS содержит отдельный
 ring-0 stack, double fault использует IST. До входа пользователя включаются
-`EFER.NXE` и `CR0.WP`. Рабочий AMD64 loader принимает `ET_DYN`, проверяет
-границы `PT_LOAD`, запрещает writable+executable сегменты, применяет
-`R_X86_64_RELATIVE`, отображает 16 страниц user stack и проверяет, что entry
-исполняемый.
+`EFER.NXE` и `CR0.WP`. Рабочий AMD64 loader проверяет RUNE SHA-256 и records
+до отображения, запрещает writable+executable regions, применяет
+`RELATIVE64`, создаёт TLS и user stack, закрывает RELRO и проверяет entry.
+ELF64 остаётся явным migration fallback и build intermediate.
 
-Тот же loader при AArch64-сборке проверяет `EM_AARCH64` и применяет
-`R_AARCH64_RELATIVE`; register context и syscall ABI выбираются `arch` HAL.
+Тот же container выбирает AArch64 slice; converter нормализует
+`R_AARCH64_RELATIVE`, а register context и syscall ABI выбираются `arch` HAL.
 Исполняемый ARM boot path появится после VBAR/GIC milestone.
 
-`init.elf` получает в bootstrap-регистрах ABI version и handle. Handle является
+`init.rune` получает в bootstrap-регистрах ABI version и handle. Handle является
 индексом только в capability table этого процесса; число само по себе не даёт
 прав. Kernel проверяет kind/rights, canonical mapped range и UTF-8, копирует
 короткий путь из user memory и только затем вызывает bootstrap RIFS backend.
@@ -144,21 +144,21 @@ services и desktop по manifests. Подробный контракт опис
 
 ## Почему это база для self-hosting
 
-`std`, dynamic loader и native seed `rustc` опираются на процессы и VFS, а не
+Upstream `std`, dynamic loader и будущий native seed `rustc` опираются на процессы и VFS, а не
 на прямые kernel shortcuts. Последовательность зависимостей следующая:
 
 ```text
 preemptive threads + IPC
         -> vfsd/blockd/filesystem + persistent files
-        -> loader.dll + system/vfs DLL client ABI
-        -> target std (thread, file, time, process, TLS, pipe)
+        -> RUNE loader + system/vfs client ABI
+        -> target std (готовы allocator/file/time/TLS; дальше thread/process/pipe)
         -> rust-lld + native seed rustc/cargo
         -> сборка RustOS внутри RustOS
 ```
 
 Новый VFS path уже использует тонкий `vfs-1.dll` client stub и capability IPC
 к `vfsd`; старый `vfs_stat` остаётся только bootstrap proof для раннего
-`init.elf` и будет удалён вместе с kernel-side initramfs spawn.
+`init.rune` и будет удалён вместе с kernel-side initramfs spawn.
 
 ## Автоматические критерии
 
@@ -167,7 +167,7 @@ PID/TID, изоляцию process fault и supervisor backoff. `make test-boot` 
 проверяет реальные privilege/page-table/trap paths и требует markers:
 
 ```text
-[process] init.elf exited cleanly; VFS capability verified
+[process] init.rune exited cleanly; VFS capability verified
 [isolation] user #UD contained; kernel and GUI continue
 [memory] user address spaces reclaimed
 [smp] discovery=ACPI MADT discovered=2 online=2 APs parked safely
@@ -175,6 +175,7 @@ PID/TID, изоляцию process fault и supervisor backoff. `make test-boot` 
 [isolation] concurrent #UD terminated one process; survivor exited=22
 [ipc] queued block/wake and attenuated VFS capability verified
 [abi-v4] spawn/wait/kill threads VM shared-memory TLS clock verified
+[std] collections allocator sync time and std::fs over vfsd verified in ring3 RUNE
 [vfsd] restart recovered committed VaraniaFS metadata and file data
 [loader] DT_NEEDED symbols RELA TLS RELRO and cross-process shared RX verified
 [process-manager] dynamic create/exit/reap reclaimed all frames

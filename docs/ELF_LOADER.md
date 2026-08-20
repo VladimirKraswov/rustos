@@ -1,5 +1,10 @@
 # Пользовательский ELF64/DLL loader
 
+> **Миграционный компонент.** Новые system applications запускаются в формате
+> RUNE. Описанный здесь ELF loader остаётся исполняемым эталоном dynamic-link
+> semantics до завершения нативного RUNE resolver. Финальный ABI описан в
+> [`RUNE.md`](RUNE.md) и [`DYNAMIC_LIBRARIES.md`](DYNAMIC_LIBRARIES.md).
+
 ## Граница ответственности
 
 Kernel не должен разбирать граф зависимостей и доверять строкам/таблицам из

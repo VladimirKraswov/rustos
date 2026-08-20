@@ -140,6 +140,7 @@ version = "0.1.0"
 dependencies = [
  "rustos-abi",
  "rustos-microkernel",
+ "rustos-rune-format",
  "rustos-video",
 ]
 
@@ -160,6 +161,17 @@ dependencies = [
 
 [[package]]
 name = "rustos-pack"
+version = "0.1.0"
+
+[[package]]
+name = "rustos-rune"
+version = "0.1.0"
+dependencies = [
+ "rustos-rune-format",
+]
+
+[[package]]
+name = "rustos-rune-format"
 version = "0.1.0"
 
 [[package]]

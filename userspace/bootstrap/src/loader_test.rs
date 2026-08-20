@@ -18,7 +18,7 @@ const CHILD_SHARED_SLOT: u32 = 5;
 const MAX_DLL_BYTES: usize = 64 * 1024;
 const ROOT_PATH: &str = "/apps/loader-test/root.elf";
 const FIXTURE_PATH: &str = "/system/lib/fixture-1.dll";
-const CHILD_PATH: &str = "system/bin/loader-child.elf";
+const CHILD_PATH: &str = "system/bin/loader-child.rune";
 
 static mut ROOT_IMAGE: [u8; MAX_DLL_BYTES] = [0; MAX_DLL_BYTES];
 static mut FIXTURE_IMAGE: [u8; MAX_DLL_BYTES] = [0; MAX_DLL_BYTES];

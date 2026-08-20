@@ -20,6 +20,7 @@ members = [
     "libs/elf-loader",
     "libs/loader-fixture",
     "libs/loader-root",
+    "rune-format",
     "userspace/bootstrap",
     "kernel",
     "boot/uefi",
@@ -28,6 +29,7 @@ members = [
     "tools/gui-check",
     "tools/hmp",
     "tools/vfs-image",
+    "tools/rune",
 ]
 
 [workspace.package]

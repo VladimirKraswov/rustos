@@ -1,0 +1,11 @@
+--- a/library/std/src/sys/fs/mod.rs
++++ b/library/std/src/sys/fs/mod.rs
+@@ -11,4 +11,8 @@
+ cfg_select! {
++    target_os = "rustos" => {
++        mod rustos;
++        use rustos as imp;
++    }
+     any(target_family = "unix", target_os = "wasi") => {
+         mod unix;
+         use unix as imp;

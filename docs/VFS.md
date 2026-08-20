@@ -3,7 +3,7 @@
 ## Что уже исполняется
 
 Файловая система больше не является RAM overlay ядра. При загрузке process
-manager создаёт отдельный ring-3 процесс `vfsd.elf` и передаёт только ему:
+manager создаёт отдельный ring-3 процесс `vfsd.rune` и передаёт только ему:
 
 - `RECEIVE` capability на служебный IPC endpoint;
 - `READ | WRITE` capability на системное блочное устройство.
@@ -22,7 +22,7 @@ vfs-1.dll                 stable C ABI + safe Rust facade
     |
     | bounded capability IPC; file data in shared memory
     v
-vfsd.elf (ring 3)         paths, open descriptions, VaraniaFS allocator
+vfsd.rune (ring 3)        paths, open descriptions, VaraniaFS allocator
     |
     | 4-KiB block syscalls; capability checked by kernel
     v
@@ -56,9 +56,10 @@ endpoint, перезапустить `vfsd` и переиздать клиент
 length. `read`/`write` автоматически разбиваются на chunks по 64 КиБ, поэтому
 размер файла не ограничен размером сообщения или окна.
 
-У `VfsClient` один синхронный запрос в полёте. Для независимых потоков нужно
-отдельное соединение/reply endpoint; это сохраняет простой учебный протокол и
-не требует скрытой блокировки внутри DLL.
+У самостоятельного `VfsClient` один синхронный запрос в полёте. Порт
+upstream `std::fs` временно сериализует вызовы процесса и переиспользует одно
+64-КиБ окно; после готовности thread runtime каждому worker выдаётся отдельный
+reply endpoint/client. Это сохраняет простой wire protocol без request races.
 
 ## Постоянный том
 
@@ -102,12 +103,15 @@ Boot-test запускает два разных клиента с полным 
 Это тестирует не только API, но и отсутствие зависимости от памяти первого
 server process.
 
+Дополнительно boot-test запускает RUNE-программу с настоящей upstream `std`.
+Она проходит `File/OpenOptions`, `Read/Write/Seek`, metadata, readdir, rename
+и cleanup через ту же границу `std -> shared memory IPC -> vfsd`.
+
 ## Честные границы текущего этапа
 
-- `vfs-1.dll` является настоящим ELF64 `ET_DYN` с `DT_SONAME` и unmangled C
-  exports; user-space loader уже умеет загрузить такие модули. Переход всех
-  приложений с bootstrap static client на import table остаётся следующим
-  интеграционным шагом.
+- `vfs-1.dll` пока является переходным ELF64 `ET_DYN` с unmangled C exports;
+  user-space loader умеет его загружать. Финальный RUNE interface/import ABI
+  описан в [`RUNE.md`](RUNE.md), но нативный resolver ещё не подключён.
 - Legacy virtio-blk transport временно находится в kernel. После появления
   PCI, DMA и IRQ capabilities он переедет в изолированный `virtioblkd`, не
   меняя VFS ABI.
@@ -117,9 +121,9 @@ server process.
 - Две checksummed копии метаданных защищают commit. Данные файла сейчас
   пишутся in-place и не имеют checksum/COW, поэтому torn sector в data block
   пока может испортить содержимое при сохранённых метаданных.
-- Сам dynamic loader читает DLL из VaraniaFS через `vfs-1.dll`; начальный
-  маленький `loader-test.elf` всё ещё запускается kernel из initramfs. Полный
-  exec path должен передать ему путь/namespace и убрать parsing ELF из kernel.
+- ELF dynamic loader читает fixture DLL из VaraniaFS через VFS client;
+  начальный `loader-test.rune` уже запускается из initramfs. После нативного
+  RUNE resolver переходные `root.elf/fixture-1.dll` будут удалены.
 
 ## Направление развития
 

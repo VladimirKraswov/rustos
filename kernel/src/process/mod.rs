@@ -1,10 +1,11 @@
-//! Процессы микроядра: ELF loader, local capability table и synchronous
+//! Процессы микроядра: RUNE/ELF bootstrap loader, local capability table и synchronous
 //! bootstrap runner. Scheduler позднее заменит synchronous enter/return, но
 //! trap/fault/lifecycle ABI останется тем же.
 
 mod elf;
 #[path = "manager_v2.rs"]
 mod manager;
+mod rune;
 
 use core::{ptr, str};
 
@@ -23,6 +24,25 @@ use crate::{
 
 pub(super) const MAX_CAPABILITIES: usize = 32;
 pub(super) const VFS_ROOT_SLOT: usize = 1;
+
+/// Результат любого executable loader. Формат файла не просачивается дальше
+/// границы process subsystem.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct LoadedImage {
+    pub entry: u64,
+    pub stack_pointer: u64,
+    pub thread_pointer: u64,
+}
+
+fn load_executable(space: &mut AddressSpace, image: &[u8]) -> Result<LoadedImage, ProcessError> {
+    if image.starts_with(&rustos_rune_format::MAGIC) {
+        rune::load(space, image).map_err(|_| ProcessError::InvalidImage)
+    } else {
+        // Временный migration path: bootstrapping старого образа остаётся
+        // возможным, но новые файлы initramfs собираются только как RUNE.
+        elf::load(space, image).map_err(|_| ProcessError::InvalidImage)
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum CapabilityKind {
@@ -93,28 +113,32 @@ impl ProcessContext {
 
 #[derive(Debug)]
 pub enum ProcessError {
-    MissingElf,
+    MissingImage,
     AddressSpace,
-    InvalidElf,
+    InvalidImage,
     UnexpectedExit,
     FrameLeak,
 }
 
 static mut CURRENT_PROCESS: *mut ProcessContext = ptr::null_mut();
 
-/// Запускает два настоящих ring-3 ELF из initramfs: нормальный VFS client и
+/// Запускает два настоящих ring-3 RUNE из initramfs: нормальный VFS client и
 /// намеренно падающий isolation test.
 pub fn run_bootstrap_milestone(initramfs: BootInitramfs) -> Result<(), ProcessError> {
-    let normal = run_one(ProcessId::new(1, 1), initramfs, "system/bin/init.elf")?;
+    let normal = run_one(ProcessId::new(1, 1), initramfs, "system/bin/init.rune")?;
     if normal.status != 0 || normal.exception != 0 {
-        log_unexpected_exit("init.elf", normal);
+        log_unexpected_exit("init.rune", normal);
         return Err(ProcessError::UnexpectedExit);
     }
-    serial::put_str("[process] init.elf exited cleanly; VFS capability verified\n");
+    serial::put_str("[process] init.rune exited cleanly; VFS capability verified\n");
 
-    let fault = run_one(ProcessId::new(1, 2), initramfs, "system/bin/fault-test.elf")?;
+    let fault = run_one(
+        ProcessId::new(1, 2),
+        initramfs,
+        "system/bin/fault-test.rune",
+    )?;
     if fault.exception != arch::ILLEGAL_INSTRUCTION_EXCEPTION {
-        log_unexpected_exit("fault-test.elf", fault);
+        log_unexpected_exit("fault-test.rune", fault);
         return Err(ProcessError::UnexpectedExit);
     }
     serial::put_str("[isolation] user #UD contained; kernel and GUI continue\n");
@@ -135,11 +159,11 @@ fn run_one(
     let free_before = memory::stats()
         .map_err(|_| ProcessError::AddressSpace)?
         .free_frames;
-    let image = fs::initramfs_file(initramfs, path).map_err(|_| ProcessError::MissingElf)?;
+    let image = fs::initramfs_file(initramfs, path).map_err(|_| ProcessError::MissingImage)?;
     let kernel_root = arch::current_address_space_root();
     let mut address_space =
         AddressSpace::new(kernel_root).map_err(|_| ProcessError::AddressSpace)?;
-    let loaded = elf::load(&mut address_space, image).map_err(|_| ProcessError::InvalidElf)?;
+    let loaded = load_executable(&mut address_space, image)?;
     let mut process = ProcessContext::new(pid, address_space, initramfs);
     serial::put_str("[process] enter ring3 pid=0x");
     serial::put_hex(pid.0);
@@ -148,6 +172,7 @@ fn run_one(
     serial::put_str("\n");
 
     unsafe { CURRENT_PROCESS = &mut process };
+    arch::set_user_thread_pointer(loaded.thread_pointer);
     let _raw_result = unsafe {
         arch::enter_user(
             loaded.entry,
@@ -157,6 +182,7 @@ fn run_one(
             false,
         )
     };
+    arch::set_user_thread_pointer(0);
     unsafe { CURRENT_PROCESS = ptr::null_mut() };
     // enter_user backend уже вернул kernel address-space root. Drop освобождает все
     // data/stack/page-table frames address space.

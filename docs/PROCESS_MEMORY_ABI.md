@@ -3,7 +3,7 @@
 Этот документ описывает первый исполняемый ABI RustOS, достаточный для
 построения `std::process`, `std::thread`, allocator и zero-copy IPC. Общие
 `#[repr(C)]` структуры находятся в `rustos-abi`, обёртки — в
-`rustos-runtime`, а проверка выполняется настоящими ELF64-процессами ring 3.
+`rustos-runtime`, а проверка выполняется настоящими RUNE-процессами ring 3.
 
 ## Capability-модель
 
@@ -23,7 +23,7 @@ capability handle:
 ## Процессы, argv и environment
 
 `process_spawn(request, result)` создаёт отдельные таблицы страниц, загружает
-ELF64 PIE и создаёт начальный поток. Сейчас image читается из read-only
+RUNE image и создаёт начальный поток. Сейчас image читается из read-only
 initramfs namespace. После запуска `vfsd` тот же request будет обслуживаться
 VFS capability без изменения структуры ABI.
 

@@ -6,6 +6,7 @@
   "dll-suffix": ".dll",
   "dynamic-linking": true,
   "executables": true,
+  "has-thread-local": true,
   "linker": "rust-lld",
   "linker-flavor": "gnu-lld",
   "llvm-target": "x86_64-unknown-none-elf",
@@ -17,5 +18,6 @@
   "relocation-model": "pic",
   "static-position-independent-executables": true,
   "target-endian": "little",
-  "target-pointer-width": 64
+  "target-pointer-width": 64,
+  "tls-model": "initial-exec"
 }

@@ -1,0 +1,126 @@
+--- a/library/std/src/sys/pal/mod.rs
++++ b/library/std/src/sys/pal/mod.rs
+@@ -6,4 +6,8 @@
+ cfg_select! {
++    target_os = "rustos" => {
++        mod rustos;
++        pub use self::rustos::*;
++    }
+     unix => {
+         mod unix;
+         pub use self::unix::*;
+--- a/library/std/src/sys/alloc/mod.rs
++++ b/library/std/src/sys/alloc/mod.rs
+@@ -66,4 +66,8 @@
+ cfg_select! {
++    target_os = "rustos" => {
++        mod rustos;
++        use rustos as imp;
++    }
+     any(
+         target_family = "unix",
+         target_os = "wasi",
+--- a/library/std/src/sys/io/error/mod.rs
++++ b/library/std/src/sys/io/error/mod.rs
+@@ -1,4 +1,8 @@
+ cfg_select! {
++    target_os = "rustos" => {
++        mod generic;
++        pub use generic::*;
++    }
+     target_os = "hermit" => {
+         mod hermit;
+         pub use hermit::*;
+--- a/library/std/src/sys/random/mod.rs
++++ b/library/std/src/sys/random/mod.rs
+@@ -1,4 +1,8 @@
+ cfg_select! {
++    target_os = "rustos" => {
++        mod rustos;
++        pub use rustos::fill_bytes;
++    }
+     // Tier 1
+     any(target_os = "linux", target_os = "android") => {
+         mod linux;
+--- a/library/std/src/sys/sync/futex/mod.rs
++++ b/library/std/src/sys/sync/futex/mod.rs
+@@ -1,4 +1,8 @@
+ cfg_select! {
++    target_os = "rustos" => {
++        mod rustos;
++        pub use rustos::*;
++    }
+     any(
+         target_os = "linux",
+         target_os = "android",
+--- a/library/std/src/sys/sync/mutex/mod.rs
++++ b/library/std/src/sys/sync/mutex/mod.rs
+@@ -10,6 +10,7 @@
+         target_os = "dragonfly",
+         all(target_family = "wasm", target_feature = "atomics"),
+         target_os = "hermit",
++        target_os = "rustos",
+         all(target_os = "wasi", target_env = "p3"),
+     ) => {
+         mod futex;
+--- a/library/std/src/sys/sync/condvar/mod.rs
++++ b/library/std/src/sys/sync/condvar/mod.rs
+@@ -11,6 +11,7 @@
+         target_os = "fuchsia",
+         all(target_family = "wasm", target_feature = "atomics"),
+         target_os = "hermit",
++        target_os = "rustos",
+         all(target_os = "wasi", target_env = "p3"),
+     ) => {
+         mod futex;
+--- a/library/std/src/sys/sync/once/mod.rs
++++ b/library/std/src/sys/sync/once/mod.rs
+@@ -20,6 +20,7 @@
+         target_os = "dragonfly",
+         target_os = "fuchsia",
+         target_os = "hermit",
++        target_os = "rustos",
+         all(target_os = "wasi", target_env = "p3"),
+     ) => {
+         mod futex;
+--- a/library/std/src/sys/sync/rwlock/mod.rs
++++ b/library/std/src/sys/sync/rwlock/mod.rs
+@@ -10,6 +10,7 @@
+         target_os = "fuchsia",
+         all(target_family = "wasm", target_feature = "atomics"),
+         target_os = "hermit",
++        target_os = "rustos",
+         target_os = "motor",
+         all(target_os = "wasi", target_env = "p3"),
+     ) => {
+--- a/library/std/src/sys/sync/thread_parking/mod.rs
++++ b/library/std/src/sys/sync/thread_parking/mod.rs
+@@ -10,6 +10,7 @@
+         target_os = "fuchsia",
+         target_os = "motor",
+         target_os = "hermit",
++        target_os = "rustos",
+         all(target_os = "wasi", target_env = "p3"),
+     ) => {
+         mod futex;
+--- a/library/std/src/sys/thread_local/mod.rs
++++ b/library/std/src/sys/thread_local/mod.rs
+@@ -121,6 +121,7 @@
+         }
+         any(
+             target_os = "hermit",
++            target_os = "rustos",
+             target_os = "xous",
+         ) => {
+             // `std` is the only runtime, so it just calls the destructor functions
+--- a/library/std/src/sys/time/mod.rs
++++ b/library/std/src/sys/time/mod.rs
+@@ -1,4 +1,8 @@
+ cfg_select! {
++    target_os = "rustos" => {
++        mod rustos;
++        use rustos as imp;
++    }
+     target_os = "hermit" => {
+         mod hermit;
+         use hermit as imp;

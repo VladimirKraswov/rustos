@@ -4,6 +4,8 @@ use rustos_abi::PAGE_SIZE;
 
 use crate::memory::{AddressSpace, UserPageFlags};
 
+use super::LoadedImage;
+
 const USER_IMAGE_BASE: u64 = 0x0000_4000_0000_0000;
 const USER_STACK_TOP: u64 = 0x0000_7fff_ffff_f000;
 const USER_STACK_PAGES: u64 = 16;
@@ -42,12 +44,6 @@ const EMPTY_SEGMENT: LoadSegment = LoadSegment {
     memory_size: 0,
     flags: 0,
 };
-
-#[derive(Clone, Copy, Debug)]
-pub struct LoadedImage {
-    pub entry: u64,
-    pub stack_pointer: u64,
-}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ElfError {
@@ -175,6 +171,7 @@ pub fn load(space: &mut AddressSpace, image: &[u8]) -> Result<LoadedImage, ElfEr
     Ok(LoadedImage {
         entry,
         stack_pointer: crate::arch::initial_user_stack(USER_STACK_TOP),
+        thread_pointer: 0,
     })
 }
 

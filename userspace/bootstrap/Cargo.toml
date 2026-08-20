@@ -59,6 +59,15 @@ path = "src/loader_test.rs"
 name = "rustos-loader-child"
 path = "src/loader_child.rs"
 
+[[bin]]
+name = "rustos-std-smoke"
+path = "src/std_smoke.rs"
+required-features = ["std-port"]
+
+[features]
+default = []
+std-port = []
+
 [dependencies]
 rustos-abi = { path = "../../abi" }
 rustos-runtime = { path = "../../runtime" }

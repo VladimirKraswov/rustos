@@ -7,27 +7,29 @@
 
 ## Текущая граница реализации
 
-Сейчас репозиторий находится на S0: target kernel cross-компилируется на
-macOS/Linux. Обязательный процессный checkpoint пройден: отдельный ELF64 PIE
-запускается в CPL3 с process-local capabilities; fault второго ELF не
-останавливает kernel/GUI, а кадры его address space освобождаются. ABI v3
-предоставляет spawn/wait/kill, несколько потоков, anonymous VM, shared
-memory, args/env, TLS и monotonic clock.
+Сейчас репозиторий находится между S1 и S2: target kernel всё ещё
+cross-компилируется на macOS/Linux, но настоящая upstream `core + alloc + std`
+уже собирается для RustOS. Отдельный RUNE-процесс запускается в CPL3 с
+process-local capabilities; fault соседнего процесса не останавливает
+kernel/GUI, а кадры address space освобождаются. Syscall ABI v4 предоставляет
+spawn/wait/kill, несколько потоков, anonymous/shared VM, TLS и monotonic clock.
 
 Следующий checkpoint тоже исполняется: изолированный ring-3 `vfsd` обслуживает
 open/read/write/seek/readdir/create/delete/rename через capability IPC и
 shared memory. VaraniaFS хранится на отдельном virtio-blk образе; boot-test
 полностью перезапускает сервис и читает сохранённый файл новым процессом.
-Первая `vfs-1.dll` собирается как ELF64 `ET_DYN`. User-space loader уже
-обрабатывает `DT_NEEDED`, symbols, основные x86-64 RELA, initial-exec TLS,
-RELRO и physically shared RX pages; это проверяется вызовом двух настоящих
-DLL из VaraniaFS.
+Публичный `std::fs` уже работает поверх capability IPC к `vfsd`: boot-test
+создаёт, читает, переименовывает и удаляет persistent VaraniaFS-файл именно
+через upstream `std`. Все запускаемые system applications упакованы в
+нативный формат RUNE. User-space ELF loader продолжает проверять `DT_NEEDED`,
+symbols, AMD64 RELA, initial-exec TLS, RELRO и physically shared RX pages для
+переходных DLL fixtures.
 
-Это всё ещё не нативный compiler: target `std`, полный `exec` через VFS,
-pipes, general-dynamic TLS/`dlopen` и полноценный SMP runtime пока отсутствуют.
-Следующая прямая зависимость self-hosting — сделать `ld-rustos` начальным
-образом нового процесса и передавать ему executable VFS capability, затем
-реализовать `std::fs`, `std::thread`, `std::process` и `std::sys::dynamic_loading`.
+Это всё ещё не нативный compiler. Не готовы `std::thread::spawn`, startup
+argc/argv/environment, `std::process`, pipes, networking/offline Cargo host
+workflow и нативный RUNE DLL resolver. Следующая прямая зависимость
+self-hosting — process startup runtime, настоящее блокирование futex и RUNE
+imports/exports; затем можно запускать cross-built native seed `rustc`.
 
 ## Три разные платформы Rust bootstrap
 
@@ -37,8 +39,9 @@ pipes, general-dynamic TLS/`dlopen` и полноценный SMP runtime пок
 - **host** — машина, на которой должен запускаться собранный `rustc`;
 - **target** — машина, для которой `rustc` генерирует программу.
 
-Текущий JSON target уже позволяет macOS/Linux генерировать freestanding ELF
-ядра. Для native compiler нужен гораздо более сложный host
+Текущий JSON target позволяет macOS/Linux генерировать ELF64 PIE intermediate,
+который `rustos-rune` превращает в нативный container. Для compiler нужен
+гораздо более сложный host
 `x86_64-unknown-rustos`: собранные `rustc`, `cargo`, build scripts и proc
 macros должны запускаться внутри RustOS. Значит до порта compiler обязательны
 полноценные `std`, процессы, потоки, TLS, VFS, часы, environment, pipes,
@@ -57,7 +60,7 @@ macros должны запускаться внутри RustOS. Значит д�
    codegen backend, которые уже запускаются как RustOS host tools.
 4. **S3 native rebuild** — S2 внутри VM собирает те же версии toolchain и
    всей RustOS из исходников на VaraniaFS.
-5. **S4 reproducibility** — S3 повторяет сборку; нормализованные ELF и disk
+5. **S4 reproducibility** — S3 повторяет сборку; нормализованные RUNE и disk
    image совпадают по digest. После этого штатный `make build` только просит
    RustOS build VM выполнить сборку, а host остаётся транспортом и QEMU.
 
@@ -73,7 +76,7 @@ Seed лежит в versioned toolchain bundle с SHA-256, исходниками
 2. `library/std/src/sys/pal/rustos`: файлы, сеть-заглушка, args/env, time,
    thread, mutex/condvar, process, pipe, dynamic loading;
 3. crates `libc`/`cc` и RustOS SDK headers/import libraries;
-4. native linker `rust-lld` и loader для ELF64 PIE/DLL;
+4. native `rust-lld`, `rustos-rune` и loader RUNE applications/DLL;
 5. `rustc_driver`, `rustdoc`, proc-macro server;
 6. Cargo с локальным registry/vendor store, без обязательной сети;
 7. bootstrap tools `rustos-pack`, `rustos-image` и test runner как native

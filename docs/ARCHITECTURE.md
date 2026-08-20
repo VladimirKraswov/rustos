@@ -19,7 +19,7 @@ rustos-boot --> BootInfo v3 --> kernel
                                   |-- serial diagnostics
                                   |-- GDT/TSS/IDT + exception containment
                                   |-- physical frame allocator
-                                  |-- ELF64 CPL3 bootstrap runner
+                                  |-- RUNE CPL3 loader (ELF migration fallback)
                                   |-- process-local VFS capability
                                   |-- local-APIC preemptive process manager
                                   |-- endpoint IPC + capability transfer
@@ -36,7 +36,7 @@ rustos-boot --> BootInfo v3 --> kernel
 Ранний GUI-сеанс работает на CPU0 и не использует heap. Unsafe MMIO и port I/O
 сосредоточены в `graphics`, `input` и `arch`; widget/window/application logic
 написана без unsafe. Первый kernel object уже существует: process-local VFS
-handle разрешает ring-3 `init.elf` выполнить ограниченный `vfs_stat`. Это
+handle разрешает ring-3 `init.rune` выполнить ограниченный `vfs_stat`. Это
 bootstrap backend initramfs, не финальный `vfsd`.
 
 Platform-independent crate `rustos-microkernel` содержит process/thread
@@ -67,7 +67,7 @@ MADT перечисляет CPU, BSP последовательно выполн
 
 1. **готово:** собственные GDT/TSS/IDT, CPL3 traps и возврат в kernel;
 2. **готово:** physical allocator, отдельные CR3, W^X/NX и полный reclaim;
-3. **готово:** ELF64 PIE loader, VFS capability и изоляционный fault test;
+3. **готово:** RUNE loader, VFS capability и изоляционный fault test;
 4. **готово на CPU0:** APIC preemption, dynamic lifecycle, endpoint IPC и
    capability transfer;
 5. **bootstrap готов:** AP startup; дальше per-CPU TSS/IDT, timer queues,
@@ -75,8 +75,8 @@ MADT перечисляет CPU, BSP последовательно выполн
 6. **готово:** shared-memory IPC и process create/kill/wait syscalls;
 7. **готово:** изолированный `vfsd`, persistent VaraniaFS и user-space
    dynamic loader (`DT_NEEDED`, symbols, TLS, RELRO, shared RX);
-8. полный `exec` через VFS, target `std`, native Rust toolchain и
-   package/build services;
+8. **частично:** upstream target `std` и `std::fs`; дальше startup runtime,
+   RUNE DLL resolver, native Rust toolchain и package/build services;
 9. `inputd`, `displayd`, compositor и terminal как отдельные процессы;
 10. supervisor применяет restart policy к реальным service manifests.
 

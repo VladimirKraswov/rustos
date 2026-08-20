@@ -106,8 +106,8 @@ pub extern "C" fn _start(vfs_handle: u64, abi_version: u64) -> ! {
     let request = ProcessSpawnRequest {
         version: PROCESS_ABI_VERSION,
         flags: 0,
-        path_address: b"/boot/system/bin/abi-child.elf".as_ptr() as u64,
-        path_length: b"/boot/system/bin/abi-child.elf".len() as u32,
+        path_address: b"/boot/system/bin/abi-child.rune".as_ptr() as u64,
+        path_length: b"/boot/system/bin/abi-child.rune".len() as u32,
         priority: PriorityClass::Interactive as u8,
         reserved0: [0; 3],
         arguments_address: arguments.as_ptr() as u64,

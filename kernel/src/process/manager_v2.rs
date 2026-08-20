@@ -37,8 +37,8 @@ use crate::{
 };
 
 use super::{
-    elf, CapabilityEntry, CapabilityKind, ProcessError, EMPTY_CAPABILITY, MAX_CAPABILITIES,
-    VFS_ROOT_SLOT,
+    load_executable, CapabilityEntry, CapabilityKind, ProcessError, EMPTY_CAPABILITY,
+    MAX_CAPABILITIES, VFS_ROOT_SLOT,
 };
 
 const MAX_PROCESSES: usize = 12;
@@ -447,7 +447,7 @@ impl ProcessManager {
     ) -> Result<ProcessId, ProcessError> {
         let image = fs::initramfs_file(self.initramfs, path).map_err(|_| {
             serial::put_str("[process-manager] spawn failed: image not found\n");
-            ProcessError::MissingElf
+            ProcessError::MissingImage
         })?;
         let process_slot = self
             .processes
@@ -482,9 +482,9 @@ impl ProcessManager {
             serial::put_str("\n");
             ProcessError::AddressSpace
         })?;
-        let loaded = elf::load(&mut address_space, image).map_err(|_| {
-            serial::put_str("[process-manager] spawn failed: ELF mapping\n");
-            ProcessError::InvalidElf
+        let loaded = load_executable(&mut address_space, image).map_err(|_| {
+            serial::put_str("[process-manager] spawn failed: executable mapping\n");
+            ProcessError::InvalidImage
         })?;
         let pid = self
             .process_table
@@ -523,10 +523,12 @@ impl ProcessManager {
             exit_reason: NO_EXIT,
             expected: options.expected,
         });
+        let mut context = UserContext::initial(loaded.entry, loaded.stack_pointer, arguments);
+        context.set_thread_pointer(loaded.thread_pointer);
         self.threads[thread_slot] = Some(ManagedThread {
             tid,
             pid,
-            context: UserContext::initial(loaded.entry, loaded.stack_pointer, arguments),
+            context,
             pending: PendingOperation::None,
             exited: false,
             exit_reason: NO_EXIT,
@@ -1179,7 +1181,7 @@ impl ProcessManager {
             Some(&start),
         ) {
             Ok(pid) => pid,
-            Err(ProcessError::MissingElf) => return status::NOT_FOUND,
+            Err(ProcessError::MissingImage) => return status::NOT_FOUND,
             Err(ProcessError::AddressSpace) => return status::OUT_OF_MEMORY,
             Err(_) => return status::INVALID_ARGUMENT,
         };
@@ -2371,7 +2373,7 @@ pub(super) fn run_milestone(info: &rustos_abi::BootInfo) -> Result<(), ProcessEr
     let manager = unsafe { &mut *ptr::addr_of_mut!(MANAGER) };
     manager.initialize(info.initramfs, hardware.counter_hz);
     manager.spawn(
-        "system/bin/preempt-a.elf",
+        "system/bin/preempt-a.rune",
         PriorityClass::Interactive,
         [0, syscall::ABI_VERSION, 0],
         21,
@@ -2379,7 +2381,7 @@ pub(super) fn run_milestone(info: &rustos_abi::BootInfo) -> Result<(), ProcessEr
         [EMPTY_CAPABILITY; MAX_CAPABILITIES],
     )?;
     manager.spawn(
-        "system/bin/preempt-b.elf",
+        "system/bin/preempt-b.rune",
         PriorityClass::Interactive,
         [0, syscall::ABI_VERSION, 0],
         22,
@@ -2403,7 +2405,7 @@ pub(super) fn run_milestone(info: &rustos_abi::BootInfo) -> Result<(), ProcessEr
 
     manager.begin_phase();
     manager.spawn(
-        "system/bin/fault-test.elf",
+        "system/bin/fault-test.rune",
         PriorityClass::Interactive,
         [0, syscall::ABI_VERSION, 0],
         status::FAULT as i32,
@@ -2411,7 +2413,7 @@ pub(super) fn run_milestone(info: &rustos_abi::BootInfo) -> Result<(), ProcessEr
         [EMPTY_CAPABILITY; MAX_CAPABILITIES],
     )?;
     manager.spawn(
-        "system/bin/preempt-b.elf",
+        "system/bin/preempt-b.rune",
         PriorityClass::Interactive,
         [0, syscall::ABI_VERSION, 0],
         22,
@@ -2425,54 +2427,22 @@ pub(super) fn run_milestone(info: &rustos_abi::BootInfo) -> Result<(), ProcessEr
     serial::put_str("[isolation] concurrent #UD terminated one process; survivor exited=22\n");
     manager.cleanup();
 
-    manager.begin_phase();
-    let endpoint_id = 0u8;
-    let mut receiver_caps = [EMPTY_CAPABILITY; MAX_CAPABILITIES];
-    receiver_caps[ENDPOINT_SLOT] = CapabilityEntry {
-        kind: CapabilityKind::Endpoint(endpoint_id),
-        rights: Rights::RECEIVE,
-    };
-    let receiver = manager.spawn(
-        "system/bin/ipc-receiver.elf",
+    // Разный priority делает обе допустимые IPC-ветви детерминированными:
+    // сначала RECEIVE -> block/wake, затем SEND -> bounded queue -> receive.
+    // Раньше равный priority связывал результат теста с timer timing.
+    run_ipc_phase(
+        manager,
         PriorityClass::System,
-        [ENDPOINT_SLOT as u64, syscall::ABI_VERSION, 0],
-        0,
-        0,
-        receiver_caps,
+        PriorityClass::Interactive,
+        1,
     )?;
-    manager.endpoints[endpoint_id as usize].receiver = receiver;
-
-    let mut sender_caps = [EMPTY_CAPABILITY; MAX_CAPABILITIES];
-    sender_caps[VFS_ROOT_SLOT] = CapabilityEntry {
-        kind: CapabilityKind::VfsRoot,
-        rights: Rights::READ.union(Rights::TRANSFER),
-    };
-    sender_caps[ENDPOINT_SLOT] = CapabilityEntry {
-        kind: CapabilityKind::Endpoint(endpoint_id),
-        rights: Rights::SEND,
-    };
-    manager.spawn(
-        "system/bin/ipc-sender.elf",
+    run_ipc_phase(
+        manager,
+        PriorityClass::Interactive,
         PriorityClass::System,
-        [
-            ENDPOINT_SLOT as u64,
-            VFS_ROOT_SLOT as u64,
-            syscall::ABI_VERSION,
-        ],
         0,
-        0,
-        sender_caps,
     )?;
-    if let Err(error) = manager.run() {
-        manager.cleanup();
-        return Err(error);
-    }
-    if manager.blocked_receives != 1 || manager.transferred_capabilities != 1 {
-        manager.cleanup();
-        return Err(ProcessError::UnexpectedExit);
-    }
     serial::put_str("[ipc] queued block/wake and attenuated VFS capability verified\n");
-    manager.cleanup();
 
     manager.begin_phase();
     let mut lifecycle_caps = [EMPTY_CAPABILITY; MAX_CAPABILITIES];
@@ -2481,7 +2451,7 @@ pub(super) fn run_milestone(info: &rustos_abi::BootInfo) -> Result<(), ProcessEr
         rights: Rights::READ.union(Rights::EXECUTE).union(Rights::TRANSFER),
     };
     manager.spawn(
-        "system/bin/abi-lifecycle.elf",
+        "system/bin/abi-lifecycle.rune",
         PriorityClass::Interactive,
         [VFS_ROOT_SLOT as u64, syscall::ABI_VERSION, 0],
         0,
@@ -2495,16 +2465,21 @@ pub(super) fn run_milestone(info: &rustos_abi::BootInfo) -> Result<(), ProcessEr
     serial::put_str("[abi-v4] spawn/wait/kill threads VM shared-memory TLS clock verified\n");
     manager.cleanup();
 
+    run_vfs_phase(manager, "system/bin/std-smoke.rune", false)?;
+    serial::put_str(
+        "[std] collections allocator sync time and std::fs over vfsd verified in ring3 RUNE\n",
+    );
+
     // Настоящий VFS vertical slice: filesystem parser и pathname policy живут
     // в ring 3. Только vfsd получает raw block capability, клиент видит лишь
     // endpoint и `vfs.dll` API. Второй запуск server доказывает persistence.
-    run_vfs_phase(manager, "system/bin/vfs-test.elf", false)?;
+    run_vfs_phase(manager, "system/bin/vfs-test.rune", false)?;
     serial::put_str(
         "[vfsd] open/read/write/seek/readdir/create/rename over shared memory verified\n",
     );
-    run_vfs_phase(manager, "system/bin/vfs-persistence.elf", false)?;
+    run_vfs_phase(manager, "system/bin/vfs-persistence.rune", false)?;
     serial::put_str("[vfsd] restart recovered committed VaraniaFS metadata and file data\n");
-    run_vfs_phase(manager, "system/bin/loader-test.elf", true)?;
+    run_vfs_phase(manager, "system/bin/loader-test.rune", true)?;
     serial::put_str(
         "[loader] DT_NEEDED symbols RELA TLS RELRO and cross-process shared RX verified\n",
     );
@@ -2541,7 +2516,7 @@ fn run_vfs_phase(
         rights: Rights::READ.union(Rights::WRITE),
     };
     let server = manager.spawn(
-        "system/bin/vfsd.elf",
+        "system/bin/vfsd.rune",
         PriorityClass::System,
         [
             SERVER_SLOT as u64,
@@ -2585,6 +2560,64 @@ fn run_vfs_phase(
     if let Err(error) = manager.run() {
         manager.cleanup();
         return Err(error);
+    }
+    manager.cleanup();
+    Ok(())
+}
+
+fn run_ipc_phase(
+    manager: &mut ProcessManager,
+    receiver_priority: PriorityClass,
+    sender_priority: PriorityClass,
+    expected_blocked_receives: u64,
+) -> Result<(), ProcessError> {
+    let endpoint_id = 0u8;
+    manager.begin_phase();
+    let mut receiver_caps = [EMPTY_CAPABILITY; MAX_CAPABILITIES];
+    receiver_caps[ENDPOINT_SLOT] = CapabilityEntry {
+        kind: CapabilityKind::Endpoint(endpoint_id),
+        rights: Rights::RECEIVE,
+    };
+    let receiver = manager.spawn(
+        "system/bin/ipc-receiver.rune",
+        receiver_priority,
+        [ENDPOINT_SLOT as u64, syscall::ABI_VERSION, 0],
+        0,
+        0,
+        receiver_caps,
+    )?;
+    manager.endpoints[endpoint_id as usize].receiver = receiver;
+
+    let mut sender_caps = [EMPTY_CAPABILITY; MAX_CAPABILITIES];
+    sender_caps[VFS_ROOT_SLOT] = CapabilityEntry {
+        kind: CapabilityKind::VfsRoot,
+        rights: Rights::READ.union(Rights::TRANSFER),
+    };
+    sender_caps[ENDPOINT_SLOT] = CapabilityEntry {
+        kind: CapabilityKind::Endpoint(endpoint_id),
+        rights: Rights::SEND,
+    };
+    manager.spawn(
+        "system/bin/ipc-sender.rune",
+        sender_priority,
+        [
+            ENDPOINT_SLOT as u64,
+            VFS_ROOT_SLOT as u64,
+            syscall::ABI_VERSION,
+        ],
+        0,
+        0,
+        sender_caps,
+    )?;
+    if let Err(error) = manager.run() {
+        manager.cleanup();
+        return Err(error);
+    }
+    if manager.blocked_receives != expected_blocked_receives
+        || manager.transferred_capabilities != 1
+    {
+        manager.cleanup();
+        return Err(ProcessError::UnexpectedExit);
     }
     manager.cleanup();
     Ok(())

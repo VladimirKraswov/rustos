@@ -1,0 +1,11 @@
+[package]
+name = "rustos-rune"
+description = "Конвертер ELF64/PIC в нативный контейнер RUNE и verifier"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+rustos-rune-format = { path = "../../rune-format" }

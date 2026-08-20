@@ -43,7 +43,7 @@ PS/2 находится в `kernel/src/input/ps2.rs`, потому что это
 - firmware root: ACPI RSDP либо Flattened Device Tree;
 - initramfs, kernel reservation и boot stack.
 
-Syscall numbers, capability handles, IPC и DLL metadata одинаковы на обеих
+Syscall numbers, capability handles, IPC и RUNE metadata одинаковы на обеих
 ISA. Различается только низкоуровневая конвенция:
 
 | Target | Номер | Аргументы | Вход | Результат |
@@ -51,8 +51,9 @@ ISA. Различается только низкоуровневая конве
 | AMD64 | RAX | RDI, RSI, RDX | `int 0x80` | RAX |
 | AArch64 | x8 | x0, x1, x2 | `svc #0` | x0 |
 
-ELF loader принимает `EM_X86_64/R_X86_64_RELATIVE` либо
-`EM_AARCH64/R_AARCH64_RELATIVE`. User stack соблюдает SysV AMD64 и AAPCS64.
+RUNE выбирает `X86_64` либо `AARCH64` slice. Build converter принимает
+соответствующий ELF machine/RELATIVE relocation только как промежуточный
+toolchain output. User stack соблюдает SysV AMD64 и AAPCS64.
 Исходники bootstrap-программ общие: даже test fault и monotonic counter
 вызываются через runtime, без assembler в приложениях.
 
@@ -60,7 +61,7 @@ ELF loader принимает `EM_X86_64/R_X86_64_RELATIVE` либо
 
 | Возможность | AMD64 | AArch64 |
 |---|---:|---:|
-| kernel/runtime/apps ELF собираются | да | да |
+| kernel/runtime/apps + RUNE converter | да | да |
 | page descriptor encoding | да | да, 4 KiB granule |
 | syscall/context ABI | работает | определён и компилируется |
 | bootloader + запуск в VM | UEFI/OVMF | следующий milestone |
