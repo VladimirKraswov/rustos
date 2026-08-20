@@ -1,0 +1,153 @@
+//! Проверка PPM screendump до и после действия window manager.
+
+use std::{env, fs, path::Path};
+
+struct Image {
+    width: usize,
+    height: usize,
+    pixels: Vec<u8>,
+}
+
+impl Image {
+    fn read(path: &Path) -> Result<Self, String> {
+        let data = fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let mut cursor = 0;
+        let magic = token(&data, &mut cursor)?;
+        if magic != b"P6" {
+            return Err(format!("{}: expected binary P6 PPM", path.display()));
+        }
+        let width = parse_number(token(&data, &mut cursor)?)?;
+        let height = parse_number(token(&data, &mut cursor)?)?;
+        let max = parse_number(token(&data, &mut cursor)?)?;
+        if max != 255 || width < 800 || height < 600 {
+            return Err(format!(
+                "{}: invalid framebuffer {width}x{height}, max={max}",
+                path.display()
+            ));
+        }
+        // После max-value PPM содержит ровно один whitespace-разделитель.
+        // Нельзя пропускать «все whitespace»: первый красный байт картинки
+        // вполне может быть 10 (`\n`), как у тёмных обоев RustOS.
+        match (data.get(cursor), data.get(cursor + 1)) {
+            (Some(b'\r'), Some(b'\n')) => cursor += 2,
+            (Some(byte), _) if byte.is_ascii_whitespace() => cursor += 1,
+            _ => return Err(format!("{}: missing PPM pixel separator", path.display())),
+        }
+        let bytes = width
+            .checked_mul(height)
+            .and_then(|v| v.checked_mul(3))
+            .ok_or("PPM dimensions overflow")?;
+        let end = cursor.checked_add(bytes).ok_or("PPM offset overflow")?;
+        let pixels = data
+            .get(cursor..end)
+            .ok_or_else(|| format!("{}: truncated pixel data", path.display()))?
+            .to_vec();
+        Ok(Self {
+            width,
+            height,
+            pixels,
+        })
+    }
+
+    fn rgb(&self, x: usize, y: usize) -> [u8; 3] {
+        let index = (y * self.width + x) * 3;
+        [
+            self.pixels[index],
+            self.pixels[index + 1],
+            self.pixels[index + 2],
+        ]
+    }
+}
+
+fn token<'a>(data: &'a [u8], cursor: &mut usize) -> Result<&'a [u8], String> {
+    loop {
+        while data.get(*cursor).is_some_and(u8::is_ascii_whitespace) {
+            *cursor += 1;
+        }
+        if data.get(*cursor) != Some(&b'#') {
+            break;
+        }
+        while data.get(*cursor).is_some_and(|b| *b != b'\n') {
+            *cursor += 1;
+        }
+    }
+    let start = *cursor;
+    while data
+        .get(*cursor)
+        .is_some_and(|byte| !byte.is_ascii_whitespace())
+    {
+        *cursor += 1;
+    }
+    if start == *cursor {
+        return Err("missing PPM token".into());
+    }
+    Ok(&data[start..*cursor])
+}
+
+fn parse_number(token: &[u8]) -> Result<usize, String> {
+    std::str::from_utf8(token)
+        .map_err(|_| "non-UTF8 PPM number".to_string())?
+        .parse()
+        .map_err(|_| "invalid PPM number".to_string())
+}
+
+fn main() {
+    let mut args = env::args_os().skip(1);
+    let before_path = args.next().unwrap_or_else(|| {
+        eprintln!("usage: rustos-gui-check <terminal.ppm> <minimized.ppm>");
+        std::process::exit(2);
+    });
+    let after_path = args.next().unwrap_or_else(|| {
+        eprintln!("usage: rustos-gui-check <terminal.ppm> <minimized.ppm>");
+        std::process::exit(2);
+    });
+    let before = match Image::read(Path::new(&before_path)) {
+        Ok(image) => image,
+        Err(error) => fatal(error),
+    };
+    let after = match Image::read(Path::new(&after_path)) {
+        Ok(image) => image,
+        Err(error) => fatal(error),
+    };
+    if before.width != after.width || before.height != after.height {
+        fatal("screenshots have different dimensions".into());
+    }
+
+    let center = (before.width / 2, before.height / 2);
+    let terminal_pixel = before.rgb(center.0, center.1);
+    let desktop_pixel = after.rgb(center.0, center.1);
+    if terminal_pixel.iter().any(|channel| *channel > 45) {
+        fatal(format!("terminal center is not dark: {terminal_pixel:?}"));
+    }
+    if desktop_pixel[2] < 35 || desktop_pixel == terminal_pixel {
+        fatal(format!(
+            "minimize did not expose blue desktop: before={terminal_pixel:?}, after={desktop_pixel:?}"
+        ));
+    }
+    let taskbar = after.rgb(before.width / 2, before.height - 12);
+    if taskbar.iter().all(|channel| *channel < 3) {
+        fatal("taskbar is black or missing".into());
+    }
+
+    let mut changed = 0;
+    for pixel in (0..before.width * before.height).step_by(97) {
+        let offset = pixel * 3;
+        if before.pixels[offset..offset + 3] != after.pixels[offset..offset + 3] {
+            changed += 1;
+        }
+    }
+    if changed < 1000 {
+        fatal(format!(
+            "window action changed too few sampled pixels: {changed}"
+        ));
+    }
+    println!(
+        "GUI verify OK: {}x{}, terminal input + minimize changed {} sampled pixels",
+        before.width, before.height, changed
+    );
+}
+
+fn fatal(message: String) -> ! {
+    eprintln!("GUI verify FAIL: {message}");
+    std::process::exit(1)
+}

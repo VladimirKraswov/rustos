@@ -1,0 +1,21 @@
+[package]
+name = "rustos-kernel"
+description = "Микроядро RustOS: CPU, память, прерывания, scheduler, IPC, capabilities"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "rustos-kernel"
+path = "src/main.rs"
+
+[dependencies]
+rustos-abi = { path = "../abi" }
+
+[features]
+default = []
+# Автоматический QEMU boot-test завершается через isa-debug-exit. Обычная
+# сборка без feature запускает интерактивный GUI-сеанс.
+boot-test = []

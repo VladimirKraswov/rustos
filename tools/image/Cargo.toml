@@ -1,0 +1,18 @@
+[package]
+name = "rustos-image"
+description = "Сборка загрузочного образа для QEMU (ESP с BOOTX64.EFI)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "rustos-image"
+path = "src/main.rs"
+
+[dependencies]
+# Форматирование FAT-томов (ESP). Версия зафиксирована жёстко (workspace-политика).
+# `default-features = false` отключает `chrono` → дефолтный TimeProvider возвращает
+# фиксированную DOS-дату 1980/1/1 → образ ESP **воспроизводим** (байт-в-байт).
+fatfs = { version = "=0.3.6", default-features = false, features = ["std", "alloc"] }

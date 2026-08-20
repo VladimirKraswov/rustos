@@ -1,0 +1,16 @@
+[package]
+name = "rustos-abi"
+description = "Стабильный ABI RustOS: BootInfo, типы memory map, номера syscall и IPC"
+documentation = "https://github.com/VladimirKraswov/rustos"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lib]
+# ABI-модуль должен собираться и для no_std (ядро, загрузчик, runtime),
+# и для host-инструментов (проверка layout в тестах).
+crate-type = ["lib"]
+
+[dependencies]

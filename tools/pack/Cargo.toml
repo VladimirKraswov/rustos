@@ -1,0 +1,14 @@
+[package]
+name = "rustos-pack"
+description = "Пакетировщик initramfs RustOS (формат RIFS v1, см. docs/BOOT.md)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "rustos-pack"
+path = "src/main.rs"
+
+[dependencies]

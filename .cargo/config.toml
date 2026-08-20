@@ -1,0 +1,16 @@
+# Сборочные флаги no_std-миров RustOS.
+#
+# * `force-unwind-tables=no` — ядро и runtime не используют unwinding
+#   (panic = abort): убираем .eh_frame и уменьшаем образ.
+# * Флаги применяются только к кастомным target'ам; host-инструменты
+#   собираются с дефолтами.
+
+[target.x86_64-unknown-rustos]
+rustflags = [
+    "-C", "force-unwind-tables=no",
+]
+
+[target.x86_64-unknown-uefi]
+rustflags = [
+    "-C", "force-unwind-tables=no",
+]

@@ -1,0 +1,14 @@
+# Toolchain для сборки. Nightly обязателен:
+# 1) кастомный JSON target spec (targets/x86_64-unknown-rustos.json)
+#    требует `-Zjson-target-spec` (unstable);
+# 2) на этапе 3 ядру понадобится `#![feature(abi_x86_interrupt)]`.
+# Версия, на которой проверено: 1.100.0-nightly (e71c0f1e3 2026-08-18).
+# При смене nightly воспроизводимость обеспечивает CI (stage 13).
+[toolchain]
+channel = "nightly-2026-08-18"
+# rust-src: необходим для `-Zbuild-std` (кастомный target ядра).
+components = ["clippy", "rustfmt", "rust-src"]
+# x86_64-unknown-uefi — встроенный tier-2 target rustc (PE/COFF EFI-приложения);
+# ядро и пользовательские программы собираются под кастомный
+# target/x86_64-unknown-rustos.json (ELF64, no_std, PIE).
+targets = ["x86_64-unknown-uefi"]

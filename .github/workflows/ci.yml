@@ -1,0 +1,46 @@
+name: RustOS build, boot and GUI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Получить исходники
+        uses: actions/checkout@v7
+
+      - name: Установить системные зависимости
+        run: |
+          sudo apt-get update --quiet
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install \
+            --yes --no-install-recommends qemu-system-x86 ovmf netcat-openbsd
+
+      - name: Установить зафиксированный Rust toolchain
+        run: |
+          rustup toolchain install nightly-2026-08-18 \
+            --profile minimal --component rust-src,rustfmt,clippy
+          rustup override set nightly-2026-08-18
+
+      - name: Форматирование и Clippy
+        run: make lint
+
+      - name: Host-тесты
+        run: make test-host
+
+      - name: UEFI boot и GUI integration
+        run: make test
+
+      - name: Сохранить диагностику при ошибке
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: rustos-test-results
+          path: build/test-results/
+          if-no-files-found: ignore

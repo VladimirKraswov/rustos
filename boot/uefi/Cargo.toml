@@ -1,0 +1,22 @@
+[package]
+name = "rustos-boot"
+description = "UEFI-загрузчик RustOS: memory map, ACPI RSDP, GOP, ELF-ядро, BootInfo"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+# Загрузчик — EFI-приложение (PE/COFF), собирается под x86_64-unknown-uefi.
+# Ядро и initramfs встраиваются через include_bytes! из payload/ (файлы
+# создаёт Makefile перед сборкой; см. docs/BOOT.md и ADR-0002).
+[[bin]]
+name = "rustos-boot"
+path = "src/main.rs"
+
+[dependencies]
+rustos-abi = { path = "../../abi" }
+# `logger` — вывод log-сообщений в ConOut; `panic_handler` — стандартный
+# обработчик паник crate'а uefi (печать в консоль + UEFI reset).
+uefi = { workspace = true, features = ["logger", "panic_handler"] }
+log = { workspace = true }
