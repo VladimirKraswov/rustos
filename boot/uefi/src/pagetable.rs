@@ -10,19 +10,30 @@
 use rustos_abi::bootinfo::BootFramebuffer;
 use uefi::mem::memory_map::{MemoryMap, MemoryMapOwned, MemoryType};
 
+// Биты PTE (page table entry, 64 бита): см. раздел 4.10 Intel SDM.
 const PRESENT: u64 = 1 << 0;
 const WRITABLE: u64 = 1 << 1;
+/// Бит 7 PTE «Page Size»: 1 — крупная 2 MiB страница (leaf), 0 — указатель
+/// на таблицу нижнего уровня. Не путать с размером страницы (4 KiB).
 const PAGE_SIZE: u64 = 1 << 7;
+/// Маска физического адреса в PTE (биты 51..12).
 const ADDRESS_MASK: u64 = 0x000f_ffff_ffff_f000;
 const PAGE_4K: u64 = 4096;
 const PAGE_2M: u64 = 2 * 1024 * 1024;
+/// Флаги для записей-указателей на таблицы.
 const TABLE_FLAGS: u64 = PRESENT | WRITABLE;
+/// Флаги для записей-листьев (самых страниц).
 const LEAF_FLAGS: u64 = PRESENT | WRITABLE;
 
+/// Ошибка построения bootstrap-карты.
 #[derive(Debug)]
 pub enum PtError {
+    /// Бюджет page tables (16 MiB) исчерпан.
     OutOfBudget,
+    /// Диапазон физический адресов выходит за пределы u64.
     AddressOverflow,
+    /// Один и тот же диапазон пытаются отображать с конфликтом
+    /// (например, 2 MiB-листь поверх существующей 4 KiB-таблицы).
     ConflictingMapping,
 }
 
@@ -55,6 +66,8 @@ fn indices(address: u64) -> Indices {
     }
 }
 
+/// Раздаёт 4 KiB page-table frames из фиксированного бюджета загрузчика;
+/// каждая таблица обнуляется при выделении.
 struct TableAllocator {
     next: u64,
     end: u64,
@@ -139,6 +152,9 @@ pub unsafe fn build_identity_map(
     Ok(pml4)
 }
 
+/// Учитываем только UEFI-типы, за которыми действительно стоит RAM (включая
+/// loader/boot/runtime service — это RAM, а не MMIO). MMIO и резерв firmware
+/// остаются unmapped: раннее ядро их не трогает.
 fn is_ram(ty: MemoryType) -> bool {
     matches!(
         ty,

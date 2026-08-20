@@ -1,0 +1,13 @@
+RustOS bootstrap system manifest v1
+
+Planned native system modules:
+  /system/lib/system-1.dll
+  /system/lib/vfs-1.dll
+  /system/lib/ui-1.dll
+  /system/bin/fs
+  /system/bin/editor
+  /system/bin/rustc
+  /system/bin/cargo
+
+DLL files are ELF64 ET_DYN modules. Filesystem services are reached through
+capability IPC; driver code is never copied into every application.

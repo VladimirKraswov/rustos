@@ -1,0 +1,11 @@
+[package]
+name = "rustos-hmp"
+description = "Portable QEMU HMP client for RustOS integration tests"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+

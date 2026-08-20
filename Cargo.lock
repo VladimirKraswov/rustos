@@ -105,6 +105,10 @@ name = "rustos-gui-check"
 version = "0.1.0"
 
 [[package]]
+name = "rustos-hmp"
+version = "0.1.0"
+
+[[package]]
 name = "rustos-image"
 version = "0.1.0"
 dependencies = [

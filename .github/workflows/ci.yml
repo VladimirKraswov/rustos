@@ -20,7 +20,7 @@ jobs:
         run: |
           sudo apt-get update --quiet
           sudo DEBIAN_FRONTEND=noninteractive apt-get install \
-            --yes --no-install-recommends qemu-system-x86 ovmf netcat-openbsd
+            --yes --no-install-recommends qemu-system-x86 ovmf
 
       - name: Установить зафиксированный Rust toolchain
         run: |

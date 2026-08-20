@@ -172,7 +172,7 @@ fn main() {
         ));
     }
     println!(
-        "GUI verify OK: {}x{}, terminal input + drag + minimize changed {} sampled pixels",
+        "GUI verify OK: {}x{}, terminal/VFS + drag + minimize changed {} sampled pixels",
         before.width, before.height, changed
     );
 }

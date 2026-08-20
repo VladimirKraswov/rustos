@@ -16,6 +16,7 @@ use rustos_abi::{
     BootInfo, MemRegionKind, PAGE_SIZE,
 };
 
+/// Цвет 8-бит на канал; упаковка в байты framebuffer'а — в [`Framebuffer::pack`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Color {
     pub r: u8,
@@ -24,10 +25,13 @@ pub struct Color {
 }
 
 impl Color {
+    /// Краткий конструктор `Color::rgb(r, g, b)`.
     pub const fn rgb(r: u8, g: u8, b: u8) -> Self {
         Self { r, g, b }
     }
 
+    /// Линейное смешивание: `amount = 0` → `self`, `amount = 255` → `other`.
+    /// Используется градиентами рабочего стола.
     pub fn mix(self, other: Self, amount: u8) -> Self {
         let a = amount as u16;
         let inv = 255 - a;
@@ -39,6 +43,9 @@ impl Color {
     }
 }
 
+/// Прямоугольник в пиксельных координатах кадра: левый-верхний угол
+/// `(x, y)` (могут быть отрицательными — всё, что вне кадра, отсекается)
+/// и размеры `width × height`.
 #[derive(Clone, Copy, Debug)]
 pub struct Rect {
     pub x: i32,
@@ -57,6 +64,8 @@ impl Rect {
         }
     }
 
+    /// Попадает ли точка внутрь (левая/верхняя границы включены,
+    /// правая/нижняя — нет).
     pub fn contains(self, x: i32, y: i32) -> bool {
         x >= self.x
             && y >= self.y
@@ -65,10 +74,15 @@ impl Rect {
     }
 }
 
+/// Double-buffered renderer кадра (см. модуль и docs/GUI.md).
+///
+/// Все методы рисования работают только с невидимым back buffer; видимый
+/// GOP-буфер обновляет `present`/`present_rect` построчным копированием.
 pub struct Framebuffer {
     /// Видимый linear framebuffer GOP. В него пишет только `present*`.
     front: *mut u8,
-    /// Невидимый программный кадр в обычной usable RAM.
+    /// Невидимый программный кадр в обычной usable RAM. Плотно упакован
+    /// (stride = width), в отличие от GOP со своим stride.
     back: *mut u32,
     back_phys: u64,
     back_bytes: u64,
@@ -115,22 +129,28 @@ impl Framebuffer {
         })
     }
 
+    /// Ширина кадра в пикселях (из GOP mode).
     pub const fn width(&self) -> u32 {
         self.width
     }
 
+    /// Высота кадра в пикселях (из GOP mode).
     pub const fn height(&self) -> u32 {
         self.height
     }
 
+    /// Физический адрес back buffer'а (для диагностики и будущих page tables).
     pub const fn backbuffer_phys(&self) -> u64 {
         self.back_phys
     }
 
+    /// Размер back buffer'а в байтах.
     pub const fn backbuffer_bytes(&self) -> u64 {
         self.back_bytes
     }
 
+    /// Упаковка `Color` в 32-битный пиксель текущего формата framebuffer'а
+    /// (RGB или BGR по `BootInfo.framebuffer.format`).
     pub fn pack(&self, color: Color) -> u32 {
         match self.format {
             // В little-endian первый компонент занимает младший байт.
@@ -141,6 +161,7 @@ impl Framebuffer {
         }
     }
 
+    /// Ставит один пиксель в back buffer; точки вне кадра молча отбрасываются.
     pub fn put_pixel(&mut self, x: i32, y: i32, color: Color) {
         if x < 0 || y < 0 || x >= self.width as i32 || y >= self.height as i32 {
             return;
@@ -148,10 +169,12 @@ impl Framebuffer {
         self.write_raw(x as u32, y as u32, self.pack(color));
     }
 
+    /// Заливает весь кадр одним цветом (очистка сцены).
     pub fn fill(&mut self, color: Color) {
         self.fill_rect(Rect::new(0, 0, self.width, self.height), color);
     }
 
+    /// Заливает прямоугольник цветом; выход за границы кадра обрезается.
     pub fn fill_rect(&mut self, rect: Rect, color: Color) {
         let x0 = rect.x.max(0) as u32;
         let y0 = rect.y.max(0) as u32;
@@ -174,6 +197,7 @@ impl Framebuffer {
         }
     }
 
+    /// Рисует рамку толщиной 1 px по периметру `rect`.
     pub fn border(&mut self, rect: Rect, color: Color) {
         if rect.width == 0 || rect.height == 0 {
             return;
@@ -190,6 +214,7 @@ impl Framebuffer {
         );
     }
 
+    /// Горизонтальный градиент в `rect`: столбец за столбцом от `left` к `right`.
     pub fn horizontal_gradient(&mut self, rect: Rect, left: Color, right: Color) {
         let width = rect.width.max(1);
         for offset in 0..width {
@@ -201,6 +226,7 @@ impl Framebuffer {
         }
     }
 
+    /// Вертикальный градиент в `rect`: строка за строкой от `top` к `bottom`.
     pub fn vertical_gradient(&mut self, rect: Rect, top: Color, bottom: Color) {
         let height = rect.height.max(1);
         for offset in 0..height {
@@ -212,6 +238,7 @@ impl Framebuffer {
         }
     }
 
+    /// Читает уже упакованный пиксель back buffer'а (вне кадра — 0).
     pub fn read_raw(&self, x: u32, y: u32) -> u32 {
         if x >= self.width || y >= self.height {
             return 0;
@@ -222,6 +249,7 @@ impl Framebuffer {
         unsafe { self.back.add(index).read() }
     }
 
+    /// Записывает уже упакованный пиксель в back buffer (вне кадра — no-op).
     pub fn write_raw(&mut self, x: u32, y: u32, value: u32) {
         if x >= self.width || y >= self.height {
             return;

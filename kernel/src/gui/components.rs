@@ -10,6 +10,8 @@ use crate::{
     graphics::{Color, Framebuffer, Rect},
 };
 
+/// Тёмная палитра desktop v0.1 (см. docs/GUI.md, «Дизайн»): все цвета —
+/// константы, чтобы скриншот-тесты были воспроизводимыми.
 pub struct Theme;
 
 impl Theme {
@@ -26,15 +28,22 @@ impl Theme {
     pub const DANGER: Color = Color::rgb(224, 86, 94);
 }
 
+/// Рендерящийся компонент: знает свои границы и умеет отрисовать себя.
+/// State-машина ввода (hover/pressed/focus) принадлежит session, а не
+/// widget'у — компоненты неизменяемы на время кадра.
 pub trait Widget {
+    /// Границы в координатах framebuffer'а (используются и для hit-test).
     fn bounds(&self) -> Rect;
+    /// Отрисовка в back buffer; framebuffer передаётся только на время вызова.
     fn draw(&self, fb: &mut Framebuffer);
 
+    /// По умолчанию — точка внутри `bounds`.
     fn hit_test(&self, x: i32, y: i32) -> bool {
         self.bounds().contains(x, y)
     }
 }
 
+/// Прямой прямоугольник заданного цвета, опционально с рамкой.
 pub struct Panel {
     pub rect: Rect,
     pub color: Color,
@@ -54,6 +63,8 @@ impl Widget for Panel {
     }
 }
 
+/// Текст без фона: рисуется из верхнего левого угла `rect` с заданным
+/// увеличением (`scale` — коэффициент глифа 8×16).
 pub struct Label<'a> {
     pub rect: Rect,
     pub text: &'a str,
@@ -78,6 +89,8 @@ impl Widget for Label<'_> {
     }
 }
 
+/// Кнопка: hover/pressed/danger задаёт владелец (session), сама кнопка
+/// только описывает состояние кадра. Текст центрируется по bounding box.
 pub struct Button<'a> {
     pub rect: Rect,
     pub label: &'a str,
@@ -113,6 +126,7 @@ impl Widget for Button<'_> {
     }
 }
 
+/// Чекбокс: квадрат 18×18 + подпись справа (размер фиксирован в draw).
 pub struct Checkbox<'a> {
     pub rect: Rect,
     pub label: &'a str,
@@ -145,6 +159,8 @@ impl Widget for Checkbox<'_> {
     }
 }
 
+/// Радио-кнопка: ромб 16×18 + подпись (появится круг — заменится на circle
+/// primitive в graphics).
 pub struct RadioButton<'a> {
     pub rect: Rect,
     pub label: &'a str,
@@ -185,6 +201,7 @@ impl Widget for RadioButton<'_> {
     }
 }
 
+/// Переключатель: трек 36×18 + «ползунок» + подпись справа.
 pub struct Toggle<'a> {
     pub rect: Rect,
     pub label: &'a str,
@@ -223,6 +240,8 @@ impl Widget for Toggle<'_> {
     }
 }
 
+/// Однострочное текстовое поле: рамка акцентируется при фокусе.
+/// Реальное редактирование (курсор, ввод) появится вместе с user-space shell.
 pub struct TextEdit<'a> {
     pub rect: Rect,
     pub text: &'a str,
@@ -263,6 +282,7 @@ pub type Tabs = Panel;
 pub type Image = Panel;
 pub type IconButton<'a> = Button<'a>;
 
+/// Иконка терминала (окно + «>_»): используется desktop и window manager.
 pub fn terminal_icon(fb: &mut Framebuffer, rect: Rect) {
     fb.fill_rect(rect, Color::rgb(20, 29, 43));
     fb.border(rect, Color::rgb(101, 212, 224));
@@ -271,6 +291,7 @@ pub fn terminal_icon(fb: &mut Framebuffer, rect: Rect) {
     font::draw_text(fb, rect.x + 10, rect.y + 12, ">_", Theme::ACCENT, 2);
 }
 
+/// Иконка корзины (desktop).
 pub fn trash_icon(fb: &mut Framebuffer, rect: Rect) {
     let body = Rect::new(rect.x + 10, rect.y + 15, rect.width - 20, rect.height - 20);
     fb.fill_rect(body, Color::rgb(155, 177, 196));
@@ -285,6 +306,7 @@ pub fn trash_icon(fb: &mut Framebuffer, rect: Rect) {
     );
 }
 
+/// Логотип «start» (четыре цветных квадранта 2×2, шаг 12px, размер 10px).
 pub fn start_icon(fb: &mut Framebuffer, x: i32, y: i32) {
     let colors = [
         Color::rgb(80, 196, 220),

@@ -10,7 +10,8 @@
 //!   (статический PIE без dynsym-ссылок) — их появление = ошибка сборки.
 //! * Точка входа = `base + (e_entry - min_vaddr)`.
 //!
-//! Подробности: docs/BOOT.md, ADR-0002.
+//! Раскладка резерва, в который кладётся образ: `main.rs` (`Layout`,
+//! `find_reservation`). Связанный формат initramfs: `tools/pack` (RIFS v1).
 
 /// Максимум PT_LOAD-сегментов в образе ядра (реалистично: десятки).
 const MAX_LOADS: usize = 64;
@@ -231,8 +232,9 @@ pub fn image_size(elf: &[u8]) -> Result<u64, ElfError> {
 ///
 /// # Safety
 ///
-/// `base` должен указывать на доступную запись RAM достаточного размера
-/// (загрузчик резервирует регион до вызова — см. main::reservation_size).
+/// `base` должен указывать на доступную для записи RAM достаточного
+/// размера (загрузчик закрепляет регион через `allocate_pages` до вызова —
+/// см. `main::boot`, шаг 2).
 pub unsafe fn load(elf: &[u8], base: u64) -> Result<u64, ElfError> {
     let eh = parse_ehdr(elf)?;
     let (loads_arr, nloads, dyninfo) = parse_phdrs(elf, &eh)?;

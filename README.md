@@ -17,6 +17,10 @@ x86-64 компьютеров. Она загружается через UEFI, п
 - window manager: drag, minimize, maximize, restore и close;
 - цветной terminal с командами `help`, `clear`, `about`, `mem`, `gui`,
   `echo` и `shutdown`;
+- bootstrap VFS: read-only RIFS initramfs в `/boot` и writable RAM overlay;
+- файловый workflow в terminal: `pwd`, `cd`, `ls`, `cat`, `mkdir`, `touch`,
+  `write`, `append`, `rm` и `stat` (также через multicall-префикс `fs`);
+- versioned ABI для capability handles, IPC, VFS и ELF64 `.dll` metadata;
 - UI-компоненты: panel, label, button, icon button, checkbox, radio button,
   toggle, text edit, scroll/list view, tabs и image surface;
 - настоящие QEMU boot/keyboard/mouse/framebuffer integration tests.
@@ -35,7 +39,7 @@ make run
 Debian/Ubuntu:
 
 ```sh
-sudo apt install qemu-system-x86 ovmf netcat-openbsd
+sudo apt install qemu-system-x86 ovmf
 make bootstrap
 make build
 make run
@@ -55,8 +59,9 @@ make test
 `make test` выполняет два разных сценария:
 
 1. UEFI boot-test завершается настоящим `isa-debug-exit`.
-2. GUI-тест вводит `help` через PS/2, перетаскивает и сворачивает terminal
-   мышью, получает QEMU screendump и проверяет геометрию и пиксели.
+2. GUI-тест через настоящий PS/2 выполняет запись/чтение файлов и работу с
+   каталогами, перетаскивает и сворачивает terminal, получает QEMU
+   screendump и проверяет геометрию и пиксели.
 
 Диагностика сохраняется в `build/test-results/`.
 
@@ -65,7 +70,12 @@ make test
 GUI сейчас является ранним bootstrap-сеансом CPU0 внутри kernel image. Это
 осознанный вертикальный срез для проверки framebuffer, input и UI API до
 переноса display/input/window services в ring 3. Следующий milestone —
-preemptive scheduler, capabilities/IPC и изолированные user-space servers.
+процессы ring 3, preemptive scheduler и реализация уже описанных
+capabilities/IPC. Нативный `rustc` ещё не заявлен готовым: точный bootstrap и
+его системные предпосылки описаны отдельно, чтобы cross-сборку нельзя было
+случайно принять за self-hosting.
 
 Подробнее: [архитектура](docs/ARCHITECTURE.md),
-[графическая подсистема](docs/GUI.md), [сборка](docs/BUILDING.md).
+[графическая подсистема](docs/GUI.md), [VFS](docs/VFS.md),
+[DLL](docs/DYNAMIC_LIBRARIES.md), [self-hosting Rust](docs/SELF_HOSTING.md),
+[сборка](docs/BUILDING.md).

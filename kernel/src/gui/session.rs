@@ -12,13 +12,19 @@ use crate::{
     input::{Event, Key, MouseEvent, Ps2Input},
     serial,
 };
-use rustos_abi::BootInfo;
+use rustos_abi::{bootinfo::BootInitramfs, BootInfo};
 
+/// Высота taskbar'а: desktop-иконки и maximized-окна не заходят на неё.
 const TASKBAR_HEIGHT: u32 = 46;
+/// Высота заголовка окна (зона перетаскивания + кнопки -/+ /X).
 const TITLE_HEIGHT: u32 = 34;
+/// Размер области курсора (рисуется стрелкой 14×20).
 const CURSOR_WIDTH: usize = 14;
 const CURSOR_HEIGHT: usize = 20;
 
+/// Точка входа GUI-сессии: создаёт compositor'а, рисует desktop и
+/// уходит в бесконечный event loop. Возвращается только через
+/// [`shutdown`] (ACPI power off) — отсюда `!`.
 pub fn run(info: &BootInfo) -> ! {
     let Some(framebuffer) = Framebuffer::from_boot(info) else {
         serial::put_str("[gui] no supported framebuffer/back buffer; system halted\n");
@@ -31,12 +37,18 @@ pub fn run(info: &BootInfo) -> ! {
     serial::put_str(" size=");
     serial::put_u32((framebuffer.backbuffer_bytes() / 1024) as u32);
     serial::put_str(" KiB\n");
-    let mut session = DesktopSession::new(framebuffer, info.total_usable_ram() / (1024 * 1024));
+    let mut session = DesktopSession::new(
+        framebuffer,
+        info.total_usable_ram() / (1024 * 1024),
+        info.initramfs,
+    );
     session.render_all();
     serial::put_str("[gui] GUI_READY desktop=1 terminal=1 mouse=ps2\n");
     session.event_loop()
 }
 
+/// Состояние единственного окна desktop v0.1 (терминал): геометрия,
+/// минимизация/максимизация/закрытие и drag по заголовку.
 struct WindowState {
     rect: Rect,
     restore_rect: Rect,
@@ -59,6 +71,8 @@ impl WindowState {
     }
 }
 
+/// Desktop-сессия: владеет framebuffer'ом, input'ом, окном терминала и
+/// курсором; отвечает и за event loop, и за отрисовку (см. модуль).
 struct DesktopSession {
     framebuffer: Framebuffer,
     input: Ps2Input,
@@ -72,7 +86,7 @@ struct DesktopSession {
 }
 
 impl DesktopSession {
-    fn new(framebuffer: Framebuffer, usable_ram_mib: u64) -> Self {
+    fn new(framebuffer: Framebuffer, usable_ram_mib: u64, initramfs: BootInitramfs) -> Self {
         let screen_width = framebuffer.width();
         let screen_height = framebuffer.height();
         let width = screen_width.saturating_sub(180).clamp(620, 1040);
@@ -85,7 +99,7 @@ impl DesktopSession {
             mouse_y: (screen_height / 2) as i32,
             framebuffer,
             input: Ps2Input::new(),
-            terminal: Terminal::new(usable_ram_mib),
+            terminal: Terminal::new(usable_ram_mib, initramfs),
             window: WindowState {
                 rect,
                 restore_rect: rect,
@@ -102,6 +116,9 @@ impl DesktopSession {
         }
     }
 
+    /// Основной цикл: poll input → обработчик → минимум перерисовки
+    /// (Redraw) → present. Без прерываний, поэтому между событиями —
+    /// `spin_loop` (см. модуль: в ring-3 срезе это станет yield).
     fn event_loop(&mut self) -> ! {
         loop {
             if let Some(event) = self.input.poll() {
@@ -111,6 +128,7 @@ impl DesktopSession {
                     Event::Key(key) => self.handle_key(key),
                     Event::Mouse(mouse) => self.handle_mouse(mouse),
                 };
+                let mut terminal_line = None;
                 if redraw == Redraw::All {
                     self.render_scene();
                 } else if redraw == Redraw::Window {
@@ -119,17 +137,28 @@ impl DesktopSession {
                     if self.start_open {
                         self.render_start_menu();
                     }
+                } else if redraw == Redraw::TerminalLine {
+                    terminal_line = self
+                        .terminal
+                        .draw_input_line(&mut self.framebuffer, self.window.content_rect());
                 }
                 self.cursor
                     .draw(&mut self.framebuffer, self.mouse_x, self.mouse_y);
-                if redraw == Redraw::None {
-                    // Обычное движение мыши меняет только две маленькие
-                    // области — прежний и новый курсор. При изменении окна
-                    // публикуем весь уже готовый кадр одним быстрым blit.
-                    self.framebuffer.present_rect(old_cursor);
-                    self.framebuffer.present_rect(self.cursor.rect());
-                } else {
-                    self.framebuffer.present();
+                match redraw {
+                    Redraw::None => {
+                        // Обычное движение мыши меняет только две маленькие
+                        // области — прежний и новый курсор.
+                        self.framebuffer.present_rect(old_cursor);
+                        self.framebuffer.present_rect(self.cursor.rect());
+                    }
+                    Redraw::TerminalLine => {
+                        self.framebuffer.present_rect(old_cursor);
+                        if let Some(line) = terminal_line {
+                            self.framebuffer.present_rect(line);
+                        }
+                        self.framebuffer.present_rect(self.cursor.rect());
+                    }
+                    Redraw::Window | Redraw::All => self.framebuffer.present(),
                 }
             } else {
                 core::hint::spin_loop();
@@ -137,6 +166,8 @@ impl DesktopSession {
         }
     }
 
+    /// Клавиша: Escape закрывает start menu, остальное — в терминал
+    /// (Shutdown из терминала гасит систему).
     fn handle_key(&mut self, key: Key) -> Redraw {
         if matches!(key, Key::Escape) && self.start_open {
             self.start_open = false;
@@ -145,10 +176,12 @@ impl DesktopSession {
         if self.window.closed || self.window.minimized {
             return Redraw::None;
         }
-        if self.terminal.handle_key(key) == TerminalAction::Shutdown {
-            shutdown();
+        match self.terminal.handle_key(key) {
+            TerminalAction::None => Redraw::None,
+            TerminalAction::RedrawInputLine => Redraw::TerminalLine,
+            TerminalAction::RedrawAll => Redraw::Window,
+            TerminalAction::Shutdown => shutdown(),
         }
-        Redraw::Window
     }
 
     fn handle_mouse(&mut self, event: MouseEvent) -> Redraw {
@@ -584,10 +617,15 @@ impl DesktopSession {
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum Redraw {
     None,
+    TerminalLine,
     Window,
     All,
 }
 
+/// Мышиный курсор со «сохранённым фоном»: `draw` снимает текущие пиксели
+/// области в `saved`, затем рисует стрелку; `restore` возвращает фон
+/// перед перерисовкой того же места. Так event loop обновляет только
+/// две маленькие области вместо всего кадра.
 struct Cursor {
     saved: [u32; CURSOR_WIDTH * CURSOR_HEIGHT],
     x: i32,
@@ -654,6 +692,9 @@ impl Cursor {
     }
 }
 
+/// ACPI power off. Текущая цель — QEMU q35: control register по фиксирован-
+/// ному адресу, SLP_TYPa=0 + SLP_EN (0x2000). На реальном железе адрес
+/// control register надо читать из ACPI DSDT — это часть platform-milestone.
 fn shutdown() -> ! {
     serial::put_str("[platform] ACPI shutdown requested\n");
     // QEMU q35 ACPI PM control block: SLP_TYP=0, SLP_EN=1<<13.

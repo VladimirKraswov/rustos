@@ -6,6 +6,8 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 bash scripts/build.sh >/dev/null
 bash scripts/bootstrap-ovmf.sh >/dev/null
+cargo build -q -p rustos-hmp
+HMP_TOOL="$ROOT/target/debug/rustos-hmp"
 
 RUN_DIR="$(mktemp -d "${TMPDIR:-/tmp}/rustos-gui-test.XXXXXX")"
 RESULT_DIR="$ROOT/build/test-results/gui"
@@ -14,16 +16,54 @@ cp -f build/ovmf/OVMF_VARS.fd "$RUN_DIR/VARS.fd"
 
 QPID=""
 GUI_TIMEOUT="${GUI_TEST_TIMEOUT:-360}"
-# OpenBSD netcat на Linux продолжает ждать EOF от постоянного HMP-сокета.
-# `-N` делает half-close после EOF stdin. В macOS этот флаг означает другое,
-# а системный nc и без него корректно заканчивает одноразовый запрос.
-HMP_CLIENT=(nc -U)
-if [[ "$(uname -s)" != "Darwin" ]]; then
-    HMP_CLIENT=(nc -N -U)
-fi
-
 hmp() {
-    "${HMP_CLIENT[@]}" "$RUN_DIR/monitor.sock" >/dev/null
+    "$HMP_TOOL" "$RUN_DIR/monitor.sock" "${1:-0}" >/dev/null
+}
+
+# Ввод ASCII-команды через настоящий виртуальный PS/2 controller. HMP здесь
+# только нажимает клавиши; guest всё равно проходит тот же scancode parser,
+# terminal и VFS command path, что и пользователь.
+send_command() {
+    local value="$1"
+    local commands=""
+    local character key lower index
+    for ((index = 0; index < ${#value}; index++)); do
+        character="${value:index:1}"
+        case "$character" in
+            ' ') key=spc ;;
+            '/') key=slash ;;
+            '.') key=dot ;;
+            '-') key=minus ;;
+            [A-Z])
+                # HMP использует имена физических клавиш: заглавная буква
+                # — это комбинация Shift + соответствующая US-клавиша.
+                lower="$(printf '%s' "$character" | tr '[:upper:]' '[:lower:]')"
+                key="shift-${lower}"
+                ;;
+            *) key="$character" ;;
+        esac
+        commands="${commands}sendkey ${key} 20\n"
+    done
+    # Один persistent HMP connection, prompt после каждой команды и короткая
+    # пауза после отпускания клавиши не переполняют виртуальный 8042. Guest
+    # обновляет только dirty-строку ввода, поэтому полный software-render
+    # больше не задерживает чтение следующего scancode.
+    printf '%b' "$commands" | hmp 120
+    # Enter отправляем отдельно: QEMU возвращает monitor prompt раньше, чем
+    # release последней буквы гарантированно покинет PS/2 output buffer.
+    sleep 0.2
+    printf 'sendkey ret 20\n' | hmp 100
+}
+
+wait_for_serial() {
+    local pattern="$1"
+    local _
+    for _ in $(seq 1 80); do
+        grep -Fq "$pattern" "$RUN_DIR/serial.log" && return 0
+        sleep 0.1
+    done
+    echo "[gui-test] serial marker timeout: $pattern" >&2
+    return 1
 }
 
 cleanup() {
@@ -64,13 +104,24 @@ done
 }
 
 # Команда идёт через настоящий PS/2 keyboard path.
-printf 'sendkey h\nsendkey e\nsendkey l\nsendkey p\nsendkey ret\n' \
-    | hmp
-for _ in $(seq 1 40); do
-    grep -q '\[terminal\] command: help' "$RUN_DIR/serial.log" && break
-    sleep 0.1
-done
-grep -q '\[terminal\] command: help' "$RUN_DIR/serial.log"
+send_command 'help'
+wait_for_serial '[terminal] command: help'
+
+# Полный bootstrap filesystem workflow: initramfs listing, RAM-file write,
+# read и cwd-relative source directory. Проверяем не только shell parser, но
+# и реальные VFS operation markers.
+send_command 'ls'
+wait_for_serial '[vfs] LIST path=/ value='
+send_command 'write note hello'
+wait_for_serial '[vfs] WRITE path=/note value=5'
+send_command 'cat note'
+wait_for_serial '[vfs] READ path=/note value=5'
+send_command 'cd src'
+wait_for_serial '[vfs] CHDIR path=/src value=0'
+send_command 'write main rust'
+wait_for_serial '[vfs] WRITE path=/src/main value=4'
+send_command 'cat /boot/README.txt'
+wait_for_serial '[vfs] READ path=/boot/README.txt value='
 # Serial marker появляется непосредственно после обработки события, а QEMU
 # обновляет display surface по таймеру. Небольшая пауза ДО screendump не даёт
 # тесту случайно прочитать предыдущий кадр compositor'а.
@@ -118,4 +169,4 @@ cargo run -q -p rustos-gui-check -- \
 printf 'quit\n' | hmp || true
 wait "$QPID" 2>/dev/null || true
 QPID=""
-echo "[gui-test] PASS: keyboard, terminal, buffered drag and minimize"
+echo "[gui-test] PASS: keyboard, VFS workflow, buffered drag and minimize"

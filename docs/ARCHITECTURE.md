@@ -19,14 +19,17 @@ rustos-boot --> BootInfo v2 --> kernel
                                   |-- serial diagnostics
                                   |-- GOP renderer
                                   |-- PS/2 input
+                                  |-- bootstrap RIFS + RAM overlay
                                   |-- UI components
                                   |-- window manager
                                   `-- desktop + terminal
 ```
 
 Ранний GUI-сеанс работает на CPU0 и не использует heap. Unsafe MMIO и port I/O
-сосредоточены в `graphics` и `arch`; widget/window/application logic написана
-без unsafe.
+сосредоточены в `graphics`, `input` и `arch`; widget/window/application logic
+написана без unsafe. Capability, IPC, VFS и DLL structures уже вынесены в
+общий versioned crate `rustos-abi`, но kernel objects/syscalls для них ещё не
+реализованы.
 
 ## Путь к микроядру
 
@@ -37,8 +40,10 @@ rustos-boot --> BootInfo v2 --> kernel
 2. physical allocator и kernel-owned address spaces;
 3. процессы ring 3 и вытесняющий scheduler;
 4. capability handles, sync/async IPC и shared memory;
-5. `inputd`, `displayd`, compositor и terminal как отдельные процессы;
-6. supervisor перезапускает упавшие сервисы без остановки системы.
+5. ELF64 process loader, `vfsd`, persistent filesystem и dynamic loader;
+6. target `std`, native Rust toolchain и package/build services;
+7. `inputd`, `displayd`, compositor и terminal как отдельные процессы;
+8. supervisor перезапускает упавшие сервисы без остановки системы.
 
 UI API уже отделён от framebuffer ownership, поэтому widget logic не должна
 переписываться при замене прямых вызовов IPC-сообщениями.

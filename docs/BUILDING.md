@@ -4,7 +4,6 @@
 
 - Rust nightly `2026-08-18` с `rust-src`, `rustfmt`, `clippy`;
 - QEMU x86-64;
-- `nc` с Unix socket support для GUI integration test;
 - стандартные POSIX shell tools.
 
 OVMF загружается `scripts/bootstrap-ovmf.sh` из зафиксированного Debian package
@@ -27,3 +26,6 @@ make clean      удалить генерируемые артефакты
 
 Большие бинарные артефакты находятся в `build/` и `target/` и не хранятся в
 Git. Итоговый EFI-диск — `build/esp.img`.
+
+GUI-тест общается с QEMU monitor через workspace tool `rustos-hmp`, поэтому
+не зависит от несовместимых вариантов `nc` на macOS и Linux.

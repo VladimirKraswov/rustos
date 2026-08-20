@@ -6,9 +6,13 @@
 
 use crate::arch;
 
+/// Порт данных PS/2: общие для клавиатуры и мыши.
 const DATA: u16 = 0x60;
+/// Порт статуса/команд контроллера PS/2 (бит 0 — данные клавиатуры,
+/// бит 1 — очередь ввода пуста, бит 5 — данные мыши).
 const STATUS_COMMAND: u16 = 0x64;
 
+/// Нормализованное нажатие клавиши (только US-раскладка, без повторений).
 #[derive(Clone, Copy, Debug)]
 pub enum Key {
     Character(u8),
@@ -18,6 +22,9 @@ pub enum Key {
     Escape,
 }
 
+/// Событие мыши: относительный сдвиг за один пакет (Y — вниз, в
+/// GUI-конвенции) + состояние кнопок. Абсолютных координат нет — GUI
+/// сам интегрирует сдвиги в позицию курсора.
 #[derive(Clone, Copy, Debug)]
 pub struct MouseEvent {
     pub dx: i16,
@@ -27,12 +34,16 @@ pub struct MouseEvent {
     pub middle: bool,
 }
 
+/// Нормализованное событие ввода, которое понимает GUI-сеанс.
 #[derive(Clone, Copy, Debug)]
 pub enum Event {
     Key(Key),
     Mouse(MouseEvent),
 }
 
+/// State-машина PS/2 контроллера: декодирует scancodes клавиатуры и
+/// 3-байтные пакеты мыши из общего потока байтов. Работает только в
+/// polling-режиме (см. модуль).
 pub struct Ps2Input {
     shift: bool,
     caps_lock: bool,
@@ -42,6 +53,9 @@ pub struct Ps2Input {
 }
 
 impl Ps2Input {
+    /// Создаёт сервис и инициализирует PS/2-мышь (enable, defaults,
+    /// включение reporting). Ошибки инициализации игнорируются: клавиатура
+    /// продолжает работать, а мышь может появиться позже.
     pub fn new() -> Self {
         let mut input = Self {
             shift: false,
@@ -90,6 +104,9 @@ impl Ps2Input {
         let _ = mouse_command(0xF4);
     }
 
+    /// Обрабатывает один scancode клавиатуры (Set 1). Возвращает нажатие;
+    /// отпускания и служебные коды (Shift/CapsLock/extended-префикс)
+    /// глотаются — GUI-сеансу нужны только нажатия.
     fn feed_keyboard(&mut self, scancode: u8) -> Option<Key> {
         if scancode == 0xE0 {
             self.extended = true;
@@ -148,6 +165,9 @@ impl Ps2Input {
     }
 }
 
+/// US QWERTY-раскладка: scancode → ASCII с учётом Shift и CapsLock.
+/// Числа в match — коды Set 1; другие раскладки — вопрос к user-space shell,
+/// а не к драйверу.
 fn scancode_ascii(code: u8, shift: bool, caps: bool) -> Option<u8> {
     let letter = match code {
         0x1E => Some(b'a'),
@@ -337,6 +357,8 @@ fn scancode_ascii(code: u8, shift: bool, caps: bool) -> Option<u8> {
     Some(value)
 }
 
+/// Ждёт, пока очередь ввода контроллера опустеет (бит 1 статуса).
+/// Таймаут ~100 000 итераций: зависший контроллер не должен вешать boot.
 fn wait_input_empty() -> bool {
     for _ in 0..100_000 {
         if unsafe { arch::inb(STATUS_COMMAND) } & 2 == 0 {
@@ -347,6 +369,7 @@ fn wait_input_empty() -> bool {
     false
 }
 
+/// Ждёт байт от устройства (бит 0 статуса) и возвращает его.
 fn wait_output_full() -> Option<u8> {
     for _ in 0..100_000 {
         if unsafe { arch::inb(STATUS_COMMAND) } & 1 != 0 {
@@ -357,6 +380,8 @@ fn wait_output_full() -> Option<u8> {
     None
 }
 
+/// Отправляет команду мыши через контроллер (`0xD4` = «следующий байт —
+/// для auxiliary-устройства»); успех = ACK `0xFA`.
 fn mouse_command(command: u8) -> bool {
     if !wait_input_empty() {
         return false;

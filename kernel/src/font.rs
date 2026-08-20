@@ -5,9 +5,13 @@
 
 use crate::graphics::{Color, Framebuffer};
 
+/// Ширина ячейки глифа в пикселях: bitmap 5×7 + 1 px пробела между знаками.
 pub const GLYPH_WIDTH: i32 = 6;
+/// Высота ячейки глифа в пикселях: bitmap 7 строк + 1 px межстрочного.
 pub const GLYPH_HEIGHT: i32 = 8;
 
+/// Рисует один ASCII-символ (заглавные; lowercase приводится к upper)
+/// в позицию `(x, y)` заданным цветом и целочисленным масштабом `scale`.
 pub fn draw_char(fb: &mut Framebuffer, x: i32, y: i32, character: u8, color: Color, scale: u32) {
     let rows = glyph(character.to_ascii_uppercase());
     let scale = scale.max(1) as i32;
@@ -24,6 +28,7 @@ pub fn draw_char(fb: &mut Framebuffer, x: i32, y: i32, character: u8, color: Col
     }
 }
 
+/// Рисует строку слева направо от `(x, y)`; шаг по X — [`GLYPH_WIDTH`] × scale.
 pub fn draw_text(fb: &mut Framebuffer, mut x: i32, y: i32, text: &str, color: Color, scale: u32) {
     let advance = GLYPH_WIDTH * scale.max(1) as i32;
     for byte in text.bytes() {

@@ -3,9 +3,11 @@
 use crate::{arch, gui, serial};
 use rustos_abi::{BootInfo, MemRegion, MemRegionKind, BOOT_INFO_MAGIC, BOOT_INFO_VERSION};
 
-/// Главная функция ядра (этап 0): serial → валидация → banner → self-test → exit.
+/// Главная функция ядра: serial → валидация BootInfo → banner → self-test,
+/// после чего графическая сессия GUI (или немедленный exit в режиме
+/// `feature = "boot-test"`).
 ///
-/// Успех завершает тестовую VM кодом 0 (QEMU isa-debug-exit), сбой —
+/// Успех boot-теста завершает VM кодом 0 (QEMU isa-debug-exit), сбой —
 /// диагностическим кодом (см. [`self_test`]).
 pub fn kernel_main(info: &BootInfo) -> ! {
     // 1. Serial — первичный диагностический канал. Загрузчик использовал
@@ -40,7 +42,8 @@ pub fn kernel_main(info: &BootInfo) -> ! {
 /// Завершение работы ядра: код в QEMU isa-debug-exit, затем idle-цикл.
 ///
 /// В VM без устройства запись в порт — no-op, и машина остаётся живой
-/// (графический режим; с этапа 4+ здесь будет yield в scheduler).
+/// (графический режим; позже здесь будет yield в scheduler — см.
+/// docs/ARCHITECTURE.md, «Путь к микроядру»).
 pub(crate) fn exit_kernel(code: u8) -> ! {
     serial::put_str("\n[boot] kernel test done, exit code=");
     serial::put_u32(code as u32);
@@ -164,7 +167,8 @@ pub fn self_test(info: &BootInfo) -> Result<(), u8> {
     //    (проверяет корректность identity-маппинга окна MMIO).
     if info.framebuffer.phys_addr != 0 {
         let fb = info.framebuffer.phys_addr as *const u32;
-        // SAFETY: загрузчик проверил доступность framebuffer'а (см. docs/BOOT.md).
+        // SAFETY: загрузчик отображает framebuffer в identity-карте
+        // (rustos-boot, pagetable.rs), поэтому адрес доступен.
         let first = unsafe { fb.read_volatile() };
         serial::put_str("[selftest] framebuffer first pixel = 0x");
         serial::put_hex(first as u64);

@@ -16,6 +16,7 @@ members = [
     "tools/image",
     "tools/pack",
     "tools/gui-check",
+    "tools/hmp",
 ]
 
 [workspace.package]

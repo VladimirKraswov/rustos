@@ -3,7 +3,7 @@
 //! Точка входа — [`_start`], которую вызывает UEFI-загрузчик после
 //! установки identity-страниц и загрузки стека. До первого прерывания ядро
 //! работает на одном CPU без preemption: это допустимо для ранней инициализации
-//! (см. docs/BOOT.md).
+//! (контракт загрузки — docs/ARCHITECTURE.md, раздел «Загрузка»).
 
 #![no_std]
 #![no_main]
@@ -13,6 +13,7 @@ mod apps;
 mod arch;
 mod boot;
 mod font;
+mod fs;
 mod graphics;
 mod gui;
 mod input;
@@ -32,8 +33,9 @@ use rustos_abi::BootInfo;
 ///
 /// # Safety
 ///
-/// Контракт устанавливает загрузчик (docs/BOOT.md): указатель валиден до
-/// конца работы системы, выравнивание `align_of::<BootInfo>()`, long mode.
+/// Контракт устанавливает загрузчик (см. модуль `rustos-boot`, раздел
+/// «Контракт ядра», и `rustos_abi::bootinfo`): указатель валиден до конца
+/// работы системы, выравнивание `align_of::<BootInfo>()`, long mode.
 #[no_mangle]
 pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     // Диагностический маркер: управление передано ядру (до serial::init

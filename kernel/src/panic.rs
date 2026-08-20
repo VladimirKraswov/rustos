@@ -1,10 +1,10 @@
 //! Panic handler ядра.
 //!
-//! На этапе 0 (нет прерываний, нет scheduler'а) единственное разумное
+//! В текущем срезе (нет IDT, нет scheduler'а) единственное разумное
 //! действие при panic — вывести сообщение в serial и остановить CPU:
 //! CI увидит отсутствие «exit code 0» и текст panic'а в serial-логе.
-//! С этапа 3 handler расширится: вывод реестров, backtrace, triple-fault
-//! для гарантированного «шума» в monitor'е QEMU.
+//! Позже handler расширится вместе с IDT (docs/ARCHITECTURE.md,
+//! «Путь к микроядру»): вывод реестров, backtrace, triple-fault.
 
 use core::fmt::{self, Write};
 

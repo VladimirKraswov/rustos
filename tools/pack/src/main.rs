@@ -1,6 +1,9 @@
 //! `rustos-pack` — упаковка каталога в initramfs-образ RustOS (формат RIFS v1).
 //!
-//! ## Формат (docs/BOOT.md)
+//! ## Формат
+//!
+//! Этот модуль — source of truth RIFS v1: ядро читает образ в
+//! `kernel/src/fs.rs` (BootstrapFs), контекст — docs/VFS.md.
 //!
 //! ```text
 //! [0..32)    Заголовок (little-endian):
@@ -36,6 +39,7 @@ const VERSION: u32 = 1;
 const ALIGN: usize = 4096;
 const NAME_LEN: usize = 48;
 
+/// Собранный файл (относительный путь + данные) до упаковки в образ.
 struct FileEntry {
     name: String,
     data: Vec<u8>,
@@ -101,6 +105,8 @@ fn collect(dir: &Path) -> Result<BTreeMap<String, Vec<u8>>, String> {
     Ok(out)
 }
 
+/// Собирает каталог и записывает RIFS-образ: заголовок + таблица +
+/// выровненные данные (см. module-документацию).
 fn pack(dir: &str, out: &str) -> Result<(), String> {
     let dir = Path::new(dir);
     if !dir.is_dir() {
@@ -214,9 +220,9 @@ fn verify(img: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Утилита: список файлов в образе.
+/// Заглушка: список файлов в образе (нужен для отладки initramfs).
 #[allow(dead_code)]
 fn list_files(_img: &str) -> Result<Vec<PathBuf>, String> {
-    // Реализуется по требованию (этап 5, отладка initramfs).
+    // Реализуется по требованию.
     Ok(Vec::new())
 }
