@@ -1,8 +1,12 @@
-//! Desktop session, software compositor и первый оконный менеджер RustOS.
+//! Desktop session, software compositor и оконный сервер RustOS.
 //!
-//! В текущем вертикальном срезе session работает на CPU0. Границы между
-//! input, terminal, widgets и compositor уже разделены; при включении ring 3
-//! эти вызовы станут IPC-сообщениями без переписывания визуальных компонентов.
+//! Окно, состояние приложения и его время жизни здесь разделены намеренно:
+//! оконный сервер владеет только geometry/Z-order, а каждый запущенный клиент —
+//! собственным [`Application`]. Закрытие удаляет экземпляр приложения и
+//! возвращает занятые им физические кадры. Это bootstrap transport на CPU0;
+//! wire ABI уже пригоден для замены прямого вызова capability IPC ring 3.
+
+use core::{mem::size_of, ptr};
 
 use crate::{
     apps::{
@@ -18,15 +22,17 @@ use crate::{
         cursor::Cursor,
     },
     input::{self, Event, Key, MouseEvent, PlatformInput},
+    memory::{self, FrameBlock},
     serial,
 };
 use rustos_abi::{
     bootinfo::BootInitramfs,
     input::{MouseSettings, PointerCursor},
     window::{
-        event as window_event, WindowCommand, WindowEvent, WindowId, WindowRect, WindowStyle,
+        event as window_event, WindowCommand, WindowCreateRequest, WindowEvent, WindowId,
+        WindowRect, WindowStyle,
     },
-    BootInfo,
+    BootInfo, PAGE_SIZE,
 };
 use rustos_system_assets::{
     wallpaper, IconKind, IconPack, PackId, PackRegistry, ResourcePack, WallpaperId,
@@ -38,19 +44,22 @@ use rustos_video::{
     PixelFormat, ResizeEdges, Scanout, WindowEventQueue,
 };
 
-/// Высота taskbar'а: desktop-иконки и maximized-окна не заходят на неё.
 const TASKBAR_HEIGHT: u32 = 46;
-/// Высота заголовка окна (зона перетаскивания + кнопки -/+ /X).
 const TITLE_HEIGHT: u32 = 34;
-/// Ширина hit area вокруг рамки для resize мышью.
 const RESIZE_BORDER: u32 = 6;
-const TERMINAL_WINDOW_ID: WindowId = WindowId::new(1);
+const WINDOW_SHADOW_RIGHT: u32 = 7;
+const WINDOW_SHADOW_BOTTOM: u32 = 8;
 const TERMINAL_MIN_WIDTH: u32 = 480;
 const TERMINAL_MIN_HEIGHT: u32 = 300;
+const GALLERY_MIN_WIDTH: u32 = 560;
+const GALLERY_MIN_HEIGHT: u32 = 360;
 
-/// Точка входа GUI-сессии: создаёт compositor'а, рисует desktop и
-/// уходит в бесконечный event loop. Возвращается только через
-/// [`shutdown`] (ACPI power off) — отсюда `!`.
+/// Bounded registry защищает ядро от исчерпания памяти одним GUI-клиентом.
+/// Состояние приложений при этом выделяется динамически из frame allocator,
+/// поэтому лимит можно менять независимо от размера kernel stack.
+const MAX_WINDOWS: usize = 16;
+const WINDOW_EVENT_CAPACITY: usize = 128;
+
 pub fn run(info: &BootInfo) -> ! {
     let Some(framebuffer) = Framebuffer::from_boot(info) else {
         serial::put_str("[gui] no supported framebuffer/back buffer; system halted\n");
@@ -91,31 +100,33 @@ pub fn run(info: &BootInfo) -> ! {
     serial::put_str(
         "[font] families=console,sans scripts=latin,cyrillic styles=regular,bold,italic sizes=10..48\n",
     );
-    serial::put_str("[ui] constructing bootstrap UI sessions\n");
+    serial::put_str("[ui] constructing independent application sessions\n");
     let mut session = DesktopSession::new(
         framebuffer,
         info.total_usable_ram() / (1024 * 1024),
         info.initramfs,
     );
-    serial::put_str("[ui] bootstrap UI sessions ready\n");
+    let _ = session.spawn_application(ApplicationKind::Terminal);
+    serial::put_str("[ui] window server ready capacity=");
+    serial::put_u32(MAX_WINDOWS as u32);
+    serial::put_str("\n");
     session.render_all();
-    serial::put_str("[ui] first component frame rendered\n");
-    serial::put_str("[gui] GUI_READY desktop=1 terminal=1 mouse=");
+    serial::put_str("[gui] GUI_READY desktop=1 terminal=1 multiwindow=1 mouse=");
     serial::put_str(input::backend_name());
     serial::put_str("\n");
     session.event_loop()
 }
 
-/// Текущая pointer-операция. Persistent state живёт в `ManagedWindow`;
-/// здесь хранятся только данны одного mouse gesture.
 #[derive(Clone, Copy)]
 enum WindowInteraction {
     None,
     Move {
+        window: WindowId,
         offset_x: i32,
         offset_y: i32,
     },
     Resize {
+        window: WindowId,
         edges: ResizeEdges,
         start_mouse_x: i32,
         start_mouse_y: i32,
@@ -123,24 +134,114 @@ enum WindowInteraction {
     },
 }
 
-/// В bootstrap-сессии приложения пока делят одно тестовое окно. Их UI уже
-/// независим от window manager; переход на отдельные ring-3 surfaces изменит
-/// только таблицу окон, а не component runtime.
-#[derive(Clone, Copy, Eq, PartialEq)]
-enum ActiveApplication {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ApplicationKind {
     Terminal,
     UiShowcase,
 }
 
-/// Результат нажатия основной кнопки над desktop icon.
+impl ApplicationKind {
+    const fn title(self) -> &'static str {
+        match self {
+            Self::Terminal => "RUSTOS · ТЕРМИНАЛ",
+            Self::UiShowcase => "RUSTOS · SYSTEM UI GALLERY",
+        }
+    }
+
+    const fn task_label(self) -> &'static str {
+        match self {
+            Self::Terminal => "TERMINAL",
+            Self::UiShowcase => "UI GALLERY",
+        }
+    }
+
+    const fn minimum_size(self) -> (u32, u32) {
+        match self {
+            Self::Terminal => (TERMINAL_MIN_WIDTH, TERMINAL_MIN_HEIGHT),
+            Self::UiShowcase => (GALLERY_MIN_WIDTH, GALLERY_MIN_HEIGHT),
+        }
+    }
+}
+
+enum Application {
+    Terminal(Terminal),
+    UiShowcase(UiShowcase),
+}
+
+impl Application {
+    const fn kind(&self) -> ApplicationKind {
+        match self {
+            Self::Terminal(_) => ApplicationKind::Terminal,
+            Self::UiShowcase(_) => ApplicationKind::UiShowcase,
+        }
+    }
+}
+
+/// Heap ядру не нужен: объект приложения размещается в непрерывных физических
+/// кадрах и уничтожается через Drop. Именно этот владелец превращает `close`
+/// из визуального флага в настоящий lifecycle transition с освобождением RAM.
+struct ApplicationMemory {
+    pointer: *mut Application,
+    block: FrameBlock,
+}
+
+impl ApplicationMemory {
+    fn new(application: Application) -> Option<Self> {
+        let bytes = u64::try_from(size_of::<Application>()).ok()?;
+        let frames = bytes.checked_add(PAGE_SIZE - 1)? / PAGE_SIZE;
+        let block = memory::allocate(frames.max(1), 1).ok()?;
+        let pointer = block.phys as *mut Application;
+        // SAFETY: frame allocator вернул уникальный identity-mapped диапазон,
+        // выровненный минимум на 4 KiB и достаточный для Application.
+        unsafe { pointer.write(application) };
+        Some(Self { pointer, block })
+    }
+
+    fn get(&self) -> &Application {
+        // SAFETY: pointer инициализирован в new и живёт до Drop владельца.
+        unsafe { &*self.pointer }
+    }
+
+    fn get_mut(&mut self) -> &mut Application {
+        // SAFETY: &mut self гарантирует единственный mutable access.
+        unsafe { &mut *self.pointer }
+    }
+
+    const fn frames(&self) -> u64 {
+        self.block.frames
+    }
+}
+
+impl Drop for ApplicationMemory {
+    fn drop(&mut self) {
+        if self.pointer.is_null() || self.block.frames == 0 {
+            return;
+        }
+        // SAFETY: значение было записано ровно один раз и ещё не уничтожено.
+        unsafe { ptr::drop_in_place(self.pointer) };
+        let _ = memory::free(self.block);
+        self.pointer = ptr::null_mut();
+        self.block = FrameBlock { phys: 0, frames: 0 };
+    }
+}
+
+struct WindowSlot {
+    model: ManagedWindow,
+    application: ApplicationMemory,
+}
+
+impl WindowSlot {
+    fn kind(&self) -> ApplicationKind {
+        self.application.get().kind()
+    }
+}
+
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum ClickKind {
     Single,
     Double,
 }
 
-/// Системное распознавание кликов использует настройки input service, а не
-/// зашитые таймауты приложения. Позже тот же state переедет в window server.
 struct ClickTracker {
     last_press_ms: u64,
     last_x: i32,
@@ -175,16 +276,21 @@ impl ClickTracker {
     }
 }
 
-/// Desktop-сессия: владеет framebuffer'ом, input'ом, окном терминала и
-/// курсором; отвечает и за event loop, и за отрисовку (см. модуль).
 struct DesktopSession {
     framebuffer: Framebuffer,
     input: PlatformInput,
-    terminal: Terminal,
-    ui_showcase: UiShowcase,
-    active_application: ActiveApplication,
-    window: ManagedWindow,
-    window_events: WindowEventQueue<32>,
+    usable_ram_mib: u64,
+    initramfs: BootInitramfs,
+    windows: [Option<WindowSlot>; MAX_WINDOWS],
+    /// От нижнего окна к верхнему. ID стабилен при любом reorder.
+    z_order: [WindowId; MAX_WINDOWS],
+    /// Порядок кнопок taskbar не меняется при смене фокуса.
+    task_order: [WindowId; MAX_WINDOWS],
+    window_count: usize,
+    focused: Option<WindowId>,
+    next_window_id: u64,
+    cascade: u32,
+    window_events: WindowEventQueue<WINDOW_EVENT_CAPACITY>,
     interaction: WindowInteraction,
     cursor: Cursor,
     icon_packs: PackRegistry<IconPack, 8>,
@@ -206,52 +312,29 @@ impl DesktopSession {
     fn new(framebuffer: Framebuffer, usable_ram_mib: u64, initramfs: BootInitramfs) -> Self {
         let screen_width = framebuffer.width();
         let screen_height = framebuffer.height();
-        let work_height = screen_height.saturating_sub(TASKBAR_HEIGHT);
-        let width = fit_window_extent(screen_width, 180, TERMINAL_MIN_WIDTH, 1040);
-        let height = fit_window_extent(work_height, 114, TERMINAL_MIN_HEIGHT, 650);
-        // На широком экране оставляем слева удобную область под desktop
-        // icons, а терминал стартует с постоянным 120px полем. На маленьком
-        // режиме окно по-прежнему центрируется и не выходит за границы.
-        let x = if screen_width >= width.saturating_add(240) {
-            120
-        } else {
-            ((screen_width - width) / 2) as i32
-        };
-        let y = (work_height.saturating_sub(height) / 2) as i32;
-        let rect = Rect::new(x, y, width, height);
-        let content = Rect::new(
-            rect.x + 4,
-            rect.y + TITLE_HEIGHT as i32,
-            rect.width.saturating_sub(8),
-            rect.height.saturating_sub(TITLE_HEIGHT + 4),
-        );
-        serial::put_str("[ui] constructing Gallery tree\n");
-        let ui_showcase = UiShowcase::new(content);
-        serial::put_str("[ui] Gallery tree ready\n");
         let mut icon_packs = PackRegistry::new();
         let _ = icon_packs.install(CLASSIC_ICON_PACK);
         let _ = icon_packs.install(MIDNIGHT_ICON_PACK);
         let _ = icon_packs.install(MONO_ICON_PACK);
         Self {
-            mouse_x: (screen_width / 2) as i32,
-            mouse_y: (screen_height / 2) as i32,
             framebuffer,
             input: PlatformInput::new(),
-            terminal: Terminal::new(usable_ram_mib, initramfs),
-            ui_showcase,
-            active_application: ActiveApplication::Terminal,
-            window: ManagedWindow::new(
-                TERMINAL_WINDOW_ID,
-                window_rect(rect),
-                WindowStyle::STANDARD,
-                TERMINAL_MIN_WIDTH,
-                TERMINAL_MIN_HEIGHT,
-            ),
+            usable_ram_mib,
+            initramfs,
+            windows: [const { None }; MAX_WINDOWS],
+            z_order: [WindowId::new(0); MAX_WINDOWS],
+            task_order: [WindowId::new(0); MAX_WINDOWS],
+            window_count: 0,
+            focused: None,
+            next_window_id: 1,
+            cascade: 0,
             window_events: WindowEventQueue::new(),
             interaction: WindowInteraction::None,
             cursor: Cursor::new(),
             icon_packs,
             wallpaper: WallpaperId::SpringRiver,
+            mouse_x: (screen_width / 2) as i32,
+            mouse_y: (screen_height / 2) as i32,
             previous_left: false,
             start_open: false,
             drag_frames: 0,
@@ -264,9 +347,6 @@ impl DesktopSession {
         }
     }
 
-    /// Основной цикл: poll input → обработчик → минимум перерисовки
-    /// (Redraw) → present. Без прерываний, поэтому между событиями —
-    /// `spin_loop` (см. модуль: в ring-3 срезе это станет yield).
     fn event_loop(&mut self) -> ! {
         loop {
             if let Some(event) = self.input.poll() {
@@ -280,43 +360,36 @@ impl DesktopSession {
                         redraw
                     }
                 };
+
                 let mut terminal_line = None;
-                let mut ui_frame = None;
                 let mut drag_cached = false;
                 match redraw {
-                    Redraw::All => self.render_scene(),
-                    Redraw::Window => {
-                        self.render_window_area();
-                        self.render_taskbar();
-                        if self.start_open {
-                            self.render_start_menu();
-                        }
-                    }
+                    Redraw::Scene => self.render_scene(),
                     Redraw::TerminalLine => {
-                        let content = self.window_content_rect();
-                        terminal_line = self
-                            .terminal
-                            .draw_input_line(&mut self.framebuffer, content);
+                        terminal_line = self.draw_focused_terminal_line();
                     }
-                    Redraw::Ui => {
-                        ui_frame = Some(self.ui_showcase.draw(&mut self.framebuffer, false));
-                    }
-                    Redraw::DragMove { previous, first } => {
-                        drag_cached = self.render_drag_preview(previous, first);
+                    Redraw::DragMove {
+                        window,
+                        previous,
+                        first,
+                    } => {
+                        drag_cached = self.render_drag_preview(window, previous, first);
                     }
                     Redraw::DragEnd {
-                        preview, visible, ..
+                        window,
+                        preview,
+                        visible,
+                        ..
                     } => {
-                        drag_cached = self.render_drag_end(preview, visible);
+                        drag_cached = self.render_drag_end(window, preview, visible);
                     }
                     Redraw::None => {}
                 }
+
                 self.cursor
                     .draw(&mut self.framebuffer, self.mouse_x, self.mouse_y);
                 match redraw {
                     Redraw::None => {
-                        // Обычное движение мыши меняет только две маленькие
-                        // области — прежний и новый курсор.
                         self.framebuffer.present_rect(old_cursor);
                         self.framebuffer.present_rect(self.cursor.rect());
                     }
@@ -327,23 +400,20 @@ impl DesktopSession {
                         }
                         self.framebuffer.present_rect(self.cursor.rect());
                     }
-                    Redraw::Ui => {
-                        self.framebuffer.present_rect(old_cursor);
-                        if let Some(frame) = ui_frame {
-                            for rect in frame.damage() {
-                                self.framebuffer.present_rect(*rect);
-                            }
-                        }
-                        self.framebuffer.present_rect(self.cursor.rect());
-                    }
-                    Redraw::DragMove { previous, first } => {
+                    Redraw::DragMove {
+                        window,
+                        previous,
+                        first,
+                    } => {
                         if drag_cached {
                             if first {
                                 self.present_drag_rect(window_damage(previous));
                             } else {
                                 self.present_preview(previous);
                             }
-                            self.present_preview(self.window_rect());
+                            if let Some(current) = self.window_rect(window) {
+                                self.present_preview(current);
+                            }
                         } else {
                             self.present_drag_full();
                         }
@@ -351,11 +421,16 @@ impl DesktopSession {
                         self.framebuffer.present_rect(self.cursor.rect());
                     }
                     Redraw::DragEnd {
-                        visible, resized, ..
+                        window,
+                        visible,
+                        resized,
+                        ..
                     } => {
                         if visible {
                             if drag_cached {
-                                self.present_drag_rect(window_damage(self.window_rect()));
+                                if let Some(current) = self.window_rect(window) {
+                                    self.present_drag_rect(window_damage(current));
+                                }
                             } else {
                                 self.present_drag_full();
                             }
@@ -363,15 +438,9 @@ impl DesktopSession {
                             self.framebuffer.present_rect(old_cursor);
                             self.framebuffer.present_rect(self.cursor.rect());
                         }
-                        self.log_drag_finished(resized);
+                        self.log_drag_finished(window, resized);
                     }
-                    Redraw::Window => self.framebuffer.present(),
-                    Redraw::All => {
-                        self.framebuffer.present();
-                        if self.window.is_minimized() {
-                            serial::put_str("[wm] frame committed minimized=1\n");
-                        }
-                    }
+                    Redraw::Scene => self.framebuffer.present(),
                 }
                 self.dispatch_window_events();
             } else if self.cursor.animate(arch::monotonic_milliseconds()) {
@@ -387,63 +456,85 @@ impl DesktopSession {
         }
     }
 
-    /// Клавиша: Escape закрывает start menu, остальное — в терминал
-    /// (Shutdown из терминала гасит систему).
     fn handle_key(&mut self, key: Key) -> Redraw {
         if matches!(key, Key::Escape) && self.start_open {
             self.start_open = false;
-            return Redraw::All;
+            return Redraw::Scene;
         }
-        if self.window.is_closed() || self.window.is_minimized() {
+        let Some(id) = self.focused else {
+            return Redraw::None;
+        };
+        if !self.window_is_visible(id) {
             return Redraw::None;
         }
-        if self.active_application == ActiveApplication::UiShowcase {
-            let key = match key {
-                Key::Tab => UiKey::Tab,
-                Key::Enter => UiKey::Enter,
-                Key::Escape => UiKey::Escape,
-                Key::Character(b' ') => UiKey::Space,
-                Key::Character(byte) if byte.is_ascii() => UiKey::Character(char::from(byte)),
-                Key::Backspace | Key::Character(_) => return Redraw::None,
-            };
-            return if self.ui_showcase.key(key, false) {
-                Redraw::Ui
-            } else {
-                Redraw::None
-            };
+        match self.window_kind(id) {
+            Some(ApplicationKind::UiShowcase) => {
+                let key = match key {
+                    Key::Tab => UiKey::Tab,
+                    Key::Enter => UiKey::Enter,
+                    Key::Escape => UiKey::Escape,
+                    Key::Character(b' ') => UiKey::Space,
+                    Key::Character(byte) if byte.is_ascii() => UiKey::Character(char::from(byte)),
+                    Key::Backspace | Key::Character(_) => return Redraw::None,
+                };
+                let changed = match self.application_mut(id) {
+                    Some(Application::UiShowcase(showcase)) => showcase.key(key, false),
+                    _ => false,
+                };
+                if changed {
+                    Redraw::Scene
+                } else {
+                    Redraw::None
+                }
+            }
+            Some(ApplicationKind::Terminal) => self.handle_terminal_key(id, key),
+            None => Redraw::None,
         }
-        match self.terminal.handle_key(key) {
+    }
+
+    fn handle_terminal_key(&mut self, id: WindowId, key: Key) -> Redraw {
+        let action = match self.application_mut(id) {
+            Some(Application::Terminal(terminal)) => terminal.handle_key(key),
+            _ => return Redraw::None,
+        };
+        match action {
             TerminalAction::None => Redraw::None,
             TerminalAction::RedrawInputLine => Redraw::TerminalLine,
-            TerminalAction::RedrawAll => Redraw::Window,
+            TerminalAction::RedrawAll => Redraw::Scene,
             TerminalAction::DisplayInfo => {
                 let mode = self.framebuffer.mode();
                 let connector = self.framebuffer.connector();
+                let driver = self.framebuffer.driver_name();
+                let color = self.framebuffer.color_mode();
                 serial::put_str("[display] info driver=");
-                serial::put_str(self.framebuffer.driver_name());
+                serial::put_str(driver);
                 serial::put_str(" mode=");
                 serial::put_u32(mode.width);
                 serial::put_str("x");
                 serial::put_u32(mode.height);
                 serial::put_str("\n");
-                self.terminal.report_display_info(
-                    self.framebuffer.driver_name(),
-                    mode.width,
-                    mode.height,
-                    connector.width_mm,
-                    connector.height_mm,
-                    self.framebuffer.color_mode(),
-                );
-                Redraw::Window
+                if let Some(Application::Terminal(terminal)) = self.application_mut(id) {
+                    terminal.report_display_info(
+                        driver,
+                        mode.width,
+                        mode.height,
+                        connector.width_mm,
+                        connector.height_mm,
+                        color,
+                    );
+                }
+                Redraw::Scene
             }
             TerminalAction::DisplayModes => {
                 let mut modes = [self.framebuffer.mode(); 20];
                 let count = self.framebuffer.modes(&mut modes);
+                if let Some(Application::Terminal(terminal)) = self.application_mut(id) {
+                    terminal.report_display_modes(&modes[..count]);
+                }
                 serial::put_str("[display] modes count=");
                 serial::put_u32(count as u32);
                 serial::put_str("\n");
-                self.terminal.report_display_modes(&modes[..count]);
-                Redraw::Window
+                Redraw::Scene
             }
             TerminalAction::DisplayMode { width, height } => {
                 let current = self.framebuffer.mode();
@@ -469,15 +560,16 @@ impl DesktopSession {
                     Err(rustos_video::ModeSetError::OutOfMemory) => " result=out-of-memory\n",
                     Err(rustos_video::ModeSetError::DeviceLost) => " result=device-lost\n",
                 });
-                self.terminal.report_display_mode(width, height, result);
-                if result.is_ok() {
-                    Redraw::All
-                } else {
-                    Redraw::Window
+                if let Some(Application::Terminal(terminal)) = self.application_mut(id) {
+                    terminal.report_display_mode(width, height, result);
                 }
+                Redraw::Scene
             }
             TerminalAction::DisplayColor(mode) => {
                 self.framebuffer.set_color_mode(mode);
+                if let Some(Application::Terminal(terminal)) = self.application_mut(id) {
+                    terminal.report_color_mode(mode);
+                }
                 serial::put_str("[display] color=");
                 serial::put_str(match mode {
                     rustos_video::ColorMode::TrueColor24 => "truecolor24",
@@ -485,12 +577,12 @@ impl DesktopSession {
                     rustos_video::ColorMode::Grayscale8 => "gray8",
                 });
                 serial::put_str("\n");
-                self.terminal.report_color_mode(mode);
-                Redraw::All
+                Redraw::Scene
             }
             TerminalAction::OpenUiShowcase => {
-                self.open_ui_showcase();
-                Redraw::Window
+                let _ = self.spawn_application(ApplicationKind::UiShowcase);
+                serial::put_str("[ui] Gallery opened runtime=system-ui-v1 independent-window=1\n");
+                Redraw::Scene
             }
             TerminalAction::Mouse(command) => {
                 let mut settings = self.input.mouse_settings();
@@ -527,8 +619,9 @@ impl DesktopSession {
                 };
                 let settings = self.input.mouse_settings();
                 let capabilities = self.input.mouse_capabilities();
-                self.terminal
-                    .report_mouse(settings, capabilities, hardware_applied);
+                if let Some(Application::Terminal(terminal)) = self.application_mut(id) {
+                    terminal.report_mouse(settings, capabilities, hardware_applied);
+                }
                 serial::put_str("[input] mouse profile updated rate=");
                 serial::put_u32(u32::from(settings.sample_rate_hz));
                 serial::put_str(" sensitivity=");
@@ -536,7 +629,7 @@ impl DesktopSession {
                 serial::put_str("% double-ms=");
                 serial::put_u32(u32::from(settings.double_click_ms));
                 serial::put_str("\n");
-                Redraw::Window
+                Redraw::Scene
             }
             TerminalAction::Cursor(command) => {
                 let value = match command {
@@ -549,126 +642,151 @@ impl DesktopSession {
                         cursor_name(kind)
                     }
                     CursorCommand::Theme(theme) => {
-                        let id = match theme {
+                        let pack = match theme {
                             CursorThemeName::Light => PackId(0x1001),
                             CursorThemeName::Midnight => PackId(0x1002),
                             CursorThemeName::Contrast => PackId(0x1003),
                         };
-                        let _ = self.cursor.select_theme(id);
+                        let _ = self.cursor.select_theme(pack);
                         self.cursor.theme_name()
                     }
                 };
-                self.terminal.report_visual_setting("CURSOR", value);
+                if let Some(Application::Terminal(terminal)) = self.application_mut(id) {
+                    terminal.report_visual_setting("CURSOR", value);
+                }
                 serial::put_str("[cursor] value=");
                 serial::put_str(value);
                 serial::put_str(" theme=");
                 serial::put_str(self.cursor.theme_name());
                 serial::put_str("\n");
-                Redraw::Window
+                Redraw::Scene
             }
             TerminalAction::Icons(theme) => {
-                let id = match theme {
+                let pack = match theme {
                     IconThemeName::Classic => PackId(0x2001),
                     IconThemeName::Midnight => PackId(0x2002),
                     IconThemeName::Mono => PackId(0x2003),
                 };
-                let _ = self.icon_packs.select(id);
+                let _ = self.icon_packs.select(pack);
                 let name = self
                     .icon_packs
                     .active()
-                    .map_or("none", |pack| pack.metadata().name);
-                self.terminal.report_visual_setting("ICON PACK", name);
+                    .map_or("none", |icons| icons.metadata().name);
+                if let Some(Application::Terminal(terminal)) = self.application_mut(id) {
+                    terminal.report_visual_setting("ICON PACK", name);
+                }
                 serial::put_str("[assets] icon-pack=");
                 serial::put_str(name);
                 serial::put_str("\n");
-                Redraw::All
+                Redraw::Scene
             }
             TerminalAction::Wallpaper(selected) => {
                 self.wallpaper = selected;
-                self.terminal
-                    .report_visual_setting("WALLPAPER", wallpaper(selected).name);
+                if let Some(Application::Terminal(terminal)) = self.application_mut(id) {
+                    terminal.report_visual_setting("WALLPAPER", wallpaper(selected).name);
+                }
                 serial::put_str("[desktop] wallpaper=");
                 serial::put_str(wallpaper(selected).name);
                 serial::put_str("\n");
-                Redraw::All
+                Redraw::Scene
             }
             TerminalAction::Shutdown => shutdown(),
         }
     }
 
     fn handle_mouse(&mut self, event: MouseEvent) -> Redraw {
-        // Вторичная и средняя кнопки уже нормализованы драйвером; текущий
-        // desktop не назначает им действий, но состояние читается здесь,
-        // чтобы дальнейшее context menu не меняло input ABI.
         let _secondary_pressed = event.right || event.middle;
         self.mouse_x = (self.mouse_x + event.dx as i32)
             .clamp(0, self.framebuffer.width().saturating_sub(1) as i32);
         self.mouse_y = (self.mouse_y + event.dy as i32)
             .clamp(0, self.framebuffer.height().saturating_sub(1) as i32);
 
-        if let WindowInteraction::Move { offset_x, offset_y } = self.interaction {
-            if !event.left {
-                return self.finish_window_gesture(false);
+        match self.interaction {
+            WindowInteraction::Move {
+                window,
+                offset_x,
+                offset_y,
+            } => {
+                if !event.left {
+                    return self.finish_window_gesture(window, false);
+                }
+                let Some(previous) = self.window_rect(window) else {
+                    self.interaction = WindowInteraction::None;
+                    return Redraw::Scene;
+                };
+                let first = !self.drag_preview_visible;
+                let command = WindowCommand::move_to(
+                    window,
+                    self.mouse_x - offset_x,
+                    self.mouse_y - offset_y,
+                );
+                let _ = self.apply_window_command(command);
+                self.previous_left = event.left;
+                self.drag_frames = self.drag_frames.saturating_add(1);
+                self.drag_packets = self.drag_packets.saturating_add(u32::from(event.packets));
+                return Redraw::DragMove {
+                    window,
+                    previous,
+                    first,
+                };
             }
-            let old_window = self.window_rect();
-            let first = !self.drag_preview_visible;
-            let command = WindowCommand::move_to(
-                TERMINAL_WINDOW_ID,
-                self.mouse_x - offset_x,
-                self.mouse_y - offset_y,
-            );
-            let _ = self.apply_window_command(command);
-            self.previous_left = event.left;
-            self.drag_frames = self.drag_frames.saturating_add(1);
-            self.drag_packets = self.drag_packets.saturating_add(u32::from(event.packets));
-            return Redraw::DragMove {
-                previous: old_window,
-                first,
-            };
-        }
-        if let WindowInteraction::Resize {
-            edges,
-            start_mouse_x,
-            start_mouse_y,
-            start,
-        } = self.interaction
-        {
-            if !event.left {
-                return self.finish_window_gesture(true);
-            }
-            let old_window = self.window_rect();
-            let first = !self.drag_preview_visible;
-            let requested = resize_from_edges(
-                start,
+            WindowInteraction::Resize {
+                window,
                 edges,
-                self.mouse_x - start_mouse_x,
-                self.mouse_y - start_mouse_y,
-                TERMINAL_MIN_WIDTH,
-                TERMINAL_MIN_HEIGHT,
-            );
-            let _ = self.apply_window_command(WindowCommand::resize(TERMINAL_WINDOW_ID, requested));
-            self.previous_left = event.left;
-            self.drag_frames = self.drag_frames.saturating_add(1);
-            self.drag_packets = self.drag_packets.saturating_add(u32::from(event.packets));
-            return Redraw::DragMove {
-                previous: old_window,
-                first,
-            };
+                start_mouse_x,
+                start_mouse_y,
+                start,
+            } => {
+                if !event.left {
+                    return self.finish_window_gesture(window, true);
+                }
+                let Some(previous) = self.window_rect(window) else {
+                    self.interaction = WindowInteraction::None;
+                    return Redraw::Scene;
+                };
+                let first = !self.drag_preview_visible;
+                let (minimum_width, minimum_height) = self
+                    .window_kind(window)
+                    .unwrap_or(ApplicationKind::Terminal)
+                    .minimum_size();
+                let requested = resize_from_edges(
+                    start,
+                    edges,
+                    self.mouse_x - start_mouse_x,
+                    self.mouse_y - start_mouse_y,
+                    minimum_width,
+                    minimum_height,
+                );
+                let _ = self.apply_window_command(WindowCommand::resize(window, requested));
+                self.previous_left = event.left;
+                self.drag_frames = self.drag_frames.saturating_add(1);
+                self.drag_packets = self.drag_packets.saturating_add(u32::from(event.packets));
+                return Redraw::DragMove {
+                    window,
+                    previous,
+                    first,
+                };
+            }
+            WindowInteraction::None => {}
         }
 
         let was_left = self.previous_left;
         let pressed = event.left && !was_left;
         let released = !event.left && was_left;
         self.previous_left = event.left;
-        if released && self.desktop_icon_pressed {
+        if released {
             self.desktop_icon_pressed = false;
         }
+
         if !pressed {
-            if self.active_application == ActiveApplication::UiShowcase
-                && self.window.is_visible()
+            let Some(id) = self.focused else {
+                return Redraw::None;
+            };
+            if self.window_kind(id) == Some(ApplicationKind::UiShowcase)
+                && self.window_is_visible(id)
                 && (self
-                    .window_content_rect()
-                    .contains(self.mouse_x, self.mouse_y)
+                    .window_content_rect(id)
+                    .is_some_and(|rect| rect.contains(self.mouse_x, self.mouse_y))
                     || released)
             {
                 let kind = if released {
@@ -676,11 +794,14 @@ impl DesktopSession {
                 } else {
                     UiPointerKind::Move
                 };
-                if self
-                    .ui_showcase
-                    .pointer(kind, self.mouse_x, self.mouse_y, 0)
-                {
-                    return Redraw::Ui;
+                let x = self.mouse_x;
+                let y = self.mouse_y;
+                let changed = match self.application_mut(id) {
+                    Some(Application::UiShowcase(showcase)) => showcase.pointer(kind, x, y, 0),
+                    _ => false,
+                };
+                if changed {
+                    return Redraw::Scene;
                 }
             }
             return Redraw::None;
@@ -688,31 +809,38 @@ impl DesktopSession {
 
         let x = self.mouse_x;
         let y = self.mouse_y;
+        // Один marker на mouse-down (не на каждый movement packet) делает
+        // GUI-тесты и реальные bug reports воспроизводимыми: видно координаты
+        // после применённой sensitivity/acceleration и верхнее окно hit-test.
+        serial::put_str("[pointer] down x=");
+        serial::put_u32(x as u32);
+        serial::put_str(" y=");
+        serial::put_u32(y as u32);
+        serial::put_str(" top=0x");
+        serial::put_hex(self.top_window_at(x, y).map_or(0, |window| window.0));
+        serial::put_str("\n");
         if self.start_button().contains(x, y) {
             self.start_open = !self.start_open;
-            serial::put_str("[wm] start menu toggled\n");
-            return Redraw::All;
+            return Redraw::Scene;
         }
         if self.start_open {
             if self.start_terminal_item().contains(x, y) {
-                self.open_terminal();
+                let _ = self.spawn_application(ApplicationKind::Terminal);
                 self.start_open = false;
-                return Redraw::All;
+                return Redraw::Scene;
             }
             if self.start_ui_item().contains(x, y) {
-                self.open_ui_showcase();
+                let _ = self.spawn_application(ApplicationKind::UiShowcase);
                 self.start_open = false;
-                return Redraw::All;
+                return Redraw::Scene;
             }
             if self.start_shutdown_item().contains(x, y) {
                 shutdown();
             }
             self.start_open = false;
-            return Redraw::All;
+            return Redraw::Scene;
         }
         if self.desktop_terminal_icon().contains(x, y) {
-            // Первый mouse-down только выбирает ярлык; второй в системном
-            // double-click окне запускает его без задержки до mouse-up.
             self.desktop_icon_selected = true;
             self.desktop_icon_pressed = true;
             let click = self.click_tracker.pressed(
@@ -722,97 +850,117 @@ impl DesktopSession {
                 self.input.mouse_settings(),
             );
             if click == ClickKind::Double {
-                self.open_terminal();
-                serial::put_str("[desktop] terminal double-click\n");
-            } else {
-                serial::put_str("[desktop] terminal single-click x=");
-                serial::put_u32(x as u32);
-                serial::put_str(" y=");
-                serial::put_u32(y as u32);
-                serial::put_str("\n");
+                let _ = self.spawn_application(ApplicationKind::Terminal);
+                serial::put_str("[desktop] new terminal requested by double-click\n");
             }
-            return Redraw::All;
+            return Redraw::Scene;
         }
         self.desktop_icon_selected = false;
-        if self.task_terminal_button().contains(x, y) && !self.window.is_closed() {
-            let command = if self.window.is_minimized() {
-                WindowCommand::restore(TERMINAL_WINDOW_ID)
+
+        if let Some(id) = self.task_window_at(x, y) {
+            if self.window_is_minimized(id) {
+                let _ = self.apply_window_command(WindowCommand::restore(id));
+                self.focus_window(id);
+            } else if self.focused == Some(id) {
+                let _ = self.apply_window_command(WindowCommand::minimize(id));
+                self.focused = self.top_visible_window();
             } else {
-                WindowCommand::minimize(TERMINAL_WINDOW_ID)
-            };
-            let _ = self.apply_window_command(command);
-            return Redraw::All;
-        }
-        if !self.window.is_visible() {
-            return Redraw::None;
+                self.focus_window(id);
+            }
+            return Redraw::Scene;
         }
 
-        let (minimize, maximize, close) = self.window_controls();
+        let Some(id) = self.top_window_at(x, y) else {
+            return Redraw::None;
+        };
+        let focus_changed = self.focus_window(id);
+        let (minimize, maximize, close) = self.window_controls(id);
         if close.is_some_and(|rect| rect.contains(x, y)) {
-            if let Ok(request) = self.window.request_close() {
-                self.push_window_event(request);
-            }
-            let _ = self.apply_window_command(WindowCommand::close(TERMINAL_WINDOW_ID));
-            serial::put_str("[wm] terminal closed\n");
-            return Redraw::All;
+            self.close_window(id);
+            return Redraw::Scene;
         }
         if minimize.is_some_and(|rect| rect.contains(x, y)) {
-            let _ = self.apply_window_command(WindowCommand::minimize(TERMINAL_WINDOW_ID));
-            serial::put_str("[wm] terminal minimized\n");
-            return Redraw::All;
+            let _ = self.apply_window_command(WindowCommand::minimize(id));
+            self.focused = self.top_visible_window();
+            serial::put_str("[wm] window minimized id=0x");
+            serial::put_hex(id.0);
+            serial::put_str("\n");
+            return Redraw::Scene;
         }
         if maximize.is_some_and(|rect| rect.contains(x, y)) {
-            self.toggle_maximize();
-            serial::put_str("[wm] terminal maximize toggled\n");
-            return Redraw::All;
+            self.toggle_maximize(id);
+            return Redraw::Scene;
         }
-        let rect = self.window.rect();
-        let resize_edges = if self.window.style().contains(WindowStyle::RESIZABLE)
-            && !self.window.is_maximized()
-        {
-            hit_test_resize(rect, x, y, RESIZE_BORDER)
+
+        let Some(model_rect) = self.window_model_rect(id) else {
+            return Redraw::None;
+        };
+        let resize_edges = if self.window_style(id).is_some_and(|style| {
+            style.contains(WindowStyle::RESIZABLE) && !self.window_is_maximized(id)
+        }) {
+            hit_test_resize(model_rect, x, y, RESIZE_BORDER)
         } else {
             ResizeEdges::NONE
         };
         if !resize_edges.is_empty() {
             self.interaction = WindowInteraction::Resize {
+                window: id,
                 edges: resize_edges,
                 start_mouse_x: x,
                 start_mouse_y: y,
-                start: rect,
+                start: model_rect,
             };
-            self.begin_window_gesture();
-            serial::put_str("[wm] terminal resize started\n");
+            self.begin_window_gesture(id);
+            serial::put_str("[wm] resize started id=0x");
+            serial::put_hex(id.0);
+            serial::put_str("\n");
             return Redraw::None;
         }
-        if self.active_application == ActiveApplication::UiShowcase
-            && self.window_content_rect().contains(x, y)
+
+        if self.window_kind(id) == Some(ApplicationKind::UiShowcase)
+            && self
+                .window_content_rect(id)
+                .is_some_and(|content| content.contains(x, y))
         {
-            if self.ui_showcase.pointer(UiPointerKind::Down, x, y, 0) {
-                return Redraw::Ui;
-            }
-            return Redraw::None;
+            let changed = match self.application_mut(id) {
+                Some(Application::UiShowcase(showcase)) => {
+                    showcase.pointer(UiPointerKind::Down, x, y, 0)
+                }
+                _ => false,
+            };
+            return if changed || focus_changed {
+                Redraw::Scene
+            } else {
+                Redraw::None
+            };
         }
-        let rect = self.window_rect();
+
+        let Some(rect) = self.window_rect(id) else {
+            return Redraw::None;
+        };
         let title = Rect::new(rect.x, rect.y, rect.width.saturating_sub(100), TITLE_HEIGHT);
-        if self.window.style().contains(WindowStyle::TITLE_BAR)
-            && self.window.style().contains(WindowStyle::MOVABLE)
-            && title.contains(x, y)
-            && !self.window.is_maximized()
-        {
+        let movable = self.window_style(id).is_some_and(|style| {
+            style.contains(WindowStyle::TITLE_BAR) && style.contains(WindowStyle::MOVABLE)
+        });
+        if movable && title.contains(x, y) && !self.window_is_maximized(id) {
             self.interaction = WindowInteraction::Move {
+                window: id,
                 offset_x: x - rect.x,
                 offset_y: y - rect.y,
             };
-            self.begin_window_gesture();
-            serial::put_str("[wm] terminal drag started\n");
+            self.begin_window_gesture(id);
+            serial::put_str("[wm] drag started id=0x");
+            serial::put_hex(id.0);
+            serial::put_str("\n");
+            return Redraw::None;
         }
-        Redraw::None
+        if focus_changed {
+            Redraw::Scene
+        } else {
+            Redraw::None
+        }
     }
 
-    /// Выбирает семантический курсор после каждого mouse event. Ни один
-    /// widget не знает конкретной картинки: hit-test сообщает только смысл,
-    /// а cursor pack определяет стиль и hotspot.
     fn update_cursor_hint(&mut self) {
         let x = self.mouse_x;
         let y = self.mouse_y;
@@ -820,49 +968,60 @@ impl DesktopSession {
             WindowInteraction::Move { .. } => PointerCursor::Grabbing,
             WindowInteraction::Resize { edges, .. } => cursor_for_resize(edges),
             WindowInteraction::None => {
-                if self.window.is_visible()
-                    && self.window.style().contains(WindowStyle::RESIZABLE)
-                    && !self.window.is_maximized()
-                {
-                    let edges = hit_test_resize(self.window.rect(), x, y, RESIZE_BORDER);
-                    if !edges.is_empty() {
-                        self.cursor.set_automatic_kind(cursor_for_resize(edges));
-                        return;
-                    }
-                }
-                let (minimize, maximize, close) = self.window_controls();
-                let over_control = minimize.is_some_and(|rect| rect.contains(x, y))
-                    || maximize.is_some_and(|rect| rect.contains(x, y))
-                    || close.is_some_and(|rect| rect.contains(x, y));
-                let over_start_menu = self.start_open
-                    && (self.start_terminal_item().contains(x, y)
-                        || self.start_ui_item().contains(x, y)
-                        || self.start_shutdown_item().contains(x, y));
-                if over_control
-                    || over_start_menu
-                    || self.start_button().contains(x, y)
-                    || self.task_terminal_button().contains(x, y)
+                if self.start_button().contains(x, y)
+                    || self.start_open
+                        && (self.start_terminal_item().contains(x, y)
+                            || self.start_ui_item().contains(x, y)
+                            || self.start_shutdown_item().contains(x, y))
+                    || self.task_window_at(x, y).is_some()
                     || self.desktop_terminal_icon().contains(x, y)
                     || self.desktop_trash_icon().contains(x, y)
                 {
                     PointerCursor::Link
-                } else if self.window.is_visible() && self.window_content_rect().contains(x, y) {
-                    if self.active_application == ActiveApplication::Terminal {
-                        PointerCursor::Text
-                    } else {
-                        PointerCursor::Link
+                } else if let Some(id) = self.top_window_at(x, y) {
+                    let model = self
+                        .window_model_rect(id)
+                        .unwrap_or(WindowRect::new(0, 0, 0, 0));
+                    if self.window_style(id).is_some_and(|style| {
+                        style.contains(WindowStyle::RESIZABLE) && !self.window_is_maximized(id)
+                    }) {
+                        let edges = hit_test_resize(model, x, y, RESIZE_BORDER);
+                        if !edges.is_empty() {
+                            self.cursor.set_automatic_kind(cursor_for_resize(edges));
+                            return;
+                        }
                     }
-                } else if self.window.is_visible()
-                    && self.window.style().contains(WindowStyle::TITLE_BAR)
-                    && Rect::new(
-                        self.window_rect().x,
-                        self.window_rect().y,
-                        self.window_rect().width.saturating_sub(100),
-                        TITLE_HEIGHT,
-                    )
-                    .contains(x, y)
-                {
-                    PointerCursor::Grab
+                    let (minimize, maximize, close) = self.window_controls(id);
+                    if minimize.is_some_and(|rect| rect.contains(x, y))
+                        || maximize.is_some_and(|rect| rect.contains(x, y))
+                        || close.is_some_and(|rect| rect.contains(x, y))
+                    {
+                        PointerCursor::Link
+                    } else if self
+                        .window_content_rect(id)
+                        .is_some_and(|content| content.contains(x, y))
+                    {
+                        if self.window_kind(id) == Some(ApplicationKind::Terminal) {
+                            PointerCursor::Text
+                        } else {
+                            PointerCursor::Link
+                        }
+                    } else if self.window_style(id).is_some_and(|style| {
+                        style.contains(WindowStyle::TITLE_BAR)
+                            && self.window_rect(id).is_some_and(|rect| {
+                                Rect::new(
+                                    rect.x,
+                                    rect.y,
+                                    rect.width.saturating_sub(100),
+                                    TITLE_HEIGHT,
+                                )
+                                .contains(x, y)
+                            })
+                    }) {
+                        PointerCursor::Grab
+                    } else {
+                        PointerCursor::Arrow
+                    }
                 } else {
                     PointerCursor::Arrow
                 }
@@ -871,52 +1030,231 @@ impl DesktopSession {
         self.cursor.set_automatic_kind(kind);
     }
 
-    fn open_terminal(&mut self) {
-        self.active_application = ActiveApplication::Terminal;
-        let command = if self.window.is_closed() {
-            WindowCommand::show(TERMINAL_WINDOW_ID)
-        } else if self.window.is_minimized() {
-            WindowCommand::restore(TERMINAL_WINDOW_ID)
-        } else {
+    fn spawn_application(&mut self, kind: ApplicationKind) -> Option<WindowId> {
+        if self.window_count == MAX_WINDOWS {
+            serial::put_str("[wm] create rejected: window registry full\n");
+            return None;
+        }
+        let slot_index = self.windows.iter().position(Option::is_none)?;
+        let id = WindowId::new(self.next_window_id.max(1));
+        self.next_window_id = self.next_window_id.wrapping_add(1).max(1);
+        let (minimum_width, minimum_height) = kind.minimum_size();
+        let requested = self.default_window_rect(kind);
+        let (model, shown) = ManagedWindow::create(
+            id,
+            WindowCreateRequest::standard(window_rect(requested), minimum_width, minimum_height),
+            self.window_work_area(),
+        )
+        .ok()?;
+        let content = content_rect_for(&model);
+        let application = match kind {
+            ApplicationKind::Terminal => {
+                Application::Terminal(Terminal::new(self.usable_ram_mib, self.initramfs))
+            }
+            ApplicationKind::UiShowcase => Application::UiShowcase(UiShowcase::new(content)),
+        };
+        let memory = ApplicationMemory::new(application)?;
+        let frames = memory.frames();
+        self.windows[slot_index] = Some(WindowSlot {
+            model,
+            application: memory,
+        });
+        self.z_order[self.window_count] = id;
+        self.task_order[self.window_count] = id;
+        self.window_count += 1;
+        self.focused = Some(id);
+        self.cascade = self.cascade.wrapping_add(1);
+        self.push_window_event(shown);
+        serial::put_str("[app] spawn id=0x");
+        serial::put_hex(id.0);
+        serial::put_str(" kind=");
+        serial::put_str(kind.task_label());
+        serial::put_str(" private-frames=");
+        serial::put_u32(frames as u32);
+        serial::put_str(" windows=");
+        serial::put_u32(self.window_count as u32);
+        if let Some(rect) = self.window_model_rect(id) {
+            serial::put_str(" rect=");
+            serial::put_u32(rect.x.max(0) as u32);
+            serial::put_str(",");
+            serial::put_u32(rect.y.max(0) as u32);
+            serial::put_str(",");
+            serial::put_u32(rect.width);
+            serial::put_str("x");
+            serial::put_u32(rect.height);
+        }
+        serial::put_str("\n");
+        Some(id)
+    }
+
+    fn close_window(&mut self, id: WindowId) {
+        let request = self
+            .window_slot_mut(id)
+            .and_then(|slot| slot.model.request_close().ok());
+        if let Some(event) = request {
+            self.push_window_event(event);
+        }
+        let _ = self.apply_window_command(WindowCommand::close(id));
+        self.destroy_window(id);
+    }
+
+    fn destroy_window(&mut self, id: WindowId) {
+        let Some(slot_index) = self.window_slot_index(id) else {
             return;
         };
-        let _ = self.apply_window_command(command);
-    }
-
-    fn open_ui_showcase(&mut self) {
-        self.active_application = ActiveApplication::UiShowcase;
-        self.ui_showcase.resize(self.window_content_rect());
-        serial::put_str("[ui] Gallery opened runtime=system-ui-v1\n");
-        let command = if self.window.is_closed() {
-            Some(WindowCommand::show(TERMINAL_WINDOW_ID))
-        } else if self.window.is_minimized() {
-            Some(WindowCommand::restore(TERMINAL_WINDOW_ID))
-        } else {
-            None
-        };
-        if let Some(command) = command {
-            let _ = self.apply_window_command(command);
+        let (kind, frames) = self.windows[slot_index]
+            .as_ref()
+            .map(|slot| (slot.kind(), slot.application.frames()))
+            .unwrap_or((ApplicationKind::Terminal, 0));
+        // take вызывает Drop ApplicationMemory: app state исчезает, кадры
+        // возвращаются allocator'у до публикации нового focused window.
+        let destroyed = self.windows[slot_index].take();
+        drop(destroyed);
+        remove_id(&mut self.z_order, &mut self.window_count, id);
+        let mut task_count = self.window_count + 1;
+        remove_id(&mut self.task_order, &mut task_count, id);
+        debug_assert_eq!(task_count, self.window_count);
+        if self.focused == Some(id) {
+            self.focused = self.top_visible_window();
         }
+        serial::put_str("[app] exit id=0x");
+        serial::put_hex(id.0);
+        serial::put_str(" kind=");
+        serial::put_str(kind.task_label());
+        serial::put_str(" released-frames=");
+        serial::put_u32(frames as u32);
+        serial::put_str(" windows=");
+        serial::put_u32(self.window_count as u32);
+        serial::put_str("\n");
     }
 
-    fn window_rect(&self) -> Rect {
-        video_rect(self.window.rect())
+    fn default_window_rect(&self, kind: ApplicationKind) -> Rect {
+        let work_height = self.framebuffer.height().saturating_sub(TASKBAR_HEIGHT);
+        let (minimum_width, minimum_height) = kind.minimum_size();
+        // Сохраняем просторную geometry прежнего desktop: терминал на
+        // 1280x800 получает 1040x640. Cascade меняет только позицию новых
+        // экземпляров, а не неожиданно уменьшает рабочую область приложения.
+        let width = fit_window_extent(self.framebuffer.width(), 180, minimum_width, 1040);
+        let height = fit_window_extent(work_height, 114, minimum_height, 650);
+        let step = (self.cascade % 10) as i32 * 28;
+        let work = self.window_work_area();
+        let max_x = work
+            .x
+            .saturating_add(work.width.saturating_sub(width) as i32);
+        let max_y = work
+            .y
+            .saturating_add(work.height.saturating_sub(height) as i32);
+        let x = (120 + step).clamp(work.x, max_x.max(work.x));
+        let y = (57 + step).clamp(work.y, max_y.max(work.y));
+        Rect::new(x, y, width, height)
     }
 
-    fn window_content_rect(&self) -> Rect {
-        let rect = self.window_rect();
-        let border = u32::from(self.window.style().contains(WindowStyle::BORDER)) * 4;
-        let top = if self.window.style().contains(WindowStyle::TITLE_BAR) {
-            TITLE_HEIGHT
-        } else {
-            border
-        };
-        Rect::new(
-            rect.x + border as i32,
-            rect.y + top as i32,
-            rect.width.saturating_sub(border * 2),
-            rect.height.saturating_sub(top + border),
-        )
+    fn focus_window(&mut self, id: WindowId) -> bool {
+        if self.window_slot_index(id).is_none() {
+            return false;
+        }
+        let changed = self.focused != Some(id) || self.z_order[self.window_count - 1] != id;
+        if let Some(position) = self.z_order[..self.window_count]
+            .iter()
+            .position(|candidate| *candidate == id)
+        {
+            for index in position..self.window_count - 1 {
+                self.z_order[index] = self.z_order[index + 1];
+            }
+            self.z_order[self.window_count - 1] = id;
+        }
+        self.focused = Some(id);
+        if changed {
+            serial::put_str("[wm] focus id=0x");
+            serial::put_hex(id.0);
+            serial::put_str("\n");
+        }
+        changed
+    }
+
+    fn top_visible_window(&self) -> Option<WindowId> {
+        self.z_order[..self.window_count]
+            .iter()
+            .rev()
+            .copied()
+            .find(|id| self.window_is_visible(*id))
+    }
+
+    fn top_window_at(&self, x: i32, y: i32) -> Option<WindowId> {
+        self.z_order[..self.window_count]
+            .iter()
+            .rev()
+            .copied()
+            .find(|id| {
+                self.window_slot(*id).is_some_and(|slot| {
+                    slot.model.is_visible()
+                        && (video_rect(slot.model.rect()).contains(x, y)
+                            || !hit_test_resize(slot.model.rect(), x, y, RESIZE_BORDER).is_empty())
+                })
+            })
+    }
+
+    fn task_window_at(&self, x: i32, y: i32) -> Option<WindowId> {
+        (0..self.window_count).find_map(|index| {
+            let id = self.task_order[index];
+            self.task_button(index, self.window_count)
+                .contains(x, y)
+                .then_some(id)
+        })
+    }
+
+    fn window_slot_index(&self, id: WindowId) -> Option<usize> {
+        self.windows
+            .iter()
+            .position(|candidate| candidate.as_ref().is_some_and(|slot| slot.model.id() == id))
+    }
+
+    fn window_slot(&self, id: WindowId) -> Option<&WindowSlot> {
+        self.windows.get(self.window_slot_index(id)?)?.as_ref()
+    }
+
+    fn window_slot_mut(&mut self, id: WindowId) -> Option<&mut WindowSlot> {
+        let index = self.window_slot_index(id)?;
+        self.windows.get_mut(index)?.as_mut()
+    }
+
+    fn application_mut(&mut self, id: WindowId) -> Option<&mut Application> {
+        Some(self.window_slot_mut(id)?.application.get_mut())
+    }
+
+    fn window_kind(&self, id: WindowId) -> Option<ApplicationKind> {
+        Some(self.window_slot(id)?.kind())
+    }
+
+    fn window_style(&self, id: WindowId) -> Option<WindowStyle> {
+        Some(self.window_slot(id)?.model.style())
+    }
+
+    fn window_model_rect(&self, id: WindowId) -> Option<WindowRect> {
+        Some(self.window_slot(id)?.model.rect())
+    }
+
+    fn window_rect(&self, id: WindowId) -> Option<Rect> {
+        self.window_model_rect(id).map(video_rect)
+    }
+
+    fn window_content_rect(&self, id: WindowId) -> Option<Rect> {
+        Some(content_rect_for(&self.window_slot(id)?.model))
+    }
+
+    fn window_is_visible(&self, id: WindowId) -> bool {
+        self.window_slot(id)
+            .is_some_and(|slot| slot.model.is_visible())
+    }
+
+    fn window_is_minimized(&self, id: WindowId) -> bool {
+        self.window_slot(id)
+            .is_some_and(|slot| slot.model.is_minimized())
+    }
+
+    fn window_is_maximized(&self, id: WindowId) -> bool {
+        self.window_slot(id)
+            .is_some_and(|slot| slot.model.is_maximized())
     }
 
     fn window_work_area(&self) -> WindowRect {
@@ -933,21 +1271,19 @@ impl DesktopSession {
 
     fn apply_window_command(&mut self, command: WindowCommand) -> bool {
         let work_area = self.window_work_area();
-        match self.window.apply(command, work_area) {
-            Ok(event) => {
-                self.push_window_event(event);
-                true
-            }
-            Err(_) => false,
+        let event = self
+            .window_slot_mut(command.window)
+            .and_then(|slot| slot.model.apply(command, work_area).ok());
+        if let Some(event) = event {
+            self.push_window_event(event);
+            true
+        } else {
+            false
         }
     }
 
     fn push_window_event(&mut self, event: WindowEvent) {
         if !self.window_events.push(event) {
-            // GUI client не должен молча терять lifecycle event. В bootstrap
-            // сессии client живёт в том же event loop, поэтому сначала
-            // дренируем очередь и повторяем. Ring-3 displayd вернёт IPC
-            // backpressure отправителю.
             self.dispatch_window_events();
             let _ = self.window_events.push(event);
         }
@@ -955,9 +1291,6 @@ impl DesktopSession {
 
     fn dispatch_window_events(&mut self) {
         while let Some(event) = self.window_events.pop() {
-            // Terminal пока встроен в session и не требует IPC. Маркеры
-            // lifecycle проверяют двунаправленный API, но не спамят serial
-            // на каждом pixel move/resize.
             if !matches!(event.kind, window_event::MOVED | window_event::RESIZED) {
                 serial::put_str("[window-event] id=0x");
                 serial::put_hex(event.window.0);
@@ -970,29 +1303,45 @@ impl DesktopSession {
         }
     }
 
-    fn begin_window_gesture(&mut self) {
+    fn begin_window_gesture(&mut self, window: WindowId) {
         self.drag_frames = 0;
         self.drag_packets = 0;
         self.drag_present_pixels = 0;
         self.drag_preview_visible = false;
+        // Cache содержит desktop и все остальные окна. Поэтому лёгкий drag
+        // preview не стирает перекрытые приложения и не требует full redraw.
+        self.render_base();
+        for index in 0..self.window_count {
+            let id = self.z_order[index];
+            if id != window && self.window_is_visible(id) {
+                self.render_window(id);
+            }
+        }
+        let _ = self.framebuffer.cache_background();
+        self.render_window(window);
     }
 
-    fn finish_window_gesture(&mut self, resized: bool) -> Redraw {
+    fn finish_window_gesture(&mut self, window: WindowId, resized: bool) -> Redraw {
         self.interaction = WindowInteraction::None;
-        let preview = self.window_rect();
+        let preview = self.window_rect(window).unwrap_or(Rect::new(0, 0, 0, 0));
         let visible = self.drag_preview_visible;
         self.drag_preview_visible = false;
         self.previous_left = false;
+        if resized {
+            if let Some(content) = self.window_content_rect(window) {
+                if let Some(Application::UiShowcase(showcase)) = self.application_mut(window) {
+                    showcase.resize(content);
+                }
+            }
+        }
         Redraw::DragEnd {
+            window,
             preview,
             visible,
             resized,
         }
     }
 
-    /// Перестраивает desktop geometry после подтверждённого native mode-set.
-    /// Ни один старый rectangle или сохранённый cursor pixel не должен
-    /// ссылаться на освобождённую поверхность прежнего размера.
     fn relayout_after_mode_set(&mut self) {
         let screen_width = self.framebuffer.width();
         let screen_height = self.framebuffer.height();
@@ -1004,15 +1353,28 @@ impl DesktopSession {
         self.interaction = WindowInteraction::None;
         self.drag_preview_visible = false;
         let work_area = self.window_work_area();
-        let event = self.window.reflow(work_area);
-        self.push_window_event(event);
+        for index in 0..MAX_WINDOWS {
+            let event = if let Some(slot) = self.windows[index].as_mut() {
+                let event = slot.model.reflow(work_area);
+                let content = content_rect_for(&slot.model);
+                if let Application::UiShowcase(showcase) = slot.application.get_mut() {
+                    showcase.resize(content);
+                }
+                Some(event)
+            } else {
+                None
+            };
+            if let Some(event) = event {
+                self.push_window_event(event);
+            }
+        }
     }
 
-    fn toggle_maximize(&mut self) {
-        let command = if self.window.is_maximized() {
-            WindowCommand::restore(TERMINAL_WINDOW_ID)
+    fn toggle_maximize(&mut self, id: WindowId) {
+        let command = if self.window_is_maximized(id) {
+            WindowCommand::restore(id)
         } else {
-            WindowCommand::maximize(TERMINAL_WINDOW_ID)
+            WindowCommand::maximize(id)
         };
         let _ = self.apply_window_command(command);
     }
@@ -1025,22 +1387,26 @@ impl DesktopSession {
     }
 
     fn render_scene(&mut self) {
-        self.render_wallpaper();
-        self.render_desktop_icons();
-        self.render_taskbar();
+        self.render_base();
         let _ = self.framebuffer.cache_background();
-        if self.window.is_visible() {
-            self.render_window();
+        for index in 0..self.window_count {
+            let id = self.z_order[index];
+            if self.window_is_visible(id) {
+                self.render_window(id);
+            }
         }
         if self.start_open {
             self.render_start_menu();
         }
     }
 
-    /// Во время drag показывает лёгкий preview (title bar + контур), а не
-    /// перерисовывает и не копирует мегабайты содержимого окна на каждый
-    /// PS/2-пакет. Полное окно появляется один раз при mouse-up.
-    fn render_drag_preview(&mut self, previous: Rect, first: bool) -> bool {
+    fn render_base(&mut self) {
+        self.render_wallpaper();
+        self.render_desktop_icons();
+        self.render_taskbar();
+    }
+
+    fn render_drag_preview(&mut self, window: WindowId, previous: Rect, first: bool) -> bool {
         if !self.framebuffer.has_background_cache() {
             self.render_scene();
             return false;
@@ -1050,12 +1416,14 @@ impl DesktopSession {
         } else {
             self.restore_preview(previous);
         }
-        self.draw_drag_preview(self.window_rect());
+        if let Some(rect) = self.window_rect(window) {
+            self.draw_drag_preview(window, rect);
+        }
         self.drag_preview_visible = true;
         true
     }
 
-    fn render_drag_end(&mut self, preview: Rect, visible: bool) -> bool {
+    fn render_drag_end(&mut self, window: WindowId, preview: Rect, visible: bool) -> bool {
         if !visible {
             return self.framebuffer.has_background_cache();
         }
@@ -1064,12 +1432,14 @@ impl DesktopSession {
             return false;
         }
         self.restore_preview(preview);
-        self.render_window();
+        self.render_window(window);
         true
     }
 
-    fn draw_drag_preview(&mut self, rect: Rect) {
-        let title = self.active_title();
+    fn draw_drag_preview(&mut self, window: WindowId, rect: Rect) {
+        let title = self
+            .window_kind(window)
+            .map_or("RUSTOS", ApplicationKind::title);
         self.framebuffer.fill_rect(
             Rect::new(rect.x, rect.y, rect.width, TITLE_HEIGHT),
             Color::rgb(28, 43, 62),
@@ -1119,12 +1489,14 @@ impl DesktopSession {
         self.framebuffer.present();
     }
 
-    fn log_drag_finished(&self, resized: bool) {
+    fn log_drag_finished(&self, window: WindowId, resized: bool) {
         serial::put_str(if resized {
-            "[wm] terminal resize finished frames="
+            "[wm] resize finished id=0x"
         } else {
-            "[wm] terminal drag finished frames="
+            "[wm] drag finished id=0x"
         });
+        serial::put_hex(window.0);
+        serial::put_str(" frames=");
         serial::put_u32(self.drag_frames);
         serial::put_str(" packets=");
         serial::put_u32(self.drag_packets);
@@ -1132,7 +1504,7 @@ impl DesktopSession {
         serial::put_u32((self.drag_present_pixels / 1000) as u32);
         serial::put_str(" compositor=");
         serial::put_str(if self.framebuffer.has_background_cache() {
-            "preview"
+            "layer-cache"
         } else {
             "full"
         });
@@ -1177,14 +1549,6 @@ impl DesktopSession {
         );
         font::draw_text(
             &mut self.framebuffer,
-            terminal.x + 6,
-            terminal.y + 62,
-            "TERMINAL",
-            Color::rgb(5, 9, 15),
-            font::UI_SMALL.bold(),
-        );
-        font::draw_text(
-            &mut self.framebuffer,
             terminal.x + 5,
             terminal.y + 61,
             "TERMINAL",
@@ -1195,14 +1559,6 @@ impl DesktopSession {
         self.draw_system_icon(
             IconKind::Trash,
             Rect::new(trash.x + 12, trash.y + 2, 48, 52),
-        );
-        font::draw_text(
-            &mut self.framebuffer,
-            trash.x + 17,
-            trash.y + 64,
-            "TRASH",
-            Color::rgb(5, 9, 15),
-            font::UI_SMALL.bold(),
         );
         font::draw_text(
             &mut self.framebuffer,
@@ -1222,83 +1578,100 @@ impl DesktopSession {
         );
     }
 
-    fn render_window_area(&mut self) {
-        if self.window.is_visible() {
-            self.render_window();
-        }
-    }
+    fn render_window(&mut self, id: WindowId) {
+        let Some(slot) = self.window_slot(id) else {
+            return;
+        };
+        let rect = video_rect(slot.model.rect());
+        let style = slot.model.style();
+        let maximized = slot.model.is_maximized();
+        let kind = slot.kind();
+        let focused = self.focused == Some(id);
 
-    fn render_window(&mut self) {
-        let rect = self.window_rect();
-        let style = self.window.style();
-        // Тень рисуется только двумя видимыми полосами. Заливать весь
-        // прямоугольник под непрозрачным окном — сотни тысяч лишних stores.
         self.framebuffer.fill_rect(
-            Rect::new(rect.x + rect.width as i32, rect.y + 8, 7, rect.height),
+            Rect::new(
+                rect.x + rect.width as i32,
+                rect.y + 8,
+                WINDOW_SHADOW_RIGHT,
+                rect.height,
+            ),
             Color::rgb(7, 12, 20),
         );
         self.framebuffer.fill_rect(
-            Rect::new(rect.x + 7, rect.y + rect.height as i32, rect.width, 8),
+            Rect::new(
+                rect.x + 7,
+                rect.y + rect.height as i32,
+                rect.width,
+                WINDOW_SHADOW_BOTTOM,
+            ),
             Color::rgb(7, 12, 20),
         );
         Panel {
             rect,
             color: Theme::PANEL,
-            border: style.contains(WindowStyle::BORDER).then_some(Theme::BORDER),
+            border: style.contains(WindowStyle::BORDER).then_some(if focused {
+                Theme::ACCENT
+            } else {
+                Theme::BORDER
+            }),
         }
         .draw(&mut self.framebuffer);
         if style.contains(WindowStyle::TITLE_BAR) {
             self.framebuffer.horizontal_gradient(
                 Rect::new(rect.x + 1, rect.y + 1, rect.width - 2, TITLE_HEIGHT - 1),
-                Color::rgb(32, 48, 68),
-                Color::rgb(22, 32, 48),
+                if focused {
+                    Color::rgb(38, 62, 86)
+                } else {
+                    Color::rgb(30, 40, 54)
+                },
+                Color::rgb(19, 28, 42),
             );
-            if self.active_application == ActiveApplication::Terminal {
-                self.draw_system_icon(
+            match kind {
+                ApplicationKind::Terminal => self.draw_system_icon(
                     IconKind::Terminal,
                     Rect::new(rect.x + 8, rect.y + 6, 22, 22),
-                );
-            } else {
-                components::start_icon(&mut self.framebuffer, rect.x + 8, rect.y + 6);
+                ),
+                ApplicationKind::UiShowcase => {
+                    components::start_icon(&mut self.framebuffer, rect.x + 8, rect.y + 6)
+                }
             }
             Label {
-                rect: Rect::new(rect.x + 38, rect.y + 8, 260, 22),
-                text: self.active_title(),
-                color: Theme::TEXT,
+                rect: Rect::new(rect.x + 38, rect.y + 8, 310, 22),
+                text: kind.title(),
+                color: if focused {
+                    Theme::TEXT
+                } else {
+                    Theme::TEXT_MUTED
+                },
                 style: font::UI_TITLE,
             }
             .draw(&mut self.framebuffer);
-
-            let (minimize, maximize, close) = self.window_controls();
-            if let Some(rect) = minimize {
+            let (minimize, maximize, close) = self.window_controls(id);
+            if let Some(control) = minimize {
                 Button {
-                    rect,
+                    rect: control,
                     label: "-",
-                    hovered: rect.contains(self.mouse_x, self.mouse_y),
+                    hovered: focused && control.contains(self.mouse_x, self.mouse_y),
                     pressed: false,
                     danger: false,
                 }
                 .draw(&mut self.framebuffer);
             }
-            if let Some(rect) = maximize {
+            if let Some(control) = maximize {
                 Button {
-                    rect,
-                    label: if self.window.is_maximized() {
-                        "[]"
-                    } else {
-                        "+"
-                    },
-                    hovered: rect.contains(self.mouse_x, self.mouse_y),
+                    rect: control,
+                    label: if maximized { "[]" } else { "+" },
+                    hovered: focused && control.contains(self.mouse_x, self.mouse_y),
                     pressed: false,
                     danger: false,
                 }
                 .draw(&mut self.framebuffer);
             }
-            if let Some(rect) = close {
+            if let Some(control) = close {
                 Button {
-                    rect,
+                    rect: control,
                     label: "X",
-                    hovered: rect.contains(self.mouse_x, self.mouse_y),
+                    hovered: focused && control.contains(self.mouse_x, self.mouse_y),
                     pressed: false,
                     danger: true,
                 }
@@ -1307,7 +1680,7 @@ impl DesktopSession {
         }
         if style.contains(WindowStyle::BORDER)
             && style.contains(WindowStyle::RESIZABLE)
-            && !self.window.is_maximized()
+            && !maximized
         {
             for inset in [4, 8, 12] {
                 self.framebuffer.fill_rect(
@@ -1321,13 +1694,33 @@ impl DesktopSession {
                 );
             }
         }
-        let content = self.window_content_rect();
-        match self.active_application {
-            ActiveApplication::Terminal => self.terminal.draw(&mut self.framebuffer, content),
-            ActiveApplication::UiShowcase => {
-                self.ui_showcase.resize(content);
-                let _ = self.ui_showcase.draw(&mut self.framebuffer, true);
+
+        let content = content_rect_from(rect, style);
+        let Some(index) = self.window_slot_index(id) else {
+            return;
+        };
+        let (framebuffer, windows) = (&mut self.framebuffer, &mut self.windows);
+        let Some(slot) = windows[index].as_mut() else {
+            return;
+        };
+        match slot.application.get_mut() {
+            Application::Terminal(terminal) => terminal.draw(framebuffer, content),
+            Application::UiShowcase(showcase) => {
+                showcase.resize(content);
+                let _ = showcase.draw(framebuffer, true);
             }
+        }
+    }
+
+    fn draw_focused_terminal_line(&mut self) -> Option<Rect> {
+        let id = self.focused?;
+        let content = self.window_content_rect(id)?;
+        let index = self.window_slot_index(id)?;
+        let (framebuffer, windows) = (&mut self.framebuffer, &mut self.windows);
+        let slot = windows[index].as_mut()?;
+        match slot.application.get_mut() {
+            Application::Terminal(terminal) => terminal.draw_input_line(framebuffer, content),
+            Application::UiShowcase(_) => None,
         }
     }
 
@@ -1357,33 +1750,47 @@ impl DesktopSession {
             Theme::TEXT,
             font::UI_NORMAL,
         );
-        if !self.window.is_closed() {
-            let task_label = self.active_task_label();
-            let task = self.task_terminal_button();
+
+        for index in 0..self.window_count {
+            let id = self.task_order[index];
+            let Some((kind, minimized)) = self
+                .window_slot(id)
+                .map(|slot| (slot.kind(), slot.model.is_minimized()))
+            else {
+                continue;
+            };
+            let task = self.task_button(index, self.window_count);
             self.framebuffer.fill_rect(
                 task,
-                if self.window.is_minimized() {
-                    Theme::PANEL
-                } else {
+                if self.focused == Some(id) && !minimized {
                     Theme::PANEL_LIGHT
+                } else {
+                    Theme::PANEL
                 },
             );
-            if self.active_application == ActiveApplication::Terminal {
-                self.draw_system_icon(
+            match kind {
+                ApplicationKind::Terminal => self.draw_system_icon(
                     IconKind::Terminal,
-                    Rect::new(task.x + 7, task.y + 7, 28, 28),
-                );
-            } else {
-                components::start_icon(&mut self.framebuffer, task.x + 8, task.y + 9);
+                    Rect::new(task.x + 6, task.y + 6, 26, 26),
+                ),
+                ApplicationKind::UiShowcase => {
+                    components::start_icon(&mut self.framebuffer, task.x + 7, task.y + 8)
+                }
             }
-            font::draw_text(
-                &mut self.framebuffer,
-                task.x + 43,
-                task.y + 17,
-                task_label,
-                Theme::TEXT,
-                font::UI_NORMAL,
-            );
+            if task.width >= 92 {
+                font::draw_text(
+                    &mut self.framebuffer,
+                    task.x + 38,
+                    task.y + 16,
+                    kind.task_label(),
+                    if minimized {
+                        Theme::TEXT_MUTED
+                    } else {
+                        Theme::TEXT
+                    },
+                    font::UI_SMALL,
+                );
+            }
         }
         let status_x = self.framebuffer.width() as i32 - 150;
         font::draw_text(
@@ -1422,7 +1829,7 @@ impl DesktopSession {
             &mut self.framebuffer,
             terminal.x + 58,
             terminal.y + 20,
-            "TERMINAL",
+            "NEW TERMINAL",
             Theme::TEXT,
             font::UI_NORMAL,
         );
@@ -1433,7 +1840,7 @@ impl DesktopSession {
             &mut self.framebuffer,
             ui.x + 58,
             ui.y + 20,
-            "UI GALLERY",
+            "NEW UI GALLERY",
             Theme::TEXT,
             font::UI_NORMAL,
         );
@@ -1466,11 +1873,17 @@ impl DesktopSession {
         )
     }
 
-    fn task_terminal_button(&self) -> Rect {
+    fn task_button(&self, index: usize, count: usize) -> Rect {
+        let available = self.framebuffer.width().saturating_sub(126 + 160);
+        let width = if count == 0 {
+            180
+        } else {
+            (available / count as u32).min(180).max(22)
+        };
         Rect::new(
-            126,
+            126 + index as i32 * width as i32,
             self.framebuffer.height() as i32 - TASKBAR_HEIGHT as i32 + 4,
-            180,
+            width.saturating_sub(3),
             TASKBAR_HEIGHT - 8,
         )
     }
@@ -1489,6 +1902,11 @@ impl DesktopSession {
         Rect::new(menu.x + 12, menu.y + 65, menu.width - 24, 52)
     }
 
+    fn start_ui_item(&self) -> Rect {
+        let menu = self.start_menu();
+        Rect::new(menu.x + 12, menu.y + 123, menu.width - 24, 52)
+    }
+
     fn start_shutdown_item(&self) -> Rect {
         let menu = self.start_menu();
         Rect::new(
@@ -1499,34 +1917,15 @@ impl DesktopSession {
         )
     }
 
-    fn start_ui_item(&self) -> Rect {
-        let menu = self.start_menu();
-        Rect::new(menu.x + 12, menu.y + 123, menu.width - 24, 52)
-    }
-
-    fn active_title(&self) -> &'static str {
-        match self.active_application {
-            ActiveApplication::Terminal => "RUSTOS · ТЕРМИНАЛ",
-            ActiveApplication::UiShowcase => "RUSTOS · SYSTEM UI GALLERY",
-        }
-    }
-
-    fn active_task_label(&self) -> &'static str {
-        match self.active_application {
-            ActiveApplication::Terminal => "TERMINAL",
-            ActiveApplication::UiShowcase => "UI GALLERY",
-        }
-    }
-
-    fn window_controls(&self) -> (Option<Rect>, Option<Rect>, Option<Rect>) {
-        let style = self.window.style();
+    fn window_controls(&self, id: WindowId) -> (Option<Rect>, Option<Rect>, Option<Rect>) {
+        let Some(slot) = self.window_slot(id) else {
+            return (None, None, None);
+        };
+        let style = slot.model.style();
         if !style.contains(WindowStyle::TITLE_BAR) {
             return (None, None, None);
         }
-
-        // Кнопки укладываются справа налево. Поэтому скрытие любой из них не
-        // оставляет пустую «дырку» в title bar и не меняет hit-test остальных.
-        let rect = self.window_rect();
+        let rect = video_rect(slot.model.rect());
         let y = rect.y + 4;
         let mut right = rect.x.saturating_add(rect.width as i32).saturating_sub(4);
         let close = place_window_control(style.contains(WindowStyle::BUTTON_CLOSE), &mut right, y);
@@ -1542,31 +1941,61 @@ impl DesktopSession {
 enum Redraw {
     None,
     TerminalLine,
-    Ui,
-    Window,
-    All,
+    Scene,
     DragMove {
+        window: WindowId,
         previous: Rect,
         first: bool,
     },
     DragEnd {
+        window: WindowId,
         preview: Rect,
         visible: bool,
         resized: bool,
     },
 }
 
-/// Переводит ABI geometry в локальный тип software renderer'а.
+fn remove_id(order: &mut [WindowId; MAX_WINDOWS], count: &mut usize, id: WindowId) {
+    let Some(position) = order[..*count]
+        .iter()
+        .position(|candidate| *candidate == id)
+    else {
+        return;
+    };
+    for index in position..count.saturating_sub(1) {
+        order[index] = order[index + 1];
+    }
+    *count = count.saturating_sub(1);
+    order[*count] = WindowId::new(0);
+}
+
 const fn video_rect(rect: WindowRect) -> Rect {
     Rect::new(rect.x, rect.y, rect.width, rect.height)
 }
 
-/// Переводит geometry renderer'а в не зависящий от реализации ABI.
 const fn window_rect(rect: Rect) -> WindowRect {
     WindowRect::new(rect.x, rect.y, rect.width, rect.height)
 }
 
-/// Выделяет место для одной видимой системной кнопки справа налево.
+fn content_rect_for(window: &ManagedWindow) -> Rect {
+    content_rect_from(video_rect(window.rect()), window.style())
+}
+
+fn content_rect_from(rect: Rect, style: WindowStyle) -> Rect {
+    let border = u32::from(style.contains(WindowStyle::BORDER)) * 4;
+    let top = if style.contains(WindowStyle::TITLE_BAR) {
+        TITLE_HEIGHT
+    } else {
+        border
+    };
+    Rect::new(
+        rect.x + border as i32,
+        rect.y + top as i32,
+        rect.width.saturating_sub(border * 2),
+        rect.height.saturating_sub(top + border),
+    )
+}
+
 fn place_window_control(enabled: bool, right: &mut i32, y: i32) -> Option<Rect> {
     if !enabled {
         return None;
@@ -1581,8 +2010,8 @@ fn window_damage(rect: Rect) -> Rect {
     Rect::new(
         rect.x,
         rect.y,
-        rect.width.saturating_add(7),
-        rect.height.saturating_add(8),
+        rect.width.saturating_add(WINDOW_SHADOW_RIGHT),
+        rect.height.saturating_add(WINDOW_SHADOW_BOTTOM),
     )
 }
 
@@ -1653,10 +2082,6 @@ fn cursor_name(kind: PointerCursor) -> &'static str {
     }
 }
 
-/// Выбирает размер окна без underflow даже для аварийного малого framebuffer.
-/// На нормальном wide mode сохраняется просторное поле desktop, на тесном —
-/// минимум 8 px с каждой стороны. `lower <= upper` гарантировано явно, поэтому
-/// `clamp` никогда не паникует.
 fn fit_window_extent(available: u32, roomy_margin: u32, minimum: u32, maximum: u32) -> u32 {
     let hard_maximum = available.saturating_sub(16).max(1);
     let margin = if available >= minimum.saturating_add(roomy_margin) {
@@ -1669,7 +2094,6 @@ fn fit_window_extent(available: u32, roomy_margin: u32, minimum: u32, maximum: u
     available.saturating_sub(margin).clamp(lower, upper)
 }
 
-/// Platform power off: ACPI PM на PC либо PSCI на AArch64.
 fn shutdown() -> ! {
     serial::put_str("[platform] shutdown requested\n");
     arch::power_off()

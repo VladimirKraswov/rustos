@@ -954,6 +954,16 @@ impl Terminal {
         }
         if verb.eq_ignore_ascii_case("pwd") {
             self.print_cwd();
+            // Lifecycle-тест GUI проверяет не текстовые пиксели, а состояние
+            // нового shell instance. После закрытия окна новый терминал
+            // обязан начать с `/`, даже если предыдущий находился в `/src`.
+            let mut path = [0u8; PATH_CAPACITY];
+            path[..self.cwd_len].copy_from_slice(&self.cwd[..self.cwd_len]);
+            self.log_fs(
+                "PWD",
+                core::str::from_utf8(&path[..self.cwd_len]).unwrap_or("?"),
+                0,
+            );
             return true;
         }
         if verb.eq_ignore_ascii_case("ls") || verb.eq_ignore_ascii_case("dir") {

@@ -5,7 +5,11 @@
 //! вызывается terminal напрямую. Persistent VaraniaFS и disk drivers заменят
 //! backend, не меняя команды и `vfs.dll` API.
 
-use core::{ptr::addr_of_mut, slice, str};
+use core::{
+    ptr::addr_of_mut,
+    slice, str,
+    sync::atomic::{AtomicU8, Ordering},
+};
 
 use rustos_abi::bootinfo::BootInitramfs;
 
@@ -220,6 +224,14 @@ impl OverlayStorage {
 // этим bootstrap backend.
 static mut OVERLAY: OverlayStorage = OverlayStorage::EMPTY;
 
+// `BootstrapFs` является лёгким клиентом общего bootstrap VFS. Раньше каждый
+// новый терминал обнулял OVERLAY, потому что GUI допускал ровно один его
+// экземпляр. Для независимых окон это недопустимо: запуск второго shell не
+// должен стирать файлы первого. 0 = не готово, 1 = инициализируется, 2 = готово.
+// Когда vfsd окончательно заменит bootstrap backend, эта синхронизация станет
+// обычным подключением клиента к capability сервиса.
+static OVERLAY_STATE: AtomicU8 = AtomicU8::new(0);
+
 /// Возвращает файл из RIFS initramfs без монтирования RAM overlay.
 /// Используется ранним ELF loader'ом и bootstrap VFS syscall до запуска
 /// отдельного `vfsd`.
@@ -252,28 +264,42 @@ pub struct BootstrapFs {
 }
 
 impl BootstrapFs {
-    /// Монтирует initramfs в `/boot` и создаёт writable RAM directories.
+    /// Подключает клиента к общему bootstrap VFS.
+    ///
+    /// Первый клиент монтирует initramfs и создаёт writable RAM directories;
+    /// последующие получают тот же namespace, не очищая уже созданные файлы.
     pub fn new(initramfs: BootInitramfs) -> Self {
         let overlay = addr_of_mut!(OVERLAY);
-        // SAFETY: ранняя загрузка однопоточна, `new` вызывается один раз;
-        // raw pointer не создаёт ссылку на `static mut`. Нулевое значение
-        // `NodeKind` — валидный Empty, остальные поля также должны быть 0.
-        unsafe { overlay.write_bytes(0, 1) };
         let mut fs = Self {
             initramfs: initramfs.phys_addr as *const u8,
             initramfs_size: usize::try_from(initramfs.size).unwrap_or(0),
             overlay,
         };
-        for path in [
-            "/system",
-            "/system/bin",
-            "/system/lib",
-            "/home",
-            "/home/user",
-            "/src",
-            "/build",
-        ] {
-            let _ = fs.insert_node(path.as_bytes(), NodeKind::Directory, &[]);
+
+        if OVERLAY_STATE
+            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            // SAFETY: состояние 1 принадлежит этому потоку; до Release-store
+            // ниже ни один другой клиент не обращается к storage. Нулевой
+            // NodeKind является валидным Empty.
+            unsafe { overlay.write_bytes(0, 1) };
+            for path in [
+                "/system",
+                "/system/bin",
+                "/system/lib",
+                "/home",
+                "/home/user",
+                "/src",
+                "/build",
+            ] {
+                let _ = fs.insert_node(path.as_bytes(), NodeKind::Directory, &[]);
+            }
+            OVERLAY_STATE.store(2, Ordering::Release);
+        } else {
+            while OVERLAY_STATE.load(Ordering::Acquire) != 2 {
+                core::hint::spin_loop();
+            }
         }
         fs
     }

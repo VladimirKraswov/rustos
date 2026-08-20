@@ -13,7 +13,8 @@ layout/event/display-list pipeline и UI Gallery описаны в
 - `input.rs` — PS/2 keyboard/mouse и нормализованные события;
 - `rustos-system-assets` — cursor/icon packs и CPU-friendly обои;
 - `gui/components.rs` — theme и базовые widgets;
-- `gui/session.rs` — compositor, desktop, taskbar и window manager;
+- `gui/session.rs` — compositor, desktop, taskbar, registry окон и lifecycle
+  независимых экземпляров приложений;
 - `apps/terminal.rs` — первый графический клиент.
 
 На QEMU ядро после GRUB hand-off подключает modern PCI virtio-gpu,
@@ -35,12 +36,13 @@ layout/event/display-list pipeline и UI Gallery описаны в
 
 Компоненты никогда не рисуют непосредственно в видимый framebuffer.
 Compositor сначала формирует кадр в back buffer из обычной RAM и только потом
-публикует его одним линейным или быстрым построчным копированием. Статический слой desktop
-(обои, иконки, taskbar) хранится во втором RAM-буфере. Во время drag compositor
-показывает лёгкий preview из title bar и контура: старый preview восстанавливает
-из кэша, а в scanout отправляет только несколько узких damage-полос. Полное окно
-рисуется один раз при mouse-up. Это осознанный software-rendering режим для
-QEMU TCG, где копирование мегабайтов scanout на каждый пакет мыши слишком дорого.
+публикует его одним линейным или быстрым построчным копированием. Перед drag
+второй RAM-буфер перестраивается из desktop и всех окон, кроме
+перетаскиваемого. Поэтому preview из title bar и контура корректно проходит над
+другими программами, не стирает их и отправляет в scanout только несколько
+узких damage-полос. Полное окно рисуется один раз при mouse-up. Это осознанный
+software-rendering режим для QEMU TCG, где копирование мегабайтов scanout на
+каждый пакет мыши слишком дорого.
 
 PS/2 service объединяет накопившиеся движения с неизменным состоянием кнопок.
 Переходы mouse-down/up сохраняются отдельно, но вместо очереди устаревших
@@ -55,14 +57,24 @@ PS/2 service объединяет накопившиеся движения с �
 
 ## Управление
 
-- ввод с клавиатуры направляется в активный terminal;
+- ввод с клавиатуры направляется только в приложение с keyboard focus;
 - кнопки `-`, `+` и `X` сворачивают, разворачивают и закрывают окно;
 - заголовок окна можно перетаскивать;
 - рамка и углы меняют размер окна с соблюдением minimum size;
-- taskbar восстанавливает свёрнутый terminal;
-- Start menu содержит terminal и shutdown;
-- один клик выбирает desktop icon, двойной — открывает terminal; интервал и
+- taskbar содержит отдельную кнопку каждого экземпляра, переключает focus и
+  восстанавливает свёрнутое окно;
+- Start menu создаёт новый Terminal или UI Gallery, а не заменяет содержимое
+  уже открытого окна;
+- один клик выбирает desktop icon, двойной — создаёт новый terminal; интервал и
   допустимое смещение берутся из общего mouse profile.
+
+Оконный registry хранит стабильные `WindowId`, отдельный Z-order и неизменный
+порядок taskbar. Каждое приложение размещается в собственных физических кадрах.
+Нажатие `X` проходит через `CLOSE_REQUESTED`/`CLOSED`, уничтожает объект клиента
+и возвращает кадры общему allocator'у. Поэтому новый Terminal всегда получает
+чистый экран, `/` как cwd и новый ID; файлы при этом сохраняются, потому что VFS
+является общим сервисом, а не частью процесса shell. Текущий защитный лимит —
+16 одновременно существующих окон.
 
 Команда `DISPLAY` показывает display driver, реальное разрешение,
 физический размер монитора и цветовой профиль. `DISPLAY MODES` выводит EDID
@@ -101,7 +113,9 @@ versioned client API без дублирования большого renderer-�
 - software compositor остаётся синхронным и пока не привязан к VSync;
 - PS/2 работает polling-режимом;
 - UTF-8 Latin/Cyrillic работает, но пока нет shaping, bidi и сложных scripts;
-- только одно terminal window;
-- parser shell и console bridge ещё находятся в kernel; сами программы и
-  `vfsd` уже исполняются в ring 3;
+- terminal и UI Gallery уже имеют независимые экземпляры, geometry, focus,
+  Z-order и lifecycle, но их event handlers пока исполняются последовательно
+  внутри bootstrap window-server loop;
+- parser shell и console bridge ещё находятся в kernel; запускаемые программы
+  и `vfsd` уже исполняются в ring 3;
 - display/input services ещё не изолированы в ring 3.

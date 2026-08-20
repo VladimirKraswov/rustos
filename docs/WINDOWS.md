@@ -14,9 +14,11 @@
 проверяет capability и ограничения, а затем возвращает событие с **фактически
 применённой** позицией, размером и состоянием.
 
-Сейчас bootstrap desktop вызывает этот контракт внутри kernel session. При
-переносе compositor'а в изолированный `displayd` структуры ABI и код клиентов
-останутся прежними; изменится только transport вызова.
+Сейчас bootstrap desktop вызывает этот контракт внутри kernel session. Уже
+работают таблица независимых окон, focus, Z-order, отдельные taskbar entries и
+динамическое владение памятью приложения. При переносе compositor'а в
+изолированный `displayd` структуры ABI и код клиентов останутся прежними;
+изменится transport вызова и владелец surface capability.
 
 ## Создание и настройка
 
@@ -101,7 +103,11 @@ backpressure вместо молчаливой потери lifecycle event.
    `WindowCommand::close`; только после этого приходит `CLOSED`.
 
 Встроенный terminal не имеет несохранённого документа, поэтому подтверждает
-закрытие сразу. Редактор сможет задержать второй шаг без блокировки desktop.
+закрытие сразу. После `CLOSED` desktop удаляет registry entry, вызывает
+destructor конкретного application instance и возвращает его физические кадры.
+Повторный запуск создаёт новый `WindowId` и чистое состояние; закрытый shell не
+может «воскреснуть» со старым cwd или экранным буфером. Редактор сможет задержать
+второй шаг без блокировки desktop.
 
 ## Состояния
 
@@ -111,7 +117,7 @@ backpressure вместо молчаливой потери lifecycle event.
 | normal/maximized | minimize | minimized | состояние до minimize |
 | minimized | restore | normal или maximized | точное предыдущее состояние |
 | maximized | restore | normal | прежний normal rect |
-| любое видимое | close | closed | restore rect для повторного show |
+| любое видимое | close | closed | server policy решает: сохранить или уничтожить |
 | closed | show | normal | валидированный restore rect |
 
 После смены разрешения `reflow` пересчитывает normal geometry и рабочую область
@@ -124,9 +130,10 @@ style policy, minimum/work-area constraints, corner resize и FIFO/backpressure.
 GUI-тест дополнительно посылает реальные PS/2 mouse events в QEMU и проверяет
 drag, resize, minimize и runtime смену видеорежима.
 
-До полноценного многопрограммного desktop остаётся вынести registry окон,
-focus/z-order и surfaces в ring-3 `displayd`. Каждому клиенту будет выдаваться
+До полностью изолированного многопрограммного desktop остаётся вынести уже
+работающие registry/focus/Z-order из bootstrap session в ring-3 `displayd` и
+запустить сами GUI-клиенты как scheduler tasks. Каждому клиенту будет выдаваться
 window capability, а пиксели будут передаваться не сообщениями, а через
 shared-memory surface capability с `commit(damage, generation)`. Падение
-клиента тогда удалит только его окна и не затронет compositor или остальные
-программы.
+клиента тогда автоматически отзовёт его capabilities и удалит только его окна,
+не затронув compositor или остальные программы.

@@ -64,6 +64,33 @@ send_command() {
     printf 'sendkey ret 20\n' | hmp 100
 }
 
+# Большие relative jumps QEMU раскладывает на несколько PS/2 packets. Если
+# сразу поставить mouse-down, он может обогнать хвост движения в 8042 queue.
+# Дробим автоматические перемещения так же, как это делает физическая мышь.
+move_mouse() {
+    local dx="$1"
+    local dy="$2"
+    local steps="${3:-4}"
+    local step_x=$((dx / steps))
+    local step_y=$((dy / steps))
+    local sent_x=0
+    local sent_y=0
+    local index part_x part_y
+    for ((index = 1; index <= steps; index++)); do
+        if ((index == steps)); then
+            part_x=$((dx - sent_x))
+            part_y=$((dy - sent_y))
+        else
+            part_x="$step_x"
+            part_y="$step_y"
+        fi
+        printf 'mouse_move %d %d\n' "$part_x" "$part_y" | hmp
+        sent_x=$((sent_x + part_x))
+        sent_y=$((sent_y + part_y))
+        sleep 0.1
+    done
+}
+
 wait_for_serial() {
     local pattern="$1"
     local _
@@ -99,7 +126,7 @@ stop_qemu() {
 cleanup() {
     trap - EXIT INT TERM HUP
     stop_qemu
-    for file in serial.log qemu-stderr.log mode-720.ppm fonts.ppm cursor-busy.ppm wallpaper-autumn.ppm terminal.ppm ui-gallery.ppm dragged.ppm resized.ppm minimized.ppm; do
+    for file in serial.log qemu-stderr.log mode-720.ppm fonts.ppm cursor-busy.ppm wallpaper-autumn.ppm lifecycle.ppm terminal.ppm ui-gallery.ppm dragged.ppm resized.ppm minimized.ppm; do
         [[ -f "$RUN_DIR/$file" ]] && cp -f "$RUN_DIR/$file" "$RESULT_DIR/$file"
     done
 }
@@ -144,9 +171,9 @@ grep -q '\[ipc\] queued block/wake and attenuated VFS capability verified' "$RUN
 grep -q '\[process-manager\] dynamic create/exit/reap reclaimed all frames' "$RUN_DIR/serial.log"
 grep -q '\[scheduler\] priority, affinity and fault-containment policy verified' "$RUN_DIR/serial.log"
 
-# Проверяем настоящий double-click до перемещения/resize окна: стартовая точка
-# курсора детерминирована (640,400), terminal icon находится около (65,78).
-printf 'mouse_move -575 -322\n' | hmp
+# Проверяем настоящий double-click и создание второго независимого экземпляра:
+# стартовая точка курсора детерминирована (640,400), icon — около (65,78).
+move_mouse -575 -322 4
 sleep 0.4
 printf 'mouse_button 1\n' | hmp
 sleep 0.08
@@ -155,9 +182,44 @@ sleep 0.12
 printf 'mouse_button 1\n' | hmp
 sleep 0.08
 printf 'mouse_button 0\n' | hmp
-wait_for_serial '[desktop] terminal double-click'
-printf 'mouse_move 575 322\n' | hmp
+wait_for_serial '[app] spawn id=0x02 kind=TERMINAL'
+wait_for_serial '[desktop] new terminal requested by double-click'
+move_mouse 575 322 4
 sleep 0.3
+
+# Lifecycle regression: меняем process-local cwd второго shell, закрываем его
+# системной кнопкой и создаём новый. Новый WindowId и PWD=/ доказывают, что X
+# уничтожил application state, а не спрятал старый объект. Первый terminal
+# остаётся живым за ним — одновременно существует больше одного окна.
+send_command 'cd src'
+wait_for_serial '[vfs] CHDIR path=/src value=0'
+send_command 'write /lifecycle shared'
+wait_for_serial '[vfs] WRITE path=/lifecycle value=6'
+# id=2: rect≈(148,85,1040,640), close center≈(1170,102).
+move_mouse 530 -298 4
+sleep 0.15
+printf 'mouse_button 1\n' | hmp
+sleep 0.08
+printf 'mouse_button 0\n' | hmp
+wait_for_serial '[app] exit id=0x02 kind=TERMINAL released-frames='
+grep -q 'windows=1' "$RUN_DIR/serial.log"
+# Снова double-click по desktop icon; ID не переиспользуется.
+move_mouse -1105 -24 7
+printf 'mouse_button 1\n' | hmp
+sleep 0.08
+printf 'mouse_button 0\n' | hmp
+sleep 0.12
+printf 'mouse_button 1\n' | hmp
+sleep 0.08
+printf 'mouse_button 0\n' | hmp
+wait_for_serial '[app] spawn id=0x03 kind=TERMINAL'
+move_mouse 575 322 4
+sleep 0.25
+send_command 'pwd'
+wait_for_serial '[vfs] PWD path=/ value=0'
+send_command 'cat /lifecycle'
+wait_for_serial '[vfs] READ path=/lifecycle value=6'
+printf 'screendump %s/lifecycle.ppm\n' "$RUN_DIR" | hmp
 
 # Команда идёт через настоящий PS/2 keyboard path.
 send_command 'help'
@@ -258,7 +320,8 @@ printf 'screendump %s/terminal.ppm\n' "$RUN_DIR" \
 # Новый System UI проходит тот же keyboard/window path. Проверяем запуск
 # декларативного component tree и сохраняем отдельный screenshot artifact.
 send_command 'uidemo'
-wait_for_serial '[ui] Gallery opened runtime=system-ui-v1'
+wait_for_serial '[app] spawn id=0x04 kind=UI GALLERY'
+wait_for_serial '[ui] Gallery opened runtime=system-ui-v1 independent-window=1'
 sleep 0.25
 printf 'screendump %s/ui-gallery.ppm\n' "$RUN_DIR" | hmp
 [[ -s "$RUN_DIR/ui-gallery.ppm" ]] || {
@@ -266,17 +329,48 @@ printf 'screendump %s/ui-gallery.ppm\n' "$RUN_DIR" | hmp
     exit 1
 }
 
-# Настоящий drag: курсор стартует в центре 1280x800. После round-trip через
-# режим 1280x720 window reflow оставляет верх окна на y=26, поэтому целимся в
-# середину title bar около y=43 и сдвигаем окно вправо-вниз.
-printf 'mouse_move 0 -357\n' | hmp
-sleep 0.1
+# Закрываем UI Gallery, затем первый boot terminal. Третий terminal остаётся
+# живым и независимым; дальнейшие drag/resize/minimize проверяют именно его.
+# UI создаётся уже после mode round-trip: rect≈(204,106,1040,640),
+# close center≈(1226,123).
+move_mouse 586 -277 4
 printf 'mouse_button 1\n' | hmp
-for _ in $(seq 1 40); do
-    grep -q '\[wm\] terminal drag started' "$RUN_DIR/serial.log" && break
-    sleep 0.1
-done
-grep -q '\[wm\] terminal drag started' "$RUN_DIR/serial.log"
+sleep 0.08
+printf 'mouse_button 0\n' | hmp
+wait_for_serial '[app] exit id=0x04 kind=UI GALLERY released-frames='
+# taskbar id=1 (первая кнопка), затем его close center≈(1142,43).
+move_mouse -1012 656 7
+printf 'mouse_button 1\n' | hmp
+sleep 0.08
+printf 'mouse_button 0\n' | hmp
+wait_for_serial '[wm] focus id=0x01'
+move_mouse 928 -736 7
+printf 'mouse_button 1\n' | hmp
+sleep 0.08
+printf 'mouse_button 0\n' | hmp
+wait_for_serial '[app] exit id=0x01 kind=TERMINAL released-frames='
+
+# Reflow малого 1280x720 режима оставил id=3 в (176,26). Перед базовым
+# screenshot ставим его в прежнюю детерминированную geometry (120,57), чтобы
+# visual checker сравнивал именно движение, а не смену набора окон.
+move_mouse -542 0 4
+printf 'mouse_button 1\n' | hmp
+wait_for_serial '[wm] drag started id=0x03'
+printf 'mouse_move -56 31\n' | hmp
+sleep 0.2
+printf 'mouse_button 0\n' | hmp
+wait_for_serial '[wm] drag finished id=0x03'
+sleep 0.25
+# Базовый кадр для geometry verifier: те же слои, что в dragged/minimized,
+# но до начала жеста. Ранний terminal screenshot с несколькими окнами уже
+# выполнил свою проверку, поэтому здесь безопасно обновить artifact.
+printf 'screendump %s/terminal.ppm\n' "$RUN_DIR" | hmp
+
+# Настоящий drag оставшегося id=3: cursor после позиционирования находится
+# около (544,74); выбираем свободную точку title и сдвигаем окно вправо-вниз.
+move_mouse 56 0 1
+printf 'mouse_button 1\n' | hmp
+wait_for_serial '[wm] drag started id=0x03'
 # Не один большой скачок, а серия движений: это regression для preview path.
 # Пауза не даёт искусственному HMP producer переполнить одно-byte 8042 быстрее,
 # чем это вообще способна сделать физическая PS/2-мышь.
@@ -287,22 +381,18 @@ done
 printf '%b' "$drag_commands" | hmp 30
 sleep 0.2
 printf 'mouse_button 0\n' | hmp
-for _ in $(seq 1 40); do
-    grep -q '\[wm\] terminal drag finished' "$RUN_DIR/serial.log" && break
-    sleep 0.1
-done
-grep -q '\[wm\] terminal drag finished' "$RUN_DIR/serial.log"
-grep -Eq '\[wm\] terminal drag finished frames=[1-9][0-9]* packets=[1-9][0-9]* present-kpx=[1-9][0-9]* compositor=preview' \
+wait_for_serial '[wm] drag finished id=0x03'
+grep -Eq '\[wm\] drag finished id=0x03 frames=[1-9][0-9]* packets=[1-9][0-9]* present-kpx=[1-9][0-9]* compositor=layer-cache' \
     "$RUN_DIR/serial.log"
 sleep 0.25
 printf 'screendump %s/dragged.ppm\n' "$RUN_DIR" | hmp
 
-# Resize за правый верхний угол проверяет обе оси и тот же bounded preview
-# compositor. Курсор после drag около (760,123), corner — около (1279,106).
-printf 'mouse_move 519 -17\n' | hmp
-sleep 0.1
+# Resize за правый верхний угол проверяет обе оси и layer cache с несколькими
+# окнами. Cursor после drag около (720,154), настоящий top-right edge —
+# около (1279,137): берём точку внутри 6px hit area, а не рядом с ней.
+move_mouse 559 -17 4
 printf 'mouse_button 1\n' | hmp
-wait_for_serial '[wm] terminal resize started'
+wait_for_serial '[wm] resize started id=0x03'
 resize_commands=""
 for _ in $(seq 1 4); do
     resize_commands="${resize_commands}mouse_move -10 8\n"
@@ -310,25 +400,21 @@ done
 printf '%b' "$resize_commands" | hmp 30
 sleep 0.2
 printf 'mouse_button 0\n' | hmp
-wait_for_serial '[wm] terminal resize finished'
-grep -Eq '\[wm\] terminal resize finished frames=[1-9][0-9]* packets=[1-9][0-9]* present-kpx=[1-9][0-9]* compositor=preview' \
+wait_for_serial '[wm] resize finished id=0x03'
+grep -Eq '\[wm\] resize finished id=0x03 frames=[1-9][0-9]* packets=[1-9][0-9]* present-kpx=[1-9][0-9]* compositor=layer-cache' \
     "$RUN_DIR/serial.log"
 sleep 0.25
 printf 'screendump %s/resized.ppm\n' "$RUN_DIR" | hmp
 
-# После corner resize окно имеет приблизительно x=240, y=138, width=1000.
-# Курсор около (1239,138); перемещаемся к новой позиции minimize-кнопки.
-printf 'mouse_move -80 16\n' | hmp
+# После diagonal resize cursor≈(1239,169), итоговый right≈1240, а minimize
+# center≈(1160,155).
+printf 'mouse_move -79 -14\n' | hmp
 sleep 0.2
 printf 'mouse_button 1\n' | hmp
 sleep 0.08
 printf 'mouse_button 0\n' | hmp
-for _ in $(seq 1 40); do
-    grep -q '\[wm\] terminal minimized' "$RUN_DIR/serial.log" && break
-    sleep 0.1
-done
-grep -q '\[wm\] terminal minimized' "$RUN_DIR/serial.log"
-wait_for_serial '[wm] frame committed minimized=1'
+wait_for_serial '[wm] window minimized id=0x03'
+sleep 0.3
 printf 'screendump %s/minimized.ppm\n' "$RUN_DIR" \
     | hmp
 
@@ -342,4 +428,4 @@ for _ in $(seq 1 20); do
     sleep 0.1
 done
 stop_qemu
-echo "[gui-test] PASS: keyboard, VFS + ring3 RUN, System UI Gallery, buffered drag/resize and minimize"
+echo "[gui-test] PASS: independent windows, lifecycle reset/reclaim, focus/Z-order, VFS + ring3 RUN, buffered drag/resize/minimize"
