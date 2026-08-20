@@ -6,7 +6,10 @@ use core::{
     ptr::addr_of_mut,
 };
 
-use super::segmentation::{KERNEL_CODE_SELECTOR, USER_CODE_SELECTOR, USER_DATA_SELECTOR};
+use super::{
+    apic::{SPURIOUS_VECTOR, TIMER_VECTOR},
+    segmentation::{KERNEL_CODE_SELECTOR, USER_CODE_SELECTOR, USER_DATA_SELECTOR},
+};
 
 #[repr(C)]
 #[derive(Debug)]
@@ -31,6 +34,10 @@ pub struct TrapFrame {
     pub rip: u64,
     pub cs: u64,
     pub rflags: u64,
+    /// Сохраняются CPU только при переходе CPL3 -> CPL0.
+    pub rsp: u64,
+    /// User stack selector; существует в frame только для user trap.
+    pub ss: u64,
 }
 
 impl TrapFrame {
@@ -116,8 +123,18 @@ extern "C" {
     fn rustos_vector_29();
     fn rustos_vector_30();
     fn rustos_vector_31();
+    fn rustos_vector_64();
     fn rustos_vector_128();
-    fn rustos_enter_user_asm(entry: u64, stack: u64, arg0: u64, arg1: u64, root: u64) -> u64;
+    fn rustos_vector_255();
+    fn rustos_enter_user_asm(
+        entry: u64,
+        stack: u64,
+        arg0: u64,
+        arg1: u64,
+        arg2: u64,
+        root: u64,
+        interrupts: u64,
+    ) -> u64;
 }
 
 /// Устанавливает exception gates и доступный из CPL3 syscall gate 0x80.
@@ -163,6 +180,10 @@ pub fn initialize() {
             IDT[vector] = IdtEntry::interrupt(*handler as usize, dpl, ist);
         }
         IDT[128] = IdtEntry::interrupt(rustos_vector_128 as *const () as usize, 3, 0);
+        IDT[TIMER_VECTOR as usize] =
+            IdtEntry::interrupt(rustos_vector_64 as *const () as usize, 0, 0);
+        IDT[SPURIOUS_VECTOR as usize] =
+            IdtEntry::interrupt(rustos_vector_255 as *const () as usize, 0, 0);
         let pointer = IdtPointer {
             limit: (size_of::<[IdtEntry; 256]>() - 1) as u16,
             base: addr_of_mut!(IDT) as u64,
@@ -173,8 +194,24 @@ pub fn initialize() {
 
 /// Синхронно запускает первое user context. Возвращается только через
 /// syscall exit либо user exception; kernel stack восстанавливает assembly.
-pub unsafe fn enter_user(entry: u64, stack: u64, arg0: u64, arg1: u64, root: u64) -> u64 {
-    unsafe { rustos_enter_user_asm(entry, stack, arg0, arg1, root) }
+pub unsafe fn enter_user(
+    entry: u64,
+    stack: u64,
+    arguments: [u64; 3],
+    root: u64,
+    interrupts: bool,
+) -> u64 {
+    unsafe {
+        rustos_enter_user_asm(
+            entry,
+            stack,
+            arguments[0],
+            arguments[1],
+            arguments[2],
+            root,
+            u64::from(interrupts),
+        )
+    }
 }
 
 #[no_mangle]
@@ -233,7 +270,9 @@ NOERR 28
 ERROR 29
 ERROR 30
 NOERR 31
+NOERR 64
 NOERR 128
+NOERR 255
 
 .global rustos_trap_common
 rustos_trap_common:
@@ -294,7 +333,8 @@ rustos_enter_user_asm:
     mov qword ptr [rip + rustos_saved_kernel_rsp], rsp
     mov rax, cr3
     mov qword ptr [rip + rustos_saved_kernel_cr3], rax
-    mov cr3, r8
+    mov r10, qword ptr [rsp + 56]
+    mov cr3, r9
     mov ax, {user_data}
     mov ds, ax
     mov es, ax
@@ -302,12 +342,19 @@ rustos_enter_user_asm:
     push rsi
     pushfq
     pop rax
+    test r10, r10
+    jz 3f
+    or rax, 512
+    jmp 4f
+3:
     and rax, -513
+4:
     push rax
     push {user_code}
     push rdi
     mov rdi, rdx
     mov rsi, rcx
+    mov rdx, r8
     iretq
 
 rustos_abort_user:

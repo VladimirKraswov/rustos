@@ -36,6 +36,20 @@ pub struct MessageHeader {
     pub reserved: u16,
 }
 
+impl MessageHeader {
+    /// Пустой корректно выровненный заголовок текущей версии ABI.
+    pub const EMPTY: Self = Self {
+        abi_version: IPC_ABI_VERSION,
+        opcode: 0,
+        flags: 0,
+        request_id: 0,
+        sender_pid: 0,
+        payload_len: 0,
+        handle_count: 0,
+        reserved: 0,
+    };
+}
+
 /// Capability, передаваемый вместе с IPC-сообщением.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -48,6 +62,15 @@ pub struct TransferredHandle {
     pub rights: Rights,
 }
 
+impl TransferredHandle {
+    /// Отсутствующий capability slot сообщения.
+    pub const EMPTY: Self = Self {
+        handle: Handle::INVALID,
+        reserved: 0,
+        rights: Rights::NONE,
+    };
+}
+
 /// Полное небольшое IPC-сообщение фиксированного размера.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -58,6 +81,15 @@ pub struct Message {
     pub payload: [u8; IPC_INLINE_BYTES],
     /// Передаваемые capabilities.
     pub handles: [TransferredHandle; IPC_MAX_HANDLES],
+}
+
+impl Message {
+    /// Пустое сообщение, которое можно заполнить без unsafe/allocator'а.
+    pub const EMPTY: Self = Self {
+        header: MessageHeader::EMPTY,
+        payload: [0; IPC_INLINE_BYTES],
+        handles: [TransferredHandle::EMPTY; IPC_MAX_HANDLES],
+    };
 }
 
 /// Флаги [`MessageHeader::flags`].

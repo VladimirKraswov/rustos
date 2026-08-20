@@ -21,6 +21,9 @@ rustos-boot --> BootInfo v2 --> kernel
                                   |-- physical frame allocator
                                   |-- ELF64 CPL3 bootstrap runner
                                   |-- process-local VFS capability
+                                  |-- x2APIC preemptive process manager
+                                  |-- endpoint IPC + capability transfer
+                                  |-- MADT + AP long-mode trampoline
                                   |-- GOP renderer
                                   |-- PS/2 input
                                   |-- bootstrap RIFS + RAM overlay
@@ -36,10 +39,16 @@ handle разрешает ring-3 `init.elf` выполнить ограниче�
 bootstrap backend initramfs, не финальный `vfsd`.
 
 Platform-independent crate `rustos-microkernel` содержит process/thread
-lifecycle, generation-safe PID/TID, CPU affinity, scheduler priority policy и
-supervisor backoff. Он `no_std`, но тестируется на host без QEMU. x86 runner
-пока выполняет один пользовательский процесс синхронно; local APIC timer и
-переключение нескольких сохранённых контекстов ещё не подключены.
+lifecycle, generation-safe PID/TID, CPU affinity, scheduler priority policy,
+bounded endpoint queue, capability attenuation и supervisor backoff. Он
+`no_std`, но тестируется на host без QEMU. x86 runner подключён к local APIC:
+timer trap сохраняет регистры/RSP, выбирает TID, меняет CR3 и возвращается
+через `iretq` в другой CPL3 context.
+
+MADT перечисляет CPU, BSP последовательно выполняет INIT–SIPI–SIPI. AP
+проходит 16 -> 32 -> 64 bit trampoline, получает отдельный stack, включает
+свой x2APIC и публикует ID. До per-CPU TSS/IDT он остаётся parked с
+выключенными interrupts и не участвует в scheduling.
 
 ## Путь к микроядру
 
@@ -49,12 +58,15 @@ supervisor backoff. Он `no_std`, но тестируется на host без 
 1. **готово:** собственные GDT/TSS/IDT, CPL3 traps и возврат в kernel;
 2. **готово:** physical allocator, отдельные CR3, W^X/NX и полный reclaim;
 3. **готово:** ELF64 PIE loader, VFS capability и изоляционный fault test;
-4. **база готова:** lifecycle/scheduler policy; дальше APIC preemption и SMP;
-5. capability transfer, очереди IPC и shared memory;
-6. process manager, `vfsd`, persistent filesystem и dynamic loader;
-7. target `std`, native Rust toolchain и package/build services;
-8. `inputd`, `displayd`, compositor и terminal как отдельные процессы;
-9. supervisor применяет restart policy к реальным service manifests.
+4. **готово на CPU0:** APIC preemption, dynamic lifecycle, endpoint IPC и
+   capability transfer;
+5. **bootstrap готов:** AP startup; дальше per-CPU TSS/IDT, timer queues,
+   TLB shootdown и work stealing;
+6. shared-memory IPC, process create/kill/wait syscalls и supervisor manifests;
+7. `vfsd`, persistent filesystem и dynamic loader;
+8. target `std`, native Rust toolchain и package/build services;
+9. `inputd`, `displayd`, compositor и terminal как отдельные процессы;
+10. supervisor применяет restart policy к реальным service manifests.
 
 UI API уже отделён от framebuffer ownership, поэтому widget logic не должна
 переписываться при замене прямых вызовов IPC-сообщениями.

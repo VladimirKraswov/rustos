@@ -12,11 +12,12 @@ macOS/Linux. Обязательный процессный checkpoint уже п�
 PIE запускается в CPL3 с process-local VFS capability, выполняет syscall и
 завершается; fault второго ELF не останавливает kernel/GUI, а все кадры его
 address space освобождаются. Это исполняемый фундамент, но ещё не нативный
-compiler: host `std`, dynamic loader, persistent filesystem, полноценные
-потоки и process spawning пока отсутствуют.
+compiler: host `std`, dynamic loader, persistent filesystem, user-facing
+process spawning и полноценный SMP runtime пока отсутствуют.
 
-Следующая прямая зависимость self-hosting — вытесняющий scheduler и IPC/VFS
-services. Только поверх них имеет смысл портировать `std::thread`,
+Local APIC preemption и bounded capability IPC уже работают на CPU0.
+Следующая прямая зависимость self-hosting — shared-memory IPC, VFS services и
+стабильные thread/process syscalls. Только поверх них имеет смысл портировать `std::thread`,
 `std::process`, файлы, pipes и dynamic loading, а затем native seed toolchain.
 
 ## Три разные платформы Rust bootstrap

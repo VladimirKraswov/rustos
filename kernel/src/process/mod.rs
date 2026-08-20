@@ -3,6 +3,7 @@
 //! trap/fault/lifecycle ABI останется тем же.
 
 mod elf;
+mod manager;
 
 use core::{ptr, str};
 
@@ -19,22 +20,23 @@ use crate::{
     serial,
 };
 
-const MAX_CAPABILITIES: usize = 32;
-const VFS_ROOT_SLOT: usize = 1;
+pub(super) const MAX_CAPABILITIES: usize = 32;
+pub(super) const VFS_ROOT_SLOT: usize = 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum CapabilityKind {
+pub(super) enum CapabilityKind {
     Empty,
     VfsRoot,
+    Endpoint(u8),
 }
 
 #[derive(Clone, Copy)]
-struct CapabilityEntry {
-    kind: CapabilityKind,
-    rights: Rights,
+pub(super) struct CapabilityEntry {
+    pub kind: CapabilityKind,
+    pub rights: Rights,
 }
 
-const EMPTY_CAPABILITY: CapabilityEntry = CapabilityEntry {
+pub(super) const EMPTY_CAPABILITY: CapabilityEntry = CapabilityEntry {
     kind: CapabilityKind::Empty,
     rights: Rights::NONE,
 };
@@ -114,6 +116,11 @@ pub fn run_bootstrap_milestone(initramfs: BootInitramfs) -> Result<(), ProcessEr
     Ok(())
 }
 
+/// Запускает preemptive и capability-IPC вертикальные срезы на local APIC.
+pub fn run_preemptive_milestone(info: &rustos_abi::BootInfo) -> Result<(), ProcessError> {
+    manager::run_milestone(info)
+}
+
 fn run_one(
     pid: ProcessId,
     initramfs: BootInitramfs,
@@ -139,9 +146,9 @@ fn run_one(
         arch::traps::enter_user(
             loaded.entry,
             loaded.stack_pointer,
-            VFS_ROOT_SLOT as u64,
-            syscall::ABI_VERSION,
+            [VFS_ROOT_SLOT as u64, syscall::ABI_VERSION, 0],
             process.address_space.root(),
+            false,
         )
     };
     unsafe { CURRENT_PROCESS = ptr::null_mut() };
@@ -172,6 +179,12 @@ fn run_one(
 /// Вызывается assembly trap stub. 0 = `iretq` обратно, 1 = завершить user run.
 #[no_mangle]
 pub extern "C" fn rustos_handle_trap(frame: &mut TrapFrame) -> u64 {
+    if let Some(disposition) = manager::handle_active_trap(frame) {
+        return disposition;
+    }
+    if frame.vector == arch::apic::SPURIOUS_VECTOR as u64 {
+        return 0;
+    }
     if !frame.is_from_user() {
         serial::put_str("[trap] FATAL kernel exception vector=");
         serial::put_u32(frame.vector as u32);

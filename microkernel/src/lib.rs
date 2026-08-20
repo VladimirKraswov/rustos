@@ -6,10 +6,15 @@
 //! фиксированную ёмкость, поэтому те же state machines можно гонять обычными
 //! unit-тестами на macOS/Linux и использовать из freestanding kernel.
 
+mod ipc;
 mod process_table;
 mod scheduler;
 mod supervisor;
 
+pub use ipc::{
+    derive_capability_rights, prepare_message, CapabilityTransferError, EndpointQueue,
+    IpcQueueError,
+};
 pub use process_table::{ProcessError, ProcessInfo, ProcessState, ProcessTable};
 pub use scheduler::{Scheduler, SchedulerError, ThreadInfo, ThreadState, DRIVER_BURST_LIMIT};
 pub use supervisor::{RestartDecision, RestartPolicy, SupervisorState};

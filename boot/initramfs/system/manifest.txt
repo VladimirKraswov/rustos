@@ -3,6 +3,10 @@ RustOS bootstrap system manifest v1
 Generated at build time and already executable:
   /system/bin/init.elf        isolated CPL3 VFS capability client
   /system/bin/fault-test.elf  intentional #UD containment test
+  /system/bin/preempt-a.elf   CPU-bound local APIC preemption client A
+  /system/bin/preempt-b.elf   CPU-bound local APIC preemption client B
+  /system/bin/ipc-receiver.elf blocking endpoint/capability receiver
+  /system/bin/ipc-sender.elf   VFS capability sender
 
 Planned native system modules:
   /system/lib/system-1.dll

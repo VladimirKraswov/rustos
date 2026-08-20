@@ -15,5 +15,21 @@ path = "src/init.rs"
 name = "rustos-fault-test"
 path = "src/fault_test.rs"
 
+[[bin]]
+name = "rustos-preempt-a"
+path = "src/preempt_a.rs"
+
+[[bin]]
+name = "rustos-preempt-b"
+path = "src/preempt_b.rs"
+
+[[bin]]
+name = "rustos-ipc-receiver"
+path = "src/ipc_receiver.rs"
+
+[[bin]]
+name = "rustos-ipc-sender"
+path = "src/ipc_sender.rs"
+
 [dependencies]
 rustos-runtime = { path = "../../runtime" }

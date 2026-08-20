@@ -10,6 +10,13 @@ kernel GUI, настоящий ring-3 `init.elf` получает read-only VFS 
 отклоняется. Финальная граница ниже — `vfsd` и драйверы как отдельные
 процессы; bootstrap parser будет удалён из kernel после их запуска.
 
+Capability transfer также выполняется настоящими CPL3-процессами: receiver
+блокируется на endpoint, sender сначала пытается незаконно добавить WRITE к
+READ capability и получает `ACCESS_DENIED`, затем передаёт допустимый
+READ-only производный handle. Receiver просыпается и использует новый handle
+для `stat`. Это проверяет будущую границу `vfs-1.dll -> IPC -> vfsd`, хотя сам
+RIFS parser пока остаётся bootstrap-кодом kernel.
+
 ## Слои
 
 ```text

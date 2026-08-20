@@ -8,8 +8,10 @@
 // модуль расширяется по мере появления драйверов, поэтому allow на уровень модуля.
 #![allow(dead_code)]
 
+pub mod apic;
 pub mod mem;
 pub mod segmentation;
+pub mod smp;
 pub mod traps;
 
 /// Остановка текущего CPU до следующего прерывания.

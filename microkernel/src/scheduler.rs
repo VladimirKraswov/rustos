@@ -1,8 +1,8 @@
 //! Приоритетный SMP-aware scheduler state machine.
 //!
-//! Пока x86 layer не подключил APIC timer, `schedule()` вызывается в тестах и
-//! в точках добровольного переключения. Состояния, affinity и policy уже не
-//! зависят от механизма сохранения регистров и останутся теми же при preemption.
+//! x86 layer вызывает `schedule()` из local APIC timer, syscall yield и
+//! block/exit paths. Сама state machine не зависит от механизма сохранения
+//! регистров, поэтому отдельно проверяется быстрыми host unit-тестами.
 
 use rustos_abi::{ExitReason, PriorityClass, ProcessId, ThreadId};
 

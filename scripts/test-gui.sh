@@ -125,6 +125,11 @@ done
 grep -q '\[microkernel\] RING3_MILESTONE_OK' "$RUN_DIR/serial.log"
 grep -q '\[isolation\] user #UD contained; kernel and GUI continue' "$RUN_DIR/serial.log"
 grep -q '\[memory\] user address spaces reclaimed' "$RUN_DIR/serial.log"
+grep -Eq '\[smp\] MADT discovered=2 online=2 APs parked safely' "$RUN_DIR/serial.log"
+grep -Eq '\[preempt\] APIC timer ticks=[1-9][0-9]* context-switches=[1-9][0-9]*' "$RUN_DIR/serial.log"
+grep -q '\[isolation\] concurrent #UD terminated one process; survivor exited=22' "$RUN_DIR/serial.log"
+grep -q '\[ipc\] queued block/wake and attenuated VFS capability verified' "$RUN_DIR/serial.log"
+grep -q '\[process-manager\] dynamic create/exit/reap reclaimed all frames' "$RUN_DIR/serial.log"
 grep -q '\[scheduler\] priority, affinity and fault-containment policy verified' "$RUN_DIR/serial.log"
 
 # Команда идёт через настоящий PS/2 keyboard path.

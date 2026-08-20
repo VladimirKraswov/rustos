@@ -27,8 +27,8 @@ pub fn kernel_main(info: &BootInfo) -> ! {
     serial::early_put_str("K3: bootinfo printed\n");
 
     // До первого CPL3 перехода kernel обязан владеть таблицами сегментов,
-    // trap stacks и защитой страниц. Прерывания остаются выключенными до
-    // настройки local APIC, но синхронные exceptions/syscalls уже изолированы.
+    // trap stacks и защитой страниц. Прерывания включаются только внутри
+    // user runner после настройки local APIC; ранние exceptions уже изолированы.
     arch::enable_memory_protection();
     let ring0_stack = arch::segmentation::initialize();
     arch::traps::initialize();
@@ -55,6 +55,10 @@ pub fn kernel_main(info: &BootInfo) -> ! {
             if process::run_bootstrap_milestone(info.initramfs).is_err() {
                 serial::put_str("[process] FATAL: ring3 bootstrap milestone failed\n");
                 exit_kernel(0x50);
+            }
+            if process::run_preemptive_milestone(info).is_err() {
+                serial::put_str("[process] FATAL: preemption/IPC milestone failed\n");
+                exit_kernel(0x52);
             }
             if !rustos_microkernel::boot_self_test() {
                 serial::put_str("[scheduler] FATAL: lifecycle/policy self-test failed\n");
@@ -217,7 +221,7 @@ pub fn self_test(info: &BootInfo) -> Result<(), u8> {
 
 /// Сообщение об idle-режиме (графическая VM без isa-debug-exit).
 pub fn print_idle_notice() {
-    serial::put_str("[boot] entering idle loop (APIC preemption not enabled yet)\n");
+    serial::put_str("[boot] entering idle loop (user APIC timer is masked)\n");
 }
 
 /// Вывод региона памяти в serial (без heap: по частям через `put_hex`).

@@ -96,27 +96,40 @@ manager.
 Обычный код драйвера не исполняется в interrupt context. Даже высокий класс
 `Driver` не разрешает обращаться к памяти kernel или другого процесса.
 
-## SMP и вытеснение: что ещё не готово
+## Рабочее вытеснение и граница SMP
 
-Сейчас bootstrap runner синхронный: CPU0 входит в один процесс и возвращается
-из него по syscall/fault. User `RFLAGS.IF` пока очищен. Поэтому наличие
-scheduler state machine нельзя называть работающей многозадачностью.
+CPU0 уже использует x2APIC timer. На CPU с TSC-deadline применяется deadline
+mode; QEMU без этой возможности калибрует periodic decrement counter по TSC.
+Каждый IRQ сохраняет все GPR, user RIP/RFLAGS/RSP, scheduler переводит текущий
+TID обратно в Ready, выбирает следующий, kernel загружает его CR3 и меняет
+trap frame. Два CPU-bound ELF не вызывают `yield`, поэтому ненулевой счётчик
+переключений доказывает именно аппаратное вытеснение.
 
-Следующий аппаратный milestone имеет измеримые пункты:
+Process manager динамически создаёт address spaces и generation-safe PID/TID,
+обрабатывает Ready/Running/Blocked/Exited, сохраняет zombie status до reap и
+после каждой фазы проверяет возврат всех физических кадров. Конкурентный тест
+запускает `UD2` и survivor одновременно: fault завершает первый PID, второй
+продолжает получать timer quanta и выходит сам.
 
-1. разобрать ACPI MADT, включить local APIC и periodic/deadline timer;
-2. завести per-CPU TSS, kernel stack, current thread и interrupt nesting;
-3. сохранять/восстанавливать полный user context на timer/IPC/block;
-4. подключить `schedule(cpu)` к timer и voluntary yield;
-5. запустить AP через INIT-SIPI-SIPI trampoline;
-6. перейти к per-CPU ready queues и work stealing, сохранив текущую policy;
-7. добавить TLB shootdown и ASID/PCID optimization;
-8. выполнить тест: два CPU одновременно меняют разные user pages, fault
-   одного процесса не останавливает второй и GUI heartbeat.
+ACPI parser проверяет RSDP/XSDT/MADT checksums и enabled flags. BSP по одному
+посылает AP INIT–SIPI–SIPI. Копируемый код ниже 1 MiB проходит real mode,
+protected mode и long mode, устанавливает kernel CR3/отдельный stack, затем AP
+включает свой x2APIC и подтверждает ID. В штатном тесте `discovered=2 online=2`.
 
-После этого process manager получает syscalls create/kill/wait, capability
-transfer и IPC queues/shared memory. Затем ring-3 `init` запускает `vfsd`,
-block/filesystem drivers, display/input services и desktop по manifests.
+При этом AP пока **parked**, а не является scheduler CPU: у него ещё нет
+per-CPU GDT/TSS/IDT, ring-0 interrupt stack, run queue и TLB shootdown inbox.
+Следующий аппаратный milestone:
+
+1. per-CPU descriptors, current thread, preemption/IRQ nesting counters;
+2. local timer и scheduler loop на каждом AP;
+3. per-CPU ready queues, affinity migration и bounded work stealing;
+4. IOAPIC routing в kernel IRQ endpoints пользовательских драйверов;
+5. TLB shootdown и PCID optimization;
+6. тест параллельной записи разных user pages двумя CPU с fault/GUI heartbeat.
+
+Следом process API получает create/kill/wait, shared-memory capabilities и
+large IPC. Ring-3 `init` сможет запускать `vfsd`, block/filesystem drivers,
+display/input services и desktop по manifests.
 
 ## Почему это база для self-hosting
 
@@ -146,6 +159,10 @@ PID/TID, изоляцию process fault и supervisor backoff. `make test-boot` 
 [process] init.elf exited cleanly; VFS capability verified
 [isolation] user #UD contained; kernel and GUI continue
 [memory] user address spaces reclaimed
-[scheduler] priority, affinity and fault-containment policy verified
+[smp] MADT discovered=2 online=2 APs parked safely
+[preempt] APIC timer ticks=... context-switches=...
+[isolation] concurrent #UD terminated one process; survivor exited=22
+[ipc] queued block/wake and attenuated VFS capability verified
+[process-manager] dynamic create/exit/reap reclaimed all frames
 [microkernel] RING3_MILESTONE_OK
 ```

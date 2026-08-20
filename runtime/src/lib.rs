@@ -9,7 +9,7 @@
 
 use core::{arch::asm, ffi::c_void};
 
-pub use rustos_abi::{syscall, Handle};
+pub use rustos_abi::{ipc::Message, syscall, Handle, Rights};
 
 /// Bootstrap capability корневого VFS namespace текущего процесса.
 #[repr(transparent)]
@@ -37,6 +37,32 @@ pub fn process_exit(status: i32) -> ! {
     // `process_exit` не возвращается. Цикл — защита от дефекта kernel ABI.
     loop {
         core::hint::spin_loop();
+    }
+}
+
+/// Отправляет небольшое inline IPC-сообщение. Capability handles внутри
+/// сообщения ядро заменяет производными handles таблицы получателя.
+pub fn ipc_send(endpoint: Handle, message: &Message) -> i64 {
+    unsafe {
+        syscall3(
+            syscall::number::IPC_SEND,
+            endpoint.0 as u64,
+            message as *const Message as u64,
+            0,
+        )
+    }
+}
+
+/// Получает следующее сообщение. При пустой очереди kernel блокирует поток и
+/// переключает CPU; после wake функция возвращает уже заполненный buffer.
+pub fn ipc_receive(endpoint: Handle, message: &mut Message) -> i64 {
+    unsafe {
+        syscall3(
+            syscall::number::IPC_RECEIVE,
+            endpoint.0 as u64,
+            message as *mut Message as u64,
+            0,
+        )
     }
 }
 

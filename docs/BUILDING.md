@@ -38,3 +38,7 @@ address space и marker `RING3_MILESTONE_OK`.
 По умолчанию boot- и GUI-тесты запускаются с минимальным профилем 128 MiB
 RAM; значения можно переопределить, например
 `BOOT_MEMORY_MB=4096 make test-boot` или `GUI_MEMORY_MB=512 make test-gui`.
+Boot-тест использует два vCPU и дополнительно требует успешный MADT/AP startup,
+ненулевые APIC timer/context-switch counters, конкурентную fault isolation и
+IPC capability transfer. Число CPU переопределяется через `BOOT_CPUS`; тест
+требует, чтобы все заявленные QEMU CPU стали online. Штатный CI-профиль — два.

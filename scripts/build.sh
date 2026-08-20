@@ -29,6 +29,14 @@ cp -R boot/initramfs/. "$STAGE/"
 cp -f target/x86_64-unknown-rustos/debug/rustos-init "$STAGE/system/bin/init.elf"
 cp -f target/x86_64-unknown-rustos/debug/rustos-fault-test \
     "$STAGE/system/bin/fault-test.elf"
+cp -f target/x86_64-unknown-rustos/debug/rustos-preempt-a \
+    "$STAGE/system/bin/preempt-a.elf"
+cp -f target/x86_64-unknown-rustos/debug/rustos-preempt-b \
+    "$STAGE/system/bin/preempt-b.elf"
+cp -f target/x86_64-unknown-rustos/debug/rustos-ipc-receiver \
+    "$STAGE/system/bin/ipc-receiver.elf"
+cp -f target/x86_64-unknown-rustos/debug/rustos-ipc-sender \
+    "$STAGE/system/bin/ipc-sender.elf"
 
 echo "[build] 4/8 initramfs (RIFS v1)"
 cargo run -q -p rustos-pack -- "$STAGE" boot/uefi/payload/initramfs.img

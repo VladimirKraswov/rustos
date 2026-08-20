@@ -18,8 +18,15 @@ x86-64 компьютеров. Она загружается через UEFI, п
   process-local VFS capability;
 - локализация user exception: намеренный `#UD` завершает только процесс, а
   все его data/stack/page-table frames возвращаются allocator'у;
-- host-tested lifecycle/scheduler core: generation-safe PID/TID, CPU affinity,
-  приоритетные классы и bounded driver priority;
+- local APIC timer и настоящее вытеснение нескольких независимых CPL3
+  контекстов без добровольного `yield`;
+- ACPI MADT discovery и INIT–SIPI–SIPI запуск AP-ядер через 16/32/64-битный
+  trampoline; AP пока безопасно parked до per-CPU TSS/IDT;
+- dynamic create/exit/reap с generation-safe PID/TID и полным reclaim;
+- bounded endpoint IPC: block/wake, kernel-supplied sender PID, FIFO queue и
+  передача только ослабленных capabilities;
+- host-tested scheduler core: CPU affinity, приоритетные классы и bounded
+  driver priority;
 - GOP 1280×800×32, CPU rendering и RAM back buffer без мерцания сцены;
 - PS/2 keyboard и mouse;
 - desktop, taskbar, Start menu и icons;
@@ -81,16 +88,17 @@ make test
 bootstrap VFS, выполняет syscall, завершается, а второй тестовый ELF вызывает
 `UD2`; ядро перехватывает fault, освобождает address space и продолжает boot.
 
-GUI пока остаётся bootstrap-сеансом CPU0 внутри kernel image. Scheduler
-state machine уже задаёт lifecycle, affinity и priority policy, однако
-аппаратное вытеснение по local APIC timer и запуск application processors ещё
-не подключены. Поэтому текущий runner ring 3 синхронный, а не параллельный.
-Следующий рубеж — interrupt-driven context switch, полноценный process manager
-и capability IPC, после чего `vfsd`, display/input и desktop переносятся в
+GUI пока остаётся bootstrap-сеансом CPU0 внутри kernel image. До его запуска
+process manager выполняет настоящую preemptive-сессию: timer IRQ сохраняет
+user context, scheduler выбирает другой TID, меняется CR3, а `iretq`
+возвращается уже в другой процесс. Второй CPU запускается и подтверждает APIC
+ID, но пока parked: без отдельного TSS/IDT/interrupt stack выдавать ему user
+thread небезопасно. Следующий рубеж — per-CPU runtime, IOAPIC/IRQ routing и
+work stealing, затем `vfsd`, display/input и desktop переносятся в
 изолированные процессы. Нативный `rustc` ещё не заявлен готовым.
 
 Подробнее: [архитектура](docs/ARCHITECTURE.md),
 [графическая подсистема](docs/GUI.md), [VFS](docs/VFS.md),
 [микроядро](docs/MICROKERNEL.md), [DLL](docs/DYNAMIC_LIBRARIES.md),
-[self-hosting Rust](docs/SELF_HOSTING.md),
+[IPC](docs/IPC.md), [self-hosting Rust](docs/SELF_HOSTING.md),
 [сборка](docs/BUILDING.md).

@@ -40,6 +40,10 @@ log = { version = "=0.4.22", default-features = false, features = ["max_level_de
 [profile.dev]
 # debuginfo нужен для GDB, но opt-level=1 заметно ускоряет TCG-запуск в QEMU.
 opt-level = 1
+# LLVM incremental CGU cache некорректно теряет anonymous constants, когда
+# kernel object содержит одновременно `.code16/.code32/.code64` AP trampoline.
+# Для системного образа полная детерминированная линковка важнее этой экономии.
+incremental = false
 
 [profile.release]
 opt-level = 2

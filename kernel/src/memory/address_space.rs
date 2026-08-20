@@ -197,6 +197,16 @@ impl AddressSpace {
         Ok(())
     }
 
+    /// Копирует syscall/IPC result в user buffer только если весь диапазон
+    /// действительно отображён writable. В отличие от loader-only
+    /// `copy_into_user`, этот метод не позволяет kernel API писать в RX code.
+    pub fn copy_to_user(&self, address: u64, data: &[u8]) -> Result<(), AddressSpaceError> {
+        if !self.contains_user_range(address, data.len(), true) {
+            return Err(AddressSpaceError::InvalidAddress);
+        }
+        self.copy_into_user(address, data)
+    }
+
     pub fn contains_user_range(&self, address: u64, length: usize, write: bool) -> bool {
         if length == 0 {
             return true;

@@ -19,6 +19,12 @@ pub mod number {
     /// Получить размер объекта относительно VFS capability.
     /// `RDI=handle, RSI=path, RDX=len`; результат — размер либо status < 0.
     pub const VFS_STAT: u64 = 2;
+    /// Отправить [`crate::ipc::Message`] в endpoint.
+    /// `RDI=endpoint handle, RSI=*const Message`.
+    pub const IPC_SEND: u64 = 3;
+    /// Получить сообщение или блокировать текущий поток до его появления.
+    /// `RDI=endpoint handle, RSI=*mut Message`.
+    pub const IPC_RECEIVE: u64 = 4;
 }
 
 /// Отрицательные результаты syscall. Не совпадают с Unix errno намеренно:
@@ -38,4 +44,8 @@ pub mod status {
     pub const NOT_SUPPORTED: i64 = -5;
     /// Процесс завершён аппаратным exception.
     pub const FAULT: i64 = -6;
+    /// Очередь endpoint заполнена; отправитель может повторить операцию позже.
+    pub const QUEUE_FULL: i64 = -7;
+    /// Все потоки заблокированы и продолжение текущего запуска невозможно.
+    pub const DEADLOCK: i64 = -8;
 }
