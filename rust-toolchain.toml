@@ -1,7 +1,7 @@
 # Toolchain для сборки. Nightly обязателен:
 # 1) кастомный JSON target spec (targets/x86_64-unknown-rustos.json)
 #    требует `-Zjson-target-spec` (unstable);
-# 2) на этапе 3 ядру понадобится `#![feature(abi_x86_interrupt)]`.
+# 2) `-Zbuild-std=core` собирает core для kernel/user target.
 # Версия, на которой проверено: 1.100.0-nightly (e71c0f1e3 2026-08-18).
 # При смене nightly воспроизводимость обеспечивает CI (stage 13).
 [toolchain]

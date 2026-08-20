@@ -1,0 +1,19 @@
+[package]
+name = "rustos-bootstrap-apps"
+description = "Первые изолированные ELF64 процессы RustOS"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "rustos-init"
+path = "src/init.rs"
+
+[[bin]]
+name = "rustos-fault-test"
+path = "src/fault_test.rs"
+
+[dependencies]
+rustos-runtime = { path = "../../runtime" }

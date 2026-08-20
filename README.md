@@ -8,9 +8,18 @@ x86-64 компьютеров. Она загружается через UEFI, п
 
 - UEFI/OVMF bootloader на Rust;
 - ELF64 PIE kernel и initramfs;
+- собственные GDT/TSS/IDT, NX/WP и отдельный ring-0 trap stack;
 - 64-битная карта памяти без ограничения 4 ГиБ;
 - реальное резервирование kernel pages через UEFI `AllocatePages`;
 - разрежённые четырёхуровневые page tables;
+- extent allocator физических кадров, служебный размер которого не зависит
+  от объёма RAM;
+- настоящий ELF64 PIE-процесс в CPL3 с отдельным CR3, W^X-страницами и
+  process-local VFS capability;
+- локализация user exception: намеренный `#UD` завершает только процесс, а
+  все его data/stack/page-table frames возвращаются allocator'у;
+- host-tested lifecycle/scheduler core: generation-safe PID/TID, CPU affinity,
+  приоритетные классы и bounded driver priority;
 - GOP 1280×800×32, CPU rendering и RAM back buffer без мерцания сцены;
 - PS/2 keyboard и mouse;
 - desktop, taskbar, Start menu и icons;
@@ -67,15 +76,21 @@ make test
 
 ## Архитектурный статус
 
-GUI сейчас является ранним bootstrap-сеансом CPU0 внутри kernel image. Это
-осознанный вертикальный срез для проверки framebuffer, input и UI API до
-переноса display/input/window services в ring 3. Следующий milestone —
-процессы ring 3, preemptive scheduler и реализация уже описанных
-capabilities/IPC. Нативный `rustc` ещё не заявлен готовым: точный bootstrap и
-его системные предпосылки описаны отдельно, чтобы cross-сборку нельзя было
-случайно принять за self-hosting.
+Обязательный первый рубеж микроядра пройден: QEMU действительно выполняет
+`system/bin/init.elf` в CPL3. Процесс получает только read-only handle корня
+bootstrap VFS, выполняет syscall, завершается, а второй тестовый ELF вызывает
+`UD2`; ядро перехватывает fault, освобождает address space и продолжает boot.
+
+GUI пока остаётся bootstrap-сеансом CPU0 внутри kernel image. Scheduler
+state machine уже задаёт lifecycle, affinity и priority policy, однако
+аппаратное вытеснение по local APIC timer и запуск application processors ещё
+не подключены. Поэтому текущий runner ring 3 синхронный, а не параллельный.
+Следующий рубеж — interrupt-driven context switch, полноценный process manager
+и capability IPC, после чего `vfsd`, display/input и desktop переносятся в
+изолированные процессы. Нативный `rustc` ещё не заявлен готовым.
 
 Подробнее: [архитектура](docs/ARCHITECTURE.md),
 [графическая подсистема](docs/GUI.md), [VFS](docs/VFS.md),
-[DLL](docs/DYNAMIC_LIBRARIES.md), [self-hosting Rust](docs/SELF_HOSTING.md),
+[микроядро](docs/MICROKERNEL.md), [DLL](docs/DYNAMIC_LIBRARIES.md),
+[self-hosting Rust](docs/SELF_HOSTING.md),
 [сборка](docs/BUILDING.md).

@@ -8,12 +8,16 @@
 ## Текущая граница реализации
 
 Сейчас репозиторий находится на S0: target kernel cross-компилируется на
-macOS/Linux. Уже добавлены versioned ABI handles/IPC/VFS/DLL, bootstrap
-initramfs и writable RAM filesystem workflow. Это исполняемый фундамент, но
-не нативный compiler: процессов ring 3, host `std`, dynamic loader и
-persistent filesystem пока нет. Ближайший обязательный checkpoint — запустить
-обычный изолированный ELF64-процесс, дать ему VFS capability и дождаться его
-завершения, не останавливая GUI/kernel.
+macOS/Linux. Обязательный процессный checkpoint уже пройден: отдельный ELF64
+PIE запускается в CPL3 с process-local VFS capability, выполняет syscall и
+завершается; fault второго ELF не останавливает kernel/GUI, а все кадры его
+address space освобождаются. Это исполняемый фундамент, но ещё не нативный
+compiler: host `std`, dynamic loader, persistent filesystem, полноценные
+потоки и process spawning пока отсутствуют.
+
+Следующая прямая зависимость self-hosting — вытесняющий scheduler и IPC/VFS
+services. Только поверх них имеет смысл портировать `std::thread`,
+`std::process`, файлы, pipes и dynamic loading, а затем native seed toolchain.
 
 ## Три разные платформы Rust bootstrap
 

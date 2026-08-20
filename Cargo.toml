@@ -11,6 +11,9 @@
 resolver = "2"
 members = [
     "abi",
+    "microkernel",
+    "runtime",
+    "userspace/bootstrap",
     "kernel",
     "boot/uefi",
     "tools/image",

@@ -9,6 +9,8 @@
 #![allow(dead_code)]
 
 pub mod mem;
+pub mod segmentation;
+pub mod traps;
 
 /// Остановка текущего CPU до следующего прерывания.
 ///
@@ -18,6 +20,58 @@ pub mod mem;
 pub fn halt() {
     unsafe {
         core::arch::asm!("hlt", options(nomem, nostack));
+    }
+}
+
+/// Текущий PML4 physical address (CR3 без PCID bits).
+pub fn read_cr3() -> u64 {
+    let value: u64;
+    unsafe { core::arch::asm!("mov {}, cr3", out(reg) value, options(nomem, nostack)) };
+    value & 0x000f_ffff_ffff_f000
+}
+
+/// Переключает address space текущего CPU.
+///
+/// # Safety
+///
+/// `root` должен быть physical address валидного PML4, содержащего mappings
+/// исполняемого kernel-кода и текущего стека.
+pub unsafe fn write_cr3(root: u64) {
+    unsafe { core::arch::asm!("mov cr3, {}", in(reg) root, options(nostack)) };
+}
+
+/// Адрес последнего page fault.
+pub fn read_cr2() -> u64 {
+    let value: u64;
+    unsafe { core::arch::asm!("mov {}, cr2", out(reg) value, options(nomem, nostack)) };
+    value
+}
+
+/// Включает NX pages (EFER.NXE) и защиту read-only supervisor pages (CR0.WP).
+pub fn enable_memory_protection() {
+    const EFER: u32 = 0xC000_0080;
+    let low: u32;
+    let high: u32;
+    unsafe {
+        core::arch::asm!(
+            "rdmsr",
+            in("ecx") EFER,
+            out("eax") low,
+            out("edx") high,
+            options(nomem, nostack),
+        );
+        let value = (u64::from(high) << 32) | u64::from(low) | (1 << 11);
+        core::arch::asm!(
+            "wrmsr",
+            in("ecx") EFER,
+            in("eax") value as u32,
+            in("edx") (value >> 32) as u32,
+            options(nomem, nostack),
+        );
+        let mut cr0: u64;
+        core::arch::asm!("mov {}, cr0", out(reg) cr0, options(nomem, nostack));
+        cr0 |= 1 << 16;
+        core::arch::asm!("mov cr0, {}", in(reg) cr0, options(nostack));
     }
 }
 

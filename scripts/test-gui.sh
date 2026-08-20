@@ -16,6 +16,11 @@ cp -f build/ovmf/OVMF_VARS.fd "$RUN_DIR/VARS.fd"
 
 QPID=""
 GUI_TIMEOUT="${GUI_TEST_TIMEOUT:-360}"
+MEMORY_MB="${GUI_MEMORY_MB:-128}"
+[[ "$MEMORY_MB" =~ ^[1-9][0-9]*$ ]] || {
+    echo "GUI_MEMORY_MB должен быть положительным числом MiB" >&2
+    exit 2
+}
 hmp() {
     "$HMP_TOOL" "$RUN_DIR/monitor.sock" "${1:-0}" >/dev/null
 }
@@ -94,7 +99,7 @@ cleanup() {
 trap cleanup EXIT INT TERM HUP
 
 qemu-system-x86_64 \
-    -machine q35 -cpu max -smp 2 -m 512 -accel tcg \
+    -machine q35 -cpu max -smp 2 -m "$MEMORY_MB" -accel tcg \
     -drive if=pflash,format=raw,readonly=on,file=build/ovmf/OVMF_CODE.fd \
     -drive if=pflash,format=raw,file="$RUN_DIR/VARS.fd" \
     -drive if=virtio,format=raw,readonly=on,file=build/esp.img \
@@ -117,6 +122,10 @@ done
     echo "[gui-test] GUI_READY timeout after ${GUI_TIMEOUT}s"
     exit 1
 }
+grep -q '\[microkernel\] RING3_MILESTONE_OK' "$RUN_DIR/serial.log"
+grep -q '\[isolation\] user #UD contained; kernel and GUI continue' "$RUN_DIR/serial.log"
+grep -q '\[memory\] user address spaces reclaimed' "$RUN_DIR/serial.log"
+grep -q '\[scheduler\] priority, affinity and fault-containment policy verified' "$RUN_DIR/serial.log"
 
 # Команда идёт через настоящий PS/2 keyboard path.
 send_command 'help'

@@ -4,10 +4,11 @@
 
 Уже работает ранний вертикальный срез: kernel монтирует RIFS initramfs
 read-only в `/boot`, создаёт volatile RAM overlay для `/system`, `/home`,
-`/src` и `/build`, а terminal выполняет основные файловые команды. Он нужен,
-чтобы проверять команды и path semantics до ring 3. Финальная граница ниже —
-`vfsd` и драйверы как отдельные процессы; bootstrap backend будет удалён из
-kernel после их запуска.
+`/src` и `/build`, а terminal выполняет основные файловые команды. Кроме
+kernel GUI, настоящий ring-3 `init.elf` получает read-only VFS root handle и
+через проверяемый syscall делает `stat /boot/README.txt`; произвольный handle
+отклоняется. Финальная граница ниже — `vfsd` и драйверы как отдельные
+процессы; bootstrap parser будет удалён из kernel после их запуска.
 
 ## Слои
 

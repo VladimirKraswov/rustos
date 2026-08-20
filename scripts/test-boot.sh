@@ -20,6 +20,11 @@ else
     DEFAULT_TIMEOUT=420
 fi
 TIMEOUT="${BOOT_TEST_TIMEOUT:-$DEFAULT_TIMEOUT}"
+MEMORY_MB="${BOOT_MEMORY_MB:-128}"
+[[ "$MEMORY_MB" =~ ^[1-9][0-9]*$ ]] || {
+    echo "BOOT_MEMORY_MB должен быть положительным числом MiB" >&2
+    exit 2
+}
 
 RESULT_DIR="$ROOT/build/test-results/boot"
 mkdir -p "$RESULT_DIR"
@@ -54,9 +59,9 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM HUP
 
-echo "[test] qemu accel=$ACCEL, timeout=${TIMEOUT}s"
+echo "[test] qemu accel=$ACCEL, memory=${MEMORY_MB}MiB, timeout=${TIMEOUT}s"
 qemu-system-x86_64 \
-    -machine q35 -cpu max -smp 1 -m 512 \
+    -machine q35 -cpu max -smp 1 -m "$MEMORY_MB" \
     -accel "$ACCEL" \
     -drive if=pflash,format=raw,readonly=on,file=build/ovmf/OVMF_CODE.fd \
     -drive if=pflash,format=raw,file="$VARS" \
@@ -104,6 +109,11 @@ patterns=(
     "\[boot\] usable RAM: [1-9][0-9]* MiB"
     "\[boot\] memory map: [1-9][0-9]* regions"
     "\[selftest\] framebuffer first pixel = 0x[0-9a-f]*"
+    "\[process\] init.elf exited cleanly; VFS capability verified"
+    "\[isolation\] user #UD contained; kernel and GUI continue"
+    "\[memory\] user address spaces reclaimed"
+    "\[scheduler\] priority, affinity and fault-containment policy verified"
+    "\[microkernel\] RING3_MILESTONE_OK"
     "\[boot\] kernel test done, exit code=0"
 )
 for pattern in "${patterns[@]}"; do

@@ -1,6 +1,6 @@
 //! Ранняя инициализация ядра: banner, разбор BootInfo, self-test.
 
-use crate::{arch, gui, serial};
+use crate::{arch, gui, memory, process, serial};
 use rustos_abi::{BootInfo, MemRegion, MemRegionKind, BOOT_INFO_MAGIC, BOOT_INFO_VERSION};
 
 /// Главная функция ядра: serial → валидация BootInfo → banner → self-test,
@@ -26,9 +26,44 @@ pub fn kernel_main(info: &BootInfo) -> ! {
     print_bootinfo(info);
     serial::early_put_str("K3: bootinfo printed\n");
 
+    // До первого CPL3 перехода kernel обязан владеть таблицами сегментов,
+    // trap stacks и защитой страниц. Прерывания остаются выключенными до
+    // настройки local APIC, но синхронные exceptions/syscalls уже изолированы.
+    arch::enable_memory_protection();
+    let ring0_stack = arch::segmentation::initialize();
+    arch::traps::initialize();
+    serial::put_str("[arch] GDT/TSS/IDT ready; ring0 stack=0x");
+    serial::put_hex(ring0_stack);
+    serial::put_str("\n");
+
+    let allocator = match memory::initialize(info) {
+        Ok(stats) => stats,
+        Err(_) => {
+            serial::put_str("[memory] FATAL: frame allocator initialization failed\n");
+            exit_kernel(0x40);
+        }
+    };
+    serial::put_str("[memory] frame allocator: free=");
+    serial::put_u32((allocator.free_frames * 4 / 1024) as u32);
+    serial::put_str(" MiB extents=");
+    serial::put_u32(allocator.extents as u32);
+    serial::put_str("\n");
+
     match self_test(info) {
         Ok(()) => {
             serial::early_put_str("K4: selftest ok\n");
+            if process::run_bootstrap_milestone(info.initramfs).is_err() {
+                serial::put_str("[process] FATAL: ring3 bootstrap milestone failed\n");
+                exit_kernel(0x50);
+            }
+            if !rustos_microkernel::boot_self_test() {
+                serial::put_str("[scheduler] FATAL: lifecycle/policy self-test failed\n");
+                exit_kernel(0x51);
+            }
+            serial::put_str(
+                "[scheduler] priority, affinity and fault-containment policy verified\n",
+            );
+            serial::put_str("[microkernel] RING3_MILESTONE_OK\n");
             if cfg!(feature = "boot-test") {
                 print_idle_notice();
                 exit_kernel(0);
@@ -182,7 +217,7 @@ pub fn self_test(info: &BootInfo) -> Result<(), u8> {
 
 /// Сообщение об idle-режиме (графическая VM без isa-debug-exit).
 pub fn print_idle_notice() {
-    serial::put_str("[boot] entering idle loop (no scheduler yet)\n");
+    serial::put_str("[boot] entering idle loop (APIC preemption not enabled yet)\n");
 }
 
 /// Вывод региона памяти в serial (без heap: по частям через `put_hex`).

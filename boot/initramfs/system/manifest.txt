@@ -1,5 +1,9 @@
 RustOS bootstrap system manifest v1
 
+Generated at build time and already executable:
+  /system/bin/init.elf        isolated CPL3 VFS capability client
+  /system/bin/fault-test.elf  intentional #UD containment test
+
 Planned native system modules:
   /system/lib/system-1.dll
   /system/lib/vfs-1.dll

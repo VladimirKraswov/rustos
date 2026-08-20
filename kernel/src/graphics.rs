@@ -13,8 +13,10 @@ use core::sync::atomic::{compiler_fence, Ordering};
 
 use rustos_abi::{
     bootinfo::{FRAMEBUFFER_FORMAT_BGR, FRAMEBUFFER_FORMAT_RGB},
-    BootInfo, MemRegionKind, PAGE_SIZE,
+    BootInfo, PAGE_SIZE,
 };
+
+use crate::memory;
 
 /// Цвет 8-бит на канал; упаковка в байты framebuffer'а — в [`Framebuffer::pack`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -95,10 +97,9 @@ pub struct Framebuffer {
 impl Framebuffer {
     /// Создаёт double-buffered renderer после проверки [`BootInfo`].
     ///
-    /// Back buffer берётся с конца подходящего `Usable`-региона. Сейчас в
-    /// ядре ещё нет общего frame allocator, поэтому это и есть единственный
-    /// владелец выбранного диапазона. При появлении allocator диапазон нужно
-    /// передать ему как раннюю reservation, а API renderer менять не придётся.
+    /// Back buffer резервируется общим frame allocator'ом как непрерывный
+    /// диапазон. Поэтому будущие процессы/DMA mappings не смогут получить
+    /// те же физические страницы.
     pub fn from_boot(boot: &BootInfo) -> Option<Self> {
         let info = &boot.framebuffer;
         if info.phys_addr == 0
@@ -115,7 +116,7 @@ impl Framebuffer {
         let back_bytes = u64::from(info.width)
             .checked_mul(u64::from(info.height))?
             .checked_mul(4)?;
-        let back_phys = reserve_back_buffer(boot, back_bytes)?;
+        let back_phys = reserve_back_buffer(back_bytes)?;
 
         Some(Self {
             front: info.phys_addr as *mut u8,
@@ -308,21 +309,9 @@ impl Framebuffer {
 /// Выбирает page-aligned диапазон RAM под кадр, не вводя фиксированного
 /// ограничения на разрешение. Для 4K потребуется около 32 MiB, для
 /// 1280x800 — около 4 MiB; размер автоматически следует GOP mode.
-fn reserve_back_buffer(boot: &BootInfo, bytes: u64) -> Option<u64> {
-    let reserved_size = bytes.checked_add(PAGE_SIZE - 1)? & !(PAGE_SIZE - 1);
-    for index in (0..boot.memmap_count as usize).rev() {
-        let region = &boot.memmap[index];
-        if region.kind != MemRegionKind::Usable as u32 || region.size < reserved_size {
-            continue;
-        }
-        let candidate = region.phys_end().checked_sub(reserved_size)? & !(PAGE_SIZE - 1);
-        if candidate >= region.phys_start
-            && candidate.checked_add(reserved_size)? <= region.phys_end()
-        {
-            return Some(candidate);
-        }
-    }
-    None
+fn reserve_back_buffer(bytes: u64) -> Option<u64> {
+    let frames = bytes.checked_add(PAGE_SIZE - 1)? / PAGE_SIZE;
+    memory::allocate(frames, 1).ok().map(|block| block.phys)
 }
 
 // MMIO framebuffer принадлежит одному GUI-сеансу CPU0; между потоками этот

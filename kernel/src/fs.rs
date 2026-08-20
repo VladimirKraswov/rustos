@@ -220,6 +220,30 @@ impl OverlayStorage {
 // этим bootstrap backend.
 static mut OVERLAY: OverlayStorage = OverlayStorage::EMPTY;
 
+/// Возвращает файл из RIFS initramfs без монтирования RAM overlay.
+/// Используется ранним ELF loader'ом и bootstrap VFS syscall до запуска
+/// отдельного `vfsd`.
+pub fn initramfs_file(initramfs: BootInitramfs, path: &str) -> Result<&'static [u8], FsError> {
+    let relative = path
+        .strip_prefix("/boot/")
+        .unwrap_or(path.strip_prefix('/').unwrap_or(path));
+    if relative.is_empty() || initramfs.phys_addr == 0 {
+        return Err(FsError::NotFound);
+    }
+    let size = usize::try_from(initramfs.size).map_err(|_| FsError::CorruptImage)?;
+    if size < RIFS_HEADER_SIZE {
+        return Err(FsError::CorruptImage);
+    }
+    // SAFETY: initramfs входит в kernel reservation и identity-mapped на весь
+    // срок работы. Поэтому возвращаемый slice действительно static.
+    let bytes = unsafe { slice::from_raw_parts(initramfs.phys_addr as *const u8, size) };
+    Rifs::parse(bytes)?
+        .entries()
+        .find(|entry| entry.name == relative.as_bytes())
+        .map(|entry| entry.data)
+        .ok_or(FsError::NotFound)
+}
+
 /// Ранний VFS facade, совместимый по семантике с будущим `vfsd`.
 pub struct BootstrapFs {
     initramfs: *const u8,

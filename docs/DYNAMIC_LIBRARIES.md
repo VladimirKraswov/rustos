@@ -8,9 +8,11 @@ RustOS использует расширение `.dll`, но не изобре�
 ## Статус
 
 Формат `ModuleDescriptor`, правила ABI, именования и relocations уже
-зафиксированы. ELF64 dynamic loader и отображение DLL в процессы — следующий
-user-space milestone; файлы из bootstrap manifest пока являются планом, а не
-ложными заглушками с именем `*.dll`.
+зафиксированы. Kernel process loader уже отображает ELF64 `ET_DYN` PIE,
+обрабатывает `R_X86_64_RELATIVE` и запускает entry в отдельном CPL3 address
+space. Полный user-space dynamic loader ещё должен добавить symbols,
+`DT_NEEDED`, TLS, RELRO и разделяемые RX pages; файлы `*.dll` из manifest пока
+являются планом, а не ложными заглушками.
 
 ## Быстрый локальный вызов
 

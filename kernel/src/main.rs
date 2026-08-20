@@ -17,7 +17,9 @@ mod fs;
 mod graphics;
 mod gui;
 mod input;
+mod memory;
 mod panic;
+mod process;
 mod serial;
 
 use rustos_abi::BootInfo;

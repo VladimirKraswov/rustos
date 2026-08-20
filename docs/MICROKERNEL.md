@@ -1,0 +1,151 @@
+# Микроядро: рабочая граница и следующий этап
+
+Этот документ отделяет уже исполняемый механизм от спроектированного API.
+Главная проверка не сводится к наличию структур в исходниках: обычный boot и
+CI действительно переходят в CPL3, вызывают kernel и переживают user fault.
+
+## Что работает сейчас
+
+```text
+RIFS initramfs
+      |
+      v
+ELF64 ET_DYN loader -- создаёт отдельный PML4/CR3
+      |              RX code, RW+NX data/stack, W^X
+      v
+iretq -> CPL3 init.elf -> int 0x80 -> VFS handle check -> RIFS stat
+      |                                   |
+      +---- process_exit / exception -----+
+                         |
+                         v
+              kernel CR3 + ring-0 stack
+                         |
+                         v
+          Drop AddressSpace -> free всех кадров
+```
+
+Kernel устанавливает собственные GDT, TSS и IDT. TSS содержит отдельный
+ring-0 stack, double fault использует IST. До входа пользователя включаются
+`EFER.NXE` и `CR0.WP`. ELF loader принимает только x86-64 `ET_DYN`, проверяет
+границы `PT_LOAD`, запрещает writable+executable сегменты, применяет
+`R_X86_64_RELATIVE`, отображает 16 страниц user stack и проверяет, что entry
+исполняемый.
+
+`init.elf` получает в bootstrap-регистрах ABI version и handle. Handle является
+индексом только в capability table этого процесса; число само по себе не даёт
+прав. Kernel проверяет kind/rights, canonical mapped range и UTF-8, копирует
+короткий путь из user memory и только затем вызывает bootstrap RIFS backend.
+Тест сначала предъявляет заведомо чужой handle и ожидает `BAD_HANDLE`, затем
+делает успешный read-only `vfs_stat`.
+
+Второй процесс выполняет `UD2`. Trap handler определяет CPL по сохранённому
+`CS`, записывает `ExitReason`, возвращает kernel CR3 и не продолжает
+неисправный instruction stream. После обычного exit и fault boot-тест
+сравнивает `free_frames` до создания address space и после `Drop`: код, данные,
+stack и все уровни page tables обязаны быть возвращены allocator'у.
+
+## Жизненный цикл и scheduler policy
+
+Crate `rustos-microkernel` не зависит от x86 и heap. Это позволяет проверять
+одну и ту же state machine unit-тестами на macOS/Linux и использовать её из
+kernel.
+
+- PID и TID состоят из `slot + generation`; stale reference после reap
+  отклоняется.
+- Process проходит `Free -> Alive -> Zombie -> Free`; exit status доступен
+  supervisor'у до reap.
+- Thread проходит `Free -> Ready -> Running/Blocked -> Exited -> Free`.
+- Fault завершает все потоки только соответствующего PID; unrelated process
+  остаётся runnable.
+- Affinity — 64-битная маска логических CPU. Ноль и биты вне конфигурации
+  запрещены.
+- Внутри одного класса используется round-robin по `last_run`.
+
+Классы, от более срочного к менее срочному:
+
+1. `Kernel` — только короткая доверенная работа ядра;
+2. `Driver` — IRQ/DMA workers пользовательских драйверов;
+3. `System` — supervisor, VFS, display и другие серверы;
+4. `Interactive` — terminal, editor и активное GUI;
+5. `Batch` — compiler, linker, indexer;
+6. `Idle`.
+
+Driver имеет приоритет, но не бесконечный realtime. После восьми driver
+quanta готовый lower-class поток получает квант, затем budget начинается
+снова. Это защищает input latency и одновременно не позволяет сломанному
+драйверу навсегда остановить supervisor. В будущем deadline/real-time policy
+будет отдельной capability, а не правом любого процесса поднять себе priority.
+
+Supervisor policy перезапускает только аварийно завершившийся сервис,
+ограничивает число попыток и использует capped exponential backoff. Успешная
+работа сбрасывает серию ошибок. На текущем этапе это протестированная state
+machine; привязка к service manifests появится вместе с асинхронным process
+manager.
+
+## Драйверы и аппаратные прерывания
+
+Финальная IRQ-модель сохраняет минимум кода в kernel:
+
+1. interrupt stub подтверждает local APIC/IOAPIC и помечает IRQ pending;
+2. kernel будит driver thread, владеющий IRQ capability;
+3. driver читает device queue в своём address space;
+4. DMA использует только кадры, выданные процессу через DMA/IOMMU capability;
+5. падение driver process отбирает MMIO/port/IRQ/DMA handles, supervisor
+   выполняет reset/backoff и перезапускает его.
+
+Обычный код драйвера не исполняется в interrupt context. Даже высокий класс
+`Driver` не разрешает обращаться к памяти kernel или другого процесса.
+
+## SMP и вытеснение: что ещё не готово
+
+Сейчас bootstrap runner синхронный: CPU0 входит в один процесс и возвращается
+из него по syscall/fault. User `RFLAGS.IF` пока очищен. Поэтому наличие
+scheduler state machine нельзя называть работающей многозадачностью.
+
+Следующий аппаратный milestone имеет измеримые пункты:
+
+1. разобрать ACPI MADT, включить local APIC и periodic/deadline timer;
+2. завести per-CPU TSS, kernel stack, current thread и interrupt nesting;
+3. сохранять/восстанавливать полный user context на timer/IPC/block;
+4. подключить `schedule(cpu)` к timer и voluntary yield;
+5. запустить AP через INIT-SIPI-SIPI trampoline;
+6. перейти к per-CPU ready queues и work stealing, сохранив текущую policy;
+7. добавить TLB shootdown и ASID/PCID optimization;
+8. выполнить тест: два CPU одновременно меняют разные user pages, fault
+   одного процесса не останавливает второй и GUI heartbeat.
+
+После этого process manager получает syscalls create/kill/wait, capability
+transfer и IPC queues/shared memory. Затем ring-3 `init` запускает `vfsd`,
+block/filesystem drivers, display/input services и desktop по manifests.
+
+## Почему это база для self-hosting
+
+`std`, dynamic loader и native seed `rustc` опираются на процессы и VFS, а не
+на прямые kernel shortcuts. Последовательность зависимостей следующая:
+
+```text
+preemptive threads + IPC
+        -> vfsd/blockd/filesystem + persistent files
+        -> loader.dll + system/vfs DLL client ABI
+        -> target std (thread, file, time, process, TLS, pipe)
+        -> rust-lld + native seed rustc/cargo
+        -> сборка RustOS внутри RustOS
+```
+
+Текущий ring-3 VFS syscall — узкий bootstrap proof. Он будет заменён вызовом
+тонкого `vfs-1.dll` client stub и capability IPC к `vfsd`; filesystem parser
+не останется в kernel.
+
+## Автоматические критерии
+
+`make test-host` проверяет starvation budget, round-robin, affinity, stale
+PID/TID, изоляцию process fault и supervisor backoff. `make test-boot` в QEMU
+проверяет реальные privilege/page-table/trap paths и требует markers:
+
+```text
+[process] init.elf exited cleanly; VFS capability verified
+[isolation] user #UD contained; kernel and GUI continue
+[memory] user address spaces reclaimed
+[scheduler] priority, affinity and fault-containment policy verified
+[microkernel] RING3_MILESTONE_OK
+```

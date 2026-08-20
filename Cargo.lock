@@ -101,6 +101,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustos-bootstrap-apps"
+version = "0.1.0"
+dependencies = [
+ "rustos-runtime",
+]
+
+[[package]]
 name = "rustos-gui-check"
 version = "0.1.0"
 
@@ -120,11 +127,26 @@ name = "rustos-kernel"
 version = "0.1.0"
 dependencies = [
  "rustos-abi",
+ "rustos-microkernel",
+]
+
+[[package]]
+name = "rustos-microkernel"
+version = "0.1.0"
+dependencies = [
+ "rustos-abi",
 ]
 
 [[package]]
 name = "rustos-pack"
 version = "0.1.0"
+
+[[package]]
+name = "rustos-runtime"
+version = "0.1.0"
+dependencies = [
+ "rustos-abi",
+]
 
 [[package]]
 name = "syn"
