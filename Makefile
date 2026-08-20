@@ -7,7 +7,7 @@
 
 SHELL := /bin/bash
 
-.PHONY: all bootstrap build run boot test test-host test-boot test-gui format lint clean
+.PHONY: all bootstrap build run boot test test-host test-arch test-boot test-gui format lint clean
 
 all: build
 
@@ -22,10 +22,13 @@ run: build
 
 boot: run
 
-test: test-host test-boot test-gui
+test: test-host test-arch test-boot test-gui
 
 test-host:
 	cargo test -p rustos-abi -p rustos-microkernel -p rustos-video -p rustos-pack -p rustos-image -p rustos-gui-check -p rustos-hmp
+
+test-arch:
+	bash scripts/check-architectures.sh
 
 test-boot:
 	RUSTOS_BOOT_TEST=1 bash scripts/build.sh
@@ -41,6 +44,7 @@ lint:
 	cargo fmt --all -- --check
 	cargo clippy -p rustos-abi -p rustos-microkernel -p rustos-video -p rustos-pack -p rustos-image -p rustos-gui-check -p rustos-hmp --all-targets -- -D warnings
 	cargo clippy -Zjson-target-spec -Zbuild-std=core -p rustos-kernel -p rustos-runtime -p rustos-bootstrap-apps --target targets/x86_64-unknown-rustos.json -- -D warnings
+	cargo clippy -Zjson-target-spec -Zbuild-std=core -p rustos-kernel -p rustos-runtime -p rustos-bootstrap-apps --target targets/aarch64-unknown-rustos.json -- -D warnings
 	cargo clippy -p rustos-boot --target x86_64-unknown-uefi -- -D warnings
 
 clean:

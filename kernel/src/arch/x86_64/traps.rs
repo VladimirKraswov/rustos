@@ -44,6 +44,68 @@ impl TrapFrame {
     pub const fn is_from_user(&self) -> bool {
         self.cs & 3 == 3
     }
+
+    pub fn kind(&self) -> crate::arch::TrapKind {
+        if self.vector == u64::from(SPURIOUS_VECTOR) {
+            crate::arch::TrapKind::Spurious
+        } else if self.vector == u64::from(TIMER_VECTOR) {
+            crate::arch::TrapKind::Timer
+        } else if self.vector == u64::from(rustos_abi::syscall::INTERRUPT_VECTOR) {
+            crate::arch::TrapKind::Syscall
+        } else {
+            crate::arch::TrapKind::Exception {
+                number: self.vector as u16,
+                code: self.error_code as u16,
+                instruction_pointer: self.rip,
+                fault_address: if self.vector == 14 {
+                    super::read_cr2()
+                } else {
+                    self.rip
+                },
+            }
+        }
+    }
+
+    pub const fn instruction_pointer(&self) -> u64 {
+        self.rip
+    }
+
+    pub const fn syscall_number(&self) -> u64 {
+        self.rax
+    }
+
+    pub const fn syscall_arguments(&self) -> [u64; 3] {
+        [self.rdi, self.rsi, self.rdx]
+    }
+
+    pub fn set_syscall_result(&mut self, result: i64) {
+        self.rax = result as u64;
+    }
+
+    pub(super) const fn general_registers(&self) -> [u64; 15] {
+        [
+            self.r15, self.r14, self.r13, self.r12, self.r11, self.r10, self.r9, self.r8, self.rdi,
+            self.rsi, self.rbp, self.rdx, self.rcx, self.rbx, self.rax,
+        ]
+    }
+
+    pub(super) fn set_general_registers(&mut self, registers: [u64; 15]) {
+        self.r15 = registers[0];
+        self.r14 = registers[1];
+        self.r13 = registers[2];
+        self.r12 = registers[3];
+        self.r11 = registers[4];
+        self.r10 = registers[5];
+        self.r9 = registers[6];
+        self.r8 = registers[7];
+        self.rdi = registers[8];
+        self.rsi = registers[9];
+        self.rbp = registers[10];
+        self.rdx = registers[11];
+        self.rcx = registers[12];
+        self.rbx = registers[13];
+        self.rax = registers[14];
+    }
 }
 
 #[repr(C, packed)]

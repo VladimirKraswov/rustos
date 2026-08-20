@@ -1,8 +1,9 @@
 # RustOS
 
-RustOS — учебная 64-битная операционная система на Rust для современных
-x86-64 компьютеров. Она загружается через UEFI, получает GOP framebuffer и
-показывает собственный рабочий стол с оконным менеджером и terminal.
+RustOS — учебная 64-битная микроядерная операционная система на Rust.
+Рабочая платформа сейчас AMD64/UEFI, а ядро, runtime и приложения также
+собираются для AArch64; CPU-зависимый код изолирован для будущих QEMU `virt`,
+Raspberry Pi и других ARMv8-A платформ.
 
 Текущий рабочий вертикальный срез:
 
@@ -37,6 +38,8 @@ x86-64 компьютеров. Она загружается через UEFI, п
 - файловый workflow в terminal: `pwd`, `cd`, `ls`, `cat`, `mkdir`, `touch`,
   `write`, `append`, `rm` и `stat` (также через multicall-префикс `fs`);
 - versioned ABI для capability handles, IPC, VFS и ELF64 `.dll` metadata;
+- архитектурный HAL с AMD64/AArch64 trap context, MMU, syscall и timer
+  контрактами; обязательная cross-сборка kernel и всего bootstrap user-space;
 - UI-компоненты: panel, label, button, icon button, checkbox, radio button,
   toggle, text edit, scroll/list view, tabs и image surface;
 - настоящие QEMU boot/keyboard/mouse/framebuffer integration tests.
@@ -69,13 +72,15 @@ terminal. Мышью можно перемещать окно и использ�
 ```sh
 make lint
 make test-host
+make test-arch
 make test
 ```
 
-`make test` выполняет два разных сценария:
+`make test` выполняет три разных сценария:
 
-1. UEFI boot-test завершается настоящим `isa-debug-exit`.
-2. GUI-тест через настоящий PS/2 выполняет запись/чтение файлов и работу с
+1. Cross-build создаёт AMD64 и AArch64 ELF ядра, runtime и приложений.
+2. UEFI boot-test завершается настоящим `isa-debug-exit`.
+3. GUI-тест через настоящий PS/2 выполняет запись/чтение файлов и работу с
    каталогами, перетаскивает и сворачивает terminal, получает QEMU
    screendump и проверяет геометрию и пиксели.
 
@@ -97,7 +102,7 @@ thread небезопасно. Следующий рубеж — per-CPU runtime
 work stealing, затем `vfsd`, display/input и desktop переносятся в
 изолированные процессы. Нативный `rustc` ещё не заявлен готовым.
 
-Подробнее: [архитектура](docs/ARCHITECTURE.md),
+Подробнее: [архитектуры CPU](docs/ARCHITECTURES.md), [архитектура системы](docs/ARCHITECTURE.md),
 [графическая подсистема](docs/GUI.md), [видеосистема](docs/VIDEO.md), [VFS](docs/VFS.md),
 [микроядро](docs/MICROKERNEL.md), [DLL](docs/DYNAMIC_LIBRARIES.md),
 [IPC](docs/IPC.md), [self-hosting Rust](docs/SELF_HOSTING.md),

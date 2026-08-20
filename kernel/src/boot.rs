@@ -12,7 +12,7 @@ use rustos_abi::{BootInfo, MemRegion, MemRegionKind, BOOT_INFO_MAGIC, BOOT_INFO_
 pub fn kernel_main(info: &BootInfo) -> ! {
     // 1. Serial — первичный диагностический канал. Загрузчик использовал
     //    UEFI ConOut; UART (COM1, 0x3F8) настроен только здесь.
-    serial::init();
+    serial::init(info);
     serial::early_put_str("K1: serial init ok\n");
 
     // 2. Валидация BootInfo до использования полей (ABI-контракт).
@@ -26,14 +26,18 @@ pub fn kernel_main(info: &BootInfo) -> ! {
     print_bootinfo(info);
     serial::early_put_str("K3: bootinfo printed\n");
 
-    // До первого CPL3 перехода kernel обязан владеть таблицами сегментов,
-    // trap stacks и защитой страниц. Прерывания включаются только внутри
-    // user runner после настройки local APIC; ранние exceptions уже изолированы.
-    arch::enable_memory_protection();
-    let ring0_stack = arch::segmentation::initialize();
-    arch::traps::initialize();
-    serial::put_str("[arch] GDT/TSS/IDT ready; ring0 stack=0x");
-    serial::put_hex(ring0_stack);
+    // CPU backend сам выбирает privilege levels, таблицу исключений и
+    // защиту страниц: GDT/TSS/IDT на AMD64, EL0/EL1/VBAR на AArch64.
+    let early = arch::initialize_early(info).unwrap_or_else(|_| {
+        serial::put_str("[arch] FATAL: early architecture initialization failed\n");
+        exit_kernel(0x31);
+    });
+    serial::put_str("[arch] backend=");
+    serial::put_str(arch::ARCH_NAME);
+    serial::put_str(" exceptions=");
+    serial::put_str(early.exception_backend);
+    serial::put_str(" kernel-stack=0x");
+    serial::put_hex(early.kernel_stack_top);
     serial::put_str("\n");
 
     let allocator = match memory::initialize(info) {
@@ -97,7 +101,9 @@ pub(crate) fn exit_kernel(code: u8) -> ! {
 pub fn print_banner() {
     serial::put_str("\n");
     serial::put_str("==================================================\n");
-    serial::put_str("  RustOS 0.1.0 — educational microkernel (x86-64)\n");
+    serial::put_str("  RustOS 0.1.0 — educational microkernel (");
+    serial::put_str(arch::ARCH_NAME);
+    serial::put_str(")\n");
     serial::put_str("==================================================\n");
 }
 
@@ -143,12 +149,18 @@ pub fn print_bootinfo(info: &BootInfo) {
         serial::put_str("[boot] no GOP framebuffer (serial-only mode)\n");
     }
 
-    if info.acpi_rsdp != 0 {
-        serial::put_str("[boot] ACPI RSDP @ 0x");
-        serial::put_hex(info.acpi_rsdp);
+    if info.firmware.root != 0 {
+        serial::put_str("[boot] firmware=");
+        serial::put_str(match info.firmware.kind {
+            rustos_abi::bootinfo::BOOT_FIRMWARE_ACPI => "ACPI",
+            rustos_abi::bootinfo::BOOT_FIRMWARE_DEVICE_TREE => "Device Tree",
+            _ => "unknown",
+        });
+        serial::put_str(" root=0x");
+        serial::put_hex(info.firmware.root);
         serial::put_str("\n");
     } else {
-        serial::put_str("[boot] WARNING: ACPI RSDP not found\n");
+        serial::put_str("[boot] WARNING: firmware description not found\n");
     }
 
     if info.initramfs.size > 0 {
@@ -181,13 +193,13 @@ pub fn self_test(info: &BootInfo) -> Result<(), u8> {
 
     // 3. ACPI RSDP: подпись "RSD PTR " по физическому адресу.
     //    (identity-маппинг: физический адрес доступен напрямую.)
-    if info.acpi_rsdp != 0 {
+    if info.firmware.kind == rustos_abi::bootinfo::BOOT_FIRMWARE_ACPI && info.firmware.root != 0 {
         // RSDP не гарантирован 8-байтовым выравниванием (у OVMF встречается
         // 4-байтное: 0x..014), поэтому подпись читаем побайтно.
         // SAFETY: RSDP лежит в RAM, identity-маппинг гарантирует доступность
         // виртуального адреса == физического; 8 байт подписи в пределах RAM.
         const RSDP_SIG: [u8; 8] = *b"RSD PTR ";
-        let p = info.acpi_rsdp as *const u8;
+        let p = info.firmware.root as *const u8;
         let mut sig_ok = true;
         for (i, expected) in RSDP_SIG.iter().copied().enumerate() {
             // SAFETY: см. выше — `p.add(i)` в пределах 8 байт подписи.
@@ -199,6 +211,20 @@ pub fn self_test(info: &BootInfo) -> Result<(), u8> {
         if !sig_ok {
             serial::put_str("[selftest] FAIL: RSDP signature mismatch\n");
             return Err(0x30);
+        }
+    } else if info.firmware.kind == rustos_abi::bootinfo::BOOT_FIRMWARE_DEVICE_TREE
+        && info.firmware.root != 0
+    {
+        // FDT magic хранится в network byte order: d0 0d fe ed.
+        const FDT_MAGIC: [u8; 4] = [0xd0, 0x0d, 0xfe, 0xed];
+        let root = info.firmware.root as *const u8;
+        for (offset, expected) in FDT_MAGIC.iter().copied().enumerate() {
+            // SAFETY: загрузчик передаёт физический адрес минимум FDT header;
+            // bootstrap direct map обязан включать эти четыре байта.
+            if unsafe { root.add(offset).read_volatile() } != expected {
+                serial::put_str("[selftest] FAIL: Device Tree magic mismatch\n");
+                return Err(0x32);
+            }
         }
     }
 
@@ -221,7 +247,7 @@ pub fn self_test(info: &BootInfo) -> Result<(), u8> {
 
 /// Сообщение об idle-режиме (графическая VM без isa-debug-exit).
 pub fn print_idle_notice() {
-    serial::put_str("[boot] entering idle loop (user APIC timer is masked)\n");
+    serial::put_str("[boot] entering idle loop (scheduler timer is masked)\n");
 }
 
 /// Вывод региона памяти в serial (без heap: по частям через `put_hex`).

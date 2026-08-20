@@ -1,153 +1,92 @@
-//! Архитектурозависимый код (x86-64): ASM-вставки, порты, halt, mem-builtins.
+//! Стабильная граница между переносимым микроядром и конкретным CPU.
 //!
-//! Все `unsafe`-блоки документируются: ядро — единственный код с ring 0
-//! привилегиями, и каждый доступ к порту/регистру осознан.
-//! Инициализация не нужна (порты x86 работают «из коробки» в long mode).
+//! Код выше этого модуля не должен упоминать APIC/GIC, CR3/TTBR, IDT,
+//! регистры x86 или system registers Arm. Для каждой поддерживаемой ISA
+//! backend экспортирует один и тот же небольшой контракт: ранний запуск,
+//! адресные пространства, trap frame, таймер и запуск вторичных ядер.
+//!
+//! Сейчас x86-64 backend полностью работает и проходит boot/GUI-тесты.
+//! AArch64 backend является собираемым porting target: в нём уже определены
+//! ABI контекста, системный вызов, MMU-примитивы и PSCI shutdown; подключение
+//! GIC/Generic Timer и конкретного загрузчика выполняется следующим этапом.
 
-// Часть функций (например, `outw` под ACPI PM) пока не используется —
-// модуль расширяется по мере появления драйверов, поэтому allow на уровень модуля.
 #![allow(dead_code)]
 
-pub mod apic;
-pub mod mem;
-pub mod segmentation;
-pub mod smp;
-pub mod traps;
+use rustos_abi::BootInfo;
 
-/// Остановка текущего CPU до следующего прерывания.
-///
-/// # Safety
-///
-/// HLT требует ring 0: функция вызывается только из ядра.
-pub fn halt() {
-    unsafe {
-        core::arch::asm!("hlt", options(nomem, nostack));
-    }
+// Эти C builtins не зависят от ISA и нужны freestanding `core` на каждом
+// kernel target. Держим их один раз, вне backend'ов.
+mod mem;
+
+/// Архитектурно-независимая классификация входа в ядро.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TrapKind {
+    /// Системный вызов пользовательского процесса.
+    Syscall,
+    /// Прерывание планировщика.
+    Timer,
+    /// Spurious interrupt, который можно безопасно проигнорировать.
+    Spurious,
+    /// Обычное архитектурное исключение.
+    Exception {
+        /// Стабильный номер причины внутри конкретной ISA.
+        number: u16,
+        /// Дополнительные флаги/код ошибки ISA.
+        code: u16,
+        /// Адрес инструкции, вызвавшей исключение.
+        instruction_pointer: u64,
+        /// Fault address, когда ISA его предоставляет.
+        fault_address: u64,
+    },
 }
 
-/// Текущий PML4 physical address (CR3 без PCID bits).
-pub fn read_cr3() -> u64 {
-    let value: u64;
-    unsafe { core::arch::asm!("mov {}, cr3", out(reg) value, options(nomem, nostack)) };
-    value & 0x000f_ffff_ffff_f000
+/// Результат ранней настройки privilege levels и таблицы исключений.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EarlyInit {
+    /// Вершина стека, используемого при входе из user mode.
+    pub kernel_stack_top: u64,
+    /// Читаемое имя установленного backend'а исключений.
+    pub exception_backend: &'static str,
 }
 
-/// Переключает address space текущего CPU.
-///
-/// # Safety
-///
-/// `root` должен быть physical address валидного PML4, содержащего mappings
-/// исполняемого kernel-кода и текущего стека.
-pub unsafe fn write_cr3(root: u64) {
-    unsafe { core::arch::asm!("mov cr3, {}", in(reg) root, options(nostack)) };
+/// Возможности interrupt controller и аппаратного таймера boot CPU.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SchedulerHardware {
+    pub boot_cpu_id: u32,
+    pub counter_hz: u64,
+    pub interrupt_controller: &'static str,
+    pub timer: &'static str,
 }
 
-/// Адрес последнего page fault.
-pub fn read_cr2() -> u64 {
-    let value: u64;
-    unsafe { core::arch::asm!("mov {}, cr2", out(reg) value, options(nomem, nostack)) };
-    value
+/// Результат запуска вторичных процессоров.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SmpInfo {
+    pub online_cpus: usize,
+    pub discovered_cpus: usize,
+    pub discovery: &'static str,
 }
 
-/// Включает NX pages (EFER.NXE) и защиту read-only supervisor pages (CR0.WP).
-pub fn enable_memory_protection() {
-    const EFER: u32 = 0xC000_0080;
-    let low: u32;
-    let high: u32;
-    unsafe {
-        core::arch::asm!(
-            "rdmsr",
-            in("ecx") EFER,
-            out("eax") low,
-            out("edx") high,
-            options(nomem, nostack),
-        );
-        let value = (u64::from(high) << 32) | u64::from(low) | (1 << 11);
-        core::arch::asm!(
-            "wrmsr",
-            in("ecx") EFER,
-            in("eax") value as u32,
-            in("edx") (value >> 32) as u32,
-            options(nomem, nostack),
-        );
-        let mut cr0: u64;
-        core::arch::asm!("mov {}, cr0", out(reg) cr0, options(nomem, nostack));
-        cr0 |= 1 << 16;
-        core::arch::asm!("mov cr0, {}", in(reg) cr0, options(nostack));
-    }
+/// Ошибка аппаратного backend'а, пригодная для общего boot path.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ArchError {
+    Unsupported,
+    InterruptController,
+    FirmwareDescription,
+    SecondaryCpuStartup,
 }
 
-/// Завершение VM через QEMU isa-debug-exit: запись 32-битного значения в
-/// IO-порт 0xF4 заставляет QEMU выйти с этим значением как кодом возврата.
-/// В системе без устройства запись игнорируется (безопасный no-op).
-pub fn debug_exit(code: u8) {
-    // SAFETY: 0xF4 — отдельный тестовый порт QEMU; запись u32 допустима.
-    unsafe {
-        // Intel-синтаксис (default в rustc asm!): явные регистры пишутся
-        // в шаблон напрямую, без плейсхолдеров. Операнды явных регистров
-        // нужны, чтобы аллокатор узнал об их занятости.
-        core::arch::asm!(
-            "out dx, eax",
-            in("eax") (code as u32),
-            in("dx") 0xF4u16,
-            options(nomem, nostack)
-        );
-    }
-}
+#[cfg(target_arch = "aarch64")]
+mod aarch64;
+#[cfg(target_arch = "aarch64")]
+pub use aarch64::*;
 
-/// Чтение 8-битного значения из IO-порта (для serial и ранней диагностики).
-///
-/// # Safety
-///
-/// Порт выбирает вызывающий; в ring 0 чтение любого порта выполнимо,
-/// но эффект на оборудование зависит от порта — вызывающий отвечает за это.
-#[inline]
-pub unsafe fn inb(port: u16) -> u8 {
-    let val: u8;
-    // SAFETY: порт выбирает вызывающий (контракт функции);
-    // в ring 0 чтение любого порта выполнимо.
-    unsafe {
-        core::arch::asm!(
-            "in al, dx",
-            out("al") val,
-            in("dx") port,
-            options(nomem, nostack)
-        );
-    }
-    val
-}
+#[cfg(target_arch = "x86_64")]
+mod x86_64;
+#[cfg(target_arch = "x86_64")]
+pub use x86_64::*;
 
-/// Запись 8-битного значения в IO-порт.
-///
-/// # Safety
-///
-/// См. [`inb`]: вызывающий отвечает за корректность порта.
-#[inline]
-pub unsafe fn outb(port: u16, val: u8) {
-    // SAFETY: см. [`inb`]: вызывающий отвечает за корректность порта.
-    unsafe {
-        core::arch::asm!(
-            "out dx, al",
-            in("al") val,
-            in("dx") port,
-            options(nomem, nostack)
-        );
-    }
-}
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+compile_error!("RustOS kernel currently supports only x86_64 and aarch64");
 
-/// Запись 16-битного значения в I/O-порт (ACPI PM control и драйверы).
-///
-/// # Safety
-///
-/// Вызывающий обязан выбрать устройство и допустимое для него значение.
-#[inline]
-pub unsafe fn outw(port: u16, val: u16) {
-    unsafe {
-        core::arch::asm!(
-            "out dx, ax",
-            in("ax") val,
-            in("dx") port,
-            options(nomem, nostack)
-        );
-    }
-}
+/// Единая сигнатура запуска CPU backend'а.
+pub type EarlyInitializer = fn(&BootInfo) -> Result<EarlyInit, ArchError>;

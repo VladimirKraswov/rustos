@@ -1,6 +1,6 @@
 //! Приоритетный SMP-aware scheduler state machine.
 //!
-//! x86 layer вызывает `schedule()` из local APIC timer, syscall yield и
+//! Архитектурный HAL вызывает `schedule()` из APIC/Generic Timer, syscall yield и
 //! block/exit paths. Сама state machine не зависит от механизма сохранения
 //! регистров, поэтому отдельно проверяется быстрыми host unit-тестами.
 

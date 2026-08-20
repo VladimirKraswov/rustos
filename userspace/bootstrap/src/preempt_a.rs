@@ -1,11 +1,11 @@
 //! CPU-bound процесс A: не вызывает yield и тем самым проверяет именно
-//! аппаратное вытеснение local APIC timer'ом.
+//! аппаратное вытеснение архитектурным timer'ом.
 
 #![no_std]
 #![no_main]
 
-use core::{arch::asm, panic::PanicInfo};
-use rustos_runtime::process_exit;
+use core::panic::PanicInfo;
+use rustos_runtime::{monotonic_counter, process_exit};
 
 #[no_mangle]
 pub extern "C" fn _start(_unused: u64, abi_version: u64) -> ! {
@@ -17,17 +17,10 @@ pub extern "C" fn _start(_unused: u64, abi_version: u64) -> ! {
 }
 
 fn burn_tsc_cycles(cycles: u64) {
-    let start = read_tsc();
-    while read_tsc().wrapping_sub(start) < cycles {
+    let start = monotonic_counter();
+    while monotonic_counter().wrapping_sub(start) < cycles {
         core::hint::spin_loop();
     }
-}
-
-fn read_tsc() -> u64 {
-    let low: u32;
-    let high: u32;
-    unsafe { asm!("rdtsc", out("eax") low, out("edx") high, options(nomem, nostack)) };
-    (u64::from(high) << 32) | u64::from(low)
 }
 
 #[panic_handler]

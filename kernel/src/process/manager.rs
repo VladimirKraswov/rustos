@@ -15,7 +15,7 @@ use rustos_microkernel::{
 };
 
 use crate::{
-    arch::{self, apic, traps::TrapFrame},
+    arch::{self, TrapFrame, TrapKind, UserContext},
     fs,
     memory::{self, AddressSpace},
     serial,
@@ -36,97 +36,6 @@ const NO_EXIT: ExitReason = ExitReason {
     flags: 0,
     fault_address: 0,
 };
-
-#[derive(Clone, Copy)]
-struct UserContext {
-    r15: u64,
-    r14: u64,
-    r13: u64,
-    r12: u64,
-    r11: u64,
-    r10: u64,
-    r9: u64,
-    r8: u64,
-    rdi: u64,
-    rsi: u64,
-    rbp: u64,
-    rdx: u64,
-    rcx: u64,
-    rbx: u64,
-    rax: u64,
-    rip: u64,
-    rflags: u64,
-    rsp: u64,
-}
-
-impl UserContext {
-    fn initial(entry: u64, stack: u64, arguments: [u64; 3]) -> Self {
-        Self {
-            r15: 0,
-            r14: 0,
-            r13: 0,
-            r12: 0,
-            r11: 0,
-            r10: 0,
-            r9: 0,
-            r8: 0,
-            rdi: arguments[0],
-            rsi: arguments[1],
-            rbp: 0,
-            rdx: arguments[2],
-            rcx: 0,
-            rbx: 0,
-            rax: 0,
-            rip: entry,
-            rflags: 0x202,
-            rsp: stack,
-        }
-    }
-
-    fn save(&mut self, frame: &TrapFrame) {
-        self.r15 = frame.r15;
-        self.r14 = frame.r14;
-        self.r13 = frame.r13;
-        self.r12 = frame.r12;
-        self.r11 = frame.r11;
-        self.r10 = frame.r10;
-        self.r9 = frame.r9;
-        self.r8 = frame.r8;
-        self.rdi = frame.rdi;
-        self.rsi = frame.rsi;
-        self.rbp = frame.rbp;
-        self.rdx = frame.rdx;
-        self.rcx = frame.rcx;
-        self.rbx = frame.rbx;
-        self.rax = frame.rax;
-        self.rip = frame.rip;
-        self.rflags = frame.rflags;
-        self.rsp = frame.rsp;
-    }
-
-    fn restore(&self, frame: &mut TrapFrame) {
-        frame.r15 = self.r15;
-        frame.r14 = self.r14;
-        frame.r13 = self.r13;
-        frame.r12 = self.r12;
-        frame.r11 = self.r11;
-        frame.r10 = self.r10;
-        frame.r9 = self.r9;
-        frame.r8 = self.r8;
-        frame.rdi = self.rdi;
-        frame.rsi = self.rsi;
-        frame.rbp = self.rbp;
-        frame.rdx = self.rdx;
-        frame.rcx = self.rcx;
-        frame.rbx = self.rbx;
-        frame.rax = self.rax;
-        frame.rip = self.rip;
-        frame.cs = u64::from(arch::segmentation::USER_CODE_SELECTOR);
-        frame.rflags = self.rflags | 0x202;
-        frame.rsp = self.rsp;
-        frame.ss = u64::from(arch::segmentation::USER_DATA_SELECTOR);
-    }
-}
 
 #[derive(Clone, Copy)]
 struct PendingReceive {
@@ -210,7 +119,7 @@ struct ProcessManager {
     current: ThreadId,
     kernel_root: u64,
     initramfs: BootInitramfs,
-    tsc_hz: u64,
+    counter_hz: u64,
     timer_ticks: u64,
     context_switches: u64,
     blocked_receives: u64,
@@ -230,7 +139,7 @@ impl ProcessManager {
                 phys_addr: 0,
                 size: 0,
             },
-            tsc_hz: 0,
+            counter_hz: 0,
             timer_ticks: 0,
             context_switches: 0,
             blocked_receives: 0,
@@ -238,11 +147,11 @@ impl ProcessManager {
         }
     }
 
-    fn initialize(&mut self, initramfs: BootInitramfs, tsc_hz: u64) {
+    fn initialize(&mut self, initramfs: BootInitramfs, counter_hz: u64) {
         self.process_table = ProcessTable::new();
         self.scheduler = Scheduler::new();
         self.initramfs = initramfs;
-        self.tsc_hz = tsc_hz;
+        self.counter_hz = counter_hz;
         self.begin_phase();
     }
 
@@ -251,7 +160,7 @@ impl ProcessManager {
     fn begin_phase(&mut self) {
         self.endpoints = [Endpoint::EMPTY; MAX_ENDPOINTS];
         self.current = ThreadId::INVALID;
-        self.kernel_root = arch::read_cr3();
+        self.kernel_root = arch::current_address_space_root();
         self.timer_ticks = 0;
         self.context_switches = 0;
         self.blocked_receives = 0;
@@ -328,17 +237,17 @@ impl ProcessManager {
         let root = first_process.address_space.root();
 
         unsafe { ACTIVE_MANAGER = self };
-        apic::start_timer(self.tsc_hz);
+        arch::start_scheduler_timer(self.counter_hz);
         let _result = unsafe {
-            arch::traps::enter_user(
-                context.rip,
-                context.rsp,
-                [context.rdi, context.rsi, context.rdx],
+            arch::enter_user(
+                context.entry(),
+                context.stack_pointer(),
+                context.arguments(),
                 root,
                 true,
             )
         };
-        apic::stop_timer();
+        arch::stop_scheduler_timer();
         unsafe { ACTIVE_MANAGER = ptr::null_mut() };
         self.current = ThreadId::INVALID;
 
@@ -361,7 +270,8 @@ impl ProcessManager {
     }
 
     fn handle_trap(&mut self, frame: &mut TrapFrame) -> u64 {
-        if frame.vector == u64::from(apic::SPURIOUS_VECTOR) {
+        let kind = frame.kind();
+        if kind == TrapKind::Spurious {
             return 0;
         }
         if !frame.is_from_user() {
@@ -375,26 +285,30 @@ impl ProcessManager {
             process.context.save(frame);
         }
 
-        if frame.vector == u64::from(apic::TIMER_VECTOR) {
-            apic::end_of_interrupt();
+        if kind == TrapKind::Timer {
+            arch::end_of_interrupt();
             self.timer_ticks = self.timer_ticks.saturating_add(1);
-            apic::rearm_timer(self.tsc_hz);
+            arch::rearm_scheduler_timer(self.counter_hz);
             return self.schedule_next(frame);
         }
 
-        if frame.vector == u64::from(syscall::INTERRUPT_VECTOR) {
+        if kind == TrapKind::Syscall {
             return self.handle_syscall(current_index, frame);
         }
 
-        let fault_address = if frame.vector == 14 {
-            arch::read_cr2()
-        } else {
-            frame.rip
+        let TrapKind::Exception {
+            number,
+            code,
+            fault_address,
+            ..
+        } = kind
+        else {
+            crate::boot::exit_kernel(0x7c);
         };
         let reason = ExitReason {
             status: status::FAULT as i32,
-            exception: frame.vector as u16,
-            flags: frame.error_code as u16,
+            exception: number,
+            flags: code,
             fault_address,
         };
         self.finish_current(current_index, reason);
@@ -402,17 +316,18 @@ impl ProcessManager {
     }
 
     fn handle_syscall(&mut self, current_index: usize, frame: &mut TrapFrame) -> u64 {
-        match frame.rax {
+        let [arg0, arg1, arg2] = frame.syscall_arguments();
+        match frame.syscall_number() {
             syscall::number::THREAD_YIELD => {
-                frame.rax = status::OK as u64;
+                frame.set_syscall_result(status::OK);
                 if let Some(process) = self.processes[current_index].as_mut() {
-                    process.context.rax = status::OK as u64;
+                    process.context.set_syscall_result(status::OK);
                 }
                 self.schedule_next(frame)
             }
             syscall::number::PROCESS_EXIT => {
                 let reason = ExitReason {
-                    status: frame.rdi as i64 as i32,
+                    status: arg0 as i64 as i32,
                     exception: 0,
                     flags: 0,
                     fault_address: 0,
@@ -421,31 +336,26 @@ impl ProcessManager {
                 self.schedule_next(frame)
             }
             syscall::number::VFS_STAT => {
-                let result = self.vfs_stat(
-                    current_index,
-                    Handle(frame.rdi as u32),
-                    frame.rsi,
-                    frame.rdx,
-                );
-                frame.rax = result as u64;
+                let result = self.vfs_stat(current_index, Handle(arg0 as u32), arg1, arg2);
+                frame.set_syscall_result(result);
                 0
             }
             syscall::number::IPC_SEND => {
-                let result = self.ipc_send(current_index, Handle(frame.rdi as u32), frame.rsi);
-                frame.rax = result as u64;
+                let result = self.ipc_send(current_index, Handle(arg0 as u32), arg1);
+                frame.set_syscall_result(result);
                 0
             }
             syscall::number::IPC_RECEIVE => {
-                match self.ipc_receive(current_index, Handle(frame.rdi as u32), frame.rsi) {
+                match self.ipc_receive(current_index, Handle(arg0 as u32), arg1) {
                     ReceiveResult::Return(result) => {
-                        frame.rax = result as u64;
+                        frame.set_syscall_result(result);
                         0
                     }
                     ReceiveResult::Blocked => self.schedule_next(frame),
                 }
             }
             _ => {
-                frame.rax = status::NOT_SUPPORTED as u64;
+                frame.set_syscall_result(status::NOT_SUPPORTED);
                 0
             }
         }
@@ -476,20 +386,20 @@ impl ProcessManager {
         let next = match self.scheduler.schedule(0) {
             Ok(Some(next)) => next,
             _ => {
-                apic::stop_timer();
-                arch::traps::set_user_result(0);
+                arch::stop_scheduler_timer();
+                arch::set_user_run_result(0);
                 return 1;
             }
         };
         let Some(index) = self.index_by_tid(next) else {
-            arch::traps::set_user_result(status::DEADLOCK as u64);
+            arch::set_user_run_result(status::DEADLOCK as u64);
             return 1;
         };
         let process = self.processes[index]
             .as_ref()
             .expect("scheduled occupied process");
         process.context.restore(frame);
-        unsafe { arch::write_cr3(process.address_space.root()) };
+        unsafe { arch::switch_address_space(process.address_space.root()) };
         self.current = next;
         if previous != next {
             self.context_switches = self.context_switches.saturating_add(1);
@@ -654,7 +564,7 @@ impl ProcessManager {
                 return status::INVALID_ARGUMENT;
             }
             receiver.pending_receive = None;
-            receiver.context.rax = status::OK as u64;
+            receiver.context.set_syscall_result(status::OK);
             let _ = self.scheduler.wake(receiver.tid);
         } else if let Err(error) = self.endpoints[endpoint_index].queue.push(message) {
             return match error {
@@ -769,33 +679,26 @@ pub(super) fn handle_active_trap(frame: &mut TrapFrame) -> Option<u64> {
 }
 
 pub(super) fn run_milestone(info: &rustos_abi::BootInfo) -> Result<(), ProcessError> {
-    let apic = arch::apic::initialize_local().map_err(|error| {
-        serial::put_str("[apic] initialization failed: ");
-        serial::put_str(match error {
-            arch::apic::ApicError::MissingApic => "APIC unavailable",
-            arch::apic::ApicError::UnsupportedMmioBase => "unsupported xAPIC MMIO base",
-        });
-        serial::put_str("\n");
+    let hardware = arch::initialize_scheduler_hardware().map_err(|_| {
+        serial::put_str("[irq] interrupt controller/timer initialization failed\n");
         ProcessError::UnexpectedExit
     })?;
-    serial::put_str("[apic] local APIC mode=");
-    serial::put_str(if apic.uses_x2apic { "x2APIC" } else { "xAPIC" });
-    serial::put_str(" BSP id=");
-    serial::put_u32(apic.id);
-    serial::put_str(" TSC MHz=");
-    serial::put_u32((apic.tsc_hz / 1_000_000) as u32);
-    serial::put_str(if apic.uses_tsc_deadline {
-        " timer=tsc-deadline"
-    } else {
-        " timer=periodic"
-    });
+    serial::put_str("[irq] controller=");
+    serial::put_str(hardware.interrupt_controller);
+    serial::put_str(" boot-cpu=");
+    serial::put_u32(hardware.boot_cpu_id);
+    serial::put_str(" counter-MHz=");
+    serial::put_u32((hardware.counter_hz / 1_000_000) as u32);
+    serial::put_str(" timer=");
+    serial::put_str(hardware.timer);
     serial::put_str("\n");
-    let smp =
-        arch::smp::start_application_processors(info.acpi_rsdp, apic.tsc_hz).map_err(|_| {
-            serial::put_str("[smp] AP startup failed\n");
-            ProcessError::UnexpectedExit
-        })?;
-    serial::put_str("[smp] MADT discovered=");
+    let smp = arch::start_secondary_cpus(info, hardware.counter_hz).map_err(|_| {
+        serial::put_str("[smp] secondary CPU startup failed\n");
+        ProcessError::UnexpectedExit
+    })?;
+    serial::put_str("[smp] discovery=");
+    serial::put_str(smp.discovery);
+    serial::put_str(" discovered=");
     serial::put_u32(smp.discovered_cpus as u32);
     serial::put_str(" online=");
     serial::put_u32(smp.online_cpus as u32);
@@ -805,7 +708,7 @@ pub(super) fn run_milestone(info: &rustos_abi::BootInfo) -> Result<(), ProcessEr
         .map_err(|_| ProcessError::AddressSpace)?
         .free_frames;
     let manager = unsafe { &mut *ptr::addr_of_mut!(MANAGER) };
-    manager.initialize(info.initramfs, apic.tsc_hz);
+    manager.initialize(info.initramfs, hardware.counter_hz);
     manager.spawn(
         "system/bin/preempt-a.elf",
         PriorityClass::Interactive,
@@ -830,7 +733,7 @@ pub(super) fn run_milestone(info: &rustos_abi::BootInfo) -> Result<(), ProcessEr
         manager.cleanup();
         return Err(ProcessError::UnexpectedExit);
     }
-    serial::put_str("[preempt] APIC timer ticks=");
+    serial::put_str("[preempt] timer ticks=");
     serial::put_u32(manager.timer_ticks as u32);
     serial::put_str(" context-switches=");
     serial::put_u32(manager.context_switches as u32);
@@ -843,7 +746,7 @@ pub(super) fn run_milestone(info: &rustos_abi::BootInfo) -> Result<(), ProcessEr
         PriorityClass::Interactive,
         [0, syscall::ABI_VERSION, 0],
         status::FAULT as i32,
-        6,
+        arch::ILLEGAL_INSTRUCTION_EXCEPTION,
         [EMPTY_CAPABILITY; MAX_CAPABILITIES],
     )?;
     manager.spawn(

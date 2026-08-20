@@ -7,7 +7,9 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-use core::{arch::asm, ffi::c_void};
+use core::ffi::c_void;
+
+mod arch;
 
 pub use rustos_abi::{ipc::Message, syscall, Handle, Rights};
 
@@ -66,7 +68,8 @@ pub fn ipc_receive(endpoint: Handle, message: &mut Message) -> i64 {
     }
 }
 
-/// Низкоуровневый ABI: RAX=number, RDI/RSI/RDX=args, RAX=result.
+/// Низкоуровневый ABI. Номера операций и семантика аргументов общие, а
+/// регистры/инструкция входа выбираются ISA backend'ом ниже.
 ///
 /// # Safety
 ///
@@ -74,18 +77,18 @@ pub fn ipc_receive(endpoint: Handle, message: &mut Message) -> i64 {
 /// процесса. Kernel всё равно проверяет диапазоны и права страниц.
 #[inline]
 pub unsafe fn syscall3(number: u64, arg0: u64, arg1: u64, arg2: u64) -> i64 {
-    let result: i64;
-    unsafe {
-        asm!(
-            "int 0x80",
-            inlateout("rax") number as i64 => result,
-            in("rdi") arg0,
-            in("rsi") arg1,
-            in("rdx") arg2,
-            options(nostack),
-        );
-    }
-    result
+    unsafe { arch::syscall3(number, arg0, arg1, arg2) }
+}
+
+/// Монотонный аппаратный counter без единиц времени. Используется тестами
+/// вытеснения; частоту в обычном приложении сообщает системный clock service.
+pub fn monotonic_counter() -> u64 {
+    arch::monotonic_counter()
+}
+
+/// Намеренно создаёт illegal-instruction fault для проверки изоляции.
+pub fn trigger_test_fault() -> ! {
+    arch::trigger_test_fault()
 }
 
 // Freestanding user ELF иногда получает ссылки на эти C builtins из core.

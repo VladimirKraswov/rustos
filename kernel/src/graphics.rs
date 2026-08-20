@@ -270,7 +270,7 @@ impl Framebuffer {
 
     /// Публикует прямоугольную dirty-область готового кадра.
     ///
-    /// GOP — linear framebuffer с обычной x86 memory semantics. Поэтому
+    /// GOP/firmware framebuffer — linear scanout memory. Поэтому
     /// построчный `copy_nonoverlapping` существенно быстрее миллионов
     /// отдельных volatile store и минимизирует время, когда scanout может
     /// пересечь копируемый кадр. Рисование компонентов никогда не происходит

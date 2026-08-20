@@ -35,6 +35,9 @@ jobs:
       - name: Host-тесты
         run: make test-host
 
+      - name: Cross-architecture compile contract
+        run: make test-arch
+
       - name: UEFI boot integration
         run: BOOT_TEST_TIMEOUT=90 make test-boot
 

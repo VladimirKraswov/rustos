@@ -1,7 +1,7 @@
-//! Отдельное x86-64 address space процесса.
+//! Переносимое владение user address space с ISA-specific PTE encoding.
 //!
 //! Kernel identity mappings копируются на верхнем уровне как supervisor-only;
-//! пользовательская половина создаётся в отдельном PML4 slot. Каждая
+//! пользовательская половина создаётся в отдельном root-table slot. Каждая
 //! выделенная data/page-table page записывается в `owned`, поэтому Drop
 //! возвращает все кадры даже при частичной ошибке ELF loader'а.
 
@@ -12,12 +12,12 @@ use rustos_abi::PAGE_SIZE;
 use super::{allocate, free, FrameBlock};
 
 const ENTRY_COUNT: usize = 512;
+#[cfg(target_arch = "x86_64")]
 const ADDRESS_MASK: u64 = 0x000f_ffff_ffff_f000;
-const PRESENT: u64 = 1 << 0;
-const WRITABLE: u64 = 1 << 1;
-const USER: u64 = 1 << 2;
-const HUGE: u64 = 1 << 7;
-const NO_EXECUTE: u64 = 1 << 63;
+#[cfg(target_arch = "aarch64")]
+const ADDRESS_MASK: u64 = 0x0000_ffff_ffff_f000;
+
+const VALID: u64 = 1 << 0;
 const MAX_OWNED_FRAMES: usize = 512;
 const MAX_USER_PAGES: usize = 384;
 
@@ -78,7 +78,7 @@ pub struct AddressSpace {
 }
 
 impl AddressSpace {
-    /// Создаёт новый PML4 и разделяет supervisor-only kernel mappings.
+    /// Создаёт новую корневую таблицу и разделяет supervisor-only mappings.
     pub fn new(kernel_root: u64) -> Result<Self, AddressSpaceError> {
         let mut space = Self {
             root: 0,
@@ -132,7 +132,7 @@ impl AddressSpace {
         let pt = self.ensure_user_table(pd, pd_index)?;
         // SAFETY: `pt` — выделенная таблица, индекс < 512.
         let slot = unsafe { (pt as *mut u64).add(pt_index) };
-        if unsafe { slot.read() } & PRESENT != 0 {
+        if entry_is_valid(unsafe { slot.read() }) {
             return Err(AddressSpaceError::AlreadyMapped);
         }
         unsafe { slot.write(physical_address | leaf_flags(flags)) };
@@ -267,20 +267,21 @@ impl AddressSpace {
     }
 
     fn ensure_user_table(&mut self, table: u64, index: usize) -> Result<u64, AddressSpaceError> {
-        // SAFETY: table — PML4/PDPT/PD frame, index <512.
+        // SAFETY: table — frame одного из верхних уровней, index <512.
         let slot = unsafe { (table as *mut u64).add(index) };
         let value = unsafe { slot.read() };
-        if value & PRESENT != 0 {
-            if value & HUGE != 0 {
+        if entry_is_valid(value) {
+            if !entry_is_table(value) {
                 return Err(AddressSpaceError::HugePageConflict);
             }
-            if value & USER == 0 {
+            let child = value & ADDRESS_MASK;
+            if !self.owns_frame(child) {
                 return Err(AddressSpaceError::KernelMappingConflict);
             }
-            return Ok(value & ADDRESS_MASK);
+            return Ok(child);
         }
         let child = self.allocate_zeroed_frame()?;
-        unsafe { slot.write(child | PRESENT | WRITABLE | USER) };
+        unsafe { slot.write(child | table_flags()) };
         Ok(child)
     }
 
@@ -295,17 +296,23 @@ impl AddressSpace {
         let index = ((virtual_address >> 12) & 0x1ff) as usize;
         let slot = unsafe { (pd as *mut u64).add(index) };
         let value = unsafe { slot.read() };
-        if value & PRESENT == 0 {
+        if !entry_is_valid(value) {
             return Err(AddressSpaceError::InvalidAddress);
         }
         unsafe { slot.write((value & ADDRESS_MASK) | leaf_flags(flags)) };
         Ok(())
     }
+
+    fn owns_frame(&self, physical_address: u64) -> bool {
+        self.owned[..self.owned_len]
+            .iter()
+            .any(|block| block.phys == physical_address && block.frames == 1)
+    }
 }
 
 impl Drop for AddressSpace {
     fn drop(&mut self) {
-        // Владелец обязан сначала вернуть kernel CR3. Reverse order удобен
+        // Владелец обязан сначала вернуть kernel address-space root. Reverse order удобен
         // для диагностики: data frames уходят до корневой таблицы.
         for index in (0..self.owned_len).rev() {
             let _ = free(self.owned[index]);
@@ -318,22 +325,63 @@ impl Drop for AddressSpace {
 unsafe fn table_entry(table: u64, address: u64, shift: u32) -> Result<u64, AddressSpaceError> {
     let index = ((address >> shift) & 0x1ff) as usize;
     let value = unsafe { (table as *const u64).add(index).read() };
-    if value & PRESENT == 0 || value & HUGE != 0 {
+    if !entry_is_valid(value) || !entry_is_table(value) {
         return Err(AddressSpaceError::InvalidAddress);
     }
     Ok(value & ADDRESS_MASK)
 }
 
+#[cfg(target_arch = "x86_64")]
+const fn table_flags() -> u64 {
+    VALID | (1 << 1) | (1 << 2) // present, writable, user
+}
+
+#[cfg(target_arch = "aarch64")]
+const fn table_flags() -> u64 {
+    VALID | (1 << 1) // valid table descriptor
+}
+
+#[cfg(target_arch = "x86_64")]
 const fn leaf_flags(flags: UserPageFlags) -> u64 {
-    PRESENT
-        | USER
-        | if flags.writable { WRITABLE } else { 0 }
-        | if flags.executable { 0 } else { NO_EXECUTE }
+    VALID
+        | (1 << 2) // user
+        | if flags.writable { 1 << 1 } else { 0 }
+        | if flags.executable { 0 } else { 1 << 63 }
+}
+
+#[cfg(target_arch = "aarch64")]
+const fn leaf_flags(flags: UserPageFlags) -> u64 {
+    // L3 page, AttrIdx=0, inner-shareable, access flag, EL0-accessible.
+    VALID
+        | (1 << 1)
+        | (1 << 6)
+        | (3 << 8)
+        | (1 << 10)
+        | if flags.writable { 0 } else { 1 << 7 }
+        | if flags.executable {
+            1 << 53 // PXN: EL1 never executes user pages
+        } else {
+            (1 << 53) | (1 << 54) // PXN + UXN
+        }
+}
+
+const fn entry_is_valid(value: u64) -> bool {
+    value & VALID != 0
+}
+
+#[cfg(target_arch = "x86_64")]
+const fn entry_is_table(value: u64) -> bool {
+    value & (1 << 7) == 0 // PS=0
+}
+
+#[cfg(target_arch = "aarch64")]
+const fn entry_is_table(value: u64) -> bool {
+    value & (1 << 1) != 0 // table descriptor on levels 0..2
 }
 
 const fn is_user_canonical(address: u64) -> bool {
-    // Lower canonical half only. Kernel identity mappings остаются ниже
-    // нескольких TiB, а loader использует отдельный PML4 slot 128.
+    // Lower 48-bit user VA only. Kernel identity mappings остаются ниже
+    // нескольких TiB, а loader использует отдельный root-table slot.
     address < 0x0000_8000_0000_0000
 }
 

@@ -1,5 +1,4 @@
-//! Serial-консоль (16550 UART, COM1, 0x3F8) — обязательный диагностический
-//! канал RustOS.
+//! Ранняя serial-консоль, выбранная загрузчиком из описания платформы.
 //!
 //! ## Почему serial
 //!
@@ -13,10 +12,15 @@
 //! вывод идёт малыми порциями, а spin-wait на THR-пустоту — приемлемая
 //! цена за простоту (без прерываний и без DMA).
 
-use crate::arch::{inb, outb};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
-/// Базовый адрес COM1.
-const COM1_BASE: u16 = 0x3F8;
+use rustos_abi::{
+    bootinfo::{BOOT_CONSOLE_16550_MMIO, BOOT_CONSOLE_16550_PORT, BOOT_CONSOLE_PL011},
+    BootInfo,
+};
+
+static CONSOLE_KIND: AtomicU32 = AtomicU32::new(0);
+static CONSOLE_BASE: AtomicU64 = AtomicU64::new(0);
 
 /// Смещение Line Status Register (LSR): статус THR/DR, ошибки.
 const LSR: u8 = 5;
@@ -28,18 +32,15 @@ const LSR_THR_EMPTY: u8 = 1 << 5;
 /// # Safety
 ///
 /// Доступ к портам COM1 — см. `crate::arch`.
-pub fn init() {
-    unsafe {
-        // Отключить прерывания (IER = 0): на этом этапе нет IDT.
-        outb(COM1_BASE + 1, 0x00);
-        // DLAB=1: открыть делитель. Baud = 1843200 / 1 = 115200.
-        outb(COM1_BASE + 3, 0x80);
-        outb(COM1_BASE, 1); // делитель по низшим битам
-        outb(COM1_BASE + 1, 0); // делитель по старшим битам
-                                // DLAB=0, 8 бит данных, без stop-бита и parity (0b0011).
-        outb(COM1_BASE + 3, 0x03);
-        // Включить FIFO и сбросить его.
-        outb(COM1_BASE + 2, 0x07);
+pub fn init(info: &BootInfo) {
+    CONSOLE_BASE.store(info.console.base, Ordering::Relaxed);
+    CONSOLE_KIND.store(info.console.kind, Ordering::Release);
+    match info.console.kind {
+        BOOT_CONSOLE_16550_PORT => initialize_16550_port(info.console.base),
+        BOOT_CONSOLE_16550_MMIO => initialize_16550_mmio(info.console.base),
+        // PL011 обычно уже настроен UEFI/firmware. Перепрограммировать baud
+        // без достоверного clock_hz опаснее, чем продолжить текущий режим.
+        _ => {}
     }
 }
 
@@ -60,14 +61,94 @@ pub fn early_put_str(s: &str) {
 ///
 /// Доступ к портам — см. `crate::arch`.
 fn put_byte(b: u8) {
-    unsafe {
-        loop {
-            if inb(COM1_BASE + u16::from(LSR)) & LSR_THR_EMPTY != 0 {
-                outb(COM1_BASE, b);
-                return;
-            }
-        }
+    let base = CONSOLE_BASE.load(Ordering::Relaxed);
+    match CONSOLE_KIND.load(Ordering::Acquire) {
+        BOOT_CONSOLE_16550_PORT => write_16550_port(base, b),
+        BOOT_CONSOLE_16550_MMIO => write_16550_mmio(base, b),
+        BOOT_CONSOLE_PL011 => write_pl011(base, b),
+        _ => {}
     }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn initialize_16550_port(base: u64) {
+    let Ok(base) = u16::try_from(base) else {
+        return;
+    };
+    unsafe {
+        crate::arch::outb(base + 1, 0x00);
+        crate::arch::outb(base + 3, 0x80);
+        crate::arch::outb(base, 1);
+        crate::arch::outb(base + 1, 0);
+        crate::arch::outb(base + 3, 0x03);
+        crate::arch::outb(base + 2, 0x07);
+    }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn initialize_16550_port(_base: u64) {}
+
+#[cfg(target_arch = "x86_64")]
+fn write_16550_port(base: u64, byte: u8) {
+    let Ok(base) = u16::try_from(base) else {
+        return;
+    };
+    unsafe {
+        while crate::arch::inb(base + u16::from(LSR)) & LSR_THR_EMPTY == 0 {
+            core::hint::spin_loop();
+        }
+        crate::arch::outb(base, byte);
+    }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn write_16550_port(_base: u64, _byte: u8) {}
+
+fn initialize_16550_mmio(base: u64) {
+    if base == 0 {
+        return;
+    }
+    unsafe {
+        write_mmio_u8(base, 1, 0x00);
+        write_mmio_u8(base, 3, 0x80);
+        write_mmio_u8(base, 0, 1);
+        write_mmio_u8(base, 1, 0);
+        write_mmio_u8(base, 3, 0x03);
+        write_mmio_u8(base, 2, 0x07);
+    }
+}
+
+fn write_16550_mmio(base: u64, byte: u8) {
+    if base == 0 {
+        return;
+    }
+    unsafe {
+        while read_mmio_u8(base, u64::from(LSR)) & LSR_THR_EMPTY == 0 {
+            core::hint::spin_loop();
+        }
+        write_mmio_u8(base, 0, byte);
+    }
+}
+
+fn write_pl011(base: u64, byte: u8) {
+    if base == 0 {
+        return;
+    }
+    // PL011 UARTFR.TXFF (bit 5): FIFO полон.
+    unsafe {
+        while (base.wrapping_add(0x18) as *const u32).read_volatile() & (1 << 5) != 0 {
+            core::hint::spin_loop();
+        }
+        (base as *mut u32).write_volatile(u32::from(byte));
+    }
+}
+
+unsafe fn read_mmio_u8(base: u64, offset: u64) -> u8 {
+    unsafe { (base.wrapping_add(offset) as *const u8).read_volatile() }
+}
+
+unsafe fn write_mmio_u8(base: u64, offset: u64, value: u8) {
+    unsafe { (base.wrapping_add(offset) as *mut u8).write_volatile(value) };
 }
 
 /// Вывести строку. `\n` преобразуется в `\r\n` (конвенция терминалов).

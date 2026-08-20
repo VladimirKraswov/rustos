@@ -80,7 +80,7 @@ pub enum PriorityClass {
 pub struct ExitReason {
     /// Обычный код `process_exit` либо отрицательный системный status.
     pub status: i32,
-    /// Ноль при обычном exit; иначе x86 exception vector.
+    /// Ноль при обычном exit; иначе номер exception/Exception Class текущей ISA.
     pub exception: u16,
     /// Зарезервировано для совместимого расширения.
     pub flags: u16,

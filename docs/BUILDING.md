@@ -18,6 +18,7 @@ make build      собрать интерактивный GUI-образ
 make run        запустить графическую VM
 make lint       fmt + Clippy -D warnings
 make test-host  ABI, scheduler/lifecycle и host-tool unit tests
+make test-arch  собрать kernel/runtime/apps для AMD64 и AArch64
 make test-boot  UEFI + CPL3 ELF/VFS/fault/reclaim test
 make test-gui   keyboard/mouse/window framebuffer test
 make test       полный test suite
@@ -35,6 +36,11 @@ GUI-тест общается с QEMU monitor через workspace tool `rustos-
 kernel и UEFI loader. Boot-тест считается успешным только если serial содержит
 успешный VFS capability call, локализованный user `#UD`, полный reclaim
 address space и marker `RING3_MILESTONE_OK`.
+
+`scripts/check-architectures.sh` создаёт настоящие ELF-артефакты для
+`targets/x86_64-unknown-rustos.json` и
+`targets/aarch64-unknown-rustos.json`. Это compile contract переносимости;
+загрузка AArch64 в QEMU станет отдельным integration test после VBAR/GIC/PSCI.
 По умолчанию boot- и GUI-тесты запускаются с минимальным профилем 128 MiB
 RAM; значения можно переопределить, например
 `BOOT_MEMORY_MB=4096 make test-boot` или `GUI_MEMORY_MB=512 make test-gui`.

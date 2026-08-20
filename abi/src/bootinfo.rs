@@ -18,7 +18,23 @@ use super::memmap::{MemRegion, MEMMAP_MAX_REGIONS};
 /// «читается» в hex: `0x5255_5354_4F53` = "RUSTOS".
 pub const BOOT_INFO_MAGIC: u64 = 0x5255_5354_4F53;
 /// Текущая версия структуры BootInfo.
-pub const BOOT_INFO_VERSION: u32 = 2;
+pub const BOOT_INFO_VERSION: u32 = 3;
+
+/// Диагностическая консоль отсутствует.
+pub const BOOT_CONSOLE_NONE: u32 = 0;
+/// 16550 UART через x86 port I/O (`base` обычно 0x3f8).
+pub const BOOT_CONSOLE_16550_PORT: u32 = 1;
+/// 16550-compatible UART через MMIO.
+pub const BOOT_CONSOLE_16550_MMIO: u32 = 2;
+/// ARM PrimeCell PL011 через MMIO.
+pub const BOOT_CONSOLE_PL011: u32 = 3;
+
+/// Firmware root отсутствует.
+pub const BOOT_FIRMWARE_NONE: u32 = 0;
+/// `root` указывает на ACPI RSDP.
+pub const BOOT_FIRMWARE_ACPI: u32 = 1;
+/// `root` указывает на Flattened Device Tree blob.
+pub const BOOT_FIRMWARE_DEVICE_TREE: u32 = 2;
 
 /// GOP framebuffer хранит байты пикселя как R, G, B, reserved.
 pub const FRAMEBUFFER_FORMAT_RGB: u32 = 0;
@@ -31,8 +47,9 @@ pub const KERNEL_STACK_SIZE: u64 = 128 * 1024;
 
 /// Бюджет физической памяти под page tables в резерве загрузчика (16 MiB).
 ///
-/// Identity-маппинг с 1 GiB-страницами потребляет ~8 KiB на 1 GiB RAM
-/// (PML4+PDPT) + 2 MiB-хвост и окно MMIO — 16 MiB хватает на сотни ГиБ.
+/// Разрежённый identity/direct map с крупными блоками расходует память
+/// пропорционально числу отображённых диапазонов, а не объёму RAM; 16 MiB
+/// хватает для bootstrap tables AMD64 и AArch64 с большим запасом.
 /// Это константа ABI: загрузчик резервирует, а ядро (этап 2) уже не
 /// перемещает таблицы.
 pub const PAGE_TABLE_BUDGET: u64 = 16 * 1024 * 1024;
@@ -73,6 +90,59 @@ impl BootFramebuffer {
     };
 }
 
+/// Ранняя debug-консоль, уже настроенная firmware/загрузчиком.
+///
+/// Описание находится в ABI, потому что UART зависит от платы, а не от ISA:
+/// AArch64 может иметь PL011/16550, x86 embedded — MMIO 16550.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct BootConsole {
+    /// Один из `BOOT_CONSOLE_*`.
+    pub kind: u32,
+    /// Резерв флагов транспорта; пока обязан быть нулём.
+    pub flags: u32,
+    /// Номер port I/O либо физический MMIO base.
+    pub base: u64,
+    /// Частота входного clock, если она известна.
+    pub clock_hz: u32,
+    /// Настроенная firmware скорость.
+    pub baud: u32,
+}
+
+impl BootConsole {
+    /// Консоль отсутствует.
+    pub const NONE: Self = Self {
+        kind: BOOT_CONSOLE_NONE,
+        flags: 0,
+        base: 0,
+        clock_hz: 0,
+        baud: 0,
+    };
+}
+
+/// Корень аппаратного описания. ACPI и Device Tree нормализуются platform
+/// layer'ом в одинаковый набор устройств/CPU, но исходный blob остаётся
+/// доступен драйверам.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct BootFirmware {
+    /// Один из `BOOT_FIRMWARE_*`.
+    pub kind: u32,
+    /// Резерв ABI; обязан быть нулём.
+    pub _reserved: u32,
+    /// Физический адрес RSDP либо FDT blob.
+    pub root: u64,
+}
+
+impl BootFirmware {
+    /// Firmware description отсутствует.
+    pub const NONE: Self = Self {
+        kind: BOOT_FIRMWARE_NONE,
+        _reserved: 0,
+        root: 0,
+    };
+}
+
 /// Параметры загрузочного (boot) стека процессора, запускающего ядро.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -93,7 +163,7 @@ pub struct BootInitramfs {
     pub size: u64,
 }
 
-/// Полная структура BootInfo (текущая версия — [`BOOT_INFO_VERSION`] = 2).
+/// Полная структура BootInfo (текущая версия — [`BOOT_INFO_VERSION`] = 3).
 ///
 /// # Layout
 ///
@@ -119,8 +189,10 @@ pub struct BootInfo {
 
     /// GOP-framebuffer (может быть нулевой).
     pub framebuffer: BootFramebuffer,
-    /// Физический адрес ACPI RSDP (0 — не найден).
-    pub acpi_rsdp: u64,
+    /// Ранняя UART-консоль, выбранная загрузчиком из platform description.
+    pub console: BootConsole,
+    /// ACPI RSDP либо FDT — без архитектурного предположения в общем ABI.
+    pub firmware: BootFirmware,
 
     /// initramfs (может отсутствовать).
     pub initramfs: BootInitramfs,
@@ -137,6 +209,8 @@ pub struct BootInfo {
 
 // Compile-time проверка layout ABI.
 const _: () = assert!(core::mem::size_of::<BootFramebuffer>() == 32);
+const _: () = assert!(core::mem::size_of::<BootConsole>() == 24);
+const _: () = assert!(core::mem::size_of::<BootFirmware>() == 16);
 const _: () = assert!(core::mem::size_of::<BootStack>() == 16);
 const _: () = assert!(core::mem::size_of::<BootInitramfs>() == 16);
 const _: () = assert!(core::mem::align_of::<BootInfo>() == 8);
@@ -151,6 +225,26 @@ impl BootInfo {
             return false;
         }
         if self.memmap_count as usize > MEMMAP_MAX_REGIONS {
+            return false;
+        }
+        if !matches!(
+            self.console.kind,
+            BOOT_CONSOLE_NONE
+                | BOOT_CONSOLE_16550_PORT
+                | BOOT_CONSOLE_16550_MMIO
+                | BOOT_CONSOLE_PL011
+        ) || !matches!(
+            self.firmware.kind,
+            BOOT_FIRMWARE_NONE | BOOT_FIRMWARE_ACPI | BOOT_FIRMWARE_DEVICE_TREE
+        ) {
+            return false;
+        }
+        if (self.console.kind == BOOT_CONSOLE_NONE) != (self.console.base == 0)
+            || (self.firmware.kind == BOOT_FIRMWARE_NONE) != (self.firmware.root == 0)
+            || self.console.flags != 0
+            || self.firmware._reserved != 0
+            || (self.console.kind == BOOT_CONSOLE_16550_PORT && self.console.base > u16::MAX as u64)
+        {
             return false;
         }
         for i in 0..self.memmap_count as usize {
@@ -178,5 +272,58 @@ impl BootInfo {
             .filter(|&i| self.memmap[i].kind == super::memmap::MemRegionKind::Usable as u32)
             .map(|i| self.memmap[i].size)
             .sum()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::MemRegion;
+
+    fn empty_info() -> BootInfo {
+        BootInfo {
+            magic: BOOT_INFO_MAGIC,
+            version: BOOT_INFO_VERSION,
+            _pad: 0,
+            memmap_count: 0,
+            _pad2: 0,
+            memmap: [MemRegion::ZERO; MEMMAP_MAX_REGIONS],
+            framebuffer: BootFramebuffer::ZERO,
+            console: BootConsole::NONE,
+            firmware: BootFirmware::NONE,
+            initramfs: BootInitramfs {
+                phys_addr: 0,
+                size: 0,
+            },
+            kernel_phys: 0,
+            kernel_size: 0,
+            boot_stack: BootStack { top: 0, size: 0 },
+        }
+    }
+
+    #[test]
+    fn platform_descriptors_are_validated_as_pairs() {
+        let mut info = empty_info();
+        assert!(info.validate());
+
+        info.console.kind = BOOT_CONSOLE_PL011;
+        assert!(!info.validate(), "MMIO console without base must fail");
+        info.console.base = 0x0900_0000;
+        assert!(info.validate());
+
+        info.firmware.kind = BOOT_FIRMWARE_DEVICE_TREE;
+        assert!(!info.validate(), "Device Tree kind without root must fail");
+        info.firmware.root = 0x4000_0000;
+        assert!(info.validate());
+    }
+
+    #[test]
+    fn reserved_platform_bits_are_rejected() {
+        let mut info = empty_info();
+        info.console.flags = 1;
+        assert!(!info.validate());
+        info.console.flags = 0;
+        info.firmware._reserved = 1;
+        assert!(!info.validate());
     }
 }

@@ -1,11 +1,11 @@
 //! Минимальный syscall ABI между ring 3 и микроядром.
 //!
-//! Первая реализация использует `int 0x80`: она медленнее `SYSCALL`, зато
-//! одинаково сохраняет полный user context и позволяет сначала проверить
-//! fault containment. После включения per-CPU GS/TSS тот же ABI регистров
-//! переводится на `SYSCALL/SYSRET` без изменения приложений.
+//! Номера операций и структуры общие для всех ISA. AMD64 bootstrap использует
+//! `int 0x80` (RAX + RDI/RSI/RDX), AArch64 — `svc #0` (x8 + x0/x1/x2).
+//! Различие скрывает `rustos-runtime`, поэтому исходный код приложений общий.
 
-/// Номер software interrupt системных вызовов.
+/// Номер software interrupt AMD64; на AArch64 непосредственное значение
+/// инструкции `svc` равно нулю.
 pub const INTERRUPT_VECTOR: u8 = 0x80;
 /// Версия syscall ABI, передаваемая вторым bootstrap-аргументом.
 pub const ABI_VERSION: u64 = 1;

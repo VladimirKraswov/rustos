@@ -14,7 +14,7 @@ use rustos_abi::{
 };
 
 use crate::{
-    arch::{self, traps::TrapFrame},
+    arch::{self, TrapFrame, TrapKind},
     fs,
     memory::{self, AddressSpace},
     serial,
@@ -107,7 +107,7 @@ pub fn run_bootstrap_milestone(initramfs: BootInitramfs) -> Result<(), ProcessEr
     serial::put_str("[process] init.elf exited cleanly; VFS capability verified\n");
 
     let fault = run_one(ProcessId::new(1, 2), initramfs, "system/bin/fault-test.elf")?;
-    if fault.exception != 6 {
+    if fault.exception != arch::ILLEGAL_INSTRUCTION_EXCEPTION {
         log_unexpected_exit("fault-test.elf", fault);
         return Err(ProcessError::UnexpectedExit);
     }
@@ -116,7 +116,7 @@ pub fn run_bootstrap_milestone(initramfs: BootInitramfs) -> Result<(), ProcessEr
     Ok(())
 }
 
-/// Запускает preemptive и capability-IPC вертикальные срезы на local APIC.
+/// Запускает preemptive и capability-IPC вертикальные срезы на timer backend.
 pub fn run_preemptive_milestone(info: &rustos_abi::BootInfo) -> Result<(), ProcessError> {
     manager::run_milestone(info)
 }
@@ -130,7 +130,7 @@ fn run_one(
         .map_err(|_| ProcessError::AddressSpace)?
         .free_frames;
     let image = fs::initramfs_file(initramfs, path).map_err(|_| ProcessError::MissingElf)?;
-    let kernel_root = arch::read_cr3();
+    let kernel_root = arch::current_address_space_root();
     let mut address_space =
         AddressSpace::new(kernel_root).map_err(|_| ProcessError::AddressSpace)?;
     let loaded = elf::load(&mut address_space, image).map_err(|_| ProcessError::InvalidElf)?;
@@ -143,7 +143,7 @@ fn run_one(
 
     unsafe { CURRENT_PROCESS = &mut process };
     let _raw_result = unsafe {
-        arch::traps::enter_user(
+        arch::enter_user(
             loaded.entry,
             loaded.stack_pointer,
             [VFS_ROOT_SLOT as u64, syscall::ABI_VERSION, 0],
@@ -152,7 +152,7 @@ fn run_one(
         )
     };
     unsafe { CURRENT_PROCESS = ptr::null_mut() };
-    // enter_user assembly уже вернул kernel CR3. Drop process освобождает все
+    // enter_user backend уже вернул kernel address-space root. Drop освобождает все
     // data/stack/page-table frames address space.
     let exit_reason = process.exit_reason;
     let free_while_alive = memory::stats()
@@ -182,26 +182,25 @@ pub extern "C" fn rustos_handle_trap(frame: &mut TrapFrame) -> u64 {
     if let Some(disposition) = manager::handle_active_trap(frame) {
         return disposition;
     }
-    if frame.vector == arch::apic::SPURIOUS_VECTOR as u64 {
+    let kind = frame.kind();
+    if kind == TrapKind::Spurious {
         return 0;
     }
     if !frame.is_from_user() {
-        serial::put_str("[trap] FATAL kernel exception vector=");
-        serial::put_u32(frame.vector as u32);
-        serial::put_str(" rip=0x");
-        serial::put_hex(frame.rip);
+        serial::put_str("[trap] FATAL kernel exception ip=0x");
+        serial::put_hex(frame.instruction_pointer());
         serial::put_str("\n");
-        crate::boot::exit_kernel(0x70 | frame.vector as u8);
+        crate::boot::exit_kernel(0x70);
     }
     let process = unsafe { CURRENT_PROCESS.as_mut() };
     let Some(process) = process else {
         crate::boot::exit_kernel(0x7f);
     };
 
-    if frame.vector == syscall::INTERRUPT_VECTOR as u64 {
+    if kind == TrapKind::Syscall {
         match dispatch_syscall(process, frame) {
             SyscallDisposition::Return(value) => {
-                frame.rax = value as u64;
+                frame.set_syscall_result(value);
                 0
             }
             SyscallDisposition::Exit(status) => {
@@ -211,30 +210,34 @@ pub extern "C" fn rustos_handle_trap(frame: &mut TrapFrame) -> u64 {
                     flags: 0,
                     fault_address: 0,
                 };
-                arch::traps::set_user_result(status as u32 as u64);
+                arch::set_user_run_result(status as u32 as u64);
                 1
             }
         }
     } else {
-        let fault_address = if frame.vector == 14 {
-            arch::read_cr2()
-        } else {
-            frame.rip
+        let TrapKind::Exception {
+            number,
+            code,
+            instruction_pointer,
+            fault_address,
+        } = kind
+        else {
+            crate::boot::exit_kernel(0x7f);
         };
         process.exit_reason = ExitReason {
             status: status::FAULT as i32,
-            exception: frame.vector as u16,
-            flags: frame.error_code as u16,
+            exception: number,
+            flags: code,
             fault_address,
         };
         serial::put_str("[fault] contained pid=0x");
         serial::put_hex(process.pid.0);
         serial::put_str(" vector=");
-        serial::put_u32(frame.vector as u32);
+        serial::put_u32(number as u32);
         serial::put_str(" rip=0x");
-        serial::put_hex(frame.rip);
+        serial::put_hex(instruction_pointer);
         serial::put_str("\n");
-        arch::traps::set_user_result((1u64 << 63) | frame.vector);
+        arch::set_user_run_result((1u64 << 63) | u64::from(number));
         1
     }
 }
@@ -257,11 +260,12 @@ enum SyscallDisposition {
 }
 
 fn dispatch_syscall(process: &mut ProcessContext, frame: &TrapFrame) -> SyscallDisposition {
-    match frame.rax {
+    let [arg0, arg1, arg2] = frame.syscall_arguments();
+    match frame.syscall_number() {
         syscall::number::THREAD_YIELD => SyscallDisposition::Return(status::OK),
-        syscall::number::PROCESS_EXIT => SyscallDisposition::Exit(frame.rdi as i64 as i32),
+        syscall::number::PROCESS_EXIT => SyscallDisposition::Exit(arg0 as i64 as i32),
         syscall::number::VFS_STAT => {
-            let result = vfs_stat(process, Handle(frame.rdi as u32), frame.rsi, frame.rdx);
+            let result = vfs_stat(process, Handle(arg0 as u32), arg1, arg2);
             SyscallDisposition::Return(result)
         }
         _ => SyscallDisposition::Return(status::NOT_SUPPORTED),

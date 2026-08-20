@@ -31,6 +31,7 @@
 #![no_main]
 #![no_std]
 
+mod arch;
 mod bootinfo;
 mod debug;
 mod elf;
@@ -39,7 +40,8 @@ mod pagetable;
 use core::time::Duration;
 
 use rustos_abi::bootinfo::{
-    BootFramebuffer, BootInitramfs, BootStack, FRAMEBUFFER_FORMAT_BGR, FRAMEBUFFER_FORMAT_RGB,
+    BootConsole, BootFirmware, BootFramebuffer, BootInitramfs, BootStack, BOOT_CONSOLE_16550_PORT,
+    BOOT_FIRMWARE_ACPI, BOOT_FIRMWARE_NONE, FRAMEBUFFER_FORMAT_BGR, FRAMEBUFFER_FORMAT_RGB,
     KERNEL_STACK_SIZE, PAGE_TABLE_BUDGET,
 };
 use rustos_abi::{BootInfo, MemRegion, BOOT_INFO_MAGIC, BOOT_INFO_VERSION, MEMMAP_MAX_REGIONS};
@@ -298,7 +300,22 @@ unsafe fn boot() -> Result<(), BootError> {
         _pad2: 0,
         memmap: [MemRegion::ZERO; MEMMAP_MAX_REGIONS],
         framebuffer,
-        acpi_rsdp: rsdp,
+        console: BootConsole {
+            kind: BOOT_CONSOLE_16550_PORT,
+            flags: 0,
+            base: 0x3f8,
+            clock_hz: 1_843_200,
+            baud: 115_200,
+        },
+        firmware: BootFirmware {
+            kind: if rsdp == 0 {
+                BOOT_FIRMWARE_NONE
+            } else {
+                BOOT_FIRMWARE_ACPI
+            },
+            _reserved: 0,
+            root: rsdp,
+        },
         initramfs: BootInitramfs {
             phys_addr: initramfs_phys,
             size: INITRAMFS.len() as u64,
@@ -330,7 +347,7 @@ unsafe fn boot() -> Result<(), BootError> {
     });
     if !reservation_is_reserved {
         debug::put_str("[dbg] FATAL: kernel reservation is still usable\n");
-        debug_exit(0xE2);
+        arch::debug_exit(0xE2);
     }
     let (regions, count) = bootinfo::normalize_map(&final_map);
     // SAFETY: bootinfo_phys — копия BootInfo в резерве (записана выше).
@@ -352,7 +369,7 @@ unsafe fn boot() -> Result<(), BootError> {
             "final memory map buffer [{buf_phys:#x}, {buf_end:#x}) overlaps kernel reservation [{base:#x}, {:#x}) — aborting",
             base + layout.size
         );
-        debug_exit(0xE1);
+        arch::debug_exit(0xE1);
     }
 
     // 9. Передача управления ядру.
@@ -382,27 +399,7 @@ unsafe fn boot() -> Result<(), BootError> {
     // SAFETY: pgd/stack_top/boot_info — валидные identity-адреса из раскладки;
     // память не используется (nomem), push/pop нет (nostack — только setup
     // стека ядра), `jmp` не возвращается (unreachable_unchecked ниже).
-    unsafe {
-        core::arch::asm!(
-            "cli",
-            "mov cr3, {pgd}",
-            "mov rsp, {kernel_rsp}",
-            "mov rdi, {boot_info}",
-            "jmp {entry}",
-            pgd = in(reg) pgd,
-            kernel_rsp = in(reg) kernel_rsp,
-            // Физический адрес передаём как u64 (а не *const BootInfo) —
-            // значение в регистре идентично, ядро интерпретирует RDI как
-            // *const BootInfo (identity-маппинг). Это гасит clippy
-            // pointers_in_nomem_asm_block (указатель в nomem-блоке).
-            boot_info = in(reg) bootinfo_phys,
-            entry = in(reg) entry,
-            out("rdi") _,
-            options(nostack, nomem),
-        );
-    }
-    // `jmp` не возвращается — сообщаем rustc о недостижимости.
-    unsafe { core::hint::unreachable_unchecked() }
+    unsafe { arch::jump_to_kernel(pgd, kernel_rsp, bootinfo_phys, entry) }
 }
 
 /// Выбор верхнего выровненного адреса в conventional-регионе ниже 4 GiB.
@@ -555,29 +552,4 @@ fn align_up(v: u64, align: u64) -> u64 {
 #[inline]
 fn align_down(v: u64, align: u64) -> u64 {
     v & !(align - 1)
-}
-
-/// Диагностический выход: запись в QEMU `isa-debug-exit` (порт 0xF4).
-///
-/// В QEMU с этим устройством — немедленный exit с кодом (для CI).
-/// На реальном железе без устройства `out` — no-op; затем HALT
-/// (машина останавливается, в CI это тоже заметный сбой).
-#[inline]
-fn debug_exit(code: u8) -> ! {
-    // SAFETY: запись в отдельный тестовый I/O-порт (DX=0xF4, EAX=code)
-    // не затрагивает память и
-    // прочие регистры; hlt останавливает CPU и не использует память/стек.
-    unsafe {
-        core::arch::asm!(
-            "out dx, eax",
-            in("eax") code as u32,
-            in("dx") 0xF4u16,
-            options(nomem, nostack),
-        );
-    }
-    loop {
-        unsafe {
-            core::arch::asm!("hlt", options(nomem, nostack));
-        }
-    }
 }

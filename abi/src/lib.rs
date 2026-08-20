@@ -33,7 +33,7 @@ pub use handle::{Handle, Rights};
 pub use memmap::{MemRegion, MemRegionKind, MEMMAP_MAX_REGIONS};
 pub use process::{ExitReason, PriorityClass, ProcessId, ThreadId};
 
-/// Размер страницы x86-64 в байтах. Базовая единица виртуальной памяти.
+/// Базовая 4-KiB granule, общая для текущих AMD64 и AArch64 targets.
 pub const PAGE_SIZE: u64 = 4096;
 /// Размер «крупной» страницы (2 MiB) — единица identity-маппинга ядра.
 pub const HUGEPAGE_SIZE: u64 = 2 * 1024 * 1024;

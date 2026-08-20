@@ -4,12 +4,12 @@
 #![no_std]
 #![no_main]
 
-use core::{arch::asm, panic::PanicInfo};
-use rustos_runtime::process_exit;
+use core::panic::PanicInfo;
+use rustos_runtime::{process_exit, trigger_test_fault};
 
 #[no_mangle]
 pub extern "C" fn _start(_vfs_handle: u64, _abi_version: u64) -> ! {
-    unsafe { asm!("ud2", options(noreturn)) }
+    trigger_test_fault()
 }
 
 #[panic_handler]

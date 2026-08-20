@@ -10,6 +10,11 @@ rustflags = [
     "-C", "force-unwind-tables=no",
 ]
 
+[target.aarch64-unknown-rustos]
+rustflags = [
+    "-C", "force-unwind-tables=no",
+]
+
 [target.x86_64-unknown-uefi]
 rustflags = [
     "-C", "force-unwind-tables=no",

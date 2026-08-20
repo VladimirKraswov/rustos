@@ -54,7 +54,10 @@ send_command() {
     # пауза после отпускания клавиши не переполняют виртуальный 8042. Guest
     # обновляет только dirty-строку ввода, поэтому полный software-render
     # больше не задерживает чтение следующего scancode.
-    printf '%b' "$commands" | hmp 120
+    # 160 ms учитывает самый медленный macOS/Apple-Silicon TCG: HMP prompt
+    # подтверждает принятие команды monitor'ом, но не окончание отложенной
+    # make/break-пары PS/2 внутри гостя.
+    printf '%b' "$commands" | hmp 160
     # Enter отправляем отдельно: QEMU возвращает monitor prompt раньше, чем
     # release последней буквы гарантированно покинет PS/2 output buffer.
     sleep 0.2
@@ -128,8 +131,8 @@ grep -Eq '\[video\] scanout=gop mode=[1-9][0-9]*x[1-9][0-9]* format=(rgb888|bgr8
     "$RUN_DIR/serial.log"
 grep -q '\[isolation\] user #UD contained; kernel and GUI continue' "$RUN_DIR/serial.log"
 grep -q '\[memory\] user address spaces reclaimed' "$RUN_DIR/serial.log"
-grep -Eq '\[smp\] MADT discovered=2 online=2 APs parked safely' "$RUN_DIR/serial.log"
-grep -Eq '\[preempt\] APIC timer ticks=[1-9][0-9]* context-switches=[1-9][0-9]*' "$RUN_DIR/serial.log"
+grep -Eq '\[smp\] discovery=ACPI MADT discovered=2 online=2 APs parked safely' "$RUN_DIR/serial.log"
+grep -Eq '\[preempt\] timer ticks=[1-9][0-9]* context-switches=[1-9][0-9]*' "$RUN_DIR/serial.log"
 grep -q '\[isolation\] concurrent #UD terminated one process; survivor exited=22' "$RUN_DIR/serial.log"
 grep -q '\[ipc\] queued block/wake and attenuated VFS capability verified' "$RUN_DIR/serial.log"
 grep -q '\[process-manager\] dynamic create/exit/reap reclaimed all frames' "$RUN_DIR/serial.log"

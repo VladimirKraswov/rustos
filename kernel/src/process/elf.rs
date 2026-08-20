@@ -10,7 +10,10 @@ const USER_STACK_PAGES: u64 = 16;
 const MAX_LOAD_SEGMENTS: usize = 16;
 
 const ET_DYN: u16 = 3;
-const EM_X86_64: u16 = 0x3e;
+#[cfg(target_arch = "x86_64")]
+const ELF_MACHINE: u16 = 0x3e; // EM_X86_64
+#[cfg(target_arch = "aarch64")]
+const ELF_MACHINE: u16 = 0xb7; // EM_AARCH64
 const PT_LOAD: u32 = 1;
 const PT_DYNAMIC: u32 = 2;
 const PF_X: u32 = 1;
@@ -18,7 +21,10 @@ const PF_W: u32 = 2;
 const DT_NULL: i64 = 0;
 const DT_RELA: i64 = 7;
 const DT_RELASZ: i64 = 8;
-const R_X86_64_RELATIVE: u32 = 8;
+#[cfg(target_arch = "x86_64")]
+const RELATIVE_RELOCATION: u32 = 8; // R_X86_64_RELATIVE
+#[cfg(target_arch = "aarch64")]
+const RELATIVE_RELOCATION: u32 = 1027; // R_AARCH64_RELATIVE
 
 #[derive(Clone, Copy)]
 struct LoadSegment {
@@ -57,7 +63,7 @@ pub fn load(space: &mut AddressSpace, image: &[u8]) -> Result<LoadedImage, ElfEr
         || image.get(4) != Some(&2)
         || image.get(5) != Some(&1)
         || read_u16(image, 16) != Some(ET_DYN)
-        || read_u16(image, 18) != Some(EM_X86_64)
+        || read_u16(image, 18) != Some(ELF_MACHINE)
     {
         return Err(ElfError::InvalidHeader);
     }
@@ -168,8 +174,7 @@ pub fn load(space: &mut AddressSpace, image: &[u8]) -> Result<LoadedImage, ElfEr
     }
     Ok(LoadedImage {
         entry,
-        // System V ABI: на входе функции RSP = 8 (mod 16), как после call.
-        stack_pointer: USER_STACK_TOP - 8,
+        stack_pointer: crate::arch::initial_user_stack(USER_STACK_TOP),
     })
 }
 
@@ -234,7 +239,7 @@ fn apply_relocations(
         let target = read_u64(image, offset as usize).ok_or(ElfError::InvalidSegment)?;
         let info = read_u64(image, offset as usize + 8).ok_or(ElfError::InvalidSegment)?;
         let addend = read_i64(image, offset as usize + 16).ok_or(ElfError::InvalidSegment)?;
-        if info as u32 != R_X86_64_RELATIVE {
+        if info as u32 != RELATIVE_RELOCATION {
             return Err(ElfError::UnsupportedRelocation);
         }
         let value = (load_bias as i128)

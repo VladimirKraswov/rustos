@@ -9,7 +9,7 @@ use crate::{
     arch, font,
     graphics::{Color, Framebuffer, Rect},
     gui::components::{self, Button, Label, Panel, Theme, Widget},
-    input::{Event, Key, MouseEvent, Ps2Input},
+    input::{self, Event, Key, MouseEvent, PlatformInput},
     serial,
 };
 use rustos_abi::{bootinfo::BootInitramfs, BootInfo};
@@ -65,7 +65,9 @@ pub fn run(info: &BootInfo) -> ! {
         info.initramfs,
     );
     session.render_all();
-    serial::put_str("[gui] GUI_READY desktop=1 terminal=1 mouse=ps2\n");
+    serial::put_str("[gui] GUI_READY desktop=1 terminal=1 mouse=");
+    serial::put_str(input::backend_name());
+    serial::put_str("\n");
     session.event_loop()
 }
 
@@ -97,7 +99,7 @@ impl WindowState {
 /// курсором; отвечает и за event loop, и за отрисовку (см. модуль).
 struct DesktopSession {
     framebuffer: Framebuffer,
-    input: Ps2Input,
+    input: PlatformInput,
     terminal: Terminal,
     window: WindowState,
     cursor: Cursor,
@@ -124,7 +126,7 @@ impl DesktopSession {
             mouse_x: (screen_width / 2) as i32,
             mouse_y: (screen_height / 2) as i32,
             framebuffer,
-            input: Ps2Input::new(),
+            input: PlatformInput::new(),
             terminal: Terminal::new(usable_ram_mib, initramfs),
             window: WindowState {
                 rect,
@@ -540,7 +542,7 @@ impl DesktopSession {
             &mut self.framebuffer,
             branding_x,
             branding_y,
-            "RUSTOS / X86-64",
+            arch::ARCH_NAME,
             Color::rgb(119, 158, 181),
             1,
         );
@@ -930,14 +932,8 @@ impl Cursor {
     }
 }
 
-/// ACPI power off. Текущая цель — QEMU q35: control register по фиксирован-
-/// ному адресу, SLP_TYPa=0 + SLP_EN (0x2000). На реальном железе адрес
-/// control register надо читать из ACPI DSDT — это часть platform-milestone.
+/// Platform power off: ACPI PM на PC либо PSCI на AArch64.
 fn shutdown() -> ! {
-    serial::put_str("[platform] ACPI shutdown requested\n");
-    // QEMU q35 ACPI PM control block: SLP_TYP=0, SLP_EN=1<<13.
-    unsafe { arch::outw(0x604, 0x2000) };
-    loop {
-        arch::halt();
-    }
+    serial::put_str("[platform] shutdown requested\n");
+    arch::power_off()
 }

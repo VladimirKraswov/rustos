@@ -10,7 +10,7 @@ CI действительно переходят в CPL3, вызывают kerne
 RIFS initramfs
       |
       v
-ELF64 ET_DYN loader -- создаёт отдельный PML4/CR3
+ELF64 ET_DYN loader -- создаёт отдельный address-space root
       |              RX code, RW+NX data/stack, W^X
       v
 iretq -> CPL3 init.elf -> int 0x80 -> VFS handle check -> RIFS stat
@@ -18,7 +18,7 @@ iretq -> CPL3 init.elf -> int 0x80 -> VFS handle check -> RIFS stat
       +---- process_exit / exception -----+
                          |
                          v
-              kernel CR3 + ring-0 stack
+              kernel address space + privileged stack
                          |
                          v
           Drop AddressSpace -> free всех кадров
@@ -26,10 +26,14 @@ iretq -> CPL3 init.elf -> int 0x80 -> VFS handle check -> RIFS stat
 
 Kernel устанавливает собственные GDT, TSS и IDT. TSS содержит отдельный
 ring-0 stack, double fault использует IST. До входа пользователя включаются
-`EFER.NXE` и `CR0.WP`. ELF loader принимает только x86-64 `ET_DYN`, проверяет
+`EFER.NXE` и `CR0.WP`. Рабочий AMD64 loader принимает `ET_DYN`, проверяет
 границы `PT_LOAD`, запрещает writable+executable сегменты, применяет
 `R_X86_64_RELATIVE`, отображает 16 страниц user stack и проверяет, что entry
 исполняемый.
+
+Тот же loader при AArch64-сборке проверяет `EM_AARCH64` и применяет
+`R_AARCH64_RELATIVE`; register context и syscall ABI выбираются `arch` HAL.
+Исполняемый ARM boot path появится после VBAR/GIC milestone.
 
 `init.elf` получает в bootstrap-регистрах ABI version и handle. Handle является
 индексом только в capability table этого процесса; число само по себе не даёт
@@ -161,8 +165,8 @@ PID/TID, изоляцию process fault и supervisor backoff. `make test-boot` 
 [process] init.elf exited cleanly; VFS capability verified
 [isolation] user #UD contained; kernel and GUI continue
 [memory] user address spaces reclaimed
-[smp] MADT discovered=2 online=2 APs parked safely
-[preempt] APIC timer ticks=... context-switches=...
+[smp] discovery=ACPI MADT discovered=2 online=2 APs parked safely
+[preempt] timer ticks=... context-switches=...
 [isolation] concurrent #UD terminated one process; survivor exited=22
 [ipc] queued block/wake and attenuated VFS capability verified
 [process-manager] dynamic create/exit/reap reclaimed all frames

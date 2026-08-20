@@ -5,7 +5,7 @@
 //! `shell` + `fs` процессами; позже прямой вызов заменит `vfs.dll`/IPC.
 
 use crate::{
-    font,
+    arch, font,
     fs::{BootstrapFs, FileKind, FsError, FILE_CAPACITY, PATH_CAPACITY},
     graphics::{Color, Framebuffer, Rect},
     input::Key,
@@ -255,7 +255,9 @@ impl Terminal {
             self.clear();
             TerminalAction::None
         } else if command.eq_ignore_ascii_case("about") {
-            self.print("RUSTOS 0.1.0 X86-64\n", CYAN);
+            self.print("RUSTOS 0.1.0 ", CYAN);
+            self.print(arch::ARCH_NAME, CYAN);
+            self.print("\n", CYAN);
             self.print("RUST, UEFI GOP, CPU SOFTWARE COMPOSITOR\n", WHITE);
             TerminalAction::None
         } else if command.eq_ignore_ascii_case("mem") {

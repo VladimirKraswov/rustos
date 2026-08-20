@@ -12,18 +12,13 @@ const LSR_THR_EMPTY: u8 = 1 << 5;
 /// Прочитать байт из I/O-порта.
 #[inline]
 fn inb(port: u16) -> u8 {
-    let v: u8;
-    // SAFETY: чтение из I/O-порта не затрагивает память; порты COM1 —
-    // корректность гарантирует вызывающий.
-    unsafe { core::arch::asm!("in al, dx", out("al") v, in("dx") port, options(nomem, nostack)) }
-    v
+    crate::arch::inb(port)
 }
 
 /// Записать байт в I/O-порт.
 #[inline]
 fn outb(port: u16, v: u8) {
-    // SAFETY: запись в I/O-порт не затрагивает память.
-    unsafe { core::arch::asm!("out dx, al", in("al") v, in("dx") port, options(nomem, nostack)) }
+    crate::arch::outb(port, v)
 }
 
 /// Настройка 16550: 115200 8N1, прерывания отключены, FIFO включены.

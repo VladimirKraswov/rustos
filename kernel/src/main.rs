@@ -26,9 +26,10 @@ use rustos_abi::BootInfo;
 
 /// Входная точка ELF-образа ядра.
 ///
-/// Вызывается загрузчиком в long mode на CPU0. К моменту вызова гарантировано:
+/// Вызывается загрузчиком в 64-битном kernel privilege level на boot CPU.
+/// К моменту вызова гарантировано:
 /// * установлен identity-маппинг всей физической памяти и окна MMIO
-///   (загрузчик записал PGD в CR3);
+///   (загрузчик установил CR3 либо TTBR/TCR);
 /// * `RSP` указывает на верх boot-стека (см. `BootInfo.boot_stack`);
 /// * аргумент `boot_info` — указатель на структуру в памяти, которая
 ///   переживает `ExitBootServices` (выделена в резерве ядра).
@@ -37,16 +38,17 @@ use rustos_abi::BootInfo;
 ///
 /// Контракт устанавливает загрузчик (см. модуль `rustos-boot`, раздел
 /// «Контракт ядра», и `rustos_abi::bootinfo`): указатель валиден до конца
-/// работы системы, выравнивание `align_of::<BootInfo>()`, long mode.
+/// работы системы, выравнивание `align_of::<BootInfo>()`, 64-битный режим.
 #[no_mangle]
 pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
+    // SAFETY: см. контракт функции: указатель валиден и выровнен.
+    let info = unsafe { &*boot_info };
+    // UART задаётся BootInfo: COM1 на PC, PL011/MMIO-16550 на ARM-платах.
+    serial::init(info);
     // Диагностический маркер: управление передано ядру (до serial::init
     // и чтения BootInfo). Маркер в логе без banner'а — проблема в начале
     // `kernel_main`; отсутствие маркера — проблема на стороне загрузчика
-    // (jmp/CR3/стек/entry).
+    // (jump/address-space root/стек/entry).
     serial::early_put_str("K0: kernel _start\n");
-    // SAFETY: см. контракт функции: указатель валиден, выровнен,
-    // long mode, одно CPU на этом этапе (без aliasing-конфликтов).
-    let info = unsafe { &*boot_info };
     boot::kernel_main(info)
 }

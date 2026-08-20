@@ -4,7 +4,7 @@
 
 UEFI-приложение `rustos-boot` находит GOP и ACPI, закрепляет единый bootstrap
 region через `AllocatePages(LOADER_DATA)`, загружает ELF64 PIE kernel и
-initramfs, строит разрежённую identity-карту и передаёт `BootInfo v2`.
+initramfs, строит разрежённую identity-карту и передаёт `BootInfo v3`.
 
 Page tables отображают реальные RAM descriptors, kernel reservation, RSDP и
 точный диапазон framebuffer. Большие MMIO-дыры не выдаются за RAM.
@@ -15,7 +15,7 @@ Page tables отображают реальные RAM descriptors, kernel reserv
 UEFI/OVMF
    |
    v
-rustos-boot --> BootInfo v2 --> kernel
+rustos-boot --> BootInfo v3 --> kernel
                                   |-- serial diagnostics
                                   |-- GDT/TSS/IDT + exception containment
                                   |-- physical frame allocator
@@ -42,9 +42,12 @@ bootstrap backend initramfs, не финальный `vfsd`.
 Platform-independent crate `rustos-microkernel` содержит process/thread
 lifecycle, generation-safe PID/TID, CPU affinity, scheduler priority policy,
 bounded endpoint queue, capability attenuation и supervisor backoff. Он
-`no_std`, но тестируется на host без QEMU. x86 runner подключён к local APIC:
+`no_std`, но тестируется на host без QEMU. Переносимый process manager
+подключён к `arch` HAL; рабочий AMD64 backend использует local APIC:
 timer trap сохраняет регистры/RSP, выбирает TID, меняет CR3 и возвращается
-через `iretq` в другой CPL3 context.
+через `iretq` в другой CPL3 context. AArch64 backend определяет эквивалентные
+EL0/EL1 context, TTBR и `svc` ABI и собирается в CI; GIC/PSCI boot ещё не
+объявляются работающими. Полный контракт описан в [ARCHITECTURES.md](ARCHITECTURES.md).
 
 Platform-independent `rustos-video` задаёт безопасные pixel surfaces,
 RGB/BGR/ARGB formats, span fill, blit, alpha composition, bounded damage и
