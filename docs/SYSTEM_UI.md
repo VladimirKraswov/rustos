@@ -19,6 +19,8 @@
 - AOT-компилятор `rustos-rui`, headless-тесты и UI Gallery в desktop.
 - компонентный desktop shell: Start `Button` + `Image`, `Menu`, пункты-команды,
   taskbar clock/date и keyboard focus без ручного hit-test пунктов.
+- desktop context menu и отдельное Settings-приложение с selected controls,
+  wallpaper preview и общесистемным font scale 100–150%.
 
 Это фундамент, а не заявление, что весь каталог controls готов. Text editing,
 shaping, popup/portal, animations, persisted state и IPC-сервис расширяются
@@ -207,6 +209,13 @@ Start menu является проверкой этого контракта н�
 ручные прямоугольники пунктов. `Menu` исключён из Tab-порядка как focus scope,
 поэтому первый Tab выбирает первый дочерний `Button`; Escape остаётся глобальной
 командой закрытия popup. Клик не проходит сквозь surface к окну под ним.
+
+Тот же механизм используется context menu рабочего стола: shell динамически
+меняет viewport `Menu`, ограничивая popup рабочей областью, но его пункты всё
+равно проходят общий pointer capture и `CommandId`. Desktop Settings получает
+снимок display/appearance state, показывает варианты через `SELECTED` и
+возвращает команды сервису. При отказе mode-set приложение синхронизируется с
+фактическим состоянием и не изображает несуществующее разрешение активным.
 
 ## Accessibility
 

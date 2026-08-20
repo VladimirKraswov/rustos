@@ -160,6 +160,13 @@ impl UiShowcase {
             .set_viewport(viewport.height.saturating_sub(130));
     }
 
+    /// Синхронизирует accessibility/UI scale с desktop settings.
+    pub fn set_scale(&mut self, scale_milli: u16) {
+        let mut theme = self.runtime.theme();
+        theme.scale_milli = scale_milli;
+        self.runtime.set_theme(theme);
+    }
+
     /// Pointer input уже нормализован window server'ом.
     pub fn pointer(&mut self, kind: PointerKind, x: i32, y: i32, scroll_y: i16) -> bool {
         if kind == PointerKind::Scroll {

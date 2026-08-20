@@ -90,6 +90,21 @@ impl FontStyle {
         self
     }
 
+    /// Применяет общесистемный UI-scale. Terminal передаёт собственный style
+    /// без этого преобразования, поэтому настройка desktop не ломает число
+    /// колонок консоли и остаётся отдельной от настройки terminal font.
+    pub const fn scaled(mut self, scale_milli: u16) -> Self {
+        let scaled = self.size as u32 * scale_milli as u32 / 1_000;
+        self.size = if scaled < 10 {
+            10
+        } else if scaled > 48 {
+            48
+        } else {
+            scaled as u16
+        };
+        self
+    }
+
     pub const fn normalized_size(self) -> i32 {
         if self.size < 10 {
             10

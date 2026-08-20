@@ -126,7 +126,7 @@ stop_qemu() {
 cleanup() {
     trap - EXIT INT TERM HUP
     stop_qemu
-    for file in serial.log qemu-stderr.log start-menu.ppm mode-720.ppm fonts.ppm cursor-busy.ppm wallpaper-autumn.ppm lifecycle.ppm terminal.ppm ui-gallery.ppm dragged.ppm resized.ppm minimized.ppm; do
+    for file in serial.log qemu-stderr.log start-menu.ppm desktop-menu.ppm desktop-settings.ppm mode-720.ppm fonts.ppm cursor-busy.ppm wallpaper-autumn.ppm lifecycle.ppm terminal.ppm ui-gallery.ppm dragged.ppm resized.ppm minimized.ppm; do
         [[ -f "$RUN_DIR/$file" ]] && cp -f "$RUN_DIR/$file" "$RESULT_DIR/$file"
     done
 }
@@ -444,6 +444,53 @@ printf 'screendump %s/minimized.ppm\n' "$RUN_DIR" \
 
 cargo run -q -p rustos-gui-check -- \
     "$RUN_DIR/terminal.ppm" "$RUN_DIR/dragged.ppm" "$RUN_DIR/minimized.ppm"
+
+# Desktop context menu принадлежит shell, открывается настоящей правой
+# кнопкой и не проходит сквозь popup. Сначала проверяем Arrange, затем отдельное
+# Settings-приложение и две команды его component tree.
+move_mouse -560 245 5
+printf 'mouse_button 2\n' | hmp
+sleep 0.08
+printf 'mouse_button 0\n' | hmp
+wait_for_serial '[desktop-menu] opened component-runtime=system-ui-v1 x=600 y=400'
+sleep 0.2
+printf 'screendump %s/desktop-menu.ppm\n' "$RUN_DIR" | hmp
+move_mouse 100 30 2
+printf 'mouse_button 1\n' | hmp
+sleep 0.08
+printf 'mouse_button 0\n' | hmp
+wait_for_serial '[desktop-menu] command=arrange-icons'
+
+# Повторный popup в новой позиции, второй MenuItem — Properties.
+printf 'mouse_button 2\n' | hmp
+sleep 0.08
+printf 'mouse_button 0\n' | hmp
+wait_for_serial '[desktop-menu] opened component-runtime=system-ui-v1 x=700 y=430'
+move_mouse 100 84 2
+printf 'mouse_button 1\n' | hmp
+sleep 0.08
+printf 'mouse_button 0\n' | hmp
+wait_for_serial '[app] spawn id=0x05 kind=SETTINGS'
+wait_for_serial '[desktop-menu] command=properties'
+
+# Settings rect≈(232,126,760,620): work-area clamp поднимает окно целиком над
+# taskbar. Выбираем осенние обои и UI scale 125%.
+move_mouse -189 73 3
+printf 'mouse_button 1\n' | hmp
+sleep 0.08
+printf 'mouse_button 0\n' | hmp
+wait_for_serial '[settings] wallpaper=autumn'
+move_mouse 0 86 2
+printf 'mouse_button 1\n' | hmp
+sleep 0.08
+printf 'mouse_button 0\n' | hmp
+wait_for_serial '[settings] ui-scale=1250'
+sleep 0.25
+printf 'screendump %s/desktop-settings.ppm\n' "$RUN_DIR" | hmp
+[[ -s "$RUN_DIR/desktop-menu.ppm" && -s "$RUN_DIR/desktop-settings.ppm" ]] || {
+    echo "[gui-test] desktop menu/settings screenshot is empty" >&2
+    exit 1
+}
 printf 'quit\n' | hmp || true
 # HMP `quit` обычно завершает QEMU сразу, но закрытие Unix socket и обработка
 # команды могут состязаться. Bounded shutdown исключает вечный `wait` в CI.
@@ -452,4 +499,4 @@ for _ in $(seq 1 20); do
     sleep 0.1
 done
 stop_qemu
-echo "[gui-test] PASS: independent windows, lifecycle reset/reclaim, focus/Z-order, VFS + ring3 RUN, buffered drag/resize/minimize"
+echo "[gui-test] PASS: independent windows, desktop popup/settings, lifecycle, VFS + ring3 RUN, buffered drag/resize/minimize"

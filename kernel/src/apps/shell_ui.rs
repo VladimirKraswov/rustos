@@ -20,6 +20,8 @@ const COMMAND_START: CommandId = CommandId(1);
 const COMMAND_TERMINAL: CommandId = CommandId(2);
 const COMMAND_GALLERY: CommandId = CommandId(3);
 const COMMAND_SHUTDOWN: CommandId = CommandId(4);
+const COMMAND_ARRANGE_DESKTOP: CommandId = CommandId(5);
+const COMMAND_DESKTOP_PROPERTIES: CommandId = CommandId(6);
 
 const TEXT_START: ResourceId = ResourceId(1);
 const IMAGE_RUSTOS: ResourceId = ResourceId(2);
@@ -33,10 +35,15 @@ const IMAGE_POWER: ResourceId = ResourceId(9);
 const TEXT_TIME: ResourceId = ResourceId(10);
 const TEXT_DATE: ResourceId = ResourceId(11);
 const TEXT_APPLICATIONS: ResourceId = ResourceId(12);
+const TEXT_ARRANGE_DESKTOP: ResourceId = ResourceId(13);
+const TEXT_DESKTOP_PROPERTIES: ResourceId = ResourceId(14);
+const IMAGE_ARRANGE: ResourceId = ResourceId(15);
+const IMAGE_SETTINGS: ResourceId = ResourceId(16);
 
 type LauncherRuntime = Runtime<5, 16, 4>;
 type MenuRuntime = Runtime<18, 48, 8>;
 type ClockRuntime = Runtime<5, 12, 4>;
+type DesktopMenuRuntime = Runtime<9, 28, 6>;
 
 /// Команда shell, независимая от конкретной реализации window manager.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -45,6 +52,8 @@ pub enum ShellAction {
     ToggleStart,
     OpenTerminal,
     OpenGallery,
+    ArrangeDesktop,
+    OpenDesktopProperties,
     Shutdown,
 }
 
@@ -72,11 +81,14 @@ pub struct ShellUi {
     launcher: LauncherRuntime,
     menu: MenuRuntime,
     clock_view: ClockRuntime,
+    desktop_menu: DesktopMenuRuntime,
     clock: SystemClock,
     taskbar_height: u32,
     screen_width: u32,
     screen_height: u32,
     open: bool,
+    desktop_menu_open: bool,
+    desktop_menu_rect: Rect,
 }
 
 impl ShellUi {
@@ -87,18 +99,25 @@ impl ShellUi {
         let mut launcher = LauncherRuntime::new(launcher_rect, shell_theme());
         let mut menu = MenuRuntime::new(menu_rect, shell_theme());
         let mut clock_view = ClockRuntime::new(clock_rect, taskbar_theme());
+        let desktop_menu_rect =
+            desktop_popup_rect(8, 8, screen_width, screen_height, taskbar_height);
+        let mut desktop_menu = DesktopMenuRuntime::new(desktop_menu_rect, shell_theme());
         build_launcher(&mut launcher);
         build_menu(&mut menu);
         build_clock(&mut clock_view);
+        build_desktop_menu(&mut desktop_menu);
         Self {
             launcher,
             menu,
             clock_view,
+            desktop_menu,
             clock: SystemClock::new(now_ms),
             taskbar_height,
             screen_width,
             screen_height,
             open: false,
+            desktop_menu_open: false,
+            desktop_menu_rect,
         }
     }
 
@@ -111,6 +130,9 @@ impl ShellUi {
             return;
         }
         self.open = open;
+        if open {
+            self.desktop_menu_open = false;
+        }
         self.launcher.invalidate_all();
         if open {
             self.menu.invalidate_all();
@@ -119,6 +141,40 @@ impl ShellUi {
 
     pub fn toggle(&mut self) {
         self.set_open(!self.open);
+    }
+
+    pub const fn desktop_menu_is_open(&self) -> bool {
+        self.desktop_menu_open
+    }
+
+    pub const fn has_popup(&self) -> bool {
+        self.open || self.desktop_menu_open
+    }
+
+    /// Открывает desktop-owned context menu рядом с указателем и удерживает
+    /// его целиком внутри рабочей области, включая малые видеорежимы.
+    pub fn open_desktop_menu(&mut self, x: i32, y: i32) {
+        self.open = false;
+        self.desktop_menu_open = true;
+        self.desktop_menu_rect = desktop_popup_rect(
+            x,
+            y,
+            self.screen_width,
+            self.screen_height,
+            self.taskbar_height,
+        );
+        self.desktop_menu.resize(self.desktop_menu_rect);
+        self.desktop_menu.invalidate_all();
+        self.launcher.invalidate_all();
+    }
+
+    pub fn close_popups(&mut self) {
+        if !self.has_popup() {
+            return;
+        }
+        self.open = false;
+        self.desktop_menu_open = false;
+        self.launcher.invalidate_all();
     }
 
     pub fn resize(&mut self, screen_width: u32, screen_height: u32) {
@@ -130,6 +186,14 @@ impl ShellUi {
             .resize(menu_rect(screen_height, self.taskbar_height));
         self.clock_view
             .resize(clock_rect(screen_width, screen_height, self.taskbar_height));
+        self.desktop_menu_rect = desktop_popup_rect(
+            self.desktop_menu_rect.x,
+            self.desktop_menu_rect.y,
+            screen_width,
+            screen_height,
+            self.taskbar_height,
+        );
+        self.desktop_menu.resize(self.desktop_menu_rect);
     }
 
     pub fn pointer(&mut self, kind: PointerKind, x: i32, y: i32) -> ShellInputResult {
@@ -145,20 +209,39 @@ impl ShellUi {
                 consumed: false,
             }
         };
-        combine(launcher, menu)
+        let desktop = if self.desktop_menu_open {
+            self.desktop_menu.dispatch(event)
+        } else {
+            empty_dispatch()
+        };
+        combine(launcher, menu, desktop)
     }
 
     pub fn key(&mut self, key: Key, shift: bool) -> ShellInputResult {
-        if !self.open {
+        if !self.has_popup() {
             return ShellInputResult::NONE;
         }
-        let result = self.menu.dispatch(InputEvent::Key(KeyEvent {
+        let event = InputEvent::Key(KeyEvent {
             key,
             pressed: true,
             modifiers: 0,
             shift,
-        }));
+        });
+        let result = if self.desktop_menu_open {
+            self.desktop_menu.dispatch(event)
+        } else {
+            self.menu.dispatch(event)
+        };
         from_dispatch(result)
+    }
+
+    /// Применяет общий масштаб ко всем shell trees. Layout controls остаётся
+    /// стабильным, а theme вычисляет увеличенный em-size для Text/Button.
+    pub fn set_scale(&mut self, scale_milli: u16) {
+        self.launcher.set_theme(shell_theme_scaled(scale_milli));
+        self.menu.set_theme(shell_theme_scaled(scale_milli));
+        self.desktop_menu.set_theme(shell_theme_scaled(scale_milli));
+        self.clock_view.set_theme(taskbar_theme_scaled(scale_milli));
     }
 
     /// Читает wall clock с bounded частотой. `true` означает, что видимая
@@ -240,6 +323,28 @@ impl ShellUi {
             .unwrap_or_else(|_| FrameResult::empty())
     }
 
+    pub fn draw_desktop_menu(
+        &mut self,
+        framebuffer: &mut Framebuffer,
+        icon_pack: IconPack,
+        full: bool,
+    ) -> FrameResult<6> {
+        if full {
+            self.desktop_menu.invalidate_all();
+        }
+        let resources = ShellResources {
+            clock: &self.clock,
+            icon_pack,
+        };
+        let mut backend = ShellBackend {
+            framebuffer,
+            resources: &resources,
+        };
+        self.desktop_menu
+            .render(&mut backend)
+            .unwrap_or_else(|_| FrameResult::empty())
+    }
+
     pub fn launcher_rect(&self) -> Rect {
         launcher_rect(self.screen_height, self.taskbar_height)
     }
@@ -249,7 +354,9 @@ impl ShellUi {
     }
 
     pub fn interactive_at(&self, x: i32, y: i32) -> bool {
-        self.launcher_rect().contains(x, y) || self.open && self.menu_rect().contains(x, y)
+        self.launcher_rect().contains(x, y)
+            || self.open && self.menu_rect().contains(x, y)
+            || self.desktop_menu_open && self.desktop_menu_rect.contains(x, y)
     }
 
     pub fn clock_source(&self) -> &'static str {
@@ -446,16 +553,67 @@ fn build_clock(runtime: &mut ClockRuntime) {
     }
 }
 
-fn combine(launcher: DispatchResult, menu: DispatchResult) -> ShellInputResult {
+fn build_desktop_menu(runtime: &mut DesktopMenuRuntime) {
+    let root = runtime.tree().root();
+    let mut ui = runtime.builder();
+    let surface = ui
+        .menu(root, LayoutSpec::fill())
+        .unwrap_or(rustos_system_ui::NodeId::NONE);
+    if surface.is_none() {
+        return;
+    }
+    let mut column = NodeSpec::new(ComponentKind::Column);
+    column.layout = LayoutSpec {
+        width: Length::Fill(1),
+        height: Length::Fill(1),
+        padding: Edges::all(6),
+        gap: 6,
+        ..LayoutSpec::default()
+    };
+    let Ok(column) = ui.component(surface, column) else {
+        return;
+    };
+    add_menu_button(
+        &mut ui,
+        column,
+        TEXT_ARRANGE_DESKTOP,
+        IMAGE_ARRANGE,
+        COMMAND_ARRANGE_DESKTOP,
+    );
+    add_menu_button(
+        &mut ui,
+        column,
+        TEXT_DESKTOP_PROPERTIES,
+        IMAGE_SETTINGS,
+        COMMAND_DESKTOP_PROPERTIES,
+    );
+}
+
+fn combine(
+    launcher: DispatchResult,
+    menu: DispatchResult,
+    desktop: DispatchResult,
+) -> ShellInputResult {
     let command = if launcher.command != CommandId(0) {
         launcher.command
-    } else {
+    } else if menu.command != CommandId(0) {
         menu.command
+    } else {
+        desktop.command
     };
     ShellInputResult {
         action: action_for(command),
-        changed: launcher.changed || menu.changed,
-        consumed: launcher.consumed || menu.consumed,
+        changed: launcher.changed || menu.changed || desktop.changed,
+        consumed: launcher.consumed || menu.consumed || desktop.consumed,
+    }
+}
+
+const fn empty_dispatch() -> DispatchResult {
+    DispatchResult {
+        target: rustos_system_ui::NodeId::NONE,
+        command: CommandId(0),
+        changed: false,
+        consumed: false,
     }
 }
 
@@ -472,6 +630,8 @@ const fn action_for(command: CommandId) -> ShellAction {
         COMMAND_START => ShellAction::ToggleStart,
         COMMAND_TERMINAL => ShellAction::OpenTerminal,
         COMMAND_GALLERY => ShellAction::OpenGallery,
+        COMMAND_ARRANGE_DESKTOP => ShellAction::ArrangeDesktop,
+        COMMAND_DESKTOP_PROPERTIES => ShellAction::OpenDesktopProperties,
         COMMAND_SHUTDOWN => ShellAction::Shutdown,
         _ => ShellAction::None,
     }
@@ -506,13 +666,48 @@ fn clock_rect(screen_width: u32, screen_height: u32, taskbar_height: u32) -> Rec
     )
 }
 
+fn desktop_popup_rect(
+    requested_x: i32,
+    requested_y: i32,
+    screen_width: u32,
+    screen_height: u32,
+    taskbar_height: u32,
+) -> Rect {
+    let width = 244u32.min(screen_width.saturating_sub(8).max(1));
+    let height = 114u32.min(
+        screen_height
+            .saturating_sub(taskbar_height)
+            .saturating_sub(8)
+            .max(1),
+    );
+    let max_x = screen_width.saturating_sub(width + 4) as i32;
+    let max_y = screen_height.saturating_sub(taskbar_height + height + 4) as i32;
+    Rect::new(
+        requested_x.clamp(4, max_x.max(4)),
+        requested_y.clamp(4, max_y.max(4)),
+        width,
+        height,
+    )
+}
+
 const fn shell_theme() -> Theme {
     Theme::dark()
 }
 
+fn shell_theme_scaled(scale_milli: u16) -> Theme {
+    let mut theme = Theme::dark();
+    theme.scale_milli = scale_milli;
+    theme
+}
+
 fn taskbar_theme() -> Theme {
+    taskbar_theme_scaled(1_000)
+}
+
+fn taskbar_theme_scaled(scale_milli: u16) -> Theme {
     let mut theme = Theme::dark();
     theme.palette.window = Color::rgb(13, 19, 30);
+    theme.scale_milli = scale_milli;
     theme
 }
 
@@ -532,6 +727,8 @@ impl ShellResources<'_> {
             TEXT_TIME => self.clock.time_text(),
             TEXT_DATE => self.clock.date_text(),
             TEXT_APPLICATIONS => "APPLICATIONS",
+            TEXT_ARRANGE_DESKTOP => "ARRANGE ICONS",
+            TEXT_DESKTOP_PROPERTIES => "PROPERTIES",
             _ => "",
         }
     }
@@ -563,7 +760,14 @@ impl RenderBackend for ShellBackend<'_, '_, '_> {
         if rect.intersection(clip).is_empty() {
             return;
         }
-        let mut style = font::FontStyle::sans(spec.size.clamp(10, 48));
+        // Две строки часов обязаны помещаться в неизменную высоту taskbar;
+        // основные подписи shell масштабируются полностью.
+        let size = if matches!(resource, TEXT_TIME | TEXT_DATE) {
+            spec.size.min(16)
+        } else {
+            spec.size
+        };
+        let mut style = font::FontStyle::sans(size.clamp(10, 48));
         if spec.bold {
             style = style.bold();
         }
@@ -595,6 +799,16 @@ impl RenderBackend for ShellBackend<'_, '_, '_> {
                     .draw(self.framebuffer, IconKind::Terminal, rect);
             }
             IMAGE_POWER => draw_power(self.framebuffer, rect),
+            IMAGE_ARRANGE => {
+                self.resources
+                    .icon_pack
+                    .draw(self.framebuffer, IconKind::Folder, rect);
+            }
+            IMAGE_SETTINGS => {
+                self.resources
+                    .icon_pack
+                    .draw(self.framebuffer, IconKind::Settings, rect);
+            }
             _ => {}
         }
     }

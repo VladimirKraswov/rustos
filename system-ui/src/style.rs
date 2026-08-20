@@ -134,6 +134,7 @@ impl Theme {
         let disabled = state.contains(NodeState::DISABLED);
         let hovered = state.contains(NodeState::HOVERED);
         let pressed = state.contains(NodeState::PRESSED);
+        let selected = state.contains(NodeState::SELECTED);
         let invalid = state.contains(NodeState::INVALID);
         let interactive = kind.focusable();
         let mut background = match kind {
@@ -156,6 +157,9 @@ impl Theme {
             }
             _ => None,
         };
+        if interactive && selected {
+            background = Some(self.palette.accent);
+        }
         if interactive && hovered {
             background = Some(self.palette.accent_hover);
         }
@@ -173,6 +177,9 @@ impl Theme {
         } else {
             self.palette.text
         };
+        let base_font_size: u16 = if kind == ComponentKind::Text { 16 } else { 14 };
+        let font_size = (u32::from(base_font_size) * u32::from(self.scale_milli.max(500)) / 1_000)
+            .clamp(10, 48) as u16;
         ComputedStyle {
             background,
             foreground,
@@ -183,7 +190,7 @@ impl Theme {
             },
             focus: self.palette.focus,
             border_width: u8::from(interactive || background.is_some()),
-            font_size: if kind == ComponentKind::Text { 16 } else { 14 },
+            font_size,
             bold: style == 1,
         }
     }
@@ -212,4 +219,18 @@ pub struct ComputedStyle {
     pub font_size: u16,
     /// Жирное начертание.
     pub bold: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn selected_control_and_scale_are_resolved_by_shared_theme() {
+        let mut theme = Theme::dark();
+        theme.scale_milli = 1_500;
+        let style = theme.resolve(ComponentKind::Button, NodeState::SELECTED, 0);
+        assert_eq!(style.background, Some(theme.palette.accent));
+        assert_eq!(style.font_size, 21);
+    }
 }

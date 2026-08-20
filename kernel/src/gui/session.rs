@@ -10,6 +10,7 @@ use core::{mem::size_of, ptr};
 
 use crate::{
     apps::{
+        desktop_settings::{DesktopSettings, DesktopSettingsAction, DesktopSettingsSnapshot},
         shell_ui::{active_icon_or_default, ShellAction, ShellUi},
         terminal::{
             CursorCommand, CursorThemeName, IconThemeName, MouseCommand, Terminal, TerminalAction,
@@ -41,8 +42,8 @@ use rustos_system_assets::{
 };
 use rustos_system_ui::{Key as UiKey, PointerKind as UiPointerKind};
 use rustos_video::{
-    hit_test_resize, resize_from_edges, DamageRegion, DisplayDriver, DisplayMode, ManagedWindow,
-    PixelFormat, ResizeEdges, Scanout, WindowEventQueue,
+    hit_test_resize, resize_from_edges, ColorMode, DamageRegion, DisplayDriver, DisplayMode,
+    ManagedWindow, ModeSetError, PixelFormat, ResizeEdges, Scanout, WindowEventQueue,
 };
 
 const TASKBAR_HEIGHT: u32 = 46;
@@ -54,6 +55,8 @@ const TERMINAL_MIN_WIDTH: u32 = 480;
 const TERMINAL_MIN_HEIGHT: u32 = 300;
 const GALLERY_MIN_WIDTH: u32 = 560;
 const GALLERY_MIN_HEIGHT: u32 = 360;
+const SETTINGS_MIN_WIDTH: u32 = 620;
+const SETTINGS_MIN_HEIGHT: u32 = 560;
 
 /// Bounded registry защищает ядро от исчерпания памяти одним GUI-клиентом.
 /// Состояние приложений при этом выделяется динамически из frame allocator,
@@ -141,6 +144,7 @@ enum WindowInteraction {
 enum ApplicationKind {
     Terminal,
     UiShowcase,
+    DesktopSettings,
 }
 
 impl ApplicationKind {
@@ -148,6 +152,7 @@ impl ApplicationKind {
         match self {
             Self::Terminal => "RUSTOS · ТЕРМИНАЛ",
             Self::UiShowcase => "RUSTOS · SYSTEM UI GALLERY",
+            Self::DesktopSettings => "RUSTOS · СВОЙСТВА РАБОЧЕГО СТОЛА",
         }
     }
 
@@ -155,6 +160,7 @@ impl ApplicationKind {
         match self {
             Self::Terminal => "TERMINAL",
             Self::UiShowcase => "UI GALLERY",
+            Self::DesktopSettings => "SETTINGS",
         }
     }
 
@@ -162,6 +168,7 @@ impl ApplicationKind {
         match self {
             Self::Terminal => (TERMINAL_MIN_WIDTH, TERMINAL_MIN_HEIGHT),
             Self::UiShowcase => (GALLERY_MIN_WIDTH, GALLERY_MIN_HEIGHT),
+            Self::DesktopSettings => (SETTINGS_MIN_WIDTH, SETTINGS_MIN_HEIGHT),
         }
     }
 }
@@ -169,6 +176,7 @@ impl ApplicationKind {
 enum Application {
     Terminal(Terminal),
     UiShowcase(UiShowcase),
+    DesktopSettings(DesktopSettings),
 }
 
 impl Application {
@@ -176,6 +184,7 @@ impl Application {
         match self {
             Self::Terminal(_) => ApplicationKind::Terminal,
             Self::UiShowcase(_) => ApplicationKind::UiShowcase,
+            Self::DesktopSettings(_) => ApplicationKind::DesktopSettings,
         }
     }
 }
@@ -301,6 +310,7 @@ struct DesktopSession {
     mouse_x: i32,
     mouse_y: i32,
     previous_left: bool,
+    previous_right: bool,
     /// Start/taskbar UI — такой же component runtime, как интерфейс обычного
     /// приложения; оконный сервер получает от него только команды.
     shell: ShellUi,
@@ -310,6 +320,11 @@ struct DesktopSession {
     drag_preview_visible: bool,
     desktop_icon_selected: bool,
     desktop_icon_pressed: bool,
+    desktop_terminal_x: i32,
+    desktop_terminal_y: i32,
+    desktop_trash_x: i32,
+    desktop_trash_y: i32,
+    ui_scale_milli: u16,
     click_tracker: ClickTracker,
 }
 
@@ -354,6 +369,7 @@ impl DesktopSession {
             mouse_x: (screen_width / 2) as i32,
             mouse_y: (screen_height / 2) as i32,
             previous_left: false,
+            previous_right: false,
             shell,
             drag_frames: 0,
             drag_packets: 0,
@@ -361,6 +377,11 @@ impl DesktopSession {
             drag_preview_visible: false,
             desktop_icon_selected: false,
             desktop_icon_pressed: false,
+            desktop_terminal_x: 28,
+            desktop_terminal_y: 35,
+            desktop_trash_x: 28,
+            desktop_trash_y: 138,
+            ui_scale_milli: 1_000,
             click_tracker: ClickTracker::new(),
         }
     }
@@ -500,10 +521,10 @@ impl DesktopSession {
     }
 
     fn handle_key(&mut self, key: Key) -> Redraw {
-        if self.shell.is_open() {
+        if self.shell.has_popup() {
             if matches!(key, Key::Escape) {
-                self.shell.set_open(false);
-                serial::put_str("[start] closed by keyboard\n");
+                self.shell.close_popups();
+                serial::put_str("[desktop-menu] closed by keyboard\n");
                 return Redraw::Scene;
             }
             let ui_key = match key {
@@ -556,6 +577,17 @@ impl DesktopSession {
                     Redraw::None
                 }
             }
+            Some(ApplicationKind::DesktopSettings) => {
+                let key = match key {
+                    Key::Tab => UiKey::Tab,
+                    Key::Enter => UiKey::Enter,
+                    Key::Escape => UiKey::Escape,
+                    Key::Character(b' ') => UiKey::Space,
+                    Key::Character(byte) if byte.is_ascii() => UiKey::Character(char::from(byte)),
+                    Key::Backspace | Key::Character(_) => return Redraw::None,
+                };
+                self.handle_settings_key(id, key)
+            }
             Some(ApplicationKind::Terminal) => self.handle_terminal_key(id, key),
             None => Redraw::None,
         }
@@ -585,11 +617,148 @@ impl DesktopSession {
                 serial::put_str("[start] command=ui-gallery\n");
                 Redraw::Scene
             }
+            ShellAction::ArrangeDesktop => {
+                self.shell.close_popups();
+                self.arrange_desktop_icons();
+                serial::put_str("[desktop-menu] command=arrange-icons\n");
+                Redraw::Scene
+            }
+            ShellAction::OpenDesktopProperties => {
+                self.shell.close_popups();
+                let _ = self.open_or_focus_application(ApplicationKind::DesktopSettings);
+                serial::put_str("[desktop-menu] command=properties\n");
+                Redraw::Scene
+            }
             ShellAction::Shutdown => {
                 serial::put_str("[start] command=shutdown\n");
                 shutdown()
             }
         }
+    }
+
+    fn handle_settings_key(&mut self, id: WindowId, key: UiKey) -> Redraw {
+        let result = match self.application_mut(id) {
+            Some(Application::DesktopSettings(settings)) => settings.key(key, false),
+            _ => return Redraw::None,
+        };
+        if result.action != DesktopSettingsAction::None {
+            self.apply_desktop_settings_action(result.action);
+            Redraw::Scene
+        } else if result.changed {
+            Redraw::Scene
+        } else {
+            Redraw::None
+        }
+    }
+
+    fn handle_settings_pointer(
+        &mut self,
+        id: WindowId,
+        kind: UiPointerKind,
+        x: i32,
+        y: i32,
+    ) -> Redraw {
+        let result = match self.application_mut(id) {
+            Some(Application::DesktopSettings(settings)) => settings.pointer(kind, x, y),
+            _ => return Redraw::None,
+        };
+        if result.action != DesktopSettingsAction::None {
+            self.apply_desktop_settings_action(result.action);
+            Redraw::Scene
+        } else if result.changed {
+            Redraw::Scene
+        } else {
+            Redraw::None
+        }
+    }
+
+    fn apply_desktop_settings_action(&mut self, action: DesktopSettingsAction) {
+        match action {
+            DesktopSettingsAction::None => return,
+            DesktopSettingsAction::SetResolution { width, height } => {
+                let current = self.framebuffer.mode();
+                let requested = DisplayMode {
+                    width,
+                    height,
+                    stride_pixels: width,
+                    format: current.format,
+                    refresh_millihertz: current.refresh_millihertz,
+                };
+                let result = self.framebuffer.set_mode(requested);
+                if result.is_ok() {
+                    self.relayout_after_mode_set();
+                }
+                serial::put_str("[settings] resolution=");
+                serial::put_u32(width);
+                serial::put_str("x");
+                serial::put_u32(height);
+                serial::put_str(" result=");
+                serial::put_str(mode_set_result_name(result));
+                serial::put_str("\n");
+            }
+            DesktopSettingsAction::SetColor(mode) => {
+                self.framebuffer.set_color_mode(mode);
+                serial::put_str("[settings] color=");
+                serial::put_str(color_mode_name(mode));
+                serial::put_str("\n");
+            }
+            DesktopSettingsAction::SetWallpaper(selected) => {
+                self.wallpaper = selected;
+                serial::put_str("[settings] wallpaper=");
+                serial::put_str(wallpaper(selected).name);
+                serial::put_str("\n");
+            }
+            DesktopSettingsAction::SetUiScale(scale_milli) => {
+                self.ui_scale_milli = scale_milli.clamp(1_000, 1_500);
+                self.shell.set_scale(self.ui_scale_milli);
+                for slot in self.windows.iter_mut().flatten() {
+                    if let Application::UiShowcase(showcase) = slot.application.get_mut() {
+                        showcase.set_scale(self.ui_scale_milli);
+                    }
+                }
+                serial::put_str("[settings] ui-scale=");
+                serial::put_u32(u32::from(self.ui_scale_milli));
+                serial::put_str("\n");
+            }
+        }
+        self.sync_desktop_settings();
+    }
+
+    fn desktop_settings_snapshot(&self) -> DesktopSettingsSnapshot {
+        let mode = self.framebuffer.mode();
+        DesktopSettingsSnapshot {
+            width: mode.width,
+            height: mode.height,
+            color: self.framebuffer.color_mode(),
+            wallpaper: self.wallpaper,
+            ui_scale_milli: self.ui_scale_milli,
+        }
+    }
+
+    fn sync_desktop_settings(&mut self) {
+        let snapshot = self.desktop_settings_snapshot();
+        for slot in self.windows.iter_mut().flatten() {
+            if let Application::DesktopSettings(settings) = slot.application.get_mut() {
+                settings.sync(snapshot);
+            }
+        }
+    }
+
+    fn arrange_desktop_icons(&mut self) {
+        self.desktop_terminal_x = 28;
+        self.desktop_terminal_y = 35;
+        self.desktop_trash_x = 28;
+        self.desktop_trash_y = 138;
+        self.desktop_icon_selected = false;
+        self.desktop_icon_pressed = false;
+    }
+
+    fn desktop_background_at(&self, x: i32, y: i32) -> bool {
+        y >= 0
+            && y < self.framebuffer.height() as i32 - TASKBAR_HEIGHT as i32
+            && self.top_window_at(x, y).is_none()
+            && !self.desktop_terminal_icon().contains(x, y)
+            && !self.desktop_trash_icon().contains(x, y)
     }
 
     fn handle_terminal_key(&mut self, id: WindowId, key: Key) -> Redraw {
@@ -663,6 +832,7 @@ impl DesktopSession {
                 if let Some(Application::Terminal(terminal)) = self.application_mut(id) {
                     terminal.report_display_mode(width, height, result);
                 }
+                self.sync_desktop_settings();
                 Redraw::Scene
             }
             TerminalAction::DisplayColor(mode) => {
@@ -677,6 +847,7 @@ impl DesktopSession {
                     rustos_video::ColorMode::Grayscale8 => "gray8",
                 });
                 serial::put_str("\n");
+                self.sync_desktop_settings();
                 Redraw::Scene
             }
             TerminalAction::OpenUiShowcase => {
@@ -788,6 +959,7 @@ impl DesktopSession {
                 serial::put_str("[desktop] wallpaper=");
                 serial::put_str(wallpaper(selected).name);
                 serial::put_str("\n");
+                self.sync_desktop_settings();
                 Redraw::Scene
             }
             TerminalAction::Shutdown => shutdown(),
@@ -795,7 +967,9 @@ impl DesktopSession {
     }
 
     fn handle_mouse(&mut self, event: MouseEvent) -> Redraw {
-        let _secondary_pressed = event.right || event.middle;
+        let right_pressed = event.right && !self.previous_right;
+        self.previous_right = event.right;
+        let _middle_pressed = event.middle;
         self.mouse_x = (self.mouse_x + event.dx as i32)
             .clamp(0, self.framebuffer.width().saturating_sub(1) as i32);
         self.mouse_y = (self.mouse_y + event.dy as i32)
@@ -870,6 +1044,22 @@ impl DesktopSession {
             WindowInteraction::None => {}
         }
 
+        if right_pressed {
+            if self.desktop_background_at(self.mouse_x, self.mouse_y) {
+                self.shell.open_desktop_menu(self.mouse_x, self.mouse_y);
+                serial::put_str("[desktop-menu] opened component-runtime=system-ui-v1 x=");
+                serial::put_u32(self.mouse_x as u32);
+                serial::put_str(" y=");
+                serial::put_u32(self.mouse_y as u32);
+                serial::put_str("\n");
+                return Redraw::Scene;
+            }
+            if self.shell.has_popup() {
+                self.shell.close_popups();
+                return Redraw::Scene;
+            }
+        }
+
         let was_left = self.previous_left;
         let pressed = event.left && !was_left;
         let released = !event.left && was_left;
@@ -903,9 +1093,9 @@ impl DesktopSession {
         if shell_result.action != ShellAction::None {
             return self.handle_shell_action(shell_result.action);
         }
-        if pressed && self.shell.is_open() && !self.shell.interactive_at(x, y) {
-            self.shell.set_open(false);
-            serial::put_str("[start] closed by outside click\n");
+        if pressed && self.shell.has_popup() && !self.shell.interactive_at(x, y) {
+            self.shell.close_popups();
+            serial::put_str("[desktop-menu] closed by outside click\n");
             return Redraw::Scene;
         }
         if shell_result.changed || shell_result.consumed {
@@ -920,8 +1110,7 @@ impl DesktopSession {
             let Some(id) = self.focused else {
                 return Redraw::None;
             };
-            if self.window_kind(id) == Some(ApplicationKind::UiShowcase)
-                && self.window_is_visible(id)
+            if self.window_is_visible(id)
                 && (self
                     .window_content_rect(id)
                     .is_some_and(|rect| rect.contains(self.mouse_x, self.mouse_y))
@@ -934,12 +1123,22 @@ impl DesktopSession {
                 };
                 let x = self.mouse_x;
                 let y = self.mouse_y;
-                let changed = match self.application_mut(id) {
-                    Some(Application::UiShowcase(showcase)) => showcase.pointer(kind, x, y, 0),
-                    _ => false,
-                };
-                if changed {
-                    return Redraw::Scene;
+                match self.window_kind(id) {
+                    Some(ApplicationKind::UiShowcase) => {
+                        let changed = match self.application_mut(id) {
+                            Some(Application::UiShowcase(showcase)) => {
+                                showcase.pointer(kind, x, y, 0)
+                            }
+                            _ => false,
+                        };
+                        if changed {
+                            return Redraw::Scene;
+                        }
+                    }
+                    Some(ApplicationKind::DesktopSettings) => {
+                        return self.handle_settings_pointer(id, kind, x, y);
+                    }
+                    Some(ApplicationKind::Terminal) | None => {}
                 }
             }
             return Redraw::None;
@@ -1022,22 +1221,34 @@ impl DesktopSession {
             return Redraw::None;
         }
 
-        if self.window_kind(id) == Some(ApplicationKind::UiShowcase)
-            && self
-                .window_content_rect(id)
-                .is_some_and(|content| content.contains(x, y))
+        if self
+            .window_content_rect(id)
+            .is_some_and(|content| content.contains(x, y))
         {
-            let changed = match self.application_mut(id) {
-                Some(Application::UiShowcase(showcase)) => {
-                    showcase.pointer(UiPointerKind::Down, x, y, 0)
+            match self.window_kind(id) {
+                Some(ApplicationKind::UiShowcase) => {
+                    let changed = match self.application_mut(id) {
+                        Some(Application::UiShowcase(showcase)) => {
+                            showcase.pointer(UiPointerKind::Down, x, y, 0)
+                        }
+                        _ => false,
+                    };
+                    return if changed || focus_changed {
+                        Redraw::Scene
+                    } else {
+                        Redraw::None
+                    };
                 }
-                _ => false,
-            };
-            return if changed || focus_changed {
-                Redraw::Scene
-            } else {
-                Redraw::None
-            };
+                Some(ApplicationKind::DesktopSettings) => {
+                    let redraw = self.handle_settings_pointer(id, UiPointerKind::Down, x, y);
+                    return if redraw == Redraw::None && focus_changed {
+                        Redraw::Scene
+                    } else {
+                        redraw
+                    };
+                }
+                Some(ApplicationKind::Terminal) | None => {}
+            }
         }
 
         let Some(rect) = self.window_rect(id) else {
@@ -1152,7 +1363,15 @@ impl DesktopSession {
             ApplicationKind::Terminal => {
                 Application::Terminal(Terminal::new(self.usable_ram_mib, self.initramfs))
             }
-            ApplicationKind::UiShowcase => Application::UiShowcase(UiShowcase::new(content)),
+            ApplicationKind::UiShowcase => {
+                let mut showcase = UiShowcase::new(content);
+                showcase.set_scale(self.ui_scale_milli);
+                Application::UiShowcase(showcase)
+            }
+            ApplicationKind::DesktopSettings => Application::DesktopSettings(DesktopSettings::new(
+                content,
+                self.desktop_settings_snapshot(),
+            )),
         };
         let memory = ApplicationMemory::new(application)?;
         let frames = memory.frames();
@@ -1186,6 +1405,21 @@ impl DesktopSession {
         }
         serial::put_str("\n");
         Some(id)
+    }
+
+    fn open_or_focus_application(&mut self, kind: ApplicationKind) -> Option<WindowId> {
+        if let Some(id) = self.z_order[..self.window_count]
+            .iter()
+            .copied()
+            .find(|id| self.window_kind(*id) == Some(kind))
+        {
+            if self.window_is_minimized(id) {
+                let _ = self.apply_window_command(WindowCommand::restore(id));
+            }
+            self.focus_window(id);
+            return Some(id);
+        }
+        self.spawn_application(kind)
     }
 
     fn close_window(&mut self, id: WindowId) {
@@ -1235,8 +1469,23 @@ impl DesktopSession {
         // Сохраняем просторную geometry прежнего desktop: терминал на
         // 1280x800 получает 1040x640. Cascade меняет только позицию новых
         // экземпляров, а не неожиданно уменьшает рабочую область приложения.
-        let width = fit_window_extent(self.framebuffer.width(), 180, minimum_width, 1040);
-        let height = fit_window_extent(work_height, 114, minimum_height, 650);
+        let preferred_width = if kind == ApplicationKind::DesktopSettings {
+            760
+        } else {
+            1040
+        };
+        let preferred_height = if kind == ApplicationKind::DesktopSettings {
+            620
+        } else {
+            650
+        };
+        let width = fit_window_extent(
+            self.framebuffer.width(),
+            180,
+            minimum_width,
+            preferred_width,
+        );
+        let height = fit_window_extent(work_height, 114, minimum_height, preferred_height);
         let step = (self.cascade % 10) as i32 * 28;
         let work = self.window_work_area();
         let max_x = work
@@ -1430,8 +1679,10 @@ impl DesktopSession {
         self.previous_left = false;
         if resized {
             if let Some(content) = self.window_content_rect(window) {
-                if let Some(Application::UiShowcase(showcase)) = self.application_mut(window) {
-                    showcase.resize(content);
+                match self.application_mut(window) {
+                    Some(Application::UiShowcase(showcase)) => showcase.resize(content),
+                    Some(Application::DesktopSettings(settings)) => settings.resize(content),
+                    Some(Application::Terminal(_)) | None => {}
                 }
             }
         }
@@ -1459,8 +1710,10 @@ impl DesktopSession {
             let event = if let Some(slot) = self.windows[index].as_mut() {
                 let event = slot.model.reflow(work_area);
                 let content = content_rect_for(&slot.model);
-                if let Application::UiShowcase(showcase) = slot.application.get_mut() {
-                    showcase.resize(content);
+                match slot.application.get_mut() {
+                    Application::UiShowcase(showcase) => showcase.resize(content),
+                    Application::DesktopSettings(settings) => settings.resize(content),
+                    Application::Terminal(_) => {}
                 }
                 Some(event)
             } else {
@@ -1496,6 +1749,9 @@ impl DesktopSession {
             if self.window_is_visible(id) {
                 self.render_window(id);
             }
+        }
+        if self.shell.desktop_menu_is_open() {
+            self.render_desktop_menu();
         }
         if self.shell.is_open() {
             self.render_start_menu();
@@ -1553,7 +1809,7 @@ impl DesktopSession {
             rect.y + 11,
             title,
             Theme::TEXT,
-            font::UI_TITLE,
+            font::UI_TITLE.scaled(self.ui_scale_milli),
         );
     }
 
@@ -1626,7 +1882,7 @@ impl DesktopSession {
             branding_y + 1,
             arch::ARCH_NAME,
             Color::rgb(8, 14, 22),
-            font::UI_SMALL.italic(),
+            font::UI_SMALL.italic().scaled(self.ui_scale_milli),
         );
         font::draw_text(
             &mut self.framebuffer,
@@ -1634,7 +1890,7 @@ impl DesktopSession {
             branding_y,
             arch::ARCH_NAME,
             Color::rgb(221, 238, 244),
-            font::UI_SMALL.italic(),
+            font::UI_SMALL.italic().scaled(self.ui_scale_milli),
         );
     }
 
@@ -1655,7 +1911,7 @@ impl DesktopSession {
             terminal.y + 61,
             "TERMINAL",
             Theme::TEXT,
-            font::UI_SMALL.bold(),
+            font::UI_SMALL.bold().scaled(self.ui_scale_milli),
         );
         let trash = self.desktop_trash_icon();
         self.draw_system_icon(
@@ -1668,7 +1924,7 @@ impl DesktopSession {
             trash.y + 63,
             "TRASH",
             Theme::TEXT,
-            font::UI_SMALL.bold(),
+            font::UI_SMALL.bold().scaled(self.ui_scale_milli),
         );
     }
 
@@ -1736,6 +1992,10 @@ impl DesktopSession {
                 ApplicationKind::UiShowcase => {
                     components::start_icon(&mut self.framebuffer, rect.x + 8, rect.y + 6)
                 }
+                ApplicationKind::DesktopSettings => self.draw_system_icon(
+                    IconKind::Settings,
+                    Rect::new(rect.x + 8, rect.y + 6, 22, 22),
+                ),
             }
             Label {
                 rect: Rect::new(rect.x + 38, rect.y + 8, 310, 22),
@@ -1745,7 +2005,7 @@ impl DesktopSession {
                 } else {
                     Theme::TEXT_MUTED
                 },
-                style: font::UI_TITLE,
+                style: font::UI_TITLE.scaled(self.ui_scale_milli),
             }
             .draw(&mut self.framebuffer);
             let (minimize, maximize, close) = self.window_controls(id);
@@ -1811,6 +2071,10 @@ impl DesktopSession {
                 showcase.resize(content);
                 let _ = showcase.draw(framebuffer, true);
             }
+            Application::DesktopSettings(settings) => {
+                settings.resize(content);
+                let _ = settings.draw(framebuffer, true);
+            }
         }
     }
 
@@ -1822,7 +2086,7 @@ impl DesktopSession {
         let slot = windows[index].as_mut()?;
         match slot.application.get_mut() {
             Application::Terminal(terminal) => terminal.draw_input_line(framebuffer, content),
-            Application::UiShowcase(_) => None,
+            Application::UiShowcase(_) | Application::DesktopSettings(_) => None,
         }
     }
 
@@ -1864,6 +2128,10 @@ impl DesktopSession {
                 ApplicationKind::UiShowcase => {
                     components::start_icon(&mut self.framebuffer, task.x + 7, task.y + 8)
                 }
+                ApplicationKind::DesktopSettings => self.draw_system_icon(
+                    IconKind::Settings,
+                    Rect::new(task.x + 6, task.y + 6, 26, 26),
+                ),
             }
             if task.width >= 92 {
                 font::draw_text(
@@ -1876,7 +2144,7 @@ impl DesktopSession {
                     } else {
                         Theme::TEXT
                     },
-                    font::UI_SMALL,
+                    font::UI_SMALL.scaled(self.ui_scale_milli),
                 );
             }
         }
@@ -1890,12 +2158,19 @@ impl DesktopSession {
         let _ = self.shell.draw_menu(&mut self.framebuffer, icon_pack, true);
     }
 
+    fn render_desktop_menu(&mut self) {
+        let icon_pack = active_icon_or_default(self.icon_packs.active());
+        let _ = self
+            .shell
+            .draw_desktop_menu(&mut self.framebuffer, icon_pack, true);
+    }
+
     fn desktop_terminal_icon(&self) -> Rect {
-        Rect::new(28, 35, 74, 86)
+        Rect::new(self.desktop_terminal_x, self.desktop_terminal_y, 74, 86)
     }
 
     fn desktop_trash_icon(&self) -> Rect {
-        Rect::new(28, 138, 74, 82)
+        Rect::new(self.desktop_trash_x, self.desktop_trash_y, 74, 82)
     }
 
     fn task_button(&self, index: usize, count: usize) -> Rect {
@@ -2075,6 +2350,24 @@ fn cursor_name(kind: PointerCursor) -> &'static str {
         PointerCursor::ResizeVertical => "VRESIZE",
         PointerCursor::ResizeNwSe => "NWSE",
         PointerCursor::ResizeNeSw => "NESW",
+    }
+}
+
+fn color_mode_name(mode: ColorMode) -> &'static str {
+    match mode {
+        ColorMode::TrueColor24 => "truecolor24",
+        ColorMode::HighColor16 => "rgb565",
+        ColorMode::Grayscale8 => "gray8",
+    }
+}
+
+fn mode_set_result_name(result: Result<DisplayMode, ModeSetError>) -> &'static str {
+    match result {
+        Ok(_) => "active",
+        Err(ModeSetError::RequiresReboot) => "reboot-required",
+        Err(ModeSetError::UnsupportedMode) => "unsupported",
+        Err(ModeSetError::OutOfMemory) => "out-of-memory",
+        Err(ModeSetError::DeviceLost) => "device-lost",
     }
 }
 
