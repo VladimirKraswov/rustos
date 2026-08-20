@@ -49,9 +49,19 @@ use uefi::{boot::AllocateType, prelude::*, system};
 
 /// Образ ядра, встроенный на этапе сборки (собирается до загрузчика).
 /// Путь относительный от `boot/uefi/src/main.rs` → `boot/uefi/payload/`.
+// Clippy анализирует загрузчик отдельно от полного build pipeline, поэтому в
+// этом режиме ему не нужны сгенерированные бинарные payload-файлы. Обычная
+// сборка по-прежнему жёстко требует реальный ELF и тем самым не сможет
+// случайно выпустить пустой загрузочный образ.
+#[cfg(not(clippy))]
 static KERNEL_ELF: &[u8] = include_bytes!("../payload/kernel.elf");
+#[cfg(clippy)]
+static KERNEL_ELF: &[u8] = &[];
 /// initramfs (RIFS v1, `tools/pack`), встроенный на этапе сборки.
+#[cfg(not(clippy))]
 static INITRAMFS: &[u8] = include_bytes!("../payload/initramfs.img");
+#[cfg(clippy)]
+static INITRAMFS: &[u8] = &[];
 
 /// Минимальный адрес резерва ядра (не трогать низ памяти: SMBIOS/EBDA и т.п.).
 const RESERVATION_MIN_ADDR: u64 = 16 * 1024 * 1024;
