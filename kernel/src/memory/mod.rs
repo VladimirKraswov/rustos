@@ -7,5 +7,5 @@
 mod address_space;
 mod frame;
 
-pub use address_space::{AddressSpace, UserPageFlags};
-pub use frame::{allocate, free, initialize, stats, FrameBlock};
+pub use address_space::{AddressSpace, AddressSpaceError, UserPageBacking, UserPageFlags};
+pub use frame::{allocate, free, initialize, stats, FrameAllocatorError, FrameBlock};

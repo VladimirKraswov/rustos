@@ -8,7 +8,7 @@
 /// инструкции `svc` равно нулю.
 pub const INTERRUPT_VECTOR: u8 = 0x80;
 /// Версия syscall ABI, передаваемая вторым bootstrap-аргументом.
-pub const ABI_VERSION: u64 = 1;
+pub const ABI_VERSION: u64 = 2;
 
 /// Номера операций (`RAX`).
 pub mod number {
@@ -25,6 +25,39 @@ pub mod number {
     /// Получить сообщение или блокировать текущий поток до его появления.
     /// `RDI=endpoint handle, RSI=*mut Message`.
     pub const IPC_RECEIVE: u64 = 4;
+    /// Создать ELF64-процесс из доступного вызывающему VFS namespace.
+    /// `arg0=*const ProcessSpawnRequest, arg1=*mut ProcessSpawnResult`.
+    pub const PROCESS_SPAWN: u64 = 5;
+    /// Ждать завершения процесса. `arg0=process handle, arg1=*mut ExitReason`.
+    pub const PROCESS_WAIT: u64 = 6;
+    /// Завершить процесс. `arg0=process handle, arg1=status`.
+    pub const PROCESS_KILL: u64 = 7;
+    /// Создать поток в текущем address space.
+    /// `arg0=*const ThreadCreateRequest, arg1=*mut ThreadCreateResult`.
+    pub const THREAD_CREATE: u64 = 8;
+    /// Завершить только вызывающий поток (`arg0=status`).
+    pub const THREAD_EXIT: u64 = 9;
+    /// Ждать завершения потока. `arg0=thread handle, arg1=*mut ExitReason`.
+    pub const THREAD_JOIN: u64 = 10;
+    /// Изменить thread pointer/TLS текущего потока (`arg0=address`).
+    pub const THREAD_SET_TLS: u64 = 11;
+    /// Отобразить новые анонимные zero-filled страницы.
+    /// `arg0=*const VmMapRequest`; результат — virtual address.
+    pub const VM_MAP: u64 = 12;
+    /// Удалить отображение (`arg0=address, arg1=length`).
+    pub const VM_UNMAP: u64 = 13;
+    /// Изменить права отображения (`arg0=address, arg1=length, arg2=VmFlags`).
+    pub const VM_PROTECT: u64 = 14;
+    /// Создать объект разделяемой памяти.
+    /// `arg0=*const SharedMemoryCreate`; результат — capability handle.
+    pub const SHARED_MEMORY_CREATE: u64 = 15;
+    /// Отобразить shared-memory capability.
+    /// `arg0=handle, arg1=*const SharedMemoryMap`; результат — virtual address.
+    pub const SHARED_MEMORY_MAP: u64 = 16;
+    /// Закрыть capability handle (`arg0=handle`).
+    pub const HANDLE_CLOSE: u64 = 17;
+    /// Монотонное время в наносекундах от аппаратной эпохи.
+    pub const CLOCK_MONOTONIC: u64 = 18;
 }
 
 /// Отрицательные результаты syscall. Не совпадают с Unix errno намеренно:
@@ -48,4 +81,10 @@ pub mod status {
     pub const QUEUE_FULL: i64 = -7;
     /// Все потоки заблокированы и продолжение текущего запуска невозможно.
     pub const DEADLOCK: i64 = -8;
+    /// Не удалось выделить физическую память или служебный объект.
+    pub const OUT_OF_MEMORY: i64 = -9;
+    /// Достигнут фиксированный защитный лимит объектов текущей сборки.
+    pub const LIMIT_REACHED: i64 = -10;
+    /// Объект существует, но находится в несовместимом состоянии.
+    pub const BUSY: i64 = -11;
 }

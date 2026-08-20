@@ -37,6 +37,10 @@ cp -f target/x86_64-unknown-rustos/debug/rustos-ipc-receiver \
     "$STAGE/system/bin/ipc-receiver.elf"
 cp -f target/x86_64-unknown-rustos/debug/rustos-ipc-sender \
     "$STAGE/system/bin/ipc-sender.elf"
+cp -f target/x86_64-unknown-rustos/debug/rustos-abi-lifecycle \
+    "$STAGE/system/bin/abi-lifecycle.elf"
+cp -f target/x86_64-unknown-rustos/debug/rustos-abi-child \
+    "$STAGE/system/bin/abi-child.elf"
 
 echo "[build] 4/8 initramfs (RIFS v1)"
 cargo run -q -p rustos-pack -- "$STAGE" boot/uefi/payload/initramfs.img

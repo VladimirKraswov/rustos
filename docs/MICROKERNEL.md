@@ -133,9 +133,11 @@ per-CPU GDT/TSS/IDT, ring-0 interrupt stack, run queue и TLB shootdown inbox.
 5. TLB shootdown и PCID optimization;
 6. тест параллельной записи разных user pages двумя CPU с fault/GUI heartbeat.
 
-Следом process API получает create/kill/wait, shared-memory capabilities и
-large IPC. Ring-3 `init` сможет запускать `vfsd`, block/filesystem drivers,
-display/input services и desktop по manifests.
+Process ABI v2 уже предоставляет spawn/kill/wait, несколько потоков,
+shared-memory capabilities, anonymous VM, args/env, TLS и monotonic clock.
+Следующий программный milestone — streaming VFS IPC: ring-3 `init` запускает
+`vfsd`, block/filesystem drivers, display/input services и desktop по
+manifests. Подробный контракт описан в [PROCESS_MEMORY_ABI.md](PROCESS_MEMORY_ABI.md).
 
 ## Почему это база для self-hosting
 
@@ -169,6 +171,7 @@ PID/TID, изоляцию process fault и supervisor backoff. `make test-boot` 
 [preempt] timer ticks=... context-switches=...
 [isolation] concurrent #UD terminated one process; survivor exited=22
 [ipc] queued block/wake and attenuated VFS capability verified
+[abi-v2] spawn/wait/kill threads VM shared-memory TLS clock verified
 [process-manager] dynamic create/exit/reap reclaimed all frames
 [microkernel] RING3_MILESTONE_OK
 ```

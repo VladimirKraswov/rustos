@@ -12,13 +12,16 @@ macOS/Linux. Обязательный процессный checkpoint уже п�
 PIE запускается в CPL3 с process-local VFS capability, выполняет syscall и
 завершается; fault второго ELF не останавливает kernel/GUI, а все кадры его
 address space освобождаются. Это исполняемый фундамент, но ещё не нативный
-compiler: host `std`, dynamic loader, persistent filesystem, user-facing
-process spawning и полноценный SMP runtime пока отсутствуют.
+compiler: host `std`, dynamic loader, persistent filesystem и полноценный SMP
+runtime пока отсутствуют. ABI v2 уже предоставляет user-facing
+spawn/wait/kill, несколько потоков, anonymous VM, shared memory, args/env, TLS
+и monotonic clock.
 
-Local APIC preemption и bounded capability IPC уже работают на CPU0.
-Следующая прямая зависимость self-hosting — shared-memory IPC, VFS services и
-стабильные thread/process syscalls. Только поверх них имеет смысл портировать `std::thread`,
-`std::process`, файлы, pipes и dynamic loading, а затем native seed toolchain.
+Local APIC preemption, bounded capability IPC и shared-memory objects уже
+работают на CPU0. Следующая прямая зависимость self-hosting — streaming VFS
+service и перевод process image loader с initramfs на VFS. После неё имеет
+смысл портировать `std::thread`, `std::process`, файлы, pipes и dynamic
+loading, а затем native seed toolchain.
 
 ## Три разные платформы Rust bootstrap
 

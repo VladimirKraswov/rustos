@@ -18,8 +18,12 @@ const ADDRESS_MASK: u64 = 0x000f_ffff_ffff_f000;
 const ADDRESS_MASK: u64 = 0x0000_ffff_ffff_f000;
 
 const VALID: u64 = 1 << 0;
-const MAX_OWNED_FRAMES: usize = 512;
-const MAX_USER_PAGES: usize = 384;
+const MAX_OWNED_FRAMES: usize = 1152;
+const MAX_USER_PAGES: usize = 1024;
+/// Отдельная arena для `vm_map`: она не пересекается с PIE image, bootstrap
+/// block и растущими вниз thread stacks.
+const USER_DYNAMIC_BASE: u64 = 0x0000_5000_0000_0000;
+const USER_DYNAMIC_END: u64 = 0x0000_7000_0000_0000;
 
 const EMPTY_BLOCK: FrameBlock = FrameBlock { phys: 0, frames: 0 };
 
@@ -48,6 +52,16 @@ struct UserPage {
     virtual_address: u64,
     physical_address: u64,
     flags: UserPageFlags,
+    allowed_flags: UserPageFlags,
+    backing: UserPageBacking,
+}
+
+/// Private frame освобождается самим address space. Shared frame принадлежит
+/// kernel object и живёт, пока существуют capability либо mapping references.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UserPageBacking {
+    Private,
+    Shared(u16),
 }
 
 const EMPTY_PAGE: UserPage = UserPage {
@@ -57,6 +71,11 @@ const EMPTY_PAGE: UserPage = UserPage {
         writable: false,
         executable: false,
     },
+    allowed_flags: UserPageFlags {
+        writable: false,
+        executable: false,
+    },
+    backing: UserPageBacking::Private,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -67,6 +86,7 @@ pub enum AddressSpaceError {
     KernelMappingConflict,
     HugePageConflict,
     AlreadyMapped,
+    AccessDenied,
 }
 
 pub struct AddressSpace {
@@ -116,11 +136,63 @@ impl AddressSpace {
             self.update_leaf_flags(virtual_address, merged)?;
             return Ok(self.pages[index].physical_address);
         }
+        let physical_address = self.allocate_zeroed_frame()?;
+        let allowed_flags = UserPageFlags {
+            writable: true,
+            executable: true,
+        };
+        if let Err(error) = self.map_physical_page(
+            virtual_address,
+            physical_address,
+            flags,
+            allowed_flags,
+            UserPageBacking::Private,
+        ) {
+            self.release_owned_frame(physical_address);
+            return Err(error);
+        }
+        Ok(physical_address)
+    }
+
+    /// Отображает frame shared-memory object без передачи владения frame'ом
+    /// address space. Повторное отображение на тот же адрес запрещено.
+    pub fn map_shared_page(
+        &mut self,
+        virtual_address: u64,
+        physical_address: u64,
+        flags: UserPageFlags,
+        allowed_flags: UserPageFlags,
+        object: u16,
+    ) -> Result<(), AddressSpaceError> {
+        if self.find_page(virtual_address).is_some() {
+            return Err(AddressSpaceError::AlreadyMapped);
+        }
+        self.map_physical_page(
+            virtual_address,
+            physical_address,
+            flags,
+            allowed_flags,
+            UserPageBacking::Shared(object),
+        )
+    }
+
+    fn map_physical_page(
+        &mut self,
+        virtual_address: u64,
+        physical_address: u64,
+        flags: UserPageFlags,
+        allowed_flags: UserPageFlags,
+        backing: UserPageBacking,
+    ) -> Result<(), AddressSpaceError> {
+        if !virtual_address.is_multiple_of(PAGE_SIZE)
+            || !physical_address.is_multiple_of(PAGE_SIZE)
+            || !is_user_canonical(virtual_address)
+        {
+            return Err(AddressSpaceError::InvalidAddress);
+        }
         if self.page_len == MAX_USER_PAGES {
             return Err(AddressSpaceError::TooManyMappings);
         }
-
-        let physical_address = self.allocate_zeroed_frame()?;
         let pml4_index = ((virtual_address >> 39) & 0x1ff) as usize;
         let pdpt_index = ((virtual_address >> 30) & 0x1ff) as usize;
         let pd_index = ((virtual_address >> 21) & 0x1ff) as usize;
@@ -140,9 +212,102 @@ impl AddressSpace {
             virtual_address,
             physical_address,
             flags,
+            allowed_flags,
+            backing,
         };
         self.page_len += 1;
-        Ok(physical_address)
+        Ok(())
+    }
+
+    /// Находит свободный непрерывный диапазон в user VM arena.
+    pub fn find_free_range(&self, length: u64) -> Result<u64, AddressSpaceError> {
+        if length == 0 || !length.is_multiple_of(PAGE_SIZE) {
+            return Err(AddressSpaceError::InvalidAddress);
+        }
+        let mut candidate = USER_DYNAMIC_BASE;
+        while candidate
+            .checked_add(length)
+            .is_some_and(|end| end <= USER_DYNAMIC_END)
+        {
+            if self.range_is_free(candidate, length) {
+                return Ok(candidate);
+            }
+            candidate = candidate
+                .checked_add(PAGE_SIZE)
+                .ok_or(AddressSpaceError::InvalidAddress)?;
+        }
+        Err(AddressSpaceError::TooManyMappings)
+    }
+
+    /// Проверяет, что диапазон целиком свободен и находится в user half.
+    pub fn range_is_free(&self, address: u64, length: u64) -> bool {
+        if length == 0 || !address.is_multiple_of(PAGE_SIZE) || !length.is_multiple_of(PAGE_SIZE) {
+            return false;
+        }
+        let Some(end) = address.checked_add(length) else {
+            return false;
+        };
+        if end == 0 || !is_user_canonical(address) || !is_user_canonical(end - 1) {
+            return false;
+        }
+        let mut page = address;
+        while page < end {
+            if self.find_page(page).is_some() {
+                return false;
+            }
+            page += PAGE_SIZE;
+        }
+        true
+    }
+
+    /// Удаляет одну страницу и возвращает тип её backing store. Private frame
+    /// освобождается здесь; shared frame освобождает владеющий объект.
+    pub fn unmap_page(
+        &mut self,
+        virtual_address: u64,
+    ) -> Result<UserPageBacking, AddressSpaceError> {
+        if !virtual_address.is_multiple_of(PAGE_SIZE) {
+            return Err(AddressSpaceError::InvalidAddress);
+        }
+        let index = self
+            .find_page(virtual_address)
+            .ok_or(AddressSpaceError::InvalidAddress)?;
+        let page = self.pages[index];
+        self.clear_leaf(virtual_address)?;
+        self.page_len -= 1;
+        self.pages[index] = self.pages[self.page_len];
+        self.pages[self.page_len] = EMPTY_PAGE;
+        if page.backing == UserPageBacking::Private {
+            self.release_owned_frame(page.physical_address);
+        }
+        Ok(page.backing)
+    }
+
+    /// Меняет права уже существующей страницы. Политика W^X проверяется
+    /// уровнем syscall, а address space отвечает только за PTE encoding.
+    pub fn protect_page(
+        &mut self,
+        virtual_address: u64,
+        flags: UserPageFlags,
+    ) -> Result<(), AddressSpaceError> {
+        let index = self
+            .find_page(virtual_address)
+            .ok_or(AddressSpaceError::InvalidAddress)?;
+        let allowed = self.pages[index].allowed_flags;
+        if (flags.writable && !allowed.writable) || (flags.executable && !allowed.executable) {
+            return Err(AddressSpaceError::AccessDenied);
+        }
+        self.pages[index].flags = flags;
+        self.update_leaf_flags(virtual_address, flags)
+    }
+
+    /// Число страниц, ссылающихся на shared-memory object. Используется при
+    /// завершении процесса для корректного refcount без обхода page tables.
+    pub fn shared_mapping_pages(&self, object: u16) -> usize {
+        self.pages[..self.page_len]
+            .iter()
+            .filter(|page| page.backing == UserPageBacking::Shared(object))
+            .count()
     }
 
     /// Копирует kernel-данные в уже отображённый user range, обходя
@@ -241,6 +406,11 @@ impl AddressSpace {
             .is_some_and(|page| page.flags.executable)
     }
 
+    pub fn is_writable(&self, address: u64) -> bool {
+        self.page_for_address(address)
+            .is_some_and(|page| page.flags.writable)
+    }
+
     fn find_page(&self, virtual_address: u64) -> Option<usize> {
         self.pages[..self.page_len]
             .iter()
@@ -301,6 +471,33 @@ impl AddressSpace {
         }
         unsafe { slot.write((value & ADDRESS_MASK) | leaf_flags(flags)) };
         Ok(())
+    }
+
+    fn clear_leaf(&mut self, virtual_address: u64) -> Result<(), AddressSpaceError> {
+        let pml4 = unsafe { table_entry(self.root, virtual_address, 39)? };
+        let pdpt = unsafe { table_entry(pml4, virtual_address, 30)? };
+        let pd = unsafe { table_entry(pdpt, virtual_address, 21)? };
+        let index = ((virtual_address >> 12) & 0x1ff) as usize;
+        let slot = unsafe { (pd as *mut u64).add(index) };
+        if !entry_is_valid(unsafe { slot.read() }) {
+            return Err(AddressSpaceError::InvalidAddress);
+        }
+        unsafe { slot.write(0) };
+        Ok(())
+    }
+
+    fn release_owned_frame(&mut self, physical_address: u64) {
+        let Some(index) = self.owned[..self.owned_len]
+            .iter()
+            .position(|block| block.phys == physical_address && block.frames == 1)
+        else {
+            return;
+        };
+        let block = self.owned[index];
+        self.owned_len -= 1;
+        self.owned[index] = self.owned[self.owned_len];
+        self.owned[self.owned_len] = EMPTY_BLOCK;
+        let _ = free(block);
     }
 
     fn owns_frame(&self, physical_address: u64) -> bool {

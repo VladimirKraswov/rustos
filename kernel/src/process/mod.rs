@@ -3,6 +3,7 @@
 //! trap/fault/lifecycle ABI останется тем же.
 
 mod elf;
+#[path = "manager_v2.rs"]
 mod manager;
 
 use core::{ptr, str};
@@ -28,6 +29,9 @@ pub(super) enum CapabilityKind {
     Empty,
     VfsRoot,
     Endpoint(u8),
+    Process(ProcessId),
+    Thread(rustos_abi::ThreadId),
+    SharedMemory(u16),
 }
 
 #[derive(Clone, Copy)]

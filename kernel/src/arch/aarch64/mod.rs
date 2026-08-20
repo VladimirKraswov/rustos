@@ -87,6 +87,7 @@ pub struct UserContext {
     stack_pointer: u64,
     instruction_pointer: u64,
     processor_state: u64,
+    thread_pointer: u64,
 }
 
 impl UserContext {
@@ -99,6 +100,7 @@ impl UserContext {
             instruction_pointer: entry,
             // EL0t, interrupts unmasked when `eret` executes.
             processor_state: 0,
+            thread_pointer: 0,
         }
     }
 
@@ -112,6 +114,14 @@ impl UserContext {
 
     pub const fn arguments(&self) -> [u64; 3] {
         [self.x[0], self.x[1], self.x[2]]
+    }
+
+    pub const fn thread_pointer(&self) -> u64 {
+        self.thread_pointer
+    }
+
+    pub fn set_thread_pointer(&mut self, address: u64) {
+        self.thread_pointer = address;
     }
 
     pub fn save(&mut self, frame: &TrapFrame) {
@@ -131,6 +141,29 @@ impl UserContext {
     pub fn set_syscall_result(&mut self, result: i64) {
         self.x[0] = result as u64;
     }
+}
+
+pub fn set_user_thread_pointer(address: u64) {
+    unsafe {
+        asm!(
+            "msr tpidr_el0, {value}",
+            "isb",
+            value = in(reg) address,
+            options(nostack),
+        );
+    }
+}
+
+pub fn read_monotonic_counter() -> u64 {
+    let value: u64;
+    unsafe {
+        asm!(
+            "mrs {value}, cntvct_el0",
+            value = out(reg) value,
+            options(nomem, nostack),
+        );
+    }
+    value
 }
 
 pub fn initialize_early(info: &BootInfo) -> Result<EarlyInit, ArchError> {

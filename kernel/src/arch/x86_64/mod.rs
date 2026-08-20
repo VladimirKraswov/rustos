@@ -33,6 +33,7 @@ pub struct UserContext {
     instruction_pointer: u64,
     flags: u64,
     stack_pointer: u64,
+    thread_pointer: u64,
 }
 
 impl UserContext {
@@ -48,6 +49,7 @@ impl UserContext {
             instruction_pointer: entry,
             flags: 0x202,
             stack_pointer: stack,
+            thread_pointer: 0,
         }
     }
 
@@ -61,6 +63,14 @@ impl UserContext {
 
     pub fn arguments(&self) -> [u64; 3] {
         [self.registers[8], self.registers[9], self.registers[11]]
+    }
+
+    pub const fn thread_pointer(&self) -> u64 {
+        self.thread_pointer
+    }
+
+    pub fn set_thread_pointer(&mut self, address: u64) {
+        self.thread_pointer = address;
     }
 
     pub fn save(&mut self, frame: &TrapFrame) {
@@ -82,6 +92,36 @@ impl UserContext {
     pub fn set_syscall_result(&mut self, result: i64) {
         self.registers[14] = result as u64;
     }
+}
+
+/// Устанавливает user FS base перед `iretq`. GS остаётся зарезервирован ядру
+/// для будущих per-CPU данных и не является частью пользовательского TLS ABI.
+pub fn set_user_thread_pointer(address: u64) {
+    const IA32_FS_BASE: u32 = 0xc000_0100;
+    unsafe {
+        core::arch::asm!(
+            "wrmsr",
+            in("ecx") IA32_FS_BASE,
+            in("eax") address as u32,
+            in("edx") (address >> 32) as u32,
+            options(nomem, nostack),
+        );
+    }
+}
+
+/// Читает invariant TSC, используемый clock syscall после калибровки APIC.
+pub fn read_monotonic_counter() -> u64 {
+    let low: u32;
+    let high: u32;
+    unsafe {
+        core::arch::asm!(
+            "rdtsc",
+            out("eax") low,
+            out("edx") high,
+            options(nomem, nostack),
+        );
+    }
+    (u64::from(high) << 32) | u64::from(low)
 }
 
 /// Настраивает GDT/TSS/IDT и аппаратную защиту страниц до первого ring 3.

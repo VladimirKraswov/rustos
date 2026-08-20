@@ -31,5 +31,14 @@ path = "src/ipc_receiver.rs"
 name = "rustos-ipc-sender"
 path = "src/ipc_sender.rs"
 
+[[bin]]
+name = "rustos-abi-lifecycle"
+path = "src/abi_lifecycle.rs"
+
+[[bin]]
+name = "rustos-abi-child"
+path = "src/abi_child.rs"
+
 [dependencies]
+rustos-abi = { path = "../../abi" }
 rustos-runtime = { path = "../../runtime" }

@@ -13,7 +13,12 @@ pub const USER_DATA_SELECTOR: u16 = 0x18 | 3;
 pub const USER_CODE_SELECTOR: u16 = 0x20 | 3;
 const TSS_SELECTOR: u16 = 0x28;
 
-const RING0_STACK_SIZE: usize = 64 * 1024;
+// ELF spawn пока конструирует фиксированный bootstrap `AddressSpace` на стеке
+// syscall'а. LLVM в dev-профиле держит несколько промежуточных значений page
+// metadata одновременно, поэтому оставляем 512 KiB с запасом для
+// вложенного trap. После перехода metadata в kernel slabs это станет малым
+// per-CPU stack + guard page без изменения пользовательского ABI.
+const RING0_STACK_SIZE: usize = 512 * 1024;
 const DOUBLE_FAULT_STACK_SIZE: usize = 16 * 1024;
 
 #[repr(C, packed)]

@@ -11,12 +11,25 @@ use core::ffi::c_void;
 
 mod arch;
 
-pub use rustos_abi::{ipc::Message, syscall, Handle, Rights};
+pub use rustos_abi::{
+    ipc::Message,
+    memory::{SharedMemoryCreate, SharedMemoryMap, VmFlags, VmMapRequest},
+    process::{
+        ProcessSpawnRequest, ProcessSpawnResult, ProcessStartInfo, ThreadCreateRequest,
+        ThreadCreateResult,
+    },
+    syscall, ExitReason, Handle, Rights,
+};
 
 /// Bootstrap capability корневого VFS namespace текущего процесса.
 #[repr(transparent)]
 #[derive(Clone, Copy)]
 pub struct VfsCapability(pub Handle);
+
+/// Добровольно отдаёт остаток текущего scheduler quantum.
+pub fn thread_yield() -> i64 {
+    unsafe { syscall3(syscall::number::THREAD_YIELD, 0, 0, 0) }
+}
 
 /// Выполняет `vfs_stat` для UTF-8 пути. Положительный результат — размер,
 /// отрицательный — `rustos_abi::syscall::status`.
@@ -40,6 +53,156 @@ pub fn process_exit(status: i32) -> ! {
     loop {
         core::hint::spin_loop();
     }
+}
+
+/// Создаёт дочерний ELF64-процесс. В отличие от PID, возвращённый handle
+/// является авторизацией для `wait` и `kill` и может безопасно передаваться.
+pub fn process_spawn(request: &ProcessSpawnRequest, result: &mut ProcessSpawnResult) -> i64 {
+    unsafe {
+        syscall3(
+            syscall::number::PROCESS_SPAWN,
+            request as *const ProcessSpawnRequest as u64,
+            result as *mut ProcessSpawnResult as u64,
+            0,
+        )
+    }
+}
+
+/// Блокирует текущий поток до завершения процесса.
+pub fn process_wait(process: Handle, reason: &mut ExitReason) -> i64 {
+    unsafe {
+        syscall3(
+            syscall::number::PROCESS_WAIT,
+            process.0 as u64,
+            reason as *mut ExitReason as u64,
+            0,
+        )
+    }
+}
+
+/// Завершает процесс, на который у caller есть capability DESTROY.
+pub fn process_kill(process: Handle, status: i32) -> i64 {
+    unsafe {
+        syscall3(
+            syscall::number::PROCESS_KILL,
+            process.0 as u64,
+            status as i64 as u64,
+            0,
+        )
+    }
+}
+
+/// Создаёт поток в текущем address space. Стек и TLS заранее отображает
+/// вызывающая сторона; kernel проверяет entry, stack и thread pointer.
+pub fn thread_create(request: &ThreadCreateRequest, result: &mut ThreadCreateResult) -> i64 {
+    unsafe {
+        syscall3(
+            syscall::number::THREAD_CREATE,
+            request as *const ThreadCreateRequest as u64,
+            result as *mut ThreadCreateResult as u64,
+            0,
+        )
+    }
+}
+
+/// Завершает только текущий поток.
+pub fn thread_exit(status: i32) -> ! {
+    unsafe {
+        let _ = syscall3(syscall::number::THREAD_EXIT, status as i64 as u64, 0, 0);
+    }
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
+/// Блокирует текущий поток до завершения целевого потока.
+pub fn thread_join(thread: Handle, reason: &mut ExitReason) -> i64 {
+    unsafe {
+        syscall3(
+            syscall::number::THREAD_JOIN,
+            thread.0 as u64,
+            reason as *mut ExitReason as u64,
+            0,
+        )
+    }
+}
+
+/// Устанавливает thread pointer текущего потока: FS base на AMD64 и
+/// TPIDR_EL0 на AArch64.
+pub fn thread_set_tls(address: u64) -> i64 {
+    unsafe { syscall3(syscall::number::THREAD_SET_TLS, address, 0, 0) }
+}
+
+/// Отображает анонимные zero-filled страницы и возвращает virtual address.
+pub fn vm_map(request: &VmMapRequest) -> i64 {
+    unsafe {
+        syscall3(
+            syscall::number::VM_MAP,
+            request as *const VmMapRequest as u64,
+            0,
+            0,
+        )
+    }
+}
+
+/// Удаляет отображение и освобождает private physical frames.
+pub fn vm_unmap(address: u64, length: u64) -> i64 {
+    unsafe { syscall3(syscall::number::VM_UNMAP, address, length, 0) }
+}
+
+/// Изменяет PTE-права диапазона с обязательной политикой W^X.
+pub fn vm_protect(address: u64, length: u64, flags: VmFlags) -> i64 {
+    unsafe { syscall3(syscall::number::VM_PROTECT, address, length, flags.0) }
+}
+
+/// Создаёт shared-memory object; положительный результат — capability handle.
+pub fn shared_memory_create(request: &SharedMemoryCreate) -> i64 {
+    unsafe {
+        syscall3(
+            syscall::number::SHARED_MEMORY_CREATE,
+            request as *const SharedMemoryCreate as u64,
+            0,
+            0,
+        )
+    }
+}
+
+/// Отображает shared-memory capability в address space процесса.
+pub fn shared_memory_map(handle: Handle, request: &SharedMemoryMap) -> i64 {
+    unsafe {
+        syscall3(
+            syscall::number::SHARED_MEMORY_MAP,
+            handle.0 as u64,
+            request as *const SharedMemoryMap as u64,
+            0,
+        )
+    }
+}
+
+/// Закрывает capability. Shared object освобождается после исчезновения
+/// последнего capability и последнего mapping reference.
+pub fn handle_close(handle: Handle) -> i64 {
+    unsafe { syscall3(syscall::number::HANDLE_CLOSE, handle.0 as u64, 0, 0) }
+}
+
+/// Возвращает монотонное время в наносекундах.
+pub fn monotonic_time_ns() -> i64 {
+    unsafe { syscall3(syscall::number::CLOCK_MONOTONIC, 0, 0, 0) }
+}
+
+/// Проверяет read-only bootstrap block нового процесса.
+///
+/// # Safety
+///
+/// `address` должен быть первым аргументом entry point, переданным ядром.
+pub unsafe fn process_start_info(address: u64) -> Option<&'static ProcessStartInfo> {
+    if address == 0 || !address.is_multiple_of(core::mem::align_of::<ProcessStartInfo>() as u64) {
+        return None;
+    }
+    let info = unsafe { &*(address as *const ProcessStartInfo) };
+    (info.version == rustos_abi::process::PROCESS_ABI_VERSION
+        && info.size as usize >= core::mem::size_of::<ProcessStartInfo>())
+    .then_some(info)
 }
 
 /// Отправляет небольшое inline IPC-сообщение. Capability handles внутри

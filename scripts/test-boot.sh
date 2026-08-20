@@ -123,6 +123,7 @@ patterns=(
     "\[preempt\] timer ticks=[1-9][0-9]* context-switches=[1-9][0-9]*"
     "\[isolation\] concurrent #UD terminated one process; survivor exited=22"
     "\[ipc\] queued block/wake and attenuated VFS capability verified"
+    "\[abi-v2\] spawn/wait/kill threads VM shared-memory TLS clock verified"
     "\[process-manager\] dynamic create/exit/reap reclaimed all frames"
     "\[scheduler\] priority, affinity and fault-containment policy verified"
     "\[microkernel\] RING3_MILESTONE_OK"

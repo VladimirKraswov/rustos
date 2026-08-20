@@ -104,6 +104,7 @@ dependencies = [
 name = "rustos-bootstrap-apps"
 version = "0.1.0"
 dependencies = [
+ "rustos-abi",
  "rustos-runtime",
 ]
 

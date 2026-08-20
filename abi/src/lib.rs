@@ -24,6 +24,7 @@ pub mod dll;
 pub mod handle;
 pub mod ipc;
 pub mod memmap;
+pub mod memory;
 pub mod process;
 pub mod syscall;
 pub mod vfs;
@@ -31,6 +32,7 @@ pub mod vfs;
 pub use bootinfo::{BootInfo, BOOT_INFO_MAGIC, BOOT_INFO_VERSION};
 pub use handle::{Handle, Rights};
 pub use memmap::{MemRegion, MemRegionKind, MEMMAP_MAX_REGIONS};
+pub use memory::{SharedMemoryCreate, SharedMemoryMap, VmFlags, VmMapRequest};
 pub use process::{ExitReason, PriorityClass, ProcessId, ThreadId};
 
 /// Базовая 4-KiB granule, общая для текущих AMD64 и AArch64 targets.
