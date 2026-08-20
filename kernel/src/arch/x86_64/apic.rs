@@ -270,7 +270,7 @@ fn write_register(msr: u32, xapic_offset: usize, value: u64) {
 }
 
 fn read_xapic(offset: usize) -> u32 {
-    // SAFETY: UEFI bootloader supervisor-map'ит LAPIC MMIO page identity;
+    // SAFETY: platform bootstrap supervisor-map'ит LAPIC MMIO page identity;
     // регистры выровнены по 16 байт и читаются только после APIC discovery.
     unsafe { ptr::read_volatile((LEGACY_APIC_PHYS + offset) as *const u32) }
 }

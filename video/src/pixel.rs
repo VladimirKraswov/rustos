@@ -50,6 +50,11 @@ pub enum PixelFormat {
     Bgr888,
     /// Числовое представление `0xAARRGGBB`, удобно для декодеров/иконок.
     Argb8888,
+    /// Логический high-color профиль 5:6:5. Значение хранится в младших
+    /// 16 битах u32 surface: это сохраняет выравнивание и быстрые spans.
+    Rgb565,
+    /// Логический 8-битный grayscale профиль в младшем байте u32 surface.
+    Grayscale8,
 }
 
 impl PixelFormat {
@@ -62,6 +67,15 @@ impl PixelFormat {
                     | ((value.r as u32) << 16)
                     | ((value.g as u32) << 8)
                     | value.b as u32
+            }
+            Self::Rgb565 => {
+                ((value.r as u32 * 31 + 127) / 255) << 11
+                    | ((value.g as u32 * 63 + 127) / 255) << 5
+                    | (value.b as u32 * 31 + 127) / 255
+            }
+            Self::Grayscale8 => {
+                // Integer BT.601 luminance; сумма коэффициентов равна 256.
+                (77 * value.r as u32 + 150 * value.g as u32 + 29 * value.b as u32 + 128) >> 8
             }
         }
     }
@@ -76,6 +90,21 @@ impl PixelFormat {
                 raw as u8,
                 (raw >> 24) as u8,
             ),
+            Self::Rgb565 => {
+                let red = (raw >> 11) & 0x1f;
+                let green = (raw >> 5) & 0x3f;
+                let blue = raw & 0x1f;
+                Rgba::new(
+                    ((red * 255 + 15) / 31) as u8,
+                    ((green * 255 + 31) / 63) as u8,
+                    ((blue * 255 + 15) / 31) as u8,
+                    255,
+                )
+            }
+            Self::Grayscale8 => {
+                let value = raw as u8;
+                Rgba::new(value, value, value, 255)
+            }
         }
     }
 
@@ -112,6 +141,19 @@ mod tests {
             PixelFormat::Argb8888.unpack(PixelFormat::Argb8888.pack(pixel)),
             pixel
         );
+    }
+
+    #[test]
+    fn reduced_colour_profiles_are_explicit_and_aligned() {
+        let source = Rgba::new(240, 128, 16, 255);
+        let rgb565 = PixelFormat::Rgb565.unpack(PixelFormat::Rgb565.pack(source));
+        assert!(rgb565.r.abs_diff(source.r) <= 8);
+        assert!(rgb565.g.abs_diff(source.g) <= 4);
+        assert!(rgb565.b.abs_diff(source.b) <= 8);
+
+        let gray = PixelFormat::Grayscale8.unpack(PixelFormat::Grayscale8.pack(source));
+        assert_eq!(gray.r, gray.g);
+        assert_eq!(gray.g, gray.b);
     }
 
     #[test]

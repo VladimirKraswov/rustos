@@ -10,6 +10,7 @@
 #![allow(dead_code)]
 
 mod apic;
+mod multiboot2;
 mod segmentation;
 mod smp;
 mod traps;

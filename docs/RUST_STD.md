@@ -25,7 +25,7 @@ bash scripts/test-boot.sh
 ```
 
 Wrapper `rustc-rustos-std.sh` подменяет ответ `rustc --print sysroot` только
-для этой Cargo-сборки. Host tools, UEFI loader и обычный rustup sysroot не
+для этой Cargo-сборки. Host tools, GRUB packaging и обычный rustup sysroot не
 смешиваются с port overlay.
 
 ## Что уже работает

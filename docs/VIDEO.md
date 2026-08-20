@@ -2,26 +2,28 @@
 
 ## Цель и границы
 
-Видеосистема строится не вокруг конкретного GOP framebuffer, а вокруг трёх
+Видеосистема строится не вокруг конкретного firmware framebuffer, а вокруг трёх
 разных контрактов:
 
 1. **scanout driver** владеет физическим дисплеем, режимом и публикацией;
 2. **surfaces/raster** хранят пиксели приложений и выполняют CPU-операции;
 3. **compositor** собирает произвольное число окон и overlays только в damage.
 
-Сейчас scanout предоставляет UEFI GOP: он даёт линейный 32-bit framebuffer,
-но не VSync, page flip или аппаратное ускорение. Это bootstrap-драйвер, а не
-заявление о поддержке конкретной GPU. В дальнейшем GOP backend можно заменить
-virtio-gpu/bochs DRM-подобным драйвером, не меняя surfaces и оконный протокол.
+Сейчас scanout предоставляет GRUB Multiboot2 framebuffer: firmware/GRUB
+выбирает режим и передаёт linear 32-bit framebuffer, но не VSync, page flip
+или аппаратное ускорение. Это bootstrap-драйвер, а не заявление о поддержке
+конкретной GPU. В дальнейшем backend можно заменить virtio-gpu или
+DRM-подобным драйвером, не меняя surfaces и оконный протокол.
 
 ## `rustos-video`
 
 Новый platform-independent `no_std` crate содержит код без MMIO, allocator'а
 и привязки к kernel:
 
-- `Scanout`, `DisplayMode` и capability contract для GOP/virtio/GPU drivers;
+- `Scanout`, `DisplayDriver`, `DisplayMode` и mode-set contract для
+  firmware/virtio/GPU drivers;
 - `Surface`/`SurfaceMut` с явными width, height, stride и pixel format;
-- RGB, BGR и ARGB8888 с корректной конвертацией каналов;
+- RGB, BGR, ARGB8888, RGB565 и grayscale8 с корректной конвертацией;
 - span-based fill и opaque blit с clipping;
 - source-over alpha composition с global opacity;
 - clipped nearest-neighbour scaling как гарантированный baseline для icons и
@@ -37,10 +39,18 @@ clipped blit, alpha, damage overflow и многослойной компози�
 
 ## Горячий путь
 
-Framebuffer использует два RAM-слоя: composited back buffer и статический
+Framebuffer использует два кэшируемых RAM-слоя: composited back buffer и статический
 desktop. `slice::fill` и построчный `copy_from_slice` позволяют LLVM применять
-wide stores вместо проверки bounds на каждом пикселе. GOP получает только
-готовые damage rectangles.
+wide stores вместо проверки bounds на каждом пикселе. Scanout получает только
+готовые damage rectangles. Полный кадр с одинаковым stride публикуется одним
+последовательным copy, а не строками или отдельными volatile pixel stores.
+Видимый framebuffer не используется как рабочая поверхность и не читается
+обратно.
+
+Физический pixel slot — XRGB/BGRX8888: 24 значащих бита цвета и один padding
+byte. Packed RGB888 не используется из-за плохого выравнивания. Команды
+`DISPLAY COLOR TRUECOLOR`, `RGB565` и `GRAY8` переключают логический формат
+software surface; present конвертирует его в выровненный scanout.
 
 Drag в TCG работает в preview-режиме. На первом движении старое окно один раз
 удаляется из scanout, затем перемещаются только title bar и тонкий контур.
@@ -63,7 +73,7 @@ scanout capability. Падение клиента удалит его layers, н
 
 ## Software OpenGL и видео
 
-Software OpenGL должен рендерить не в GOP, а в ARGB/RGB surface приложения.
+Software OpenGL должен рендерить не в firmware framebuffer, а в ARGB/RGB surface приложения.
 SwapBuffers станет surface commit: compositor заберёт последний полностью
 готовый buffer и отбросит устаревшие кадры. Начальный практичный путь — API
 совместимости OpenGL поверх software rasterizer/softpipe; аппаратный backend
@@ -85,10 +95,10 @@ damage и fence, а сами пиксели остаются в shared memory.
 - front/back/triple-buffer protocol с generation и fences;
 - SSE2/AVX2 dispatch для blend, scale и RGB/YUV conversion;
 - virtio-gpu 2D scanout/page flip как первая независимая display-служба;
-- EDID/mode enumeration и несколько мониторов;
+- native EDID/mode enumeration и несколько мониторов;
 - перенос compositor/input/terminal из kernel bootstrap в ring 3;
 - software OpenGL compatibility layer, затем порт Mesa по частям.
 
-Текущих гарантий пока недостаточно для плавного видео: GOP не имеет VSync, а
+Текущих гарантий пока недостаточно для плавного видео: firmware framebuffer не имеет VSync, а
 compositor синхронный. Но surfaces, alpha, damage и layer ABI уже отделены от
 этого ограничения и не потребуют переписывания при появлении нового драйвера.

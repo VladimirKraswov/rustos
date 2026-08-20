@@ -69,6 +69,7 @@ echo "[test] qemu accel=$ACCEL, cpu=$CPU_MODEL, cpus=$CPUS, memory=${MEMORY_MB}M
 qemu-system-x86_64 \
     -machine q35 -cpu "$CPU_MODEL" -smp "$CPUS" -m "$MEMORY_MB" \
     -accel "$ACCEL" \
+    -device virtio-vga,edid=on,xres=1280,yres=800 \
     -drive if=pflash,format=raw,readonly=on,file=build/ovmf/OVMF_CODE.fd \
     -drive if=pflash,format=raw,file="$VARS" \
     -drive if=none,id=systemdisk,format=raw,file=build/system.vfs \
@@ -112,6 +113,8 @@ else
 fi
 
 patterns=(
+    "\[grub\] Multiboot2 tags normalized; installing identity map"
+    "\[grub\] long-mode identity map ready; entering kernel"
     "RustOS 0.1.0"
     "\[boot\] BootInfo v[1-9][0-9]* ok"
     "\[boot\] usable RAM: [1-9][0-9]* MiB"

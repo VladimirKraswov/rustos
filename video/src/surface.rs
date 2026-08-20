@@ -67,6 +67,16 @@ impl<'a> Surface<'a> {
         let start = y as usize * self.stride as usize + x as usize;
         Some(&self.pixels[start..start + width as usize])
     }
+
+    /// Возвращает весь кадр одним span, только если surface плотно упакован.
+    /// Scanout использует этот путь для единственного линейного copy кадра.
+    pub fn contiguous_pixels(self) -> Option<&'a [u32]> {
+        if self.stride != self.width {
+            return None;
+        }
+        let length = self.width as usize * self.height as usize;
+        self.pixels.get(..length)
+    }
 }
 
 /// Mutable surface. Конструктор один раз доказывает все bounds, после чего

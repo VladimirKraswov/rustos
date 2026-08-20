@@ -13,7 +13,7 @@ use crate::{
     serial,
 };
 use rustos_abi::{bootinfo::BootInitramfs, BootInfo};
-use rustos_video::{DamageRegion, PixelFormat, Scanout};
+use rustos_video::{DamageRegion, DisplayDriver, DisplayMode, PixelFormat, Scanout};
 
 /// Высота taskbar'а: desktop-иконки и maximized-окна не заходят на неё.
 const TASKBAR_HEIGHT: u32 = 46;
@@ -46,7 +46,9 @@ pub fn run(info: &BootInfo) -> ! {
     serial::put_str("\n");
     let mode = framebuffer.mode();
     let capabilities = framebuffer.capabilities();
-    serial::put_str("[video] scanout=gop mode=");
+    serial::put_str("[video] scanout=");
+    serial::put_str(framebuffer.driver_name());
+    serial::put_str(" mode=");
     serial::put_u32(mode.width);
     serial::put_str("x");
     serial::put_u32(mode.height);
@@ -55,6 +57,8 @@ pub fn run(info: &BootInfo) -> ! {
         PixelFormat::Rgb888 => "rgb888",
         PixelFormat::Bgr888 => "bgr888",
         PixelFormat::Argb8888 => "argb8888",
+        PixelFormat::Rgb565 => "rgb565",
+        PixelFormat::Grayscale8 => "gray8",
     });
     serial::put_str(" present=immediate page-flip=");
     serial::put_str(if capabilities.page_flip { "yes" } else { "no" });
@@ -119,7 +123,14 @@ impl DesktopSession {
         let screen_height = framebuffer.height();
         let width = screen_width.saturating_sub(180).clamp(620, 1040);
         let height = screen_height.saturating_sub(160).clamp(420, 650);
-        let x = ((screen_width - width) / 2) as i32;
+        // На широком экране оставляем слева удобную область под desktop
+        // icons, а терминал стартует с постоянным 120px полем. На маленьком
+        // режиме окно по-прежнему центрируется и не выходит за границы.
+        let x = if screen_width >= width.saturating_add(240) {
+            120
+        } else {
+            ((screen_width - width) / 2) as i32
+        };
         let y = ((screen_height.saturating_sub(TASKBAR_HEIGHT) - height) / 2) as i32;
         let rect = Rect::new(x, y, width, height);
         Self {
@@ -255,6 +266,57 @@ impl DesktopSession {
             TerminalAction::None => Redraw::None,
             TerminalAction::RedrawInputLine => Redraw::TerminalLine,
             TerminalAction::RedrawAll => Redraw::Window,
+            TerminalAction::DisplayInfo => {
+                let mode = self.framebuffer.mode();
+                serial::put_str("[display] info driver=");
+                serial::put_str(self.framebuffer.driver_name());
+                serial::put_str(" mode=");
+                serial::put_u32(mode.width);
+                serial::put_str("x");
+                serial::put_u32(mode.height);
+                serial::put_str("\n");
+                self.terminal.report_display_info(
+                    self.framebuffer.driver_name(),
+                    mode.width,
+                    mode.height,
+                    self.framebuffer.color_mode(),
+                );
+                Redraw::Window
+            }
+            TerminalAction::DisplayMode { width, height } => {
+                let current = self.framebuffer.mode();
+                let requested = DisplayMode {
+                    width,
+                    height,
+                    stride_pixels: width,
+                    format: current.format,
+                    refresh_millihertz: current.refresh_millihertz,
+                };
+                let applied = self.framebuffer.set_mode(requested).is_ok();
+                serial::put_str("[display] mode request=");
+                serial::put_u32(width);
+                serial::put_str("x");
+                serial::put_u32(height);
+                serial::put_str(if applied {
+                    " result=active\n"
+                } else {
+                    " result=reboot-required\n"
+                });
+                self.terminal.report_display_mode(width, height, applied);
+                Redraw::Window
+            }
+            TerminalAction::DisplayColor(mode) => {
+                self.framebuffer.set_color_mode(mode);
+                serial::put_str("[display] color=");
+                serial::put_str(match mode {
+                    rustos_video::ColorMode::TrueColor24 => "truecolor24",
+                    rustos_video::ColorMode::HighColor16 => "rgb565",
+                    rustos_video::ColorMode::Grayscale8 => "gray8",
+                });
+                serial::put_str("\n");
+                self.terminal.report_color_mode(mode);
+                Redraw::All
+            }
             TerminalAction::Shutdown => shutdown(),
         }
     }

@@ -104,6 +104,7 @@ trap cleanup EXIT INT TERM HUP
 
 qemu-system-x86_64 \
     -machine q35 -cpu "$CPU_MODEL" -smp 2 -m "$MEMORY_MB" -accel tcg \
+    -device virtio-vga,edid=on,xres=1280,yres=800 \
     -drive if=pflash,format=raw,readonly=on,file=build/ovmf/OVMF_CODE.fd \
     -drive if=pflash,format=raw,file="$RUN_DIR/VARS.fd" \
     -drive if=none,id=systemdisk,format=raw,file=build/system.vfs \
@@ -129,7 +130,7 @@ done
     exit 1
 }
 grep -q '\[microkernel\] RING3_MILESTONE_OK' "$RUN_DIR/serial.log"
-grep -Eq '\[video\] scanout=gop mode=[1-9][0-9]*x[1-9][0-9]* format=(rgb888|bgr888) present=immediate page-flip=no' \
+grep -Eq '\[video\] scanout=grub-fb mode=[1-9][0-9]*x[1-9][0-9]* format=(rgb888|bgr888) present=immediate page-flip=no' \
     "$RUN_DIR/serial.log"
 grep -q '\[isolation\] user #UD contained; kernel and GUI continue' "$RUN_DIR/serial.log"
 grep -q '\[memory\] user address spaces reclaimed' "$RUN_DIR/serial.log"
@@ -143,6 +144,17 @@ grep -q '\[scheduler\] priority, affinity and fault-containment policy verified'
 # Команда идёт через настоящий PS/2 keyboard path.
 send_command 'help'
 wait_for_serial '[terminal] command: help'
+
+# Display manager: monitor info, runtime software color profile and honest
+# firmware mode-set boundary. Возвращаем truecolor до screenshot-проверок.
+send_command 'display'
+wait_for_serial '[display] info driver=grub-fb mode='
+send_command 'display color gray8'
+wait_for_serial '[display] color=gray8'
+send_command 'display color truecolor'
+wait_for_serial '[display] color=truecolor24'
+send_command 'display mode 1280x720'
+wait_for_serial '[display] mode request=1280x720 result=reboot-required'
 
 # Полный bootstrap filesystem workflow: initramfs listing, RAM-file write,
 # read и cwd-relative source directory. Проверяем не только shell parser, но

@@ -1,4 +1,4 @@
-//! Версионированная структура `BootInfo`, передаваемая UEFI-загрузчиком ядру.
+//! Версионированная структура `BootInfo`, передаваемая загрузчиком ядру.
 //!
 //! ## Инварианты
 //!
@@ -6,9 +6,8 @@
 //!   версия = отказ загрузки (better safe than corrupt state).
 //! * Все адреса — *физические*. Ядро работает в identity-маппинге, поэтому
 //!   виртуальные адреса загрузчика в BootInfo не передаются.
-//! * Структура размещена в памяти, которая переживает `ExitBootServices`
-//!   (выделена загрузчиком через `AllocatePages` из свободных регионов UEFI
-//!   memory map; детали в docs/ARCHITECTURE.md, раздел «Загрузка»).
+//! * Структура размещена в зарезервированной загрузчиком памяти. GRUB передаёт
+//!   исходные теги, а AMD64 bootstrap копирует их в этот единый ABI.
 //! * Поле `version` монотонно растёт; совместимые расширения добавляются
 //!   только в конец структуры, и ядро знает свой размер структуры.
 
@@ -36,10 +35,14 @@ pub const BOOT_FIRMWARE_ACPI: u32 = 1;
 /// `root` указывает на Flattened Device Tree blob.
 pub const BOOT_FIRMWARE_DEVICE_TREE: u32 = 2;
 
-/// GOP framebuffer хранит байты пикселя как R, G, B, reserved.
+/// Linear framebuffer хранит байты пикселя как R, G, B, reserved.
 pub const FRAMEBUFFER_FORMAT_RGB: u32 = 0;
-/// GOP framebuffer хранит байты пикселя как B, G, R, reserved.
+/// Linear framebuffer хранит байты пикселя как B, G, R, reserved.
 pub const FRAMEBUFFER_FORMAT_BGR: u32 = 1;
+/// Framebuffer был настроен непосредственно UEFI GOP loader'ом.
+pub const FRAMEBUFFER_SOURCE_UEFI_GOP: u32 = 0;
+/// Framebuffer и выбранный видеорежим переданы GRUB по Multiboot2.
+pub const FRAMEBUFFER_SOURCE_GRUB: u32 = 1;
 
 /// Размер boot-стека CPU0 (128 KiB — с запасом на ранний вызов прерываний
 /// до появления полноценного стека ядра).
@@ -54,7 +57,7 @@ pub const KERNEL_STACK_SIZE: u64 = 128 * 1024;
 /// перемещает таблицы.
 pub const PAGE_TABLE_BUDGET: u64 = 16 * 1024 * 1024;
 
-/// Информация о GOP-framebuffer'е.
+/// Информация о framebuffer, настроенном firmware/загрузчиком.
 ///
 /// Если `phys_addr == 0`, графический вывод недоступен (система работает
 /// только через serial — ядро обязано деградировать gracefully).
@@ -73,7 +76,8 @@ pub struct BootFramebuffer {
     pub bpp: u32,
     /// Один из `FRAMEBUFFER_FORMAT_*`; определяет упаковку R/G/B.
     pub format: u32,
-    /// Резерв для совместимого расширения ABI.
+    /// Один из `FRAMEBUFFER_SOURCE_*`. Поле раньше было резервом, поэтому
+    /// значение 0 совместимо с прежним UEFI GOP loader'ом.
     pub _reserved: u32,
 }
 
@@ -187,7 +191,7 @@ pub struct BootInfo {
     /// Нормализованная карта физической памяти.
     pub memmap: [MemRegion; MEMMAP_MAX_REGIONS],
 
-    /// GOP-framebuffer (может быть нулевой).
+    /// Linear framebuffer (может быть нулевым).
     pub framebuffer: BootFramebuffer,
     /// Ранняя UART-консоль, выбранная загрузчиком из platform description.
     pub console: BootConsole,
@@ -244,6 +248,31 @@ impl BootInfo {
             || self.console.flags != 0
             || self.firmware._reserved != 0
             || (self.console.kind == BOOT_CONSOLE_16550_PORT && self.console.base > u16::MAX as u64)
+        {
+            return false;
+        }
+        let framebuffer = &self.framebuffer;
+        if framebuffer.phys_addr == 0 {
+            if framebuffer.width != 0
+                || framebuffer.height != 0
+                || framebuffer.stride != 0
+                || framebuffer.bpp != 0
+            {
+                return false;
+            }
+        } else if framebuffer.width == 0
+            || framebuffer.height == 0
+            || framebuffer.bpp != 32
+            || !framebuffer.stride.is_multiple_of(4)
+            || framebuffer.stride < framebuffer.width.saturating_mul(4)
+            || !matches!(
+                framebuffer.format,
+                FRAMEBUFFER_FORMAT_RGB | FRAMEBUFFER_FORMAT_BGR
+            )
+            || !matches!(
+                framebuffer._reserved,
+                FRAMEBUFFER_SOURCE_UEFI_GOP | FRAMEBUFFER_SOURCE_GRUB
+            )
         {
             return false;
         }
@@ -324,6 +353,26 @@ mod tests {
         assert!(!info.validate());
         info.console.flags = 0;
         info.firmware._reserved = 1;
+        assert!(!info.validate());
+    }
+
+    #[test]
+    fn framebuffer_layout_and_source_are_validated() {
+        let mut info = empty_info();
+        info.framebuffer = BootFramebuffer {
+            phys_addr: 0x8000_0000,
+            width: 1280,
+            height: 800,
+            stride: 1280 * 4,
+            bpp: 32,
+            format: FRAMEBUFFER_FORMAT_BGR,
+            _reserved: FRAMEBUFFER_SOURCE_GRUB,
+        };
+        assert!(info.validate());
+        info.framebuffer.stride -= 4;
+        assert!(!info.validate());
+        info.framebuffer.stride += 4;
+        info.framebuffer._reserved = 99;
         assert!(!info.validate());
     }
 }

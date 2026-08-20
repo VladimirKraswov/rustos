@@ -192,8 +192,8 @@ cargo run -p rustos-rune -- inspect output.rune
 ```
 
 Build автоматически конвертирует все запускаемые system programs и кладёт в
-initramfs только `.rune`. Kernel UEFI image пока остаётся ELF: его читает
-маленький firmware loader до запуска микроядра, и это отдельная trust boundary.
+initramfs только `.rune`. Kernel остаётся фиксированным ELF64: его читает GRUB
+до запуска микроядра, и это отдельная trust boundary.
 
 ## Статус реализации
 

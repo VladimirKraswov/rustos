@@ -13,6 +13,7 @@ use crate::{
     serial,
 };
 use rustos_abi::bootinfo::BootInitramfs;
+use rustos_video::ColorMode;
 
 /// Размер буфера терминала: подогнан под дефолтное окно desktop
 /// (шире/выше окна буфер просто не умещается целиком).
@@ -50,6 +51,16 @@ pub enum TerminalAction {
     RedrawInputLine,
     /// Команда изменила несколько строк или прокрутила терминал.
     RedrawAll,
+    /// Запросить текущий monitor/scanout mode у display driver'а.
+    DisplayInfo,
+    /// Запросить физический mode-set. Firmware framebuffer может вернуть,
+    /// что режим применяется только через меню GRUB после перезапуска.
+    DisplayMode {
+        width: u32,
+        height: u32,
+    },
+    /// Переключить software-renderer между 24-bit, RGB565 и grayscale.
+    DisplayColor(ColorMode),
     Shutdown,
 }
 
@@ -241,6 +252,7 @@ impl Terminal {
             self.print("  ABOUT     SYSTEM INFORMATION\n", WHITE);
             self.print("  MEM       USABLE MEMORY\n", WHITE);
             self.print("  GUI       GUI SERVER STATUS\n", WHITE);
+            self.print("  DISPLAY   MONITOR/MODE/COLOR SETTINGS\n", WHITE);
             self.print("  ECHO TEXT PRINT TEXT\n", WHITE);
             self.print("  PWD/CD    CURRENT DIRECTORY\n", WHITE);
             self.print("  LS/CAT    LIST OR READ FILES\n", WHITE);
@@ -260,7 +272,7 @@ impl Terminal {
             self.print("RUSTOS 0.1.0 ", CYAN);
             self.print(arch::ARCH_NAME, CYAN);
             self.print("\n", CYAN);
-            self.print("RUST, UEFI GOP, CPU SOFTWARE COMPOSITOR\n", WHITE);
+            self.print("RUST, GRUB MULTIBOOT2, CPU SOFTWARE COMPOSITOR\n", WHITE);
             TerminalAction::None
         } else if command.eq_ignore_ascii_case("mem") {
             self.print("USABLE RAM: ", GREEN);
@@ -269,9 +281,15 @@ impl Terminal {
             TerminalAction::None
         } else if command.eq_ignore_ascii_case("gui") {
             self.print("DISPLAYD: ONLINE\n", GREEN);
-            self.print("COMPOSITOR: SOFTWARE / GOP 32-BIT\n", WHITE);
+            self.print("COMPOSITOR: SOFTWARE / ALIGNED 32-BIT SURFACES\n", WHITE);
             self.print("WINDOW MANAGER: ONLINE\n", GREEN);
             TerminalAction::None
+        } else if command.eq_ignore_ascii_case("display")
+            || command
+                .get(..8)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("display "))
+        {
+            self.command_display(command)
         } else if command.eq_ignore_ascii_case("shutdown") {
             self.print("POWERING OFF...\n", YELLOW);
             TerminalAction::Shutdown
@@ -290,14 +308,101 @@ impl Terminal {
             self.newline();
             TerminalAction::None
         };
-        if action != TerminalAction::Shutdown {
-            self.prompt();
-        }
-        if action == TerminalAction::Shutdown {
+        match action {
             TerminalAction::Shutdown
-        } else {
-            TerminalAction::RedrawAll
+            | TerminalAction::DisplayInfo
+            | TerminalAction::DisplayMode { .. }
+            | TerminalAction::DisplayColor(_) => action,
+            _ => {
+                self.prompt();
+                TerminalAction::RedrawAll
+            }
         }
+    }
+
+    fn command_display(&mut self, command: &str) -> TerminalAction {
+        let arguments = command.get(7..).unwrap_or("").trim();
+        if arguments.is_empty() || arguments.eq_ignore_ascii_case("info") {
+            return TerminalAction::DisplayInfo;
+        }
+        if let Some(value) = strip_prefix_ascii_case(arguments, "mode ") {
+            if let Some((width, height)) = parse_resolution(value.trim()) {
+                return TerminalAction::DisplayMode { width, height };
+            }
+            self.print("USAGE: DISPLAY MODE WIDTHxHEIGHT\n", RED);
+            return TerminalAction::None;
+        }
+        if let Some(value) = strip_prefix_ascii_case(arguments, "color ") {
+            let mode = if value.eq_ignore_ascii_case("truecolor")
+                || value.eq_ignore_ascii_case("24")
+            {
+                Some(ColorMode::TrueColor24)
+            } else if value.eq_ignore_ascii_case("rgb565") || value.eq_ignore_ascii_case("16") {
+                Some(ColorMode::HighColor16)
+            } else if value.eq_ignore_ascii_case("gray8") || value.eq_ignore_ascii_case("grayscale")
+            {
+                Some(ColorMode::Grayscale8)
+            } else {
+                None
+            };
+            if let Some(mode) = mode {
+                return TerminalAction::DisplayColor(mode);
+            }
+            self.print("COLOR: TRUECOLOR | RGB565 | GRAY8\n", RED);
+            return TerminalAction::None;
+        }
+        self.print("DISPLAY [INFO]\n", YELLOW);
+        self.print("DISPLAY MODE WIDTHxHEIGHT\n", WHITE);
+        self.print("DISPLAY COLOR TRUECOLOR|RGB565|GRAY8\n", WHITE);
+        TerminalAction::None
+    }
+
+    pub fn report_display_info(&mut self, driver: &str, width: u32, height: u32, color: ColorMode) {
+        self.print("DISPLAY DRIVER: ", GREEN);
+        self.print(driver, WHITE);
+        self.print("\nPHYSICAL MODE: ", GREEN);
+        self.print_number(u64::from(width));
+        self.print("x", WHITE);
+        self.print_number(u64::from(height));
+        self.print("x32 (24 COLOR BITS)\nRENDER COLOR: ", WHITE);
+        self.print_color_mode(color);
+        self.print("\nMODE SWITCH: GRUB MENU / NATIVE DRIVER API\n", MUTED);
+        self.prompt();
+    }
+
+    pub fn report_display_mode(&mut self, width: u32, height: u32, applied: bool) {
+        if applied {
+            self.print("DISPLAY MODE ALREADY ACTIVE: ", GREEN);
+        } else {
+            self.print("FIRMWARE FRAMEBUFFER CANNOT MODE-SET AFTER BOOT: ", YELLOW);
+        }
+        self.print_number(u64::from(width));
+        self.print("x", WHITE);
+        self.print_number(u64::from(height));
+        if !applied {
+            self.print("\nSELECT THE MODE IN GRUB AND RESTART.\n", MUTED);
+        } else {
+            self.newline();
+        }
+        self.prompt();
+    }
+
+    pub fn report_color_mode(&mut self, mode: ColorMode) {
+        self.print("SOFTWARE COLOR MODE: ", GREEN);
+        self.print_color_mode(mode);
+        self.print(" (PHYSICAL SCANOUT REMAINS ALIGNED XRGB8888)\n", MUTED);
+        self.prompt();
+    }
+
+    fn print_color_mode(&mut self, mode: ColorMode) {
+        self.print(
+            match mode {
+                ColorMode::TrueColor24 => "TRUECOLOR/24-BIT",
+                ColorMode::HighColor16 => "RGB565/16-BIT",
+                ColorMode::Grayscale8 => "GRAYSCALE/8-BIT",
+            },
+            WHITE,
+        );
     }
 
     fn command_run(&mut self, command: &str) {
@@ -721,4 +826,18 @@ impl Terminal {
             self.cells[(ROWS - 1) * COLS + column] = EMPTY_CELL;
         }
     }
+}
+
+fn strip_prefix_ascii_case<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
+    let candidate = value.get(..prefix.len())?;
+    candidate
+        .eq_ignore_ascii_case(prefix)
+        .then(|| &value[prefix.len()..])
+}
+
+fn parse_resolution(value: &str) -> Option<(u32, u32)> {
+    let (width, height) = value.split_once(['x', 'X'])?;
+    let width = width.parse::<u32>().ok()?;
+    let height = height.parse::<u32>().ok()?;
+    (width >= 640 && height >= 480).then_some((width, height))
 }

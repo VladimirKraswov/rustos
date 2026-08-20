@@ -18,5 +18,8 @@ pub use compositor::{composite, Layer};
 pub use damage::DamageRegion;
 pub use geometry::{Point, Rect};
 pub use pixel::{Color, PixelFormat, Rgba};
-pub use scanout::{DisplayMode, PresentStats, Scanout, ScanoutCapabilities, ScanoutError};
+pub use scanout::{
+    ColorMode, ConnectorInfo, ConnectorKind, DisplayDriver, DisplayMode, ModeSetError,
+    PresentStats, Scanout, ScanoutCapabilities, ScanoutError,
+};
 pub use surface::{Surface, SurfaceError, SurfaceMut};

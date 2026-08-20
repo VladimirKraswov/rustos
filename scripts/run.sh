@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Интерактивный графический запуск RustOS. Serial остаётся в терминале,
-# framebuffer показывается отдельным масштабируемым окном QEMU.
+# framebuffer показывается отдельным масштабируемым окном QEMU. virtio-vga
+# публикует современный wide EDID; GRUB выбирает его preferred mode.
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
@@ -20,11 +21,18 @@ if [[ "$(uname -s)" == "Darwin" ]]; then
         DISPLAY_ARGS=(-display cocoa,zoom-to-fit=on,show-cursor=on,full-screen=on)
     fi
 fi
-echo "[run] qemu accel=$ACCEL, graphical GOP, serial=console"
+WIDTH="${RUSTOS_DISPLAY_WIDTH:-1600}"
+HEIGHT="${RUSTOS_DISPLAY_HEIGHT:-900}"
+[[ "$WIDTH" =~ ^[1-9][0-9]*$ && "$HEIGHT" =~ ^[1-9][0-9]*$ ]] || {
+    echo "RUSTOS_DISPLAY_WIDTH/HEIGHT должны быть положительными числами" >&2
+    exit 2
+}
+echo "[run] qemu accel=$ACCEL, GRUB/Multiboot2, EDID request=${WIDTH}x${HEIGHT}, serial=console"
 
 exec qemu-system-x86_64 \
     -machine q35 -cpu max -smp 2 -m 512 \
     -accel "$ACCEL" \
+    -device virtio-vga,edid=on,xres="$WIDTH",yres="$HEIGHT" \
     -drive if=pflash,format=raw,readonly=on,file=build/ovmf/OVMF_CODE.fd \
     -drive if=pflash,format=raw,file=build/ovmf/OVMF_VARS_RUNTIME.fd \
     -drive if=none,id=systemdisk,format=raw,file=build/system.vfs \

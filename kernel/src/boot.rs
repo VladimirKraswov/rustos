@@ -162,7 +162,7 @@ pub fn print_bootinfo(info: &BootInfo) {
     }
 
     if info.framebuffer.phys_addr != 0 {
-        serial::put_str("[boot] GOP framebuffer @ 0x");
+        serial::put_str("[boot] linear framebuffer @ 0x");
         serial::put_hex(info.framebuffer.phys_addr);
         serial::put_str(" ");
         serial::put_u32(info.framebuffer.width);
@@ -172,7 +172,7 @@ pub fn print_bootinfo(info: &BootInfo) {
         serial::put_u32(info.framebuffer.bpp);
         serial::put_str("\n");
     } else {
-        serial::put_str("[boot] no GOP framebuffer (serial-only mode)\n");
+        serial::put_str("[boot] no linear framebuffer (serial-only mode)\n");
     }
 
     if info.firmware.root != 0 {

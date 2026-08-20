@@ -26,8 +26,8 @@ ACPI / Device Tree / PCI / virtio / GPIO / USB / framebuffer
 Process manager видит только `TrapFrame`, `TrapKind`, `UserContext`, root
 address space и абстрактный scheduler timer. Он не знает имён регистров,
 номеров APIC/GIC или способа возврата в user mode. ISA-specific assembler
-разрешён только в `kernel/src/arch/*`, `runtime/src/arch.rs` и
-`boot/uefi/src/arch/*`.
+разрешён только в `kernel/src/arch/*`, `runtime/src/arch.rs` и platform boot
+слое. AMD64 Multiboot entry изолирован в `arch/x86_64/multiboot2.rs`.
 
 PS/2 находится в `kernel/src/input/ps2.rs`, потому что это устройство PC, а
 не часть x86. На ARM input backend пока пустой; конкретная плата позднее
@@ -64,7 +64,7 @@ toolchain output. User stack соблюдает SysV AMD64 и AAPCS64.
 | kernel/runtime/apps + RUNE converter | да | да |
 | page descriptor encoding | да | да, 4 KiB granule |
 | syscall/context ABI | работает | определён и компилируется |
-| bootloader + запуск в VM | UEFI/OVMF | следующий milestone |
+| bootloader + запуск в VM | GRUB 2/Multiboot2 + OVMF | следующий milestone |
 | interrupt controller | xAPIC/x2APIC | нужен GICv2/v3 driver |
 | SMP startup | ACPI + INIT-SIPI | нужен PSCI + DT/ACPI CPU discovery |
 | input | PS/2 bootstrap | нужен virtio-input/USB HID |

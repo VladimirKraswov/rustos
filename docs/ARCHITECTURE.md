@@ -2,12 +2,13 @@
 
 ## Загрузка
 
-UEFI-приложение `rustos-boot` находит GOP и ACPI, закрепляет единый bootstrap
-region через `AllocatePages(LOADER_DATA)`, загружает ELF64 PIE kernel и
-initramfs, строит разрежённую identity-карту и передаёт `BootInfo v3`.
+Standalone GRUB 2 загружает фиксированный ELF64 kernel по Multiboot2 и
+initramfs как module. Архитектурный bootstrap переводит memory map,
+framebuffer и ACPI в переносимый `BootInfo v3`, строит identity map и входит
+в обычную Rust-точку `_start`. Подробности находятся в [GRUB.md](GRUB.md).
 
-Page tables отображают реальные RAM descriptors, kernel reservation, RSDP и
-точный диапазон framebuffer. Большие MMIO-дыры не выдаются за RAM.
+Kernel, module и Multiboot information вырезаются из usable descriptors.
+Большие MMIO-дыры отображаются для раннего доступа, но не выдаются за RAM.
 
 ## Текущие подсистемы
 
@@ -15,7 +16,7 @@ Page tables отображают реальные RAM descriptors, kernel reserv
 UEFI/OVMF
    |
    v
-rustos-boot --> BootInfo v3 --> kernel
+GRUB 2 / Multiboot2 --> BootInfo v3 --> kernel
                                   |-- serial diagnostics
                                   |-- GDT/TSS/IDT + exception containment
                                   |-- physical frame allocator
@@ -24,7 +25,7 @@ rustos-boot --> BootInfo v3 --> kernel
                                   |-- local-APIC preemptive process manager
                                   |-- endpoint IPC + capability transfer
                                   |-- MADT + AP long-mode trampoline
-                                  |-- GOP scanout + rustos-video surfaces
+                                  |-- GRUB framebuffer + rustos-video surfaces
                                   |-- damage/layer CPU compositor
                                   |-- PS/2 input
                                   |-- bootstrap RIFS + RAM overlay
@@ -50,9 +51,11 @@ EL0/EL1 context, TTBR и `svc` ABI и собирается в CI; GIC/PSCI boot 
 объявляются работающими. Полный контракт описан в [ARCHITECTURES.md](ARCHITECTURES.md).
 
 Platform-independent `rustos-video` задаёт безопасные pixel surfaces,
-RGB/BGR/ARGB formats, span fill, blit, alpha composition, bounded damage и
+RGB/BGR/ARGB/RGB565/grayscale formats, span fill, blit, alpha composition,
+bounded damage и
 неограниченный slice layers. Kernel desktop уже использует его raster/damage
-часть поверх GOP; тот же контракт предназначен будущему ring-3 `displayd`.
+часть поверх firmware scanout; тот же контракт предназначен будущему ring-3
+`displayd` и native/virtio display driver'ам.
 
 MADT перечисляет CPU, BSP последовательно выполняет INIT–SIPI–SIPI. AP
 проходит 16 -> 32 -> 64 bit trampoline, получает отдельный stack, включает
@@ -88,7 +91,7 @@ UI API уже отделён от framebuffer ownership, поэтому widget l
 ## Масштаб памяти
 
 On-disk offsets и физические адреса используют `u64`. Frame allocator уже
-хранит ограниченный набор свободных extent'ов из usable UEFI descriptors, а
+хранит ограниченный набор свободных extent'ов из usable Multiboot descriptors, а
 не bitmap до максимального MMIO-адреса. Поэтому терабайты RAM не требуют
 терабайтно-пропорциональной служебной таблицы. Будущий NUMA allocator разделит
 эти extent'ы по node/zone, не меняя 64-битный ABI.

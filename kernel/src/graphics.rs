@@ -1,7 +1,7 @@
-//! Безопасная оболочка над UEFI GOP linear framebuffer.
+//! Безопасная оболочка над GRUB/firmware linear framebuffer.
 //!
 //! GPU-драйвера пока нет: все примитивы рисуются CPU в обычный RAM back
-//! buffer. Видимый GOP framebuffer обновляется только методом [`present`],
+//! buffer. Видимый scanout framebuffer обновляется только методом [`present`],
 //! когда кадр уже полностью готов. Благодаря этому пользователь не видит,
 //! как compositor по частям стирает старое и рисует новое положение окна.
 //!
@@ -12,13 +12,14 @@
 use core::sync::atomic::{compiler_fence, Ordering};
 
 use rustos_abi::{
-    bootinfo::{FRAMEBUFFER_FORMAT_BGR, FRAMEBUFFER_FORMAT_RGB},
+    bootinfo::{FRAMEBUFFER_FORMAT_BGR, FRAMEBUFFER_FORMAT_RGB, FRAMEBUFFER_SOURCE_GRUB},
     BootInfo, PAGE_SIZE,
 };
 pub use rustos_video::{Color, Rect};
 use rustos_video::{
-    DamageRegion, DisplayMode, PixelFormat, PresentStats, Scanout, ScanoutCapabilities,
-    ScanoutError, Surface, SurfaceMut,
+    ColorMode, ConnectorInfo, ConnectorKind, DamageRegion, DisplayDriver, DisplayMode,
+    ModeSetError, PixelFormat, PresentStats, Scanout, ScanoutCapabilities, ScanoutError, Surface,
+    SurfaceMut,
 };
 
 use crate::memory;
@@ -26,12 +27,12 @@ use crate::memory;
 /// Double-buffered renderer кадра (см. модуль и docs/GUI.md).
 ///
 /// Все методы рисования работают только с невидимым back buffer; видимый
-/// GOP-буфер обновляет `present`/`present_rect` построчным копированием.
+/// Scanout обновляется `present`/`present_rect` линейным копированием.
 pub struct Framebuffer {
-    /// Видимый linear framebuffer GOP. В него пишет только `present*`.
+    /// Видимый linear framebuffer. В него пишет только `present*`.
     front: *mut u8,
     /// Невидимый программный кадр в обычной usable RAM. Плотно упакован
-    /// (stride = width), в отличие от GOP со своим stride.
+    /// (stride = width), в отличие от scanout со своим stride.
     back: *mut u32,
     back_phys: u64,
     back_bytes: u64,
@@ -42,7 +43,12 @@ pub struct Framebuffer {
     width: u32,
     height: u32,
     stride: u32,
-    format: PixelFormat,
+    /// Формат физической scanout-памяти, выбранный GRUB/firmware.
+    scanout_format: PixelFormat,
+    /// Формат software surface. Может переключаться между true-color,
+    /// RGB565 и grayscale без packed/unaligned framebuffer writes.
+    render_format: PixelFormat,
+    source: u32,
     present_sequence: u64,
 }
 
@@ -75,7 +81,7 @@ impl Framebuffer {
             .checked_mul(4)?;
         let back_phys = reserve_back_buffer(back_bytes)?;
         // Кэш — оптимизация, а не условие работоспособности. На очень
-        // большом GOP при минимуме RAM compositor корректно откатится к
+        // большом framebuffer при минимуме RAM compositor корректно откатится к
         // полному redraw, если второй непрерывный диапазон получить нельзя.
         let background = reserve_back_buffer(back_bytes)
             .map(|block| block as *mut u32)
@@ -90,17 +96,19 @@ impl Framebuffer {
             width: info.width,
             height: info.height,
             stride: info.stride,
-            format,
+            scanout_format: format,
+            render_format: format,
+            source: info._reserved,
             present_sequence: 0,
         })
     }
 
-    /// Ширина кадра в пикселях (из GOP mode).
+    /// Ширина кадра в пикселях (из monitor mode).
     pub const fn width(&self) -> u32 {
         self.width
     }
 
-    /// Высота кадра в пикселях (из GOP mode).
+    /// Высота кадра в пикселях (из monitor mode).
     pub const fn height(&self) -> u32 {
         self.height
     }
@@ -120,10 +128,38 @@ impl Framebuffer {
         !self.background.is_null()
     }
 
+    /// Имя bootstrap display driver'а для диагностики и GUI.
+    pub const fn driver_name(&self) -> &'static str {
+        if self.source == FRAMEBUFFER_SOURCE_GRUB {
+            "grub-fb"
+        } else {
+            "uefi-gop"
+        }
+    }
+
+    pub const fn color_mode(&self) -> ColorMode {
+        match self.render_format {
+            PixelFormat::Rgb565 => ColorMode::HighColor16,
+            PixelFormat::Grayscale8 => ColorMode::Grayscale8,
+            _ => ColorMode::TrueColor24,
+        }
+    }
+
+    /// Меняет цветовой профиль renderer'а. Backbuffer остаётся u32-aligned,
+    /// а present при необходимости конвертирует его в физический XRGB/BGRX.
+    /// Caller обязан полностью перерисовать сцену после смены профиля.
+    pub fn set_color_mode(&mut self, mode: ColorMode) {
+        self.render_format = match mode {
+            ColorMode::TrueColor24 => self.scanout_format,
+            ColorMode::HighColor16 => PixelFormat::Rgb565,
+            ColorMode::Grayscale8 => PixelFormat::Grayscale8,
+        };
+    }
+
     /// Упаковка `Color` в 32-битный пиксель текущего формата framebuffer'а
     /// (RGB или BGR по `BootInfo.framebuffer.format`).
     pub fn pack(&self, color: Color) -> u32 {
-        self.format.pack_color(color)
+        self.render_format.pack_color(color)
     }
 
     /// Ставит один пиксель в back buffer; точки вне кадра молча отбрасываются.
@@ -214,7 +250,14 @@ impl Framebuffer {
         // SAFETY: `back` принадлежит этому Framebuffer на весь срок GUI;
         // &mut self гарантирует единственное mutable представление.
         let storage = unsafe { core::slice::from_raw_parts_mut(self.back, pixels) };
-        SurfaceMut::new(storage, self.width, self.height, self.width, self.format).ok()
+        SurfaceMut::new(
+            storage,
+            self.width,
+            self.height,
+            self.width,
+            self.render_format,
+        )
+        .ok()
     }
 
     /// Сохраняет готовый desktop без окон/курсора в отдельный RAM-слой.
@@ -256,7 +299,7 @@ impl Framebuffer {
         true
     }
 
-    /// Публикует целиком уже готовый кадр в GOP.
+    /// Публикует целиком уже готовый кадр в scanout.
     pub fn present(&mut self) {
         self.present_rect(Rect::new(0, 0, self.width, self.height));
     }
@@ -270,7 +313,7 @@ impl Framebuffer {
 
     /// Публикует прямоугольную dirty-область готового кадра.
     ///
-    /// GOP/firmware framebuffer — linear scanout memory. Поэтому
+    /// GRUB/firmware framebuffer — linear scanout memory. Поэтому
     /// построчный `copy_nonoverlapping` существенно быстрее миллионов
     /// отдельных volatile store и минимизирует время, когда scanout может
     /// пересечь копируемый кадр. Рисование компонентов никогда не происходит
@@ -282,10 +325,15 @@ impl Framebuffer {
     fn present_regions(&mut self, damage: &[Rect]) {
         let pixels = (self.back_bytes / 4) as usize;
         // SAFETY: source читает только back, а Scanout::present пишет только
-        // отдельный GOP front. Эксклюзивный &mut self не покидает вызов.
+        // отдельный front. Эксклюзивный &mut self не покидает вызов.
         let storage = unsafe { core::slice::from_raw_parts(self.back, pixels) };
-        let Ok(source) = Surface::new(storage, self.width, self.height, self.width, self.format)
-        else {
+        let Ok(source) = Surface::new(
+            storage,
+            self.width,
+            self.height,
+            self.width,
+            self.render_format,
+        ) else {
             return;
         };
         self.present_sequence = self.present_sequence.wrapping_add(1);
@@ -313,7 +361,7 @@ impl Scanout for Framebuffer {
             width: self.width,
             height: self.height,
             stride_pixels: self.stride / 4,
-            format: self.format,
+            format: self.scanout_format,
             refresh_millihertz: 0,
         }
     }
@@ -337,6 +385,31 @@ impl Scanout for Framebuffer {
             return Err(ScanoutError::InvalidSurface);
         }
         let bounds = Rect::new(0, 0, self.width, self.height);
+        if damage.len() == 1
+            && damage[0].intersection(bounds) == bounds
+            && source.format() == self.scanout_format
+            && self.stride / 4 == self.width
+        {
+            if let Some(frame) = source.contiguous_pixels() {
+                // Самый частый полный commit: одна последовательная запись
+                // вместо height отдельных копирований. Framebuffer никогда
+                // не читается обратно, поэтому CPU cache не загрязняется
+                // лишним read-modify-write на стороне compositor'а.
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        frame.as_ptr(),
+                        self.front.cast::<u32>(),
+                        frame.len(),
+                    )
+                };
+                compiler_fence(Ordering::Release);
+                return Ok(PresentStats {
+                    sequence,
+                    rectangles: 1,
+                    pixels: u64::from(self.width) * u64::from(self.height),
+                });
+            }
+        }
         let mut rectangles = 0u32;
         let mut pixels = 0u64;
         for rect in damage.iter().copied() {
@@ -353,9 +426,9 @@ impl Scanout for Framebuffer {
                 let front_offset = y as usize * self.stride as usize
                     + clipped.x as usize * core::mem::size_of::<u32>();
                 let destination = self.front.wrapping_add(front_offset).cast::<u32>();
-                if source.format() == self.format {
+                if source.format() == self.scanout_format {
                     // SAFETY: source row валиден; destination находится в
-                    // mapped GOP строке, RAM back и MMIO front не пересекаются.
+                    // mapped scanout-строке, RAM back и MMIO front не пересекаются.
                     unsafe {
                         core::ptr::copy_nonoverlapping(
                             source_row.as_ptr(),
@@ -365,8 +438,8 @@ impl Scanout for Framebuffer {
                     };
                 } else {
                     for (offset, raw) in source_row.iter().copied().enumerate() {
-                        let converted = self.format.pack(source.format().unpack(raw));
-                        // SAFETY: offset < clipped.width; GOP row проверена mode.
+                        let converted = self.scanout_format.pack(source.format().unpack(raw));
+                        // SAFETY: offset < clipped.width; scanout row проверена mode.
                         unsafe { destination.add(offset).write(converted) };
                     }
                 }
@@ -381,9 +454,42 @@ impl Scanout for Framebuffer {
     }
 }
 
+impl DisplayDriver for Framebuffer {
+    fn connector(&self) -> ConnectorInfo {
+        ConnectorInfo {
+            kind: ConnectorKind::FirmwareFramebuffer,
+            connected: true,
+            preferred_mode: self.mode(),
+            width_mm: 0,
+            height_mm: 0,
+        }
+    }
+
+    fn modes(&self, output: &mut [DisplayMode]) -> usize {
+        if let Some(first) = output.first_mut() {
+            *first = self.mode();
+            1
+        } else {
+            0
+        }
+    }
+
+    fn set_mode(&mut self, requested: DisplayMode) -> Result<DisplayMode, ModeSetError> {
+        let current = self.mode();
+        if requested.width == current.width
+            && requested.height == current.height
+            && requested.format == current.format
+        {
+            Ok(current)
+        } else {
+            Err(ModeSetError::RequiresReboot)
+        }
+    }
+}
+
 /// Выбирает page-aligned диапазон RAM под кадр, не вводя фиксированного
 /// ограничения на разрешение. Для 4K потребуется около 32 MiB, для
-/// 1280x800 — около 4 MiB; размер автоматически следует GOP mode.
+/// 1280x800 — около 4 MiB; размер автоматически следует monitor mode.
 fn reserve_back_buffer(bytes: u64) -> Option<u64> {
     let frames = bytes.checked_add(PAGE_SIZE - 1)? / PAGE_SIZE;
     memory::allocate(frames, 1).ok().map(|block| block.phys)
