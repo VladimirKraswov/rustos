@@ -23,6 +23,7 @@ mod memory;
 mod panic;
 mod process;
 mod serial;
+mod time;
 
 use rustos_abi::BootInfo;
 

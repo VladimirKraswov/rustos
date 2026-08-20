@@ -10,6 +10,7 @@ use core::{mem::size_of, ptr};
 
 use crate::{
     apps::{
+        shell_ui::{active_icon_or_default, ShellAction, ShellUi},
         terminal::{
             CursorCommand, CursorThemeName, IconThemeName, MouseCommand, Terminal, TerminalAction,
         },
@@ -111,7 +112,9 @@ pub fn run(info: &BootInfo) -> ! {
     serial::put_u32(MAX_WINDOWS as u32);
     serial::put_str("\n");
     session.render_all();
-    serial::put_str("[gui] GUI_READY desktop=1 terminal=1 multiwindow=1 mouse=");
+    serial::put_str("[gui] GUI_READY desktop=1 terminal=1 multiwindow=1 start=system-ui clock=");
+    serial::put_str(session.shell.clock_source());
+    serial::put_str(" mouse=");
     serial::put_str(input::backend_name());
     serial::put_str("\n");
     session.event_loop()
@@ -298,7 +301,9 @@ struct DesktopSession {
     mouse_x: i32,
     mouse_y: i32,
     previous_left: bool,
-    start_open: bool,
+    /// Start/taskbar UI — такой же component runtime, как интерфейс обычного
+    /// приложения; оконный сервер получает от него только команды.
+    shell: ShellUi,
     drag_frames: u32,
     drag_packets: u32,
     drag_present_pixels: u64,
@@ -316,6 +321,19 @@ impl DesktopSession {
         let _ = icon_packs.install(CLASSIC_ICON_PACK);
         let _ = icon_packs.install(MIDNIGHT_ICON_PACK);
         let _ = icon_packs.install(MONO_ICON_PACK);
+        let shell = ShellUi::new(
+            screen_width,
+            screen_height,
+            TASKBAR_HEIGHT,
+            arch::monotonic_milliseconds(),
+        );
+        serial::put_str("[clock] source=");
+        serial::put_str(shell.clock_source());
+        serial::put_str(" time=");
+        serial::put_str(shell.clock_time());
+        serial::put_str(" date=");
+        serial::put_str(shell.clock_date());
+        serial::put_str("\n");
         Self {
             framebuffer,
             input: PlatformInput::new(),
@@ -336,7 +354,7 @@ impl DesktopSession {
             mouse_x: (screen_width / 2) as i32,
             mouse_y: (screen_height / 2) as i32,
             previous_left: false,
-            start_open: false,
+            shell,
             drag_frames: 0,
             drag_packets: 0,
             drag_present_pixels: 0,
@@ -443,23 +461,74 @@ impl DesktopSession {
                     Redraw::Scene => self.framebuffer.present(),
                 }
                 self.dispatch_window_events();
-            } else if self.cursor.animate(arch::monotonic_milliseconds()) {
-                let old_cursor = self.cursor.rect();
-                self.cursor.restore(&mut self.framebuffer);
-                self.cursor
-                    .draw(&mut self.framebuffer, self.mouse_x, self.mouse_y);
-                self.framebuffer.present_rect(old_cursor);
-                self.framebuffer.present_rect(self.cursor.rect());
             } else {
-                core::hint::spin_loop();
+                let now_ms = arch::monotonic_milliseconds();
+                if self.shell.update_clock(now_ms) {
+                    let old_cursor = self.cursor.rect();
+                    self.cursor.restore(&mut self.framebuffer);
+                    self.render_taskbar();
+                    if self.shell.is_open() {
+                        self.render_start_menu();
+                    }
+                    self.cursor
+                        .draw(&mut self.framebuffer, self.mouse_x, self.mouse_y);
+                    self.framebuffer.present_rect(old_cursor);
+                    self.framebuffer.present_rect(Rect::new(
+                        0,
+                        self.framebuffer.height() as i32 - TASKBAR_HEIGHT as i32,
+                        self.framebuffer.width(),
+                        TASKBAR_HEIGHT,
+                    ));
+                    if self.shell.is_open() {
+                        self.framebuffer.present_rect(self.shell.menu_rect());
+                    }
+                    self.framebuffer.present_rect(self.cursor.rect());
+                    continue;
+                }
+                if self.cursor.animate(now_ms) {
+                    let old_cursor = self.cursor.rect();
+                    self.cursor.restore(&mut self.framebuffer);
+                    self.cursor
+                        .draw(&mut self.framebuffer, self.mouse_x, self.mouse_y);
+                    self.framebuffer.present_rect(old_cursor);
+                    self.framebuffer.present_rect(self.cursor.rect());
+                } else {
+                    core::hint::spin_loop();
+                }
             }
         }
     }
 
     fn handle_key(&mut self, key: Key) -> Redraw {
-        if matches!(key, Key::Escape) && self.start_open {
-            self.start_open = false;
-            return Redraw::Scene;
+        if self.shell.is_open() {
+            if matches!(key, Key::Escape) {
+                self.shell.set_open(false);
+                serial::put_str("[start] closed by keyboard\n");
+                return Redraw::Scene;
+            }
+            let ui_key = match key {
+                Key::Tab => Some(UiKey::Tab),
+                Key::Enter => Some(UiKey::Enter),
+                Key::Character(b' ') => Some(UiKey::Space),
+                Key::Character(byte) if byte.is_ascii() => Some(UiKey::Character(char::from(byte))),
+                Key::Escape | Key::Backspace | Key::Character(_) => None,
+            };
+            if let Some(ui_key) = ui_key {
+                let result = self.shell.key(ui_key, false);
+                if result.action != ShellAction::None {
+                    return self.handle_shell_action(result.action);
+                }
+                if result.changed || result.consumed {
+                    return if result.changed {
+                        Redraw::Scene
+                    } else {
+                        Redraw::None
+                    };
+                }
+            }
+            // Открытое menu владеет keyboard scope: случайный символ не
+            // должен одновременно попасть в terminal под ним.
+            return Redraw::None;
         }
         let Some(id) = self.focused else {
             return Redraw::None;
@@ -489,6 +558,37 @@ impl DesktopSession {
             }
             Some(ApplicationKind::Terminal) => self.handle_terminal_key(id, key),
             None => Redraw::None,
+        }
+    }
+
+    fn handle_shell_action(&mut self, action: ShellAction) -> Redraw {
+        match action {
+            ShellAction::None => Redraw::None,
+            ShellAction::ToggleStart => {
+                self.shell.toggle();
+                serial::put_str(if self.shell.is_open() {
+                    "[start] opened component-runtime=system-ui-v1\n"
+                } else {
+                    "[start] closed component-runtime=system-ui-v1\n"
+                });
+                Redraw::Scene
+            }
+            ShellAction::OpenTerminal => {
+                self.shell.set_open(false);
+                let _ = self.spawn_application(ApplicationKind::Terminal);
+                serial::put_str("[start] command=terminal\n");
+                Redraw::Scene
+            }
+            ShellAction::OpenGallery => {
+                self.shell.set_open(false);
+                let _ = self.spawn_application(ApplicationKind::UiShowcase);
+                serial::put_str("[start] command=ui-gallery\n");
+                Redraw::Scene
+            }
+            ShellAction::Shutdown => {
+                serial::put_str("[start] command=shutdown\n");
+                shutdown()
+            }
         }
     }
 
@@ -778,6 +878,44 @@ impl DesktopSession {
             self.desktop_icon_pressed = false;
         }
 
+        let x = self.mouse_x;
+        let y = self.mouse_y;
+        if pressed {
+            // Один marker на mouse-down (не на каждый movement packet) делает
+            // GUI-тесты и реальные bug reports воспроизводимыми.
+            serial::put_str("[pointer] down x=");
+            serial::put_u32(x as u32);
+            serial::put_str(" y=");
+            serial::put_u32(y as u32);
+            serial::put_str(" top=0x");
+            serial::put_hex(self.top_window_at(x, y).map_or(0, |window| window.0));
+            serial::put_str("\n");
+        }
+
+        let pointer_kind = if pressed {
+            UiPointerKind::Down
+        } else if released {
+            UiPointerKind::Up
+        } else {
+            UiPointerKind::Move
+        };
+        let shell_result = self.shell.pointer(pointer_kind, x, y);
+        if shell_result.action != ShellAction::None {
+            return self.handle_shell_action(shell_result.action);
+        }
+        if pressed && self.shell.is_open() && !self.shell.interactive_at(x, y) {
+            self.shell.set_open(false);
+            serial::put_str("[start] closed by outside click\n");
+            return Redraw::Scene;
+        }
+        if shell_result.changed || shell_result.consumed {
+            return if shell_result.changed {
+                Redraw::Scene
+            } else {
+                Redraw::None
+            };
+        }
+
         if !pressed {
             let Some(id) = self.focused else {
                 return Redraw::None;
@@ -807,39 +945,6 @@ impl DesktopSession {
             return Redraw::None;
         }
 
-        let x = self.mouse_x;
-        let y = self.mouse_y;
-        // Один marker на mouse-down (не на каждый movement packet) делает
-        // GUI-тесты и реальные bug reports воспроизводимыми: видно координаты
-        // после применённой sensitivity/acceleration и верхнее окно hit-test.
-        serial::put_str("[pointer] down x=");
-        serial::put_u32(x as u32);
-        serial::put_str(" y=");
-        serial::put_u32(y as u32);
-        serial::put_str(" top=0x");
-        serial::put_hex(self.top_window_at(x, y).map_or(0, |window| window.0));
-        serial::put_str("\n");
-        if self.start_button().contains(x, y) {
-            self.start_open = !self.start_open;
-            return Redraw::Scene;
-        }
-        if self.start_open {
-            if self.start_terminal_item().contains(x, y) {
-                let _ = self.spawn_application(ApplicationKind::Terminal);
-                self.start_open = false;
-                return Redraw::Scene;
-            }
-            if self.start_ui_item().contains(x, y) {
-                let _ = self.spawn_application(ApplicationKind::UiShowcase);
-                self.start_open = false;
-                return Redraw::Scene;
-            }
-            if self.start_shutdown_item().contains(x, y) {
-                shutdown();
-            }
-            self.start_open = false;
-            return Redraw::Scene;
-        }
         if self.desktop_terminal_icon().contains(x, y) {
             self.desktop_icon_selected = true;
             self.desktop_icon_pressed = true;
@@ -968,11 +1073,7 @@ impl DesktopSession {
             WindowInteraction::Move { .. } => PointerCursor::Grabbing,
             WindowInteraction::Resize { edges, .. } => cursor_for_resize(edges),
             WindowInteraction::None => {
-                if self.start_button().contains(x, y)
-                    || self.start_open
-                        && (self.start_terminal_item().contains(x, y)
-                            || self.start_ui_item().contains(x, y)
-                            || self.start_shutdown_item().contains(x, y))
+                if self.shell.interactive_at(x, y)
                     || self.task_window_at(x, y).is_some()
                     || self.desktop_terminal_icon().contains(x, y)
                     || self.desktop_trash_icon().contains(x, y)
@@ -1352,6 +1453,7 @@ impl DesktopSession {
             .clamp(0, screen_height.saturating_sub(1) as i32);
         self.interaction = WindowInteraction::None;
         self.drag_preview_visible = false;
+        self.shell.resize(screen_width, screen_height);
         let work_area = self.window_work_area();
         for index in 0..MAX_WINDOWS {
             let event = if let Some(slot) = self.windows[index].as_mut() {
@@ -1395,7 +1497,7 @@ impl DesktopSession {
                 self.render_window(id);
             }
         }
-        if self.start_open {
+        if self.shell.is_open() {
             self.render_start_menu();
         }
     }
@@ -1732,24 +1834,10 @@ impl DesktopSession {
         );
         self.framebuffer
             .fill_rect(Rect::new(0, y, self.framebuffer.width(), 1), Theme::BORDER);
-        let start = self.start_button();
-        self.framebuffer.fill_rect(
-            start,
-            if self.start_open {
-                Theme::PANEL_LIGHT
-            } else {
-                Theme::PANEL
-            },
-        );
-        components::start_icon(&mut self.framebuffer, start.x + 14, start.y + 11);
-        font::draw_text(
-            &mut self.framebuffer,
-            start.x + 47,
-            start.y + 17,
-            "START",
-            Theme::TEXT,
-            font::UI_NORMAL,
-        );
+        let icon_pack = active_icon_or_default(self.icon_packs.active());
+        let _ = self
+            .shell
+            .draw_launcher(&mut self.framebuffer, icon_pack, true);
 
         for index in 0..self.window_count {
             let id = self.task_order[index];
@@ -1792,68 +1880,14 @@ impl DesktopSession {
                 );
             }
         }
-        let status_x = self.framebuffer.width() as i32 - 150;
-        font::draw_text(
-            &mut self.framebuffer,
-            status_x,
-            y + 17,
-            "CPU0  64-BIT",
-            Theme::TEXT_MUTED,
-            font::UI_SMALL,
-        );
+        let _ = self
+            .shell
+            .draw_clock(&mut self.framebuffer, icon_pack, true);
     }
 
     fn render_start_menu(&mut self) {
-        let menu = self.start_menu();
-        Panel {
-            rect: menu,
-            color: Color::rgb(19, 28, 42),
-            border: Some(Theme::BORDER),
-        }
-        .draw(&mut self.framebuffer);
-        font::draw_text(
-            &mut self.framebuffer,
-            menu.x + 18,
-            menu.y + 18,
-            "RUSTOS",
-            Theme::ACCENT,
-            font::UI_LARGE,
-        );
-        let terminal = self.start_terminal_item();
-        self.framebuffer.fill_rect(terminal, Theme::PANEL_LIGHT);
-        self.draw_system_icon(
-            IconKind::Terminal,
-            Rect::new(terminal.x + 10, terminal.y + 8, 34, 34),
-        );
-        font::draw_text(
-            &mut self.framebuffer,
-            terminal.x + 58,
-            terminal.y + 20,
-            "NEW TERMINAL",
-            Theme::TEXT,
-            font::UI_NORMAL,
-        );
-        let ui = self.start_ui_item();
-        self.framebuffer.fill_rect(ui, Theme::PANEL_LIGHT);
-        components::start_icon(&mut self.framebuffer, ui.x + 12, ui.y + 12);
-        font::draw_text(
-            &mut self.framebuffer,
-            ui.x + 58,
-            ui.y + 20,
-            "NEW UI GALLERY",
-            Theme::TEXT,
-            font::UI_NORMAL,
-        );
-        let shutdown = self.start_shutdown_item();
-        self.framebuffer.fill_rect(shutdown, Color::rgb(45, 31, 39));
-        font::draw_text(
-            &mut self.framebuffer,
-            shutdown.x + 18,
-            shutdown.y + 17,
-            "SHUTDOWN",
-            Color::rgb(245, 151, 157),
-            font::UI_NORMAL,
-        );
+        let icon_pack = active_icon_or_default(self.icon_packs.active());
+        let _ = self.shell.draw_menu(&mut self.framebuffer, icon_pack, true);
     }
 
     fn desktop_terminal_icon(&self) -> Rect {
@@ -1862,15 +1896,6 @@ impl DesktopSession {
 
     fn desktop_trash_icon(&self) -> Rect {
         Rect::new(28, 138, 74, 82)
-    }
-
-    fn start_button(&self) -> Rect {
-        Rect::new(
-            6,
-            self.framebuffer.height() as i32 - TASKBAR_HEIGHT as i32 + 4,
-            112,
-            TASKBAR_HEIGHT - 8,
-        )
     }
 
     fn task_button(&self, index: usize, count: usize) -> Rect {
@@ -1885,35 +1910,6 @@ impl DesktopSession {
             self.framebuffer.height() as i32 - TASKBAR_HEIGHT as i32 + 4,
             width.saturating_sub(3),
             TASKBAR_HEIGHT - 8,
-        )
-    }
-
-    fn start_menu(&self) -> Rect {
-        Rect::new(
-            6,
-            self.framebuffer.height() as i32 - TASKBAR_HEIGHT as i32 - 288,
-            300,
-            282,
-        )
-    }
-
-    fn start_terminal_item(&self) -> Rect {
-        let menu = self.start_menu();
-        Rect::new(menu.x + 12, menu.y + 65, menu.width - 24, 52)
-    }
-
-    fn start_ui_item(&self) -> Rect {
-        let menu = self.start_menu();
-        Rect::new(menu.x + 12, menu.y + 123, menu.width - 24, 52)
-    }
-
-    fn start_shutdown_item(&self) -> Rect {
-        let menu = self.start_menu();
-        Rect::new(
-            menu.x + 12,
-            menu.y + menu.height as i32 - 58,
-            menu.width - 24,
-            44,
         )
     }
 

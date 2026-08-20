@@ -126,7 +126,7 @@ stop_qemu() {
 cleanup() {
     trap - EXIT INT TERM HUP
     stop_qemu
-    for file in serial.log qemu-stderr.log mode-720.ppm fonts.ppm cursor-busy.ppm wallpaper-autumn.ppm lifecycle.ppm terminal.ppm ui-gallery.ppm dragged.ppm resized.ppm minimized.ppm; do
+    for file in serial.log qemu-stderr.log start-menu.ppm mode-720.ppm fonts.ppm cursor-busy.ppm wallpaper-autumn.ppm lifecycle.ppm terminal.ppm ui-gallery.ppm dragged.ppm resized.ppm minimized.ppm; do
         [[ -f "$RUN_DIR/$file" ]] && cp -f "$RUN_DIR/$file" "$RESULT_DIR/$file"
     done
 }
@@ -170,6 +170,30 @@ grep -q '\[isolation\] concurrent #UD terminated one process; survivor exited=22
 grep -q '\[ipc\] queued block/wake and attenuated VFS capability verified' "$RUN_DIR/serial.log"
 grep -q '\[process-manager\] dynamic create/exit/reap reclaimed all frames' "$RUN_DIR/serial.log"
 grep -q '\[scheduler\] priority, affinity and fault-containment policy verified' "$RUN_DIR/serial.log"
+grep -Eq '\[clock\] source=cmos-rtc time=[0-2][0-9]:[0-5][0-9] date=[0-3][0-9]\.[01][0-9]\.[0-9]{4}' \
+    "$RUN_DIR/serial.log"
+
+# Start является настоящим system-ui tree. Down/Up проходят общий pointer
+# capture, а popup состоит из Menu/Button/Image/Text и не меняет WindowId.
+move_mouse -578 377 5
+printf 'mouse_button 1\n' | hmp
+sleep 0.08
+printf 'mouse_button 0\n' | hmp
+wait_for_serial '[start] opened component-runtime=system-ui-v1'
+sleep 0.25
+printf 'screendump %s/start-menu.ppm\n' "$RUN_DIR" | hmp
+[[ -s "$RUN_DIR/start-menu.ppm" ]] || {
+    echo "[gui-test] component Start screenshot is empty" >&2
+    exit 1
+}
+# Повторное нажатие той же Button закрывает popup; возвращаем курсор в центр,
+# чтобы существующий lifecycle сценарий сохранил детерминированные координаты.
+printf 'mouse_button 1\n' | hmp
+sleep 0.08
+printf 'mouse_button 0\n' | hmp
+wait_for_serial '[start] closed component-runtime=system-ui-v1'
+move_mouse 578 -377 5
+sleep 0.2
 
 # Проверяем настоящий double-click и создание второго независимого экземпляра:
 # стартовая точка курсора детерминирована (640,400), icon — около (65,78).

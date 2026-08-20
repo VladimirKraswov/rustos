@@ -65,6 +65,10 @@ PS/2 service объединяет накопившиеся движения с �
   восстанавливает свёрнутое окно;
 - Start menu создаёт новый Terminal или UI Gallery, а не заменяет содержимое
   уже открытого окна;
+- кнопка Start, само меню, его пункты, изображения и часы построены тем же
+  `rustos-system-ui`, что интерфейсы приложений: `Button` выдаёт `CommandId`,
+  `Image` разрешается через общий icon/resource backend, `Menu` владеет
+  focus scope, а дата и время являются обычными `Text`-компонентами;
 - один клик выбирает desktop icon, двойной — создаёт новый terminal; интервал и
   допустимое смещение берутся из общего mouse profile.
 
@@ -95,6 +99,15 @@ REGULAR|BOLD|ITALIC|BOLDITALIC` применяются сразу и не тре
 автоматически показывает I-beam над terminal, hand над действиями,
 grab/grabbing над заголовком и правильную стрелку на каждой стороне/углу.
 
+Taskbar показывает `HH:MM` и `DD.MM.YYYY`. На x86-64 wall clock читается из
+CMOS RTC двумя совпадающими snapshot, поэтому секундный rollover не может
+смешать старую дату с новым временем. Опрос ограничен одним разом в секунду,
+но repaint выполняется только при смене минуты и затрагивает taskbar (и
+открытое Start menu), а не все окна. Таймауты и scheduler по-прежнему используют
+только monotonic clock. На ARM без описанного в ACPI/Device Tree RTC выводится
+честный uptime fallback. Текущее RTC-время считается UTC; выбор часового пояса
+будет policy отдельного time service, а не скрытой поправкой ядра.
+
 Команда `RUN /apps/examples/hello.rune student` запускает настоящий
 изолированный процесс с VaraniaFS. Persistent `vfsd` обслуживает executable и
 DLL, stdout/stderr идут через capability pipe обратно в окно. Заполнение pipe
@@ -103,8 +116,11 @@ DLL, stdout/stderr идут через capability pipe обратно в окн�
 
 ## Компоненты
 
-SDK-слой содержит `Widget`, `Panel`, `Label`, `Button`, `IconButton`,
-`Tabs` и `Image`. Сейчас они компилируются вместе с bootstrap GUI. После IPC
+Retained SDK-слой содержит `Panel`, `Label/Text`, `Button`, `Menu`, `Image`,
+layout, focus, commands и renderer-neutral display list. Start уже переведён
+на этот слой и служит системным vertical slice: shell и приложение используют
+одинаковые controls, но разные bounded component trees. Старые bootstrap
+`Widget`-примитивы пока оставлены только в frame/title-bar пути. После IPC
 milestone renderer/theme останутся в GUI server, а приложения получат тонкий
 versioned client API без дублирования большого renderer-кода.
 

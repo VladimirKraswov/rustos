@@ -82,6 +82,39 @@ impl<'a, const N: usize> UiBuilder<'a, N> {
         self.component(parent, spec)
     }
 
+    /// Image из таблицы ресурсов приложения или системного resource pack.
+    /// Декоративное изображение передаёт `ResourceId(0)` как accessible name;
+    /// смысловая иллюстрация получает роль Image и локализованное имя.
+    pub fn image(
+        &mut self,
+        parent: NodeId,
+        resource: ResourceId,
+        accessible_name: ResourceId,
+        layout: LayoutSpec,
+    ) -> Result<NodeId, TreeError> {
+        let mut spec = NodeSpec::new(ComponentKind::Image);
+        spec.layout = layout;
+        spec.content = Content::Resource(resource);
+        spec.accessible_name = accessible_name;
+        if accessible_name != ResourceId(0) {
+            spec.role = SemanticRole::Image;
+        }
+        self.component(parent, spec)
+    }
+
+    /// Всплывающая Menu surface. Пункты остаются обычными Button-компонентами
+    /// с `SemanticRole::MenuItem`, поэтому мышь, Tab и Enter используют один
+    /// dispatcher, а не отдельный набор координат shell'а.
+    pub fn menu(&mut self, parent: NodeId, layout: LayoutSpec) -> Result<NodeId, TreeError> {
+        let mut spec = NodeSpec::new(ComponentKind::Menu);
+        spec.layout = layout;
+        spec.role = SemanticRole::Menu;
+        // Menu является focus scope, а не отдельным пунктом Tab-порядка.
+        // Фокус сразу переходит на первый дочерний control.
+        spec.tab_index = -1;
+        self.component(parent, spec)
+    }
+
     /// Button, привязанный к объекту команды.
     pub fn button(
         &mut self,
@@ -94,6 +127,26 @@ impl<'a, const N: usize> UiBuilder<'a, N> {
             parent,
             ComponentKind::Button,
             SemanticRole::Button,
+            label,
+            command,
+            layout,
+        )
+    }
+
+    /// Пункт Menu с визуальным поведением Button и отдельной семантической
+    /// ролью. Это позволяет screen reader отличить action в popup от обычной
+    /// кнопки формы, не создавая второй input implementation.
+    pub fn menu_item(
+        &mut self,
+        parent: NodeId,
+        label: ResourceId,
+        command: CommandId,
+        layout: LayoutSpec,
+    ) -> Result<NodeId, TreeError> {
+        self.control(
+            parent,
+            ComponentKind::Button,
+            SemanticRole::MenuItem,
             label,
             command,
             layout,
@@ -202,5 +255,31 @@ impl<'a, const N: usize> UiBuilder<'a, N> {
         spec.role = role;
         spec.accessible_name = label;
         self.component(parent, spec)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn image_and_menu_keep_resource_and_accessibility_contract() {
+        let mut tree = Tree::<8>::new();
+        let root = tree.root();
+        let mut ui = UiBuilder::new(&mut tree);
+        let menu = ui.menu(root, LayoutSpec::fill()).unwrap();
+        let item = ui
+            .menu_item(menu, ResourceId(7), CommandId(8), LayoutSpec::fill())
+            .unwrap();
+        let image = ui
+            .image(menu, ResourceId(41), ResourceId(42), LayoutSpec::fill())
+            .unwrap();
+        assert_eq!(tree.get(menu).unwrap().role, SemanticRole::Menu);
+        assert_eq!(tree.get(item).unwrap().role, SemanticRole::MenuItem);
+        let image = tree.get(image).unwrap();
+        assert_eq!(image.kind, ComponentKind::Image);
+        assert_eq!(image.content, Content::Resource(ResourceId(41)));
+        assert_eq!(image.accessible_name, ResourceId(42));
+        assert_eq!(image.role, SemanticRole::Image);
     }
 }

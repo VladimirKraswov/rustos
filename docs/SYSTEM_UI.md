@@ -17,6 +17,8 @@
 - bounded virtual-list range для десятков тысяч items;
 - стабильный wire ABI приложения к будущему `uid`;
 - AOT-компилятор `rustos-rui`, headless-тесты и UI Gallery в desktop.
+- компонентный desktop shell: Start `Button` + `Image`, `Menu`, пункты-команды,
+  taskbar clock/date и keyboard focus без ручного hit-test пунктов.
 
 Это фундамент, а не заявление, что весь каталог controls готов. Text editing,
 shaping, popup/portal, animations, persisted state и IPC-сервис расширяются
@@ -198,6 +200,13 @@ behaviours, inspector и recorder. Focus переходит по стабиль�
 Control не содержит application callback: runtime возвращает command event,
 приложение обновляет state. Следующий `CommandRegistry` добавит общие
 enabled/visible/checked/title/icon и shortcut scopes.
+
+Start menu является проверкой этого контракта на системном UI. Window server
+передаёт ему нормализованные `Down/Up/Move`, runtime удерживает pointer capture
+и возвращает `OpenTerminal`, `OpenGallery` либо `Shutdown`. Нажатие не сверяет
+ручные прямоугольники пунктов. `Menu` исключён из Tab-порядка как focus scope,
+поэтому первый Tab выбирает первый дочерний `Button`; Escape остаётся глобальной
+командой закрытия popup. Клик не проходит сквозь surface к окну под ним.
 
 ## Accessibility
 
