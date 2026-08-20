@@ -15,6 +15,7 @@ mod segmentation;
 mod smp;
 mod traps;
 
+use core::sync::atomic::{AtomicU64, Ordering};
 use rustos_abi::BootInfo;
 
 use super::{ArchError, EarlyInit, SchedulerHardware, SmpInfo};
@@ -25,6 +26,10 @@ pub use traps::TrapFrame;
 pub const ARCH_NAME: &str = "x86-64";
 /// `#UD` — архитектурная причина тестового illegal instruction.
 pub const ILLEGAL_INSTRUCTION_EXCEPTION: u16 = 6;
+
+/// Частота invariant TSC калибруется APIC backend'ом. Значение 1 ГГц —
+/// безопасный ранний fallback до scheduler milestone.
+static MONOTONIC_HZ: AtomicU64 = AtomicU64::new(1_000_000_000);
 
 /// Сохранённый пользовательский контекст. Его раскладка является деталью
 /// AMD64 backend'а и не видна scheduler/process manager.
@@ -125,6 +130,13 @@ pub fn read_monotonic_counter() -> u64 {
     (u64::from(high) << 32) | u64::from(low)
 }
 
+/// Монотонное время для input gestures и GUI-анимаций.
+pub fn monotonic_milliseconds() -> u64 {
+    let frequency = MONOTONIC_HZ.load(Ordering::Acquire).max(1);
+    let ticks = read_monotonic_counter();
+    ticks / frequency * 1_000 + (ticks % frequency) * 1_000 / frequency
+}
+
 /// Настраивает GDT/TSS/IDT и аппаратную защиту страниц до первого ring 3.
 pub fn initialize_early(_info: &BootInfo) -> Result<EarlyInit, ArchError> {
     enable_memory_protection();
@@ -138,6 +150,7 @@ pub fn initialize_early(_info: &BootInfo) -> Result<EarlyInit, ArchError> {
 
 pub fn initialize_scheduler_hardware() -> Result<SchedulerHardware, ArchError> {
     let info = apic::initialize_local().map_err(|_| ArchError::InterruptController)?;
+    MONOTONIC_HZ.store(info.tsc_hz.max(1), Ordering::Release);
     Ok(SchedulerHardware {
         boot_cpu_id: info.id,
         counter_hz: info.tsc_hz,

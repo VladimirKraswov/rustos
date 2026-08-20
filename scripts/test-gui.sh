@@ -99,7 +99,7 @@ stop_qemu() {
 cleanup() {
     trap - EXIT INT TERM HUP
     stop_qemu
-    for file in serial.log qemu-stderr.log mode-720.ppm fonts.ppm terminal.ppm ui-gallery.ppm dragged.ppm resized.ppm minimized.ppm; do
+    for file in serial.log qemu-stderr.log mode-720.ppm fonts.ppm cursor-busy.ppm wallpaper-autumn.ppm terminal.ppm ui-gallery.ppm dragged.ppm resized.ppm minimized.ppm; do
         [[ -f "$RUN_DIR/$file" ]] && cp -f "$RUN_DIR/$file" "$RESULT_DIR/$file"
     done
 }
@@ -144,6 +144,21 @@ grep -q '\[ipc\] queued block/wake and attenuated VFS capability verified' "$RUN
 grep -q '\[process-manager\] dynamic create/exit/reap reclaimed all frames' "$RUN_DIR/serial.log"
 grep -q '\[scheduler\] priority, affinity and fault-containment policy verified' "$RUN_DIR/serial.log"
 
+# Проверяем настоящий double-click до перемещения/resize окна: стартовая точка
+# курсора детерминирована (640,400), terminal icon находится около (65,78).
+printf 'mouse_move -575 -322\n' | hmp
+sleep 0.4
+printf 'mouse_button 1\n' | hmp
+sleep 0.08
+printf 'mouse_button 0\n' | hmp
+sleep 0.12
+printf 'mouse_button 1\n' | hmp
+sleep 0.08
+printf 'mouse_button 0\n' | hmp
+wait_for_serial '[desktop] terminal double-click'
+printf 'mouse_move 575 322\n' | hmp
+sleep 0.3
+
 # Команда идёт через настоящий PS/2 keyboard path.
 send_command 'help'
 wait_for_serial '[terminal] command: help'
@@ -165,6 +180,33 @@ send_command 'font style regular'
 wait_for_serial '[font] terminal family=console size=20 style=regular'
 send_command 'font size 18'
 wait_for_serial '[font] terminal family=console size=18 style=regular'
+
+# Input/resource services: hardware PS/2 rate plus portable software profile,
+# animated cursor preview and hot-swappable visual packs.
+send_command 'mouse rate 200'
+wait_for_serial '[input] mouse profile updated rate=200'
+send_command 'mouse sensitivity 125'
+wait_for_serial '[input] mouse profile updated rate=200 sensitivity=125%'
+send_command 'mouse double 500'
+wait_for_serial '[input] mouse profile updated rate=200 sensitivity=125% double-ms=500'
+send_command 'cursor preview busy'
+wait_for_serial '[cursor] value=BUSY theme=light'
+sleep 0.25
+printf 'screendump %s/cursor-busy.ppm\n' "$RUN_DIR" | hmp
+send_command 'cursor auto'
+wait_for_serial '[cursor] value=AUTO theme=light'
+send_command 'icons theme midnight'
+wait_for_serial '[assets] icon-pack=midnight'
+send_command 'icons theme classic'
+wait_for_serial '[assets] icon-pack=classic'
+send_command 'wallpaper autumn'
+wait_for_serial '[desktop] wallpaper=autumn'
+sleep 0.25
+printf 'screendump %s/wallpaper-autumn.ppm\n' "$RUN_DIR" | hmp
+send_command 'wallpaper spring'
+wait_for_serial '[desktop] wallpaper=spring'
+send_command 'mouse sensitivity 100'
+wait_for_serial '[input] mouse profile updated rate=200 sensitivity=100% double-ms=500'
 
 # Display manager: monitor info, runtime software color profile and honest
 # firmware mode-set boundary. Возвращаем truecolor до screenshot-проверок.
@@ -278,7 +320,9 @@ printf 'screendump %s/resized.ppm\n' "$RUN_DIR" | hmp
 # Курсор около (1239,138); перемещаемся к новой позиции minimize-кнопки.
 printf 'mouse_move -80 16\n' | hmp
 sleep 0.2
-printf 'mouse_button 1\nmouse_button 0\n' | hmp
+printf 'mouse_button 1\n' | hmp
+sleep 0.08
+printf 'mouse_button 0\n' | hmp
 for _ in $(seq 1 40); do
     grep -q '\[wm\] terminal minimized' "$RUN_DIR/serial.log" && break
     sleep 0.1

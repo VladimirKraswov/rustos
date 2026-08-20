@@ -166,6 +166,15 @@ pub fn read_monotonic_counter() -> u64 {
     value
 }
 
+/// Монотонное время на architected Generic Timer, без platform MMIO.
+pub fn monotonic_milliseconds() -> u64 {
+    let frequency: u64;
+    unsafe { asm!("mrs {value}, cntfrq_el0", value = out(reg) frequency, options(nomem, nostack)) };
+    let frequency = frequency.max(1);
+    let ticks = read_monotonic_counter();
+    ticks / frequency * 1_000 + (ticks % frequency) * 1_000 / frequency
+}
+
 pub fn initialize_early(info: &BootInfo) -> Result<EarlyInit, ArchError> {
     // Синхронизируем записи загрузчика перед будущей установкой VBAR_EL1.
     unsafe { asm!("dsb sy", "isb", options(nostack, preserves_flags)) };

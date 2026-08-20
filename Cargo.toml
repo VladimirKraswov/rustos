@@ -14,6 +14,7 @@ members = [
     "microkernel",
     "video",
     "system-ui",
+    "system-assets",
     "runtime",
     "userspace/crt",
     "sdk/examples/hello",

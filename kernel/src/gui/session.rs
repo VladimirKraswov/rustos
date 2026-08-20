@@ -6,21 +6,31 @@
 
 use crate::{
     apps::{
-        terminal::{Terminal, TerminalAction},
+        terminal::{
+            CursorCommand, CursorThemeName, IconThemeName, MouseCommand, Terminal, TerminalAction,
+        },
         ui_showcase::UiShowcase,
     },
     arch, font,
     graphics::{Color, Framebuffer, Rect},
-    gui::components::{self, Button, Label, Panel, Theme, Widget},
+    gui::{
+        components::{self, Button, Label, Panel, Theme, Widget},
+        cursor::Cursor,
+    },
     input::{self, Event, Key, MouseEvent, PlatformInput},
     serial,
 };
 use rustos_abi::{
     bootinfo::BootInitramfs,
+    input::{MouseSettings, PointerCursor},
     window::{
         event as window_event, WindowCommand, WindowEvent, WindowId, WindowRect, WindowStyle,
     },
     BootInfo,
+};
+use rustos_system_assets::{
+    wallpaper, IconKind, IconPack, PackId, PackRegistry, ResourcePack, WallpaperId,
+    CLASSIC_ICON_PACK, MIDNIGHT_ICON_PACK, MONO_ICON_PACK,
 };
 use rustos_system_ui::{Key as UiKey, PointerKind as UiPointerKind};
 use rustos_video::{
@@ -37,9 +47,6 @@ const RESIZE_BORDER: u32 = 6;
 const TERMINAL_WINDOW_ID: WindowId = WindowId::new(1);
 const TERMINAL_MIN_WIDTH: u32 = 480;
 const TERMINAL_MIN_HEIGHT: u32 = 300;
-/// Размер области курсора (рисуется стрелкой 14×20).
-const CURSOR_WIDTH: usize = 14;
-const CURSOR_HEIGHT: usize = 20;
 
 /// Точка входа GUI-сессии: создаёт compositor'а, рисует desktop и
 /// уходит в бесконечный event loop. Возвращается только через
@@ -125,6 +132,49 @@ enum ActiveApplication {
     UiShowcase,
 }
 
+/// Результат нажатия основной кнопки над desktop icon.
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum ClickKind {
+    Single,
+    Double,
+}
+
+/// Системное распознавание кликов использует настройки input service, а не
+/// зашитые таймауты приложения. Позже тот же state переедет в window server.
+struct ClickTracker {
+    last_press_ms: u64,
+    last_x: i32,
+    last_y: i32,
+}
+
+impl ClickTracker {
+    const fn new() -> Self {
+        Self {
+            last_press_ms: 0,
+            last_x: 0,
+            last_y: 0,
+        }
+    }
+
+    fn pressed(&mut self, now_ms: u64, x: i32, y: i32, settings: MouseSettings) -> ClickKind {
+        let elapsed = now_ms.saturating_sub(self.last_press_ms);
+        let movement = (x - self.last_x).abs().max((y - self.last_y).abs());
+        let double = self.last_press_ms != 0
+            && elapsed >= u64::from(settings.click_debounce_ms)
+            && elapsed <= u64::from(settings.double_click_ms)
+            && movement <= i32::from(settings.drag_threshold_px);
+        if double {
+            self.last_press_ms = 0;
+            ClickKind::Double
+        } else {
+            self.last_press_ms = now_ms;
+            self.last_x = x;
+            self.last_y = y;
+            ClickKind::Single
+        }
+    }
+}
+
 /// Desktop-сессия: владеет framebuffer'ом, input'ом, окном терминала и
 /// курсором; отвечает и за event loop, и за отрисовку (см. модуль).
 struct DesktopSession {
@@ -137,6 +187,8 @@ struct DesktopSession {
     window_events: WindowEventQueue<32>,
     interaction: WindowInteraction,
     cursor: Cursor,
+    icon_packs: PackRegistry<IconPack, 8>,
+    wallpaper: WallpaperId,
     mouse_x: i32,
     mouse_y: i32,
     previous_left: bool,
@@ -145,6 +197,9 @@ struct DesktopSession {
     drag_packets: u32,
     drag_present_pixels: u64,
     drag_preview_visible: bool,
+    desktop_icon_selected: bool,
+    desktop_icon_pressed: bool,
+    click_tracker: ClickTracker,
 }
 
 impl DesktopSession {
@@ -172,6 +227,10 @@ impl DesktopSession {
         serial::put_str("[ui] constructing Gallery tree\n");
         let ui_showcase = UiShowcase::new(content);
         serial::put_str("[ui] Gallery tree ready\n");
+        let mut icon_packs = PackRegistry::new();
+        let _ = icon_packs.install(CLASSIC_ICON_PACK);
+        let _ = icon_packs.install(MIDNIGHT_ICON_PACK);
+        let _ = icon_packs.install(MONO_ICON_PACK);
         Self {
             mouse_x: (screen_width / 2) as i32,
             mouse_y: (screen_height / 2) as i32,
@@ -190,12 +249,17 @@ impl DesktopSession {
             window_events: WindowEventQueue::new(),
             interaction: WindowInteraction::None,
             cursor: Cursor::new(),
+            icon_packs,
+            wallpaper: WallpaperId::SpringRiver,
             previous_left: false,
             start_open: false,
             drag_frames: 0,
             drag_packets: 0,
             drag_present_pixels: 0,
             drag_preview_visible: false,
+            desktop_icon_selected: false,
+            desktop_icon_pressed: false,
+            click_tracker: ClickTracker::new(),
         }
     }
 
@@ -209,7 +273,11 @@ impl DesktopSession {
                 self.cursor.restore(&mut self.framebuffer);
                 let redraw = match event {
                     Event::Key(key) => self.handle_key(key),
-                    Event::Mouse(mouse) => self.handle_mouse(mouse),
+                    Event::Mouse(mouse) => {
+                        let redraw = self.handle_mouse(mouse);
+                        self.update_cursor_hint();
+                        redraw
+                    }
                 };
                 let mut terminal_line = None;
                 let mut ui_frame = None;
@@ -305,6 +373,13 @@ impl DesktopSession {
                     }
                 }
                 self.dispatch_window_events();
+            } else if self.cursor.animate(arch::monotonic_milliseconds()) {
+                let old_cursor = self.cursor.rect();
+                self.cursor.restore(&mut self.framebuffer);
+                self.cursor
+                    .draw(&mut self.framebuffer, self.mouse_x, self.mouse_y);
+                self.framebuffer.present_rect(old_cursor);
+                self.framebuffer.present_rect(self.cursor.rect());
             } else {
                 core::hint::spin_loop();
             }
@@ -416,6 +491,106 @@ impl DesktopSession {
                 self.open_ui_showcase();
                 Redraw::Window
             }
+            TerminalAction::Mouse(command) => {
+                let mut settings = self.input.mouse_settings();
+                let hardware_applied = match command {
+                    MouseCommand::Info => None,
+                    MouseCommand::Rate(value) => {
+                        settings.sample_rate_hz = value;
+                        Some(self.input.set_mouse_settings(settings))
+                    }
+                    MouseCommand::Resolution(value) => {
+                        settings.resolution_level = value;
+                        Some(self.input.set_mouse_settings(settings))
+                    }
+                    MouseCommand::Sensitivity(value) => {
+                        settings.sensitivity_percent = value;
+                        Some(self.input.set_mouse_settings(settings))
+                    }
+                    MouseCommand::Acceleration(value) => {
+                        settings.acceleration_percent = value;
+                        Some(self.input.set_mouse_settings(settings))
+                    }
+                    MouseCommand::DoubleClick(value) => {
+                        settings.double_click_ms = value;
+                        Some(self.input.set_mouse_settings(settings))
+                    }
+                    MouseCommand::Debounce(value) => {
+                        settings.click_debounce_ms = value;
+                        Some(self.input.set_mouse_settings(settings))
+                    }
+                    MouseCommand::DragThreshold(value) => {
+                        settings.drag_threshold_px = value;
+                        Some(self.input.set_mouse_settings(settings))
+                    }
+                };
+                let settings = self.input.mouse_settings();
+                let capabilities = self.input.mouse_capabilities();
+                self.terminal
+                    .report_mouse(settings, capabilities, hardware_applied);
+                serial::put_str("[input] mouse profile updated rate=");
+                serial::put_u32(u32::from(settings.sample_rate_hz));
+                serial::put_str(" sensitivity=");
+                serial::put_u32(u32::from(settings.sensitivity_percent));
+                serial::put_str("% double-ms=");
+                serial::put_u32(u32::from(settings.double_click_ms));
+                serial::put_str("\n");
+                Redraw::Window
+            }
+            TerminalAction::Cursor(command) => {
+                let value = match command {
+                    CursorCommand::Auto => {
+                        self.cursor.set_preview(None);
+                        "AUTO"
+                    }
+                    CursorCommand::Preview(kind) => {
+                        self.cursor.set_preview(Some(kind));
+                        cursor_name(kind)
+                    }
+                    CursorCommand::Theme(theme) => {
+                        let id = match theme {
+                            CursorThemeName::Light => PackId(0x1001),
+                            CursorThemeName::Midnight => PackId(0x1002),
+                            CursorThemeName::Contrast => PackId(0x1003),
+                        };
+                        let _ = self.cursor.select_theme(id);
+                        self.cursor.theme_name()
+                    }
+                };
+                self.terminal.report_visual_setting("CURSOR", value);
+                serial::put_str("[cursor] value=");
+                serial::put_str(value);
+                serial::put_str(" theme=");
+                serial::put_str(self.cursor.theme_name());
+                serial::put_str("\n");
+                Redraw::Window
+            }
+            TerminalAction::Icons(theme) => {
+                let id = match theme {
+                    IconThemeName::Classic => PackId(0x2001),
+                    IconThemeName::Midnight => PackId(0x2002),
+                    IconThemeName::Mono => PackId(0x2003),
+                };
+                let _ = self.icon_packs.select(id);
+                let name = self
+                    .icon_packs
+                    .active()
+                    .map_or("none", |pack| pack.metadata().name);
+                self.terminal.report_visual_setting("ICON PACK", name);
+                serial::put_str("[assets] icon-pack=");
+                serial::put_str(name);
+                serial::put_str("\n");
+                Redraw::All
+            }
+            TerminalAction::Wallpaper(selected) => {
+                self.wallpaper = selected;
+                self.terminal
+                    .report_visual_setting("WALLPAPER", wallpaper(selected).name);
+                serial::put_str("[desktop] wallpaper=");
+                serial::put_str(wallpaper(selected).name);
+                serial::put_str("\n");
+                Redraw::All
+            }
             TerminalAction::Shutdown => shutdown(),
         }
     }
@@ -484,6 +659,9 @@ impl DesktopSession {
         let pressed = event.left && !was_left;
         let released = !event.left && was_left;
         self.previous_left = event.left;
+        if released && self.desktop_icon_pressed {
+            self.desktop_icon_pressed = false;
+        }
         if !pressed {
             if self.active_application == ActiveApplication::UiShowcase
                 && self.window.is_visible()
@@ -532,9 +710,29 @@ impl DesktopSession {
             return Redraw::All;
         }
         if self.desktop_terminal_icon().contains(x, y) {
-            self.open_terminal();
+            // Первый mouse-down только выбирает ярлык; второй в системном
+            // double-click окне запускает его без задержки до mouse-up.
+            self.desktop_icon_selected = true;
+            self.desktop_icon_pressed = true;
+            let click = self.click_tracker.pressed(
+                arch::monotonic_milliseconds(),
+                x,
+                y,
+                self.input.mouse_settings(),
+            );
+            if click == ClickKind::Double {
+                self.open_terminal();
+                serial::put_str("[desktop] terminal double-click\n");
+            } else {
+                serial::put_str("[desktop] terminal single-click x=");
+                serial::put_u32(x as u32);
+                serial::put_str(" y=");
+                serial::put_u32(y as u32);
+                serial::put_str("\n");
+            }
             return Redraw::All;
         }
+        self.desktop_icon_selected = false;
         if self.task_terminal_button().contains(x, y) && !self.window.is_closed() {
             let command = if self.window.is_minimized() {
                 WindowCommand::restore(TERMINAL_WINDOW_ID)
@@ -609,6 +807,67 @@ impl DesktopSession {
             serial::put_str("[wm] terminal drag started\n");
         }
         Redraw::None
+    }
+
+    /// Выбирает семантический курсор после каждого mouse event. Ни один
+    /// widget не знает конкретной картинки: hit-test сообщает только смысл,
+    /// а cursor pack определяет стиль и hotspot.
+    fn update_cursor_hint(&mut self) {
+        let x = self.mouse_x;
+        let y = self.mouse_y;
+        let kind = match self.interaction {
+            WindowInteraction::Move { .. } => PointerCursor::Grabbing,
+            WindowInteraction::Resize { edges, .. } => cursor_for_resize(edges),
+            WindowInteraction::None => {
+                if self.window.is_visible()
+                    && self.window.style().contains(WindowStyle::RESIZABLE)
+                    && !self.window.is_maximized()
+                {
+                    let edges = hit_test_resize(self.window.rect(), x, y, RESIZE_BORDER);
+                    if !edges.is_empty() {
+                        self.cursor.set_automatic_kind(cursor_for_resize(edges));
+                        return;
+                    }
+                }
+                let (minimize, maximize, close) = self.window_controls();
+                let over_control = minimize.is_some_and(|rect| rect.contains(x, y))
+                    || maximize.is_some_and(|rect| rect.contains(x, y))
+                    || close.is_some_and(|rect| rect.contains(x, y));
+                let over_start_menu = self.start_open
+                    && (self.start_terminal_item().contains(x, y)
+                        || self.start_ui_item().contains(x, y)
+                        || self.start_shutdown_item().contains(x, y));
+                if over_control
+                    || over_start_menu
+                    || self.start_button().contains(x, y)
+                    || self.task_terminal_button().contains(x, y)
+                    || self.desktop_terminal_icon().contains(x, y)
+                    || self.desktop_trash_icon().contains(x, y)
+                {
+                    PointerCursor::Link
+                } else if self.window.is_visible() && self.window_content_rect().contains(x, y) {
+                    if self.active_application == ActiveApplication::Terminal {
+                        PointerCursor::Text
+                    } else {
+                        PointerCursor::Link
+                    }
+                } else if self.window.is_visible()
+                    && self.window.style().contains(WindowStyle::TITLE_BAR)
+                    && Rect::new(
+                        self.window_rect().x,
+                        self.window_rect().y,
+                        self.window_rect().width.saturating_sub(100),
+                        TITLE_HEIGHT,
+                    )
+                    .contains(x, y)
+                {
+                    PointerCursor::Grab
+                } else {
+                    PointerCursor::Arrow
+                }
+            }
+        };
+        self.cursor.set_automatic_kind(kind);
     }
 
     fn open_terminal(&mut self) {
@@ -882,45 +1141,46 @@ impl DesktopSession {
     fn render_wallpaper(&mut self) {
         let width = self.framebuffer.width();
         let height = self.framebuffer.height().saturating_sub(TASKBAR_HEIGHT);
-        self.framebuffer.fill(Theme::DESKTOP_TOP);
-        self.framebuffer.vertical_gradient(
-            Rect::new(0, 0, width, height),
-            Theme::DESKTOP_TOP,
-            Theme::DESKTOP_BOTTOM,
-        );
-
-        // Спокойные полупрозрачные волны имитируются смешанными полосами.
-        let band = Color::rgb(40, 109, 139);
-        for y in 0..height {
-            let center = height as i32 / 2 + ((y as i32 / 18) % 7 - 3) * 3;
-            let x = center + (y as i32 * 3 / 2);
-            self.framebuffer.fill_rect(
-                Rect::new(x - 260, y as i32, 520, 1),
-                band.mix(Theme::DESKTOP_BOTTOM, 145),
-            );
-        }
-        self.framebuffer.horizontal_gradient(
-            Rect::new(0, height as i32 - 120, width, 120),
-            Color::rgb(12, 51, 76),
-            Color::rgb(37, 77, 98),
-        );
+        self.framebuffer
+            .draw_wallpaper(Rect::new(0, 0, width, height), wallpaper(self.wallpaper));
         let branding_x = self.framebuffer.width() as i32 - 210;
         let branding_y = self.framebuffer.height() as i32 - TASKBAR_HEIGHT as i32 - 28;
+        font::draw_text(
+            &mut self.framebuffer,
+            branding_x + 1,
+            branding_y + 1,
+            arch::ARCH_NAME,
+            Color::rgb(8, 14, 22),
+            font::UI_SMALL.italic(),
+        );
         font::draw_text(
             &mut self.framebuffer,
             branding_x,
             branding_y,
             arch::ARCH_NAME,
-            Color::rgb(119, 158, 181),
+            Color::rgb(221, 238, 244),
             font::UI_SMALL.italic(),
         );
     }
 
     fn render_desktop_icons(&mut self) {
         let terminal = self.desktop_terminal_icon();
-        components::terminal_icon(
-            &mut self.framebuffer,
+        if self.desktop_icon_selected {
+            self.framebuffer
+                .fill_rect(terminal, Color::rgb(35, 81, 105));
+            self.framebuffer.border(terminal, Theme::ACCENT);
+        }
+        self.draw_system_icon(
+            IconKind::Terminal,
             Rect::new(terminal.x + 12, terminal.y + 3, 48, 48),
+        );
+        font::draw_text(
+            &mut self.framebuffer,
+            terminal.x + 6,
+            terminal.y + 62,
+            "TERMINAL",
+            Color::rgb(5, 9, 15),
+            font::UI_SMALL.bold(),
         );
         font::draw_text(
             &mut self.framebuffer,
@@ -928,12 +1188,20 @@ impl DesktopSession {
             terminal.y + 61,
             "TERMINAL",
             Theme::TEXT,
-            font::UI_SMALL,
+            font::UI_SMALL.bold(),
         );
-        let trash = Rect::new(28, 138, 74, 82);
-        components::trash_icon(
-            &mut self.framebuffer,
+        let trash = self.desktop_trash_icon();
+        self.draw_system_icon(
+            IconKind::Trash,
             Rect::new(trash.x + 12, trash.y + 2, 48, 52),
+        );
+        font::draw_text(
+            &mut self.framebuffer,
+            trash.x + 17,
+            trash.y + 64,
+            "TRASH",
+            Color::rgb(5, 9, 15),
+            font::UI_SMALL.bold(),
         );
         font::draw_text(
             &mut self.framebuffer,
@@ -941,7 +1209,15 @@ impl DesktopSession {
             trash.y + 63,
             "TRASH",
             Theme::TEXT,
-            font::UI_SMALL,
+            font::UI_SMALL.bold(),
+        );
+    }
+
+    fn draw_system_icon(&mut self, kind: IconKind, rect: Rect) {
+        self.icon_packs.active().unwrap_or(CLASSIC_ICON_PACK).draw(
+            &mut self.framebuffer,
+            kind,
+            rect,
         );
     }
 
@@ -977,8 +1253,8 @@ impl DesktopSession {
                 Color::rgb(22, 32, 48),
             );
             if self.active_application == ActiveApplication::Terminal {
-                components::terminal_icon(
-                    &mut self.framebuffer,
+                self.draw_system_icon(
+                    IconKind::Terminal,
                     Rect::new(rect.x + 8, rect.y + 6, 22, 22),
                 );
             } else {
@@ -1092,8 +1368,8 @@ impl DesktopSession {
                 },
             );
             if self.active_application == ActiveApplication::Terminal {
-                components::terminal_icon(
-                    &mut self.framebuffer,
+                self.draw_system_icon(
+                    IconKind::Terminal,
                     Rect::new(task.x + 7, task.y + 7, 28, 28),
                 );
             } else {
@@ -1137,8 +1413,8 @@ impl DesktopSession {
         );
         let terminal = self.start_terminal_item();
         self.framebuffer.fill_rect(terminal, Theme::PANEL_LIGHT);
-        components::terminal_icon(
-            &mut self.framebuffer,
+        self.draw_system_icon(
+            IconKind::Terminal,
             Rect::new(terminal.x + 10, terminal.y + 8, 34, 34),
         );
         font::draw_text(
@@ -1174,6 +1450,10 @@ impl DesktopSession {
 
     fn desktop_terminal_icon(&self) -> Rect {
         Rect::new(28, 35, 74, 86)
+    }
+
+    fn desktop_trash_icon(&self) -> Rect {
+        Rect::new(28, 138, 74, 82)
     }
 
     fn start_button(&self) -> Rect {
@@ -1339,77 +1619,36 @@ fn clipped_area(rect: Rect, width: u32, height: u32) -> u64 {
     u64::from(x1.saturating_sub(x0)) * u64::from(y1.saturating_sub(y0))
 }
 
-/// Мышиный курсор со «сохранённым фоном»: `draw` снимает текущие пиксели
-/// области в `saved`, затем рисует стрелку; `restore` возвращает фон
-/// перед перерисовкой того же места. Так event loop обновляет только
-/// две маленькие области вместо всего кадра.
-struct Cursor {
-    saved: [u32; CURSOR_WIDTH * CURSOR_HEIGHT],
-    x: i32,
-    y: i32,
-    valid: bool,
+fn cursor_for_resize(edges: ResizeEdges) -> PointerCursor {
+    let horizontal = edges.contains(ResizeEdges::LEFT) || edges.contains(ResizeEdges::RIGHT);
+    let vertical = edges.contains(ResizeEdges::TOP) || edges.contains(ResizeEdges::BOTTOM);
+    if horizontal && vertical {
+        if edges.contains(ResizeEdges::LEFT) == edges.contains(ResizeEdges::TOP) {
+            PointerCursor::ResizeNwSe
+        } else {
+            PointerCursor::ResizeNeSw
+        }
+    } else if horizontal {
+        PointerCursor::ResizeHorizontal
+    } else {
+        PointerCursor::ResizeVertical
+    }
 }
 
-impl Cursor {
-    const fn new() -> Self {
-        Self {
-            saved: [0; CURSOR_WIDTH * CURSOR_HEIGHT],
-            x: 0,
-            y: 0,
-            valid: false,
-        }
-    }
-
-    fn invalidate(&mut self) {
-        self.valid = false;
-    }
-
-    fn rect(&self) -> Rect {
-        Rect::new(self.x, self.y, CURSOR_WIDTH as u32, CURSOR_HEIGHT as u32)
-    }
-
-    fn restore(&mut self, fb: &mut Framebuffer) {
-        if !self.valid {
-            return;
-        }
-        for dy in 0..CURSOR_HEIGHT {
-            for dx in 0..CURSOR_WIDTH {
-                let x = self.x + dx as i32;
-                let y = self.y + dy as i32;
-                if x >= 0 && y >= 0 && x < fb.width() as i32 && y < fb.height() as i32 {
-                    fb.write_raw(x as u32, y as u32, self.saved[dy * CURSOR_WIDTH + dx]);
-                }
-            }
-        }
-        self.valid = false;
-    }
-
-    fn draw(&mut self, fb: &mut Framebuffer, x: i32, y: i32) {
-        self.x = x;
-        self.y = y;
-        for dy in 0..CURSOR_HEIGHT {
-            for dx in 0..CURSOR_WIDTH {
-                let px = x + dx as i32;
-                let py = y + dy as i32;
-                if px >= 0 && py >= 0 && px < fb.width() as i32 && py < fb.height() as i32 {
-                    self.saved[dy * CURSOR_WIDTH + dx] = fb.read_raw(px as u32, py as u32);
-                    let inside = dx == 0 || (dy < 14 && dx <= dy / 2 + 1) || (dy >= 11 && dx == 5);
-                    if inside {
-                        let outline = dx == 0 || dx == dy / 2 + 1 || dy == 13;
-                        fb.put_pixel(
-                            px,
-                            py,
-                            if outline {
-                                Color::rgb(7, 12, 20)
-                            } else {
-                                Color::rgb(242, 248, 252)
-                            },
-                        );
-                    }
-                }
-            }
-        }
-        self.valid = true;
+fn cursor_name(kind: PointerCursor) -> &'static str {
+    match kind {
+        PointerCursor::Arrow => "ARROW",
+        PointerCursor::Text => "TEXT",
+        PointerCursor::Link => "LINK",
+        PointerCursor::Grab => "GRAB",
+        PointerCursor::Grabbing => "GRABBING",
+        PointerCursor::Busy => "BUSY",
+        PointerCursor::Crosshair => "CROSSHAIR",
+        PointerCursor::NotAllowed => "FORBIDDEN",
+        PointerCursor::ResizeHorizontal => "HRESIZE",
+        PointerCursor::ResizeVertical => "VRESIZE",
+        PointerCursor::ResizeNwSe => "NWSE",
+        PointerCursor::ResizeNeSw => "NESW",
     }
 }
 

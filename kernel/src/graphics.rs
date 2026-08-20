@@ -15,6 +15,7 @@ use rustos_abi::{
     bootinfo::{FRAMEBUFFER_FORMAT_BGR, FRAMEBUFFER_FORMAT_RGB, FRAMEBUFFER_SOURCE_GRUB},
     BootInfo, PAGE_SIZE,
 };
+use rustos_system_assets::{IconTarget, Wallpaper};
 pub use rustos_video::{Color, Rect};
 use rustos_video::{
     ColorMode, ConnectorInfo, ConnectorKind, DamageRegion, DisplayDriver, DisplayMode,
@@ -249,11 +250,6 @@ impl Framebuffer {
         self.put_pixel(x, y, background.mix(foreground, coverage));
     }
 
-    /// Заливает весь кадр одним цветом (очистка сцены).
-    pub fn fill(&mut self, color: Color) {
-        self.fill_rect(Rect::new(0, 0, self.width, self.height), color);
-    }
-
     /// Заливает прямоугольник цветом; выход за границы кадра обрезается.
     pub fn fill_rect(&mut self, rect: Rect, color: Color) {
         if let Some(mut surface) = self.back_surface() {
@@ -290,15 +286,49 @@ impl Framebuffer {
         }
     }
 
-    /// Вертикальный градиент в `rect`: строка за строкой от `top` к `bottom`.
-    pub fn vertical_gradient(&mut self, rect: Rect, top: Color, bottom: Color) {
-        let height = rect.height.max(1);
-        for offset in 0..height {
-            let amount = ((offset as u64 * 255) / height as u64) as u8;
-            self.fill_rect(
-                Rect::new(rect.x, rect.y + offset as i32, rect.width, 1),
-                top.mix(bottom, amount),
-            );
+    /// Масштабирует RGB565-обои в `rect` по правилу cover, сохраняя пропорции.
+    /// Декодер не требует heap: исходник memory-mapped в read-only секцию, а
+    /// каждый пиксель сразу преобразуется в активный render format.
+    pub fn draw_wallpaper(&mut self, rect: Rect, image: Wallpaper) {
+        if rect.width == 0 || rect.height == 0 || image.width == 0 || image.height == 0 {
+            return;
+        }
+        let destination_ratio_wide = u64::from(rect.width) * u64::from(image.height)
+            > u64::from(rect.height) * u64::from(image.width);
+        let (sample_width, sample_height) = if destination_ratio_wide {
+            (
+                image.width,
+                (u64::from(image.width) * u64::from(rect.height) / u64::from(rect.width)).max(1)
+                    as u32,
+            )
+        } else {
+            (
+                (u64::from(image.height) * u64::from(rect.width) / u64::from(rect.height)).max(1)
+                    as u32,
+                image.height,
+            )
+        };
+        let crop_x = image.width.saturating_sub(sample_width) / 2;
+        let crop_y = image.height.saturating_sub(sample_height) / 2;
+        for destination_y in 0..rect.height {
+            let screen_y = rect.y + destination_y as i32;
+            if screen_y < 0 || screen_y >= self.height as i32 {
+                continue;
+            }
+            let source_y = crop_y
+                + (u64::from(destination_y) * u64::from(sample_height) / u64::from(rect.height))
+                    as u32;
+            for destination_x in 0..rect.width {
+                let screen_x = rect.x + destination_x as i32;
+                if screen_x < 0 || screen_x >= self.width as i32 {
+                    continue;
+                }
+                let source_x = crop_x
+                    + (u64::from(destination_x) * u64::from(sample_width) / u64::from(rect.width))
+                        as u32;
+                let raw = self.pack(image.pixel(source_x, source_y));
+                self.write_raw(screen_x as u32, screen_y as u32, raw);
+            }
         }
     }
 
@@ -431,6 +461,16 @@ impl Framebuffer {
             .saturating_add(rect.height as i32)
             .clamp(0, self.height as i32) as u32;
         (x0 < x1 && y0 < y1).then_some((x0, y0, x1, y1))
+    }
+}
+
+impl IconTarget for Framebuffer {
+    fn fill(&mut self, rect: Rect, color: Color) {
+        self.fill_rect(rect, color);
+    }
+
+    fn stroke(&mut self, rect: Rect, color: Color) {
+        self.border(rect, color);
     }
 }
 

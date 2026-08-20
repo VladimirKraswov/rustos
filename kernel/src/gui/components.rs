@@ -283,37 +283,6 @@ pub type Tabs = Panel;
 pub type Image = Panel;
 pub type IconButton<'a> = Button<'a>;
 
-/// Иконка терминала (окно + «>_»): используется desktop и window manager.
-pub fn terminal_icon(fb: &mut Framebuffer, rect: Rect) {
-    fb.fill_rect(rect, Color::rgb(20, 29, 43));
-    fb.border(rect, Color::rgb(101, 212, 224));
-    let inner = Rect::new(rect.x + 5, rect.y + 6, rect.width - 10, rect.height - 12);
-    fb.fill_rect(inner, Color::rgb(7, 12, 20));
-    font::draw_text(
-        fb,
-        rect.x + 10,
-        rect.y + 12,
-        ">_",
-        Theme::ACCENT,
-        font::FontStyle::console(18).bold(),
-    );
-}
-
-/// Иконка корзины (desktop).
-pub fn trash_icon(fb: &mut Framebuffer, rect: Rect) {
-    let body = Rect::new(rect.x + 10, rect.y + 15, rect.width - 20, rect.height - 20);
-    fb.fill_rect(body, Color::rgb(155, 177, 196));
-    fb.border(body, Theme::TEXT);
-    fb.fill_rect(
-        Rect::new(rect.x + 7, rect.y + 10, rect.width - 14, 4),
-        Theme::TEXT,
-    );
-    fb.fill_rect(
-        Rect::new(rect.x + 18, rect.y + 6, rect.width - 36, 4),
-        Theme::TEXT,
-    );
-}
-
 /// Логотип «start» (четыре цветных квадранта 2×2, шаг 12px, размер 10px).
 pub fn start_icon(fb: &mut Framebuffer, x: i32, y: i32) {
     let colors = [

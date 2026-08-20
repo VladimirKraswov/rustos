@@ -13,6 +13,8 @@ use crate::{
     serial,
 };
 use rustos_abi::bootinfo::BootInitramfs;
+use rustos_abi::input::{MouseCapabilities, MouseSettings, PointerCursor};
+use rustos_system_assets::WallpaperId;
 use rustos_video::{ColorMode, DisplayMode, ModeSetError};
 
 /// Размер логического буфера terminal. Число видимых строк и столбцов
@@ -109,7 +111,69 @@ pub enum TerminalAction {
     DisplayColor(ColorMode),
     /// Открыть системное демонстрационное приложение UI Gallery.
     OpenUiShowcase,
+    /// Показать или изменить профиль мыши.
+    Mouse(MouseCommand),
+    /// Выбрать cursor pack или временно показать конкретный cursor shape.
+    Cursor(CursorCommand),
+    /// Выбрать icon pack.
+    Icons(IconThemeName),
+    /// Выбрать системные обои.
+    Wallpaper(WallpaperId),
     Shutdown,
+}
+
+/// Команда input service, разобранная shell без доступа к драйверу.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MouseCommand {
+    /// Показать профиль и hardware capabilities.
+    Info,
+    /// Частота hardware reports, Гц.
+    Rate(u16),
+    /// Разрешение PS/2, уровень 0..3.
+    Resolution(u8),
+    /// Линейная чувствительность, проценты.
+    Sensitivity(u16),
+    /// Ускорение быстрых движений, проценты.
+    Acceleration(u16),
+    /// Окно двойного клика, миллисекунды.
+    DoubleClick(u16),
+    /// Подавление повторного контакта, миллисекунды.
+    Debounce(u16),
+    /// Порог начала drag, пиксели.
+    DragThreshold(u16),
+}
+
+/// Управление cursor service.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CursorCommand {
+    /// Вернуть автоматический выбор курсора по hit-test.
+    Auto,
+    /// Выбрать тему.
+    Theme(CursorThemeName),
+    /// Зафиксировать форму для просмотра и отладки.
+    Preview(PointerCursor),
+}
+
+/// Имена встроенных cursor packs.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CursorThemeName {
+    /// Светлая.
+    Light,
+    /// Тёмная.
+    Midnight,
+    /// Высококонтрастная.
+    Contrast,
+}
+
+/// Имена встроенных icon packs.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IconThemeName {
+    /// Классическая, с жёлтыми папками.
+    Classic,
+    /// Тёмная.
+    Midnight,
+    /// Монохромная.
+    Mono,
 }
 
 /// Буфер экрана + shell + доступ к bootstrap-файловой системе.
@@ -320,6 +384,10 @@ impl Terminal {
             self.print("  UIDEMO    OPEN SYSTEM UI GALLERY\n", WHITE);
             self.print("  DISPLAY   MONITOR/MODE/COLOR SETTINGS\n", WHITE);
             self.print("  FONT      FAMILY/SIZE/STYLE SETTINGS\n", WHITE);
+            self.print("  MOUSE     RATE/SENSITIVITY/CLICK SETTINGS\n", WHITE);
+            self.print("  CURSOR    THEME/PREVIEW/AUTO\n", WHITE);
+            self.print("  ICONS     SWITCH EXTENSIBLE ICON PACK\n", WHITE);
+            self.print("  WALLPAPER SPRING|AUTUMN|WINTER\n", WHITE);
             self.print("  ECHO TEXT PRINT TEXT\n", WHITE);
             self.print("  PWD/CD    CURRENT DIRECTORY\n", WHITE);
             self.print("  LS/CAT    LIST OR READ FILES\n", WHITE);
@@ -366,6 +434,30 @@ impl Terminal {
         {
             self.command_font(command);
             TerminalAction::None
+        } else if command.eq_ignore_ascii_case("mouse")
+            || command
+                .get(..6)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("mouse "))
+        {
+            self.command_mouse(command)
+        } else if command.eq_ignore_ascii_case("cursor")
+            || command
+                .get(..7)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("cursor "))
+        {
+            self.command_cursor(command)
+        } else if command.eq_ignore_ascii_case("icons")
+            || command
+                .get(..6)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("icons "))
+        {
+            self.command_icons(command)
+        } else if command.eq_ignore_ascii_case("wallpaper")
+            || command
+                .get(..10)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("wallpaper "))
+        {
+            self.command_wallpaper(command)
         } else if command.eq_ignore_ascii_case("shutdown") {
             self.print("POWERING OFF...\n", YELLOW);
             TerminalAction::Shutdown
@@ -390,7 +482,11 @@ impl Terminal {
             | TerminalAction::DisplayModes
             | TerminalAction::DisplayMode { .. }
             | TerminalAction::DisplayColor(_)
-            | TerminalAction::OpenUiShowcase => action,
+            | TerminalAction::OpenUiShowcase
+            | TerminalAction::Mouse(_)
+            | TerminalAction::Cursor(_)
+            | TerminalAction::Icons(_)
+            | TerminalAction::Wallpaper(_) => action,
             _ => {
                 self.prompt();
                 TerminalAction::RedrawAll
@@ -437,6 +533,125 @@ impl Terminal {
         self.print("DISPLAY MODE WIDTHxHEIGHT\n", WHITE);
         self.print("DISPLAY COLOR TRUECOLOR|RGB565|GRAY8\n", WHITE);
         TerminalAction::None
+    }
+
+    fn command_mouse(&mut self, command: &str) -> TerminalAction {
+        let arguments = command.get(5..).unwrap_or("").trim();
+        if arguments.is_empty() || arguments.eq_ignore_ascii_case("info") {
+            return TerminalAction::Mouse(MouseCommand::Info);
+        }
+        let Some((name, value)) = arguments.split_once(' ') else {
+            self.print_mouse_help();
+            return TerminalAction::None;
+        };
+        let Some(number) = value.trim().parse::<u16>().ok() else {
+            self.print("MOUSE VALUE MUST BE A POSITIVE INTEGER\n", RED);
+            return TerminalAction::None;
+        };
+        let setting = if name.eq_ignore_ascii_case("rate") {
+            MouseCommand::Rate(number)
+        } else if name.eq_ignore_ascii_case("resolution") {
+            MouseCommand::Resolution(number.min(u16::from(u8::MAX)) as u8)
+        } else if name.eq_ignore_ascii_case("sensitivity") || name.eq_ignore_ascii_case("speed") {
+            MouseCommand::Sensitivity(number)
+        } else if name.eq_ignore_ascii_case("acceleration") {
+            MouseCommand::Acceleration(number)
+        } else if name.eq_ignore_ascii_case("double") || name.eq_ignore_ascii_case("double-click") {
+            MouseCommand::DoubleClick(number)
+        } else if name.eq_ignore_ascii_case("debounce") || name.eq_ignore_ascii_case("single-click")
+        {
+            MouseCommand::Debounce(number)
+        } else if name.eq_ignore_ascii_case("drag") {
+            MouseCommand::DragThreshold(number)
+        } else {
+            self.print_mouse_help();
+            return TerminalAction::None;
+        };
+        TerminalAction::Mouse(setting)
+    }
+
+    fn print_mouse_help(&mut self) {
+        self.print("MOUSE [INFO]\n", YELLOW);
+        self.print("MOUSE RATE 10|20|40|60|80|100|200\n", WHITE);
+        self.print("MOUSE RESOLUTION 0..3\n", WHITE);
+        self.print("MOUSE SENSITIVITY 25..400 (%)\n", WHITE);
+        self.print("MOUSE ACCELERATION 0..300 (%)\n", WHITE);
+        self.print("MOUSE DOUBLE 100..1200 (MS)\n", WHITE);
+        self.print("MOUSE DEBOUNCE 0..250 (MS)\n", WHITE);
+        self.print("MOUSE DRAG 1..32 (PX)\n", WHITE);
+    }
+
+    fn command_cursor(&mut self, command: &str) -> TerminalAction {
+        let arguments = command.get(6..).unwrap_or("").trim();
+        if arguments.eq_ignore_ascii_case("auto") {
+            return TerminalAction::Cursor(CursorCommand::Auto);
+        }
+        if let Some(value) = strip_prefix_ascii_case(arguments, "theme ") {
+            let theme = if value.eq_ignore_ascii_case("light") {
+                Some(CursorThemeName::Light)
+            } else if value.eq_ignore_ascii_case("midnight") || value.eq_ignore_ascii_case("dark") {
+                Some(CursorThemeName::Midnight)
+            } else if value.eq_ignore_ascii_case("contrast") {
+                Some(CursorThemeName::Contrast)
+            } else {
+                None
+            };
+            if let Some(theme) = theme {
+                return TerminalAction::Cursor(CursorCommand::Theme(theme));
+            }
+        }
+        if let Some(value) = strip_prefix_ascii_case(arguments, "preview ") {
+            if let Some(cursor) = parse_cursor(value.trim()) {
+                return TerminalAction::Cursor(CursorCommand::Preview(cursor));
+            }
+        }
+        self.print("CURSOR THEME LIGHT|MIDNIGHT|CONTRAST\n", YELLOW);
+        self.print("CURSOR PREVIEW ARROW|TEXT|LINK|GRAB|GRABBING|BUSY\n", WHITE);
+        self.print(
+            "               CROSSHAIR|FORBIDDEN|HRESIZE|VRESIZE|NWSE|NESW\n",
+            WHITE,
+        );
+        self.print("CURSOR AUTO\n", WHITE);
+        TerminalAction::None
+    }
+
+    fn command_icons(&mut self, command: &str) -> TerminalAction {
+        let arguments = command.get(5..).unwrap_or("").trim();
+        let value = strip_prefix_ascii_case(arguments, "theme ").unwrap_or(arguments);
+        let theme = if value.eq_ignore_ascii_case("classic") {
+            Some(IconThemeName::Classic)
+        } else if value.eq_ignore_ascii_case("midnight") || value.eq_ignore_ascii_case("dark") {
+            Some(IconThemeName::Midnight)
+        } else if value.eq_ignore_ascii_case("mono") {
+            Some(IconThemeName::Mono)
+        } else {
+            None
+        };
+        if let Some(theme) = theme {
+            TerminalAction::Icons(theme)
+        } else {
+            self.print("ICONS THEME CLASSIC|MIDNIGHT|MONO\n", YELLOW);
+            TerminalAction::None
+        }
+    }
+
+    fn command_wallpaper(&mut self, command: &str) -> TerminalAction {
+        let value = command.get(9..).unwrap_or("").trim();
+        let wallpaper = if value.eq_ignore_ascii_case("spring") {
+            Some(WallpaperId::SpringRiver)
+        } else if value.eq_ignore_ascii_case("autumn") {
+            Some(WallpaperId::AutumnRiver)
+        } else if value.eq_ignore_ascii_case("winter") {
+            Some(WallpaperId::WinterField)
+        } else {
+            None
+        };
+        if let Some(wallpaper) = wallpaper {
+            TerminalAction::Wallpaper(wallpaper)
+        } else {
+            self.print("WALLPAPER SPRING|AUTUMN|WINTER\n", YELLOW);
+            TerminalAction::None
+        }
     }
 
     /// Настройка типографики терминала без перезапуска GUI. Семейство Sans
@@ -612,6 +827,66 @@ impl Terminal {
         self.print("SOFTWARE COLOR MODE: ", GREEN);
         self.print_color_mode(mode);
         self.print(" (PHYSICAL SCANOUT REMAINS ALIGNED XRGB8888)\n", MUTED);
+        self.prompt();
+    }
+
+    /// Печатает фактически применённый профиль input service.
+    pub fn report_mouse(
+        &mut self,
+        settings: MouseSettings,
+        capabilities: MouseCapabilities,
+        hardware_applied: Option<bool>,
+    ) {
+        self.print("MOUSE PROFILE: RATE=", GREEN);
+        self.print_number(u64::from(settings.sample_rate_hz));
+        self.print("HZ RESOLUTION=", WHITE);
+        self.print_number(u64::from(settings.resolution_level));
+        self.print(" SENSITIVITY=", WHITE);
+        self.print_number(u64::from(settings.sensitivity_percent));
+        self.print("% ACCELERATION=", WHITE);
+        self.print_number(u64::from(settings.acceleration_percent));
+        self.print("%\nDOUBLE=", WHITE);
+        self.print_number(u64::from(settings.double_click_ms));
+        self.print("MS DEBOUNCE=", WHITE);
+        self.print_number(u64::from(settings.click_debounce_ms));
+        self.print("MS DRAG=", WHITE);
+        self.print_number(u64::from(settings.drag_threshold_px));
+        self.print("PX\nHARDWARE RATE/RESOLUTION: ", WHITE);
+        self.print(
+            if capabilities.configurable_sample_rate != 0
+                && capabilities.configurable_resolution != 0
+            {
+                "SUPPORTED"
+            } else {
+                "SOFTWARE FALLBACK"
+            },
+            if capabilities.configurable_sample_rate != 0 {
+                GREEN
+            } else {
+                YELLOW
+            },
+        );
+        if let Some(applied) = hardware_applied {
+            self.print(
+                if applied {
+                    " / APPLIED\n"
+                } else {
+                    " / DEVICE DID NOT ACK\n"
+                },
+                if applied { GREEN } else { YELLOW },
+            );
+        } else {
+            self.newline();
+        }
+        self.prompt();
+    }
+
+    /// Подтверждает выбор визуального ресурса.
+    pub fn report_visual_setting(&mut self, category: &str, value: &str) {
+        self.print(category, GREEN);
+        self.print(": ", GREEN);
+        self.print(value, WHITE);
+        self.newline();
         self.prompt();
     }
 
@@ -1070,4 +1345,34 @@ fn parse_resolution(value: &str) -> Option<(u32, u32)> {
     let width = width.parse::<u32>().ok()?;
     let height = height.parse::<u32>().ok()?;
     (width >= 640 && height >= 480).then_some((width, height))
+}
+
+fn parse_cursor(value: &str) -> Option<PointerCursor> {
+    if value.eq_ignore_ascii_case("arrow") {
+        Some(PointerCursor::Arrow)
+    } else if value.eq_ignore_ascii_case("text") || value.eq_ignore_ascii_case("ibeam") {
+        Some(PointerCursor::Text)
+    } else if value.eq_ignore_ascii_case("link") || value.eq_ignore_ascii_case("hand") {
+        Some(PointerCursor::Link)
+    } else if value.eq_ignore_ascii_case("grab") {
+        Some(PointerCursor::Grab)
+    } else if value.eq_ignore_ascii_case("grabbing") {
+        Some(PointerCursor::Grabbing)
+    } else if value.eq_ignore_ascii_case("busy") || value.eq_ignore_ascii_case("loader") {
+        Some(PointerCursor::Busy)
+    } else if value.eq_ignore_ascii_case("crosshair") {
+        Some(PointerCursor::Crosshair)
+    } else if value.eq_ignore_ascii_case("forbidden") {
+        Some(PointerCursor::NotAllowed)
+    } else if value.eq_ignore_ascii_case("hresize") {
+        Some(PointerCursor::ResizeHorizontal)
+    } else if value.eq_ignore_ascii_case("vresize") {
+        Some(PointerCursor::ResizeVertical)
+    } else if value.eq_ignore_ascii_case("nwse") {
+        Some(PointerCursor::ResizeNwSe)
+    } else if value.eq_ignore_ascii_case("nesw") {
+        Some(PointerCursor::ResizeNeSw)
+    } else {
+        None
+    }
 }

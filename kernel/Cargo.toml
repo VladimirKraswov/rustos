@@ -15,6 +15,7 @@ path = "src/main.rs"
 rustos-abi = { path = "../abi" }
 rustos-microkernel = { path = "../microkernel" }
 rustos-rune-format = { path = "../rune-format" }
+rustos-system-assets = { path = "../system-assets" }
 rustos-system-ui = { path = "../system-ui" }
 rustos-video = { path = "../video" }
 embedded-graphics = { version = "=0.8.2", default-features = false }

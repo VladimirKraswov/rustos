@@ -1,0 +1,12 @@
+[package]
+name = "rustos-system-assets"
+description = "Расширяемые cursor/icon packs и системные обои RustOS"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+rustos-abi = { path = "../abi" }
+rustos-video = { path = "../video" }

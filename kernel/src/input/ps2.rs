@@ -8,6 +8,7 @@ use crate::{
     arch,
     input::{Event, Key, MouseEvent},
 };
+use rustos_abi::input::{MouseCapabilities, MouseSettings};
 
 /// Порт данных PS/2: общие для клавиатуры и мыши.
 const DATA: u16 = 0x60;
@@ -26,6 +27,11 @@ pub struct Ps2Input {
     mouse_index: usize,
     pending: Option<Event>,
     reported_mouse_buttons: u8,
+    settings: MouseSettings,
+    /// Остаток fixed-point scaling: медленное движение не теряется даже при
+    /// чувствительности ниже 100%.
+    remainder_x: i32,
+    remainder_y: i32,
 }
 
 impl Ps2Input {
@@ -41,9 +47,42 @@ impl Ps2Input {
             mouse_index: 0,
             pending: None,
             reported_mouse_buttons: 0,
+            settings: MouseSettings::DEFAULT,
+            remainder_x: 0,
+            remainder_y: 0,
         };
         input.initialize_mouse();
         input
+    }
+
+    /// Текущий профиль, включая реально выбранную стандартную PS/2-частоту.
+    pub const fn mouse_settings(&self) -> MouseSettings {
+        self.settings
+    }
+
+    /// Возможности PS/2 backend. Чувствительность, ускорение и click timing
+    /// доступны поверх любого устройства и потому не перечисляются флагами.
+    pub const fn mouse_capabilities(&self) -> MouseCapabilities {
+        MouseCapabilities {
+            configurable_sample_rate: 1,
+            configurable_resolution: 1,
+            wheel: 0,
+            extra_buttons: 0,
+            minimum_rate_hz: 10,
+            maximum_rate_hz: 200,
+            resolution_levels: 4,
+            reserved: [0; 7],
+        }
+    }
+
+    /// Применяет настройки. Программные поля вступают в силу всегда;
+    /// `false` означает лишь, что контроллер не подтвердил hardware rate или
+    /// resolution и оставил собственные значения.
+    pub fn set_mouse_settings(&mut self, requested: MouseSettings) -> bool {
+        self.settings = requested.sanitized();
+        self.remainder_x = 0;
+        self.remainder_y = 0;
+        self.program_mouse_settings()
     }
 
     /// Возвращает не более одного высокоуровневого события за вызов.
@@ -125,10 +164,75 @@ impl Ps2Input {
         }
         unsafe { arch::outb(STATUS_COMMAND, 0xA8) }; // enable auxiliary device
 
-        // Defaults + enable data reporting. ACK читаем синхронно, пока GUI
-        // ещё не начал принимать пользовательский ввод.
-        let _ = mouse_command(0xF6);
-        let _ = mouse_command(0xF4);
+        // Defaults, затем желаемые rate/resolution и reporting. ACK читаем
+        // синхронно, пока GUI ещё не начал принимать пользовательский ввод.
+        let _ = self.mouse_command(0xF6);
+        let _ = self.program_mouse_settings();
+    }
+
+    fn program_mouse_settings(&mut self) -> bool {
+        // Удаляем уже накопленные movement packets: первый их байт тоже имеет
+        // auxiliary-флаг, но не является ACK команды F5.
+        for _ in 0..96 {
+            let status = unsafe { arch::inb(STATUS_COMMAND) };
+            if status & 1 == 0 {
+                break;
+            }
+            let byte = unsafe { arch::inb(DATA) };
+            if status & (1 << 5) == 0 {
+                self.preserve_keyboard_byte(byte);
+            }
+        }
+        // Останавливаем поток пакетов: иначе ACK можно спутать с байтом
+        // движения. Неудача не делает input service неработоспособным.
+        let disabled = self.mouse_command(0xF5);
+        let rate = self.mouse_command_with_data(0xF3, self.settings.sample_rate_hz as u8);
+        let resolution = self.mouse_command_with_data(0xE8, self.settings.resolution_level);
+        let enabled = self.mouse_command(0xF4);
+        disabled && rate && resolution && enabled
+    }
+
+    fn mouse_command_with_data(&mut self, command: u8, data: u8) -> bool {
+        self.mouse_command(command) && self.mouse_command(data)
+    }
+
+    /// Отправляет команду через 8042 (`D4` означает auxiliary device).
+    fn mouse_command(&mut self, command: u8) -> bool {
+        if !wait_input_empty() {
+            return false;
+        }
+        unsafe { arch::outb(STATUS_COMMAND, 0xD4) };
+        if !wait_input_empty() {
+            return false;
+        }
+        unsafe { arch::outb(DATA, command) };
+        self.wait_mouse_reply() == Some(0xFA)
+    }
+
+    /// Keyboard release может прийти между shell-командой и ACK мыши. Мы
+    /// обязательно прогоняем его через state machine, иначе Shift способен
+    /// остаться «зажатым» после команды, набранной заглавными буквами.
+    fn wait_mouse_reply(&mut self) -> Option<u8> {
+        for _ in 0..100_000 {
+            let status = unsafe { arch::inb(STATUS_COMMAND) };
+            if status & 1 != 0 {
+                let byte = unsafe { arch::inb(DATA) };
+                if status & (1 << 5) != 0 {
+                    return Some(byte);
+                }
+                self.preserve_keyboard_byte(byte);
+            }
+            core::hint::spin_loop();
+        }
+        None
+    }
+
+    fn preserve_keyboard_byte(&mut self, byte: u8) {
+        if let Some(key) = self.feed_keyboard(byte) {
+            if self.pending.is_none() {
+                self.pending = Some(Event::Key(key));
+            }
+        }
     }
 
     /// Обрабатывает один scancode клавиатуры (Set 1). Возвращает нажатие;
@@ -181,15 +285,43 @@ impl Ps2Input {
         if flags & 0xC0 != 0 {
             return None; // overflow — пакет нельзя интерпретировать точно
         }
+        let raw_x = self.mouse_packet[1] as i8 as i16;
+        // PS/2: положительный Y направлен вверх; GUI — вниз.
+        let raw_y = -(self.mouse_packet[2] as i8 as i16);
+        let (dx, dy) = self.scale_motion(raw_x, raw_y);
         Some(Event::Mouse(MouseEvent {
-            dx: self.mouse_packet[1] as i8 as i16,
+            dx,
             // PS/2: положительный Y направлен вверх; GUI — вниз.
-            dy: -(self.mouse_packet[2] as i8 as i16),
+            dy,
             left: flags & 1 != 0,
             right: flags & 2 != 0,
             middle: flags & 4 != 0,
             packets: 1,
         }))
+    }
+
+    /// Software gain одинаков на PS/2, USB HID и virtio-input. Fixed-point
+    /// остаток особенно важен при sensitivity=25%: четыре малых отчёта всё
+    /// равно дают один пиксель, курсор не «залипает».
+    fn scale_motion(&mut self, dx: i16, dy: i16) -> (i16, i16) {
+        let speed = i32::from(dx)
+            .abs()
+            .saturating_add(i32::from(dy).abs())
+            .min(32);
+        let gain = i32::from(self.settings.sensitivity_percent)
+            + i32::from(self.settings.acceleration_percent) * speed / 32;
+        let x = i32::from(dx)
+            .saturating_mul(gain)
+            .saturating_add(self.remainder_x);
+        let y = i32::from(dy)
+            .saturating_mul(gain)
+            .saturating_add(self.remainder_y);
+        self.remainder_x = x % 100;
+        self.remainder_y = y % 100;
+        (
+            (x / 100).clamp(i16::MIN as i32, i16::MAX as i32) as i16,
+            (y / 100).clamp(i16::MIN as i32, i16::MAX as i32) as i16,
+        )
     }
 
     fn remember_buttons(&mut self, event: Event) {
@@ -405,29 +537,4 @@ fn wait_input_empty() -> bool {
         core::hint::spin_loop();
     }
     false
-}
-
-/// Ждёт байт от устройства (бит 0 статуса) и возвращает его.
-fn wait_output_full() -> Option<u8> {
-    for _ in 0..100_000 {
-        if unsafe { arch::inb(STATUS_COMMAND) } & 1 != 0 {
-            return Some(unsafe { arch::inb(DATA) });
-        }
-        core::hint::spin_loop();
-    }
-    None
-}
-
-/// Отправляет команду мыши через контроллер (`0xD4` = «следующий байт —
-/// для auxiliary-устройства»); успех = ACK `0xFA`.
-fn mouse_command(command: u8) -> bool {
-    if !wait_input_empty() {
-        return false;
-    }
-    unsafe { arch::outb(STATUS_COMMAND, 0xD4) };
-    if !wait_input_empty() {
-        return false;
-    }
-    unsafe { arch::outb(DATA, command) };
-    wait_output_full() == Some(0xFA)
 }

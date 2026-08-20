@@ -3,4 +3,5 @@
 //! * [`session`] — compositor, desktop, taskbar и window manager
 //!   (единственный владелец framebuffer'а и input).
 pub mod components;
+mod cursor;
 pub mod session;

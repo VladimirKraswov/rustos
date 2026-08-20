@@ -23,6 +23,7 @@ pub mod block;
 pub mod bootinfo;
 pub mod dll;
 pub mod handle;
+pub mod input;
 pub mod ipc;
 pub mod memmap;
 pub mod memory;

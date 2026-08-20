@@ -11,6 +11,7 @@ layout/event/display-list pipeline и UI Gallery описаны в
 - `rustos-video` — безопасные CPU surfaces, blit/alpha, damage и layers;
 - `font.rs` — системные Console/Sans bitmap fonts, UTF-8 и типографический API;
 - `input.rs` — PS/2 keyboard/mouse и нормализованные события;
+- `rustos-system-assets` — cursor/icon packs и CPU-friendly обои;
 - `gui/components.rs` — theme и базовые widgets;
 - `gui/session.rs` — compositor, desktop, taskbar и window manager;
 - `apps/terminal.rs` — первый графический клиент.
@@ -29,7 +30,8 @@ layout/event/display-list pipeline и UI Gallery описаны в
 Подробный контракт scanout/surfaces/compositor и путь к software OpenGL описан
 в [VIDEO.md](VIDEO.md). Команды, события, style-флаги и state machine окон
 описаны отдельно в [WINDOWS.md](WINDOWS.md), а семейства, размеры и
-начертания — в [FONTS.md](FONTS.md).
+начертания — в [FONTS.md](FONTS.md). Курсоры, настройки мыши, icon packs и
+обои документированы в [SYSTEM_ASSETS.md](SYSTEM_ASSETS.md).
 
 Компоненты никогда не рисуют непосредственно в видимый framebuffer.
 Compositor сначала формирует кадр в back buffer из обычной RAM и только потом
@@ -59,7 +61,8 @@ PS/2 service объединяет накопившиеся движения с �
 - рамка и углы меняют размер окна с соблюдением minimum size;
 - taskbar восстанавливает свёрнутый terminal;
 - Start menu содержит terminal и shutdown;
-- desktop icon повторно открывает закрытый terminal.
+- один клик выбирает desktop icon, двойной — открывает terminal; интервал и
+  допустимое смещение берутся из общего mouse profile.
 
 Команда `DISPLAY` показывает display driver, реальное разрешение,
 физический размер монитора и цветовой профиль. `DISPLAY MODES` выводит EDID
@@ -74,6 +77,11 @@ Bootstrap `grub-fb` не умеет mode-set после hand-off и предла
 Команда `FONT` показывает текущую типографику terminal. `FONT FAMILY
 CONSOLE|SANS`, `FONT SIZE 10..48` и `FONT STYLE
 REGULAR|BOLD|ITALIC|BOLDITALIC` применяются сразу и не требуют перезапуска GUI.
+
+Команды `MOUSE`, `CURSOR`, `ICONS` и `WALLPAPER` меняют input profile,
+курсорную/иконную тему и природный фон без перезапуска. Оконный manager
+автоматически показывает I-beam над terminal, hand над действиями,
+grab/grabbing над заголовком и правильную стрелку на каждой стороне/углу.
 
 Команда `RUN /apps/examples/hello.rune student` запускает настоящий
 изолированный процесс с VaraniaFS. Persistent `vfsd` обслуживает executable и
