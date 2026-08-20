@@ -35,8 +35,11 @@ jobs:
       - name: Host-тесты
         run: make test-host
 
-      - name: UEFI boot и GUI integration
-        run: make test
+      - name: UEFI boot integration
+        run: BOOT_TEST_TIMEOUT=90 make test-boot
+
+      - name: GUI keyboard/mouse integration
+        run: GUI_TEST_TIMEOUT=90 make test-gui
 
       - name: Сохранить диагностику при ошибке
         if: failure()

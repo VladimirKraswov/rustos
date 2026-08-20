@@ -13,6 +13,19 @@ mkdir -p "$RESULT_DIR"
 cp -f build/ovmf/OVMF_VARS.fd "$RUN_DIR/VARS.fd"
 
 QPID=""
+GUI_TIMEOUT="${GUI_TEST_TIMEOUT:-360}"
+# OpenBSD netcat на Linux продолжает ждать EOF от постоянного HMP-сокета.
+# `-N` делает half-close после EOF stdin. В macOS этот флаг означает другое,
+# а системный nc и без него корректно заканчивает одноразовый запрос.
+HMP_CLIENT=(nc -U)
+if [[ "$(uname -s)" != "Darwin" ]]; then
+    HMP_CLIENT=(nc -N -U)
+fi
+
+hmp() {
+    "${HMP_CLIENT[@]}" "$RUN_DIR/monitor.sock" >/dev/null
+}
+
 cleanup() {
     trap - EXIT INT TERM HUP
     if [[ -n "$QPID" ]] && kill -0 "$QPID" 2>/dev/null; then
@@ -37,43 +50,46 @@ qemu-system-x86_64 \
 QPID=$!
 
 ready=0
-for _ in $(seq 1 180); do
+for _ in $(seq 1 "$GUI_TIMEOUT"); do
     if grep -q 'GUI_READY' "$RUN_DIR/serial.log" 2>/dev/null; then
         ready=1
         break
     fi
     kill -0 "$QPID" 2>/dev/null || break
-    sleep 2
+    sleep 1
 done
-[[ $ready == 1 ]] || { echo "[gui-test] GUI_READY timeout"; exit 1; }
+[[ $ready == 1 ]] || {
+    echo "[gui-test] GUI_READY timeout after ${GUI_TIMEOUT}s"
+    exit 1
+}
 
 # Команда идёт через настоящий PS/2 keyboard path.
 printf 'sendkey h\nsendkey e\nsendkey l\nsendkey p\nsendkey ret\n' \
-    | nc -U "$RUN_DIR/monitor.sock" >/dev/null
+    | hmp
 for _ in $(seq 1 40); do
     grep -q '\[terminal\] command: help' "$RUN_DIR/serial.log" && break
     sleep 0.1
 done
 grep -q '\[terminal\] command: help' "$RUN_DIR/serial.log"
 printf 'screendump %s/terminal.ppm\n' "$RUN_DIR" \
-    | nc -U "$RUN_DIR/monitor.sock" >/dev/null
+    | hmp
 sleep 0.5
 
 # Курсор стартует в центре 1280x800; перемещаем его к minimize-кнопке.
-printf 'mouse_move 435 -325\n' | nc -U "$RUN_DIR/monitor.sock" >/dev/null
+printf 'mouse_move 435 -325\n' | hmp
 sleep 0.2
-printf 'mouse_button 1\nmouse_button 0\n' | nc -U "$RUN_DIR/monitor.sock" >/dev/null
+printf 'mouse_button 1\nmouse_button 0\n' | hmp
 for _ in $(seq 1 40); do
     grep -q '\[wm\] terminal minimized' "$RUN_DIR/serial.log" && break
     sleep 0.1
 done
 grep -q '\[wm\] terminal minimized' "$RUN_DIR/serial.log"
 printf 'screendump %s/minimized.ppm\n' "$RUN_DIR" \
-    | nc -U "$RUN_DIR/monitor.sock" >/dev/null
+    | hmp
 sleep 0.5
 
 cargo run -q -p rustos-gui-check -- "$RUN_DIR/terminal.ppm" "$RUN_DIR/minimized.ppm"
-printf 'quit\n' | nc -U "$RUN_DIR/monitor.sock" >/dev/null || true
+printf 'quit\n' | hmp || true
 wait "$QPID" 2>/dev/null || true
 QPID=""
 echo "[gui-test] PASS: keyboard, terminal, mouse and minimize"
