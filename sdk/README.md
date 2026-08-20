@@ -22,6 +22,11 @@ Build pipeline преобразует ELF linker intermediate в `hello.rune`, �
 границе разрешены `extern "C"`, `#[repr(C)]`, integer фиксированной ширины и
 явные handles/buffers. Rust ABI наружу не экспортируется.
 
+Пошаговый выбор между приложением, утилитой, service и DLL, структура малой
+задачи и checklist публикации описаны в
+[`docs/SDK_DEVELOPMENT.md`](../docs/SDK_DEVELOPMENT.md). Coding-agent также
+обязан прочитать корневой и этот каталоговый `AGENTS.md`.
+
 До появления native seed `rustc` этот пример является cross-hosted SDK, а не
 доказательством self-hosting. Точный статус и критерий перехода описаны в
 [`docs/SELF_HOSTING.md`](../docs/SELF_HOSTING.md).
