@@ -206,8 +206,9 @@ impl DesktopSession {
     fn new(framebuffer: Framebuffer, usable_ram_mib: u64, initramfs: BootInitramfs) -> Self {
         let screen_width = framebuffer.width();
         let screen_height = framebuffer.height();
-        let width = screen_width.saturating_sub(180).clamp(620, 1040);
-        let height = screen_height.saturating_sub(160).clamp(420, 650);
+        let work_height = screen_height.saturating_sub(TASKBAR_HEIGHT);
+        let width = fit_window_extent(screen_width, 180, TERMINAL_MIN_WIDTH, 1040);
+        let height = fit_window_extent(work_height, 114, TERMINAL_MIN_HEIGHT, 650);
         // На широком экране оставляем слева удобную область под desktop
         // icons, а терминал стартует с постоянным 120px полем. На маленьком
         // режиме окно по-прежнему центрируется и не выходит за границы.
@@ -216,7 +217,7 @@ impl DesktopSession {
         } else {
             ((screen_width - width) / 2) as i32
         };
-        let y = ((screen_height.saturating_sub(TASKBAR_HEIGHT) - height) / 2) as i32;
+        let y = (work_height.saturating_sub(height) / 2) as i32;
         let rect = Rect::new(x, y, width, height);
         let content = Rect::new(
             rect.x + 4,
@@ -1650,6 +1651,22 @@ fn cursor_name(kind: PointerCursor) -> &'static str {
         PointerCursor::ResizeNwSe => "NWSE",
         PointerCursor::ResizeNeSw => "NESW",
     }
+}
+
+/// Выбирает размер окна без underflow даже для аварийного малого framebuffer.
+/// На нормальном wide mode сохраняется просторное поле desktop, на тесном —
+/// минимум 8 px с каждой стороны. `lower <= upper` гарантировано явно, поэтому
+/// `clamp` никогда не паникует.
+fn fit_window_extent(available: u32, roomy_margin: u32, minimum: u32, maximum: u32) -> u32 {
+    let hard_maximum = available.saturating_sub(16).max(1);
+    let margin = if available >= minimum.saturating_add(roomy_margin) {
+        roomy_margin
+    } else {
+        16
+    };
+    let lower = minimum.min(hard_maximum);
+    let upper = maximum.min(hard_maximum).max(lower);
+    available.saturating_sub(margin).clamp(lower, upper)
 }
 
 /// Platform power off: ACPI PM на PC либо PSCI на AArch64.

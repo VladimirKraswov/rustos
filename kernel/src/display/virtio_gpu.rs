@@ -585,12 +585,20 @@ impl VirtioGpu {
 /// Ограничивает только начальный logical mode. Если monitor меньше лимита,
 /// сохраняется его preferred mode; ручной `DISPLAY MODE` не ограничивается.
 fn startup_mode(preferred: DisplayMode, fallback: DisplayMode) -> DisplayMode {
-    if preferred.width <= STARTUP_MAX_WIDTH && preferred.height <= STARTUP_MAX_HEIGHT {
+    let preferred_is_usable = preferred.width >= MIN_WIDTH && preferred.height >= MIN_HEIGHT;
+    if preferred_is_usable
+        && preferred.width <= STARTUP_MAX_WIDTH
+        && preferred.height <= STARTUP_MAX_HEIGHT
+    {
         return preferred;
     }
-    let (width, height) = if preferred.width >= 16 * preferred.height / 10 {
+    let fallback_is_usable = fallback.width >= MIN_WIDTH
+        && fallback.height >= MIN_HEIGHT
+        && fallback.width <= STARTUP_MAX_WIDTH
+        && fallback.height <= STARTUP_MAX_HEIGHT;
+    let (width, height) = if preferred_is_usable && preferred.width >= 16 * preferred.height / 10 {
         (STARTUP_MAX_WIDTH, STARTUP_MAX_HEIGHT)
-    } else if fallback.width <= STARTUP_MAX_WIDTH && fallback.height <= STARTUP_MAX_HEIGHT {
+    } else if fallback_is_usable {
         (fallback.width, fallback.height)
     } else {
         (1280, 800)
