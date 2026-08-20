@@ -63,13 +63,13 @@ impl Widget for Panel {
     }
 }
 
-/// Текст без фона: рисуется из верхнего левого угла `rect` с заданным
-/// увеличением (`scale` — коэффициент глифа 8×16).
+/// Текст без фона: рисуется из верхнего левого угла `rect` заданным системным
+/// семейством, начертанием и размером.
 pub struct Label<'a> {
     pub rect: Rect,
     pub text: &'a str,
     pub color: Color,
-    pub scale: u32,
+    pub style: font::FontStyle,
 }
 
 impl Widget for Label<'_> {
@@ -84,7 +84,7 @@ impl Widget for Label<'_> {
             self.rect.y,
             self.text,
             self.color,
-            self.scale,
+            self.style,
         );
     }
 }
@@ -119,10 +119,11 @@ impl Widget for Button<'_> {
         };
         fb.fill_rect(self.rect, color);
         fb.border(self.rect, Theme::BORDER);
-        let text_width = self.label.len() as i32 * font::GLYPH_WIDTH * 2;
-        let x = self.rect.x + (self.rect.width as i32 - text_width) / 2;
-        let y = self.rect.y + (self.rect.height as i32 - font::GLYPH_HEIGHT * 2) / 2;
-        font::draw_text(fb, x, y, self.label, Theme::TEXT, 2);
+        let style = font::UI_TITLE;
+        let metrics = font::measure_text(self.label, style);
+        let x = self.rect.x + (self.rect.width as i32 - metrics.width as i32) / 2;
+        let y = self.rect.y + (self.rect.height as i32 - metrics.height as i32) / 2;
+        font::draw_text(fb, x, y, self.label, Theme::TEXT, style);
     }
 }
 
@@ -154,7 +155,7 @@ impl Widget for Checkbox<'_> {
             self.rect.y + 5,
             self.label,
             Theme::TEXT,
-            1,
+            font::UI_SMALL,
         );
     }
 }
@@ -196,7 +197,7 @@ impl Widget for RadioButton<'_> {
             self.rect.y + 4,
             self.label,
             Theme::TEXT,
-            1,
+            font::UI_SMALL,
         );
     }
 }
@@ -235,7 +236,7 @@ impl Widget for Toggle<'_> {
             self.rect.y + 5,
             self.label,
             Theme::TEXT,
-            1,
+            font::UI_SMALL,
         );
     }
 }
@@ -269,7 +270,7 @@ impl Widget for TextEdit<'_> {
             self.rect.y + 6,
             self.text,
             Theme::TEXT,
-            1,
+            font::UI_NORMAL,
         );
     }
 }
@@ -288,7 +289,14 @@ pub fn terminal_icon(fb: &mut Framebuffer, rect: Rect) {
     fb.border(rect, Color::rgb(101, 212, 224));
     let inner = Rect::new(rect.x + 5, rect.y + 6, rect.width - 10, rect.height - 12);
     fb.fill_rect(inner, Color::rgb(7, 12, 20));
-    font::draw_text(fb, rect.x + 10, rect.y + 12, ">_", Theme::ACCENT, 2);
+    font::draw_text(
+        fb,
+        rect.x + 10,
+        rect.y + 12,
+        ">_",
+        Theme::ACCENT,
+        font::FontStyle::console(18).bold(),
+    );
 }
 
 /// Иконка корзины (desktop).

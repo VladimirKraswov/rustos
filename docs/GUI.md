@@ -4,7 +4,7 @@
 
 - `graphics.rs` — clipping, RGB/BGR packing, RAM back buffer и scanout present;
 - `rustos-video` — безопасные CPU surfaces, blit/alpha, damage и layers;
-- `font.rs` — независимый от файловой системы аварийный bitmap font;
+- `font.rs` — системные Console/Sans bitmap fonts, UTF-8 и типографический API;
 - `input.rs` — PS/2 keyboard/mouse и нормализованные события;
 - `gui/components.rs` — theme и базовые widgets;
 - `gui/session.rs` — compositor, desktop, taskbar и window manager;
@@ -14,9 +14,17 @@
 читает EDID и переводит scanout на выбранный wide mode. GRUB framebuffer
 остаётся fallback для машин без поддерживаемого display device. Rendering
 полностью выполняется CPU, закрытые GPU-драйверы не требуются.
+
+На HiDPI/Retina monitor native EDID mode остаётся в `DISPLAY MODES`, но
+стартовый logical scanout ограничен комфортным 1600×900. Поэтому интерфейс не
+становится микроскопическим до появления полноценного fractional DPI scaling.
+Для monitor меньше лимита сохраняется его preferred mode; после загрузки любой
+поддержанный режим по-прежнему выбирается командой `DISPLAY MODE WxH`.
+
 Подробный контракт scanout/surfaces/compositor и путь к software OpenGL описан
 в [VIDEO.md](VIDEO.md). Команды, события, style-флаги и state machine окон
-описаны отдельно в [WINDOWS.md](WINDOWS.md).
+описаны отдельно в [WINDOWS.md](WINDOWS.md), а семейства, размеры и
+начертания — в [FONTS.md](FONTS.md).
 
 Компоненты никогда не рисуют непосредственно в видимый framebuffer.
 Compositor сначала формирует кадр в back buffer из обычной RAM и только потом
@@ -58,6 +66,10 @@ PS/2 service объединяет накопившиеся движения с �
 Bootstrap `grub-fb` не умеет mode-set после hand-off и предлагает выбрать
 режим в GRUB и перезапуститься.
 
+Команда `FONT` показывает текущую типографику terminal. `FONT FAMILY
+CONSOLE|SANS`, `FONT SIZE 10..48` и `FONT STYLE
+REGULAR|BOLD|ITALIC|BOLDITALIC` применяются сразу и не требуют перезапуска GUI.
+
 Команда `RUN /apps/examples/hello.rune student` запускает настоящий
 изолированный процесс с VaraniaFS. Persistent `vfsd` обслуживает executable и
 DLL, stdout/stderr идут через capability pipe обратно в окно. Заполнение pipe
@@ -67,7 +79,6 @@ DLL, stdout/stderr идут через capability pipe обратно в окн�
 ## Компоненты
 
 SDK-слой содержит `Widget`, `Panel`, `Label`, `Button`, `IconButton`,
-`Checkbox`, `RadioButton`, `Toggle`, `TextEdit`, `ScrollView`, `ListView`,
 `Tabs` и `Image`. Сейчас они компилируются вместе с bootstrap GUI. После IPC
 milestone renderer/theme останутся в GUI server, а приложения получат тонкий
 versioned client API без дублирования большого renderer-кода.
@@ -76,7 +87,7 @@ versioned client API без дублирования большого renderer-�
 
 - software compositor остаётся синхронным и пока не привязан к VSync;
 - PS/2 работает polling-режимом;
-- нет Unicode font shaping;
+- UTF-8 Latin/Cyrillic работает, но пока нет shaping, bidi и сложных scripts;
 - только одно terminal window;
 - parser shell и console bridge ещё находятся в kernel; сами программы и
   `vfsd` уже исполняются в ring 3;

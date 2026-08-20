@@ -41,6 +41,12 @@ const MIN_WIDTH: u32 = 640;
 const MIN_HEIGHT: u32 = 480;
 const MAX_WIDTH: u32 = 3840;
 const MAX_HEIGHT: u32 = 2160;
+/// Retina host сообщает virtio-gpu физический native mode (например,
+/// 2880×1800), но без DPI scaling такой desktop получается слишком мелким.
+/// Native mode остаётся доступен для `DISPLAY MODE`, а при загрузке GUI
+/// выбирает комфортный широкий logical scanout не больше 1600×900.
+const STARTUP_MAX_WIDTH: u32 = 1600;
+const STARTUP_MAX_HEIGHT: u32 = 900;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -234,20 +240,21 @@ impl VirtioGpu {
                 refresh_millihertz: 60_000,
             });
         }
-        let preferred = DisplayMode {
+        let connector_preferred = DisplayMode {
             format: PixelFormat::Bgr888,
             stride_pixels: preferred.width,
             ..preferred
         };
-        let resource = gpu.allocate_resource(preferred)?;
-        if let Err(error) = gpu.set_scanout_resource(resource.id, preferred) {
+        let startup = startup_mode(connector_preferred, fallback);
+        let resource = gpu.allocate_resource(startup)?;
+        if let Err(error) = gpu.set_scanout_resource(resource.id, startup) {
             let _ = gpu.detach_resource(resource.id);
             let _ = gpu.unref_resource(resource.id);
             let _ = memory::free(resource.backing);
             return Err(error);
         }
         gpu.resource = resource;
-        gpu.mode = preferred;
+        gpu.mode = startup;
         Ok(gpu)
     }
 
@@ -572,6 +579,28 @@ impl VirtioGpu {
             fence_id: self.fence,
             ..ControlHeader::ZERO
         }
+    }
+}
+
+/// Ограничивает только начальный logical mode. Если monitor меньше лимита,
+/// сохраняется его preferred mode; ручной `DISPLAY MODE` не ограничивается.
+fn startup_mode(preferred: DisplayMode, fallback: DisplayMode) -> DisplayMode {
+    if preferred.width <= STARTUP_MAX_WIDTH && preferred.height <= STARTUP_MAX_HEIGHT {
+        return preferred;
+    }
+    let (width, height) = if preferred.width >= 16 * preferred.height / 10 {
+        (STARTUP_MAX_WIDTH, STARTUP_MAX_HEIGHT)
+    } else if fallback.width <= STARTUP_MAX_WIDTH && fallback.height <= STARTUP_MAX_HEIGHT {
+        (fallback.width, fallback.height)
+    } else {
+        (1280, 800)
+    };
+    DisplayMode {
+        width,
+        height,
+        stride_pixels: width,
+        format: PixelFormat::Bgr888,
+        refresh_millihertz: preferred.refresh_millihertz.max(60_000),
     }
 }
 

@@ -67,7 +67,10 @@ send_command() {
 wait_for_serial() {
     local pattern="$1"
     local _
-    for _ in $(seq 1 80); do
+    # Некоторые ring-3 команды создают несколько процессов и на macOS/TCG
+    # законно занимают больше восьми секунд. Короткий polling interval
+    # сохраняем, но даём интеграционному пути до 30 секунд.
+    for _ in $(seq 1 300); do
         grep -Fq "$pattern" "$RUN_DIR/serial.log" && return 0
         sleep 0.1
     done
@@ -96,7 +99,7 @@ stop_qemu() {
 cleanup() {
     trap - EXIT INT TERM HUP
     stop_qemu
-    for file in serial.log qemu-stderr.log mode-720.ppm terminal.ppm dragged.ppm resized.ppm minimized.ppm; do
+    for file in serial.log qemu-stderr.log mode-720.ppm fonts.ppm terminal.ppm dragged.ppm resized.ppm minimized.ppm; do
         [[ -f "$RUN_DIR/$file" ]] && cp -f "$RUN_DIR/$file" "$RESULT_DIR/$file"
     done
 }
@@ -144,6 +147,24 @@ grep -q '\[scheduler\] priority, affinity and fault-containment policy verified'
 # Команда идёт через настоящий PS/2 keyboard path.
 send_command 'help'
 wait_for_serial '[terminal] command: help'
+
+# System fonts: family, bold+italic and variable em-size are changed through
+# the same PS/2 terminal path as a human uses. Then restore the default
+# console profile so the remaining screenshot geometry is deterministic.
+send_command 'font family sans'
+wait_for_serial '[font] terminal family=sans size=18 style=regular'
+send_command 'font style bolditalic'
+wait_for_serial '[font] terminal family=sans size=18 style=bolditalic'
+send_command 'font size 20'
+wait_for_serial '[font] terminal family=sans size=20 style=bolditalic'
+sleep 0.25
+printf 'screendump %s/fonts.ppm\n' "$RUN_DIR" | hmp
+send_command 'font family console'
+wait_for_serial '[font] terminal family=console size=20 style=bolditalic'
+send_command 'font style regular'
+wait_for_serial '[font] terminal family=console size=20 style=regular'
+send_command 'font size 18'
+wait_for_serial '[font] terminal family=console size=18 style=regular'
 
 # Display manager: monitor info, runtime software color profile and honest
 # firmware mode-set boundary. Возвращаем truecolor до screenshot-проверок.

@@ -15,8 +15,8 @@ use crate::{
 use rustos_abi::bootinfo::BootInitramfs;
 use rustos_video::{ColorMode, DisplayMode, ModeSetError};
 
-/// Размер буфера терминала: подогнан под дефолтное окно desktop
-/// (шире/выше окна буфер просто не умещается целиком).
+/// Размер логического буфера terminal. Число видимых строк и столбцов
+/// вычисляется из текущего размера окна и выбранного системного шрифта.
 const COLS: usize = 118;
 const ROWS: usize = 52;
 /// Максимальная длина строки ввода (без учёта переноса).
@@ -30,18 +30,62 @@ const YELLOW: Color = Color::rgb(238, 198, 108);
 const RED: Color = Color::rgb(239, 110, 118);
 const BACKGROUND: Color = Color::rgb(7, 12, 20);
 
-/// Клетка экрана терминала: ASCII-символ + цвет. Отдельные глифы не
-/// хранятся — отрисовка идёт из `font` по коду символа.
+/// Компактная клетка terminal: BMP code point + индекс фиксированной палитры.
+/// Latin/Cyrillic целиком лежат в BMP. Важно не хранить здесь `char + Color`:
+/// из-за alignment такая клетка заняла бы 8 байт и переполнила ранний 128-KiB
+/// kernel stack при глубоком process-spawn пути.
 #[derive(Clone, Copy)]
 struct Cell {
-    character: u8,
-    color: Color,
+    character: u16,
+    color: u8,
 }
 
+const _: [(); 4] = [(); core::mem::size_of::<Cell>()];
+
 const EMPTY_CELL: Cell = Cell {
-    character: b' ',
-    color: WHITE,
+    character: ' ' as u16,
+    color: COLOR_WHITE,
 };
+
+const COLOR_WHITE: u8 = 0;
+const COLOR_MUTED: u8 = 1;
+const COLOR_CYAN: u8 = 2;
+const COLOR_GREEN: u8 = 3;
+const COLOR_YELLOW: u8 = 4;
+const COLOR_RED: u8 = 5;
+
+impl Cell {
+    fn character(self) -> char {
+        char::from_u32(u32::from(self.character)).unwrap_or('�')
+    }
+
+    fn color(self) -> Color {
+        match self.color {
+            COLOR_MUTED => MUTED,
+            COLOR_CYAN => CYAN,
+            COLOR_GREEN => GREEN,
+            COLOR_YELLOW => YELLOW,
+            COLOR_RED => RED,
+            _ => WHITE,
+        }
+    }
+}
+
+fn color_index(color: Color) -> u8 {
+    if color == MUTED {
+        COLOR_MUTED
+    } else if color == CYAN {
+        COLOR_CYAN
+    } else if color == GREEN {
+        COLOR_GREEN
+    } else if color == YELLOW {
+        COLOR_YELLOW
+    } else if color == RED {
+        COLOR_RED
+    } else {
+        COLOR_WHITE
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TerminalAction {
@@ -75,6 +119,7 @@ pub struct Terminal {
     input: [u8; INPUT_CAPACITY],
     input_len: usize,
     usable_ram_mib: u64,
+    font_style: font::FontStyle,
     fs: BootstrapFs,
     cwd: [u8; PATH_CAPACITY],
     cwd_len: usize,
@@ -93,12 +138,13 @@ impl Terminal {
             input: [0; INPUT_CAPACITY],
             input_len: 0,
             usable_ram_mib,
+            font_style: font::TERMINAL_DEFAULT,
             fs: BootstrapFs::new(initramfs),
             cwd,
             cwd_len: 1,
         };
-        terminal.print("RUSTOS GRAPHICAL TERMINAL 0.1\n", CYAN);
-        terminal.print("MICROKERNEL DEVELOPMENT SESSION\n", MUTED);
+        terminal.print("RUSTOS GRAPHICAL TERMINAL 0.2\n", CYAN);
+        terminal.print("СИСТЕМНЫЙ ТЕРМИНАЛ · LATIN + КИРИЛЛИЦА\n", MUTED);
         terminal.print("BOOT VFS: RIFS /BOOT (RO) + RAM OVERLAY (RW)\n", GREEN);
         terminal.print("TYPE HELP TO SEE AVAILABLE COMMANDS.\n\n", WHITE);
         terminal.prompt();
@@ -114,7 +160,7 @@ impl Terminal {
                 if self.input_len < INPUT_CAPACITY {
                     self.input[self.input_len] = byte;
                     self.input_len += 1;
-                    self.put(byte, WHITE);
+                    self.put(char::from(byte), WHITE);
                     return self.input_redraw(previous_row);
                 }
             }
@@ -132,7 +178,7 @@ impl Terminal {
                     if self.input_len < INPUT_CAPACITY {
                         self.input[self.input_len] = b' ';
                         self.input_len += 1;
-                        self.put(b' ', WHITE);
+                        self.put(' ', WHITE);
                     }
                 }
                 return self.input_redraw(previous_row);
@@ -157,10 +203,12 @@ impl Terminal {
     /// к последней строке) + caret. Полная отрисовка окна.
     pub fn draw(&self, fb: &mut Framebuffer, rect: Rect) {
         fb.fill_rect(rect, BACKGROUND);
+        let cell_width = self.font_style.cell_width().max(1);
+        let line_height = self.font_style.line_height().max(1);
         let visible_cols =
-            ((rect.width.saturating_sub(12)) / font::GLYPH_WIDTH as u32).min(COLS as u32) as usize;
-        let visible_rows = ((rect.height.saturating_sub(12)) / font::GLYPH_HEIGHT as u32)
-            .min(ROWS as u32) as usize;
+            ((rect.width.saturating_sub(12)) / cell_width as u32).min(COLS as u32) as usize;
+        let visible_rows =
+            ((rect.height.saturating_sub(12)) / line_height as u32).min(ROWS as u32) as usize;
         let first_row = self.row.saturating_add(1).saturating_sub(visible_rows);
         for screen_row in 0..visible_rows {
             let source_row = first_row + screen_row;
@@ -169,14 +217,14 @@ impl Terminal {
             }
             for column in 0..visible_cols {
                 let cell = self.cells[source_row * COLS + column];
-                if cell.character != b' ' {
+                if cell.character != ' ' as u16 {
                     font::draw_char(
                         fb,
-                        rect.x + 6 + column as i32 * font::GLYPH_WIDTH,
-                        rect.y + 6 + screen_row as i32 * font::GLYPH_HEIGHT,
-                        cell.character,
-                        cell.color,
-                        1,
+                        rect.x + 6 + column as i32 * cell_width,
+                        rect.y + 6 + screen_row as i32 * line_height,
+                        cell.character(),
+                        cell.color(),
+                        self.font_style,
                     );
                 }
             }
@@ -184,9 +232,12 @@ impl Terminal {
 
         // Тонкий caret в активной позиции.
         if self.row >= first_row && self.row < first_row + visible_rows {
-            let caret_x = rect.x + 6 + self.column as i32 * font::GLYPH_WIDTH;
-            let caret_y = rect.y + 6 + (self.row - first_row) as i32 * font::GLYPH_HEIGHT + 7;
-            fb.fill_rect(Rect::new(caret_x, caret_y, 5, 1), CYAN);
+            let caret_x = rect.x + 6 + self.column as i32 * cell_width;
+            let caret_y = rect.y
+                + 6
+                + (self.row - first_row) as i32 * line_height
+                + line_height.saturating_sub(2);
+            fb.fill_rect(Rect::new(caret_x, caret_y, cell_width as u32, 2), CYAN);
         }
     }
 
@@ -194,10 +245,12 @@ impl Terminal {
     /// rectangle. Это критично для раннего polling input: полный software
     /// redraw на каждую букву надолго оставлял виртуальный 8042 без чтения.
     pub fn draw_input_line(&self, fb: &mut Framebuffer, rect: Rect) -> Option<Rect> {
+        let cell_width = self.font_style.cell_width().max(1);
+        let line_height = self.font_style.line_height().max(1);
         let visible_cols =
-            ((rect.width.saturating_sub(12)) / font::GLYPH_WIDTH as u32).min(COLS as u32) as usize;
-        let visible_rows = ((rect.height.saturating_sub(12)) / font::GLYPH_HEIGHT as u32)
-            .min(ROWS as u32) as usize;
+            ((rect.width.saturating_sub(12)) / cell_width as u32).min(COLS as u32) as usize;
+        let visible_rows =
+            ((rect.height.saturating_sub(12)) / line_height as u32).min(ROWS as u32) as usize;
         let first_row = self.row.saturating_add(1).saturating_sub(visible_rows);
         if self.row < first_row || self.row >= first_row + visible_rows {
             return None;
@@ -206,26 +259,34 @@ impl Terminal {
         let screen_row = self.row - first_row;
         let line = Rect::new(
             rect.x,
-            rect.y + 6 + screen_row as i32 * font::GLYPH_HEIGHT,
+            rect.y + 6 + screen_row as i32 * line_height,
             rect.width,
-            font::GLYPH_HEIGHT as u32,
+            line_height as u32,
         );
         fb.fill_rect(line, BACKGROUND);
         for column in 0..visible_cols {
             let cell = self.cells[self.row * COLS + column];
-            if cell.character != b' ' {
+            if cell.character != ' ' as u16 {
                 font::draw_char(
                     fb,
-                    rect.x + 6 + column as i32 * font::GLYPH_WIDTH,
+                    rect.x + 6 + column as i32 * cell_width,
                     line.y,
-                    cell.character,
-                    cell.color,
-                    1,
+                    cell.character(),
+                    cell.color(),
+                    self.font_style,
                 );
             }
         }
-        let caret_x = rect.x + 6 + self.column as i32 * font::GLYPH_WIDTH;
-        fb.fill_rect(Rect::new(caret_x, line.y + 7, 5, 1), CYAN);
+        let caret_x = rect.x + 6 + self.column as i32 * cell_width;
+        fb.fill_rect(
+            Rect::new(
+                caret_x,
+                line.y + line_height.saturating_sub(2),
+                cell_width as u32,
+                2,
+            ),
+            CYAN,
+        );
         Some(line)
     }
 
@@ -255,6 +316,7 @@ impl Terminal {
             self.print("  MEM       USABLE MEMORY\n", WHITE);
             self.print("  GUI       GUI SERVER STATUS\n", WHITE);
             self.print("  DISPLAY   MONITOR/MODE/COLOR SETTINGS\n", WHITE);
+            self.print("  FONT      FAMILY/SIZE/STYLE SETTINGS\n", WHITE);
             self.print("  ECHO TEXT PRINT TEXT\n", WHITE);
             self.print("  PWD/CD    CURRENT DIRECTORY\n", WHITE);
             self.print("  LS/CAT    LIST OR READ FILES\n", WHITE);
@@ -292,6 +354,13 @@ impl Terminal {
                 .is_some_and(|prefix| prefix.eq_ignore_ascii_case("display "))
         {
             self.command_display(command)
+        } else if command.eq_ignore_ascii_case("font")
+            || command
+                .get(..5)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("font "))
+        {
+            self.command_font(command);
+            TerminalAction::None
         } else if command.eq_ignore_ascii_case("shutdown") {
             self.print("POWERING OFF...\n", YELLOW);
             TerminalAction::Shutdown
@@ -362,6 +431,104 @@ impl Terminal {
         self.print("DISPLAY MODE WIDTHxHEIGHT\n", WHITE);
         self.print("DISPLAY COLOR TRUECOLOR|RGB565|GRAY8\n", WHITE);
         TerminalAction::None
+    }
+
+    /// Настройка типографики терминала без перезапуска GUI. Семейство Sans
+    /// полезно для проверки SDK, но default всегда остаётся моноширинным.
+    fn command_font(&mut self, command: &str) {
+        let arguments = command.get(4..).unwrap_or("").trim();
+        if arguments.is_empty() {
+            self.print_font_info();
+            self.print("FONT FAMILY CONSOLE|SANS\n", WHITE);
+            self.print("FONT SIZE 10..48\n", WHITE);
+            self.print("FONT STYLE REGULAR|BOLD|ITALIC|BOLDITALIC\n", WHITE);
+            return;
+        }
+
+        let (setting, value) = arguments.split_once(' ').unwrap_or(("size", arguments));
+        let value = value.trim();
+        if setting.eq_ignore_ascii_case("family") {
+            self.font_style.family = if value.eq_ignore_ascii_case("console") {
+                font::FontFamily::Console
+            } else if value.eq_ignore_ascii_case("sans") {
+                font::FontFamily::Sans
+            } else {
+                self.print("FONT FAMILY: CONSOLE | SANS\n", RED);
+                return;
+            };
+        } else if setting.eq_ignore_ascii_case("size") {
+            let Some(size) = value
+                .parse::<u16>()
+                .ok()
+                .filter(|size| (10..=48).contains(size))
+            else {
+                self.print("FONT SIZE MUST BE 10..48\n", RED);
+                return;
+            };
+            self.font_style.size = size;
+        } else if setting.eq_ignore_ascii_case("style") {
+            let (weight, italic) = if value.eq_ignore_ascii_case("regular") {
+                (font::FontWeight::Regular, false)
+            } else if value.eq_ignore_ascii_case("bold") {
+                (font::FontWeight::Bold, false)
+            } else if value.eq_ignore_ascii_case("italic") {
+                (font::FontWeight::Regular, true)
+            } else if value.eq_ignore_ascii_case("bolditalic")
+                || value.eq_ignore_ascii_case("bold-italic")
+            {
+                (font::FontWeight::Bold, true)
+            } else {
+                self.print("FONT STYLE: REGULAR | BOLD | ITALIC | BOLDITALIC\n", RED);
+                return;
+            };
+            self.font_style.weight = weight;
+            self.font_style.italic = italic;
+        } else {
+            self.print("UNKNOWN FONT SETTING\n", RED);
+            return;
+        }
+        self.log_font_style();
+        self.print("FONT UPDATED: ", GREEN);
+        self.print_font_info();
+    }
+
+    fn log_font_style(&self) {
+        serial::put_str("[font] terminal family=");
+        serial::put_str(match self.font_style.family {
+            font::FontFamily::Console => "console",
+            font::FontFamily::Sans => "sans",
+        });
+        serial::put_str(" size=");
+        serial::put_u32(u32::from(self.font_style.size));
+        serial::put_str(" style=");
+        serial::put_str(match (self.font_style.weight, self.font_style.italic) {
+            (font::FontWeight::Regular, false) => "regular",
+            (font::FontWeight::Bold, false) => "bold",
+            (font::FontWeight::Regular, true) => "italic",
+            (font::FontWeight::Bold, true) => "bolditalic",
+        });
+        serial::put_str("\n");
+    }
+
+    fn print_font_info(&mut self) {
+        self.print(
+            match self.font_style.family {
+                font::FontFamily::Console => "CONSOLE ",
+                font::FontFamily::Sans => "SANS ",
+            },
+            CYAN,
+        );
+        self.print_number(u64::from(self.font_style.size));
+        self.print("PX ", WHITE);
+        self.print(
+            match (self.font_style.weight, self.font_style.italic) {
+                (font::FontWeight::Regular, false) => "REGULAR\n",
+                (font::FontWeight::Bold, false) => "BOLD\n",
+                (font::FontWeight::Regular, true) => "ITALIC\n",
+                (font::FontWeight::Bold, true) => "BOLDITALIC\n",
+            },
+            WHITE,
+        );
     }
 
     pub fn report_display_info(
@@ -771,16 +938,25 @@ impl Terminal {
     }
 
     fn print_file_bytes(&mut self, bytes: &[u8]) {
+        if let Ok(text) = core::str::from_utf8(bytes) {
+            self.print(text, WHITE);
+            if !text.ends_with('\n') {
+                self.newline();
+            }
+            return;
+        }
         for byte in bytes.iter().copied() {
             match byte {
                 b'\n' => self.newline(),
                 b'\t' => {
                     for _ in 0..4 {
-                        self.put(b' ', WHITE);
+                        self.put(' ', WHITE);
                     }
                 }
-                byte if byte.is_ascii_graphic() || byte == b' ' => self.put(byte, WHITE),
-                _ => self.put(b'.', MUTED),
+                byte if byte.is_ascii_graphic() || byte == b' ' => {
+                    self.put(char::from(byte), WHITE)
+                }
+                _ => self.put('�', MUTED),
             }
         }
         if !bytes.ends_with(b"\n") {
@@ -815,7 +991,7 @@ impl Terminal {
 
     fn print_number(&mut self, mut number: u64) {
         if number == 0 {
-            self.put(b'0', GREEN);
+            self.put('0', GREEN);
             return;
         }
         let mut digits = [0u8; 20];
@@ -827,27 +1003,27 @@ impl Terminal {
         }
         while count > 0 {
             count -= 1;
-            self.put(digits[count], GREEN);
+            self.put(char::from(digits[count]), GREEN);
         }
     }
 
     fn print(&mut self, text: &str, color: Color) {
-        for byte in text.bytes() {
-            if byte == b'\n' {
+        for character in text.chars() {
+            if character == '\n' {
                 self.newline();
             } else {
-                self.put(byte, color);
+                self.put(character, color);
             }
         }
     }
 
-    fn put(&mut self, byte: u8, color: Color) {
+    fn put(&mut self, character: char, color: Color) {
         if self.column >= COLS {
             self.newline();
         }
         self.cells[self.row * COLS + self.column] = Cell {
-            character: byte,
-            color,
+            character: u16::try_from(u32::from(character)).unwrap_or('�' as u16),
+            color: color_index(color),
         };
         self.column += 1;
     }

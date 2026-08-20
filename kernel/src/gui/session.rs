@@ -77,6 +77,9 @@ pub fn run(info: &BootInfo) -> ! {
     serial::put_str(" present=immediate page-flip=");
     serial::put_str(if capabilities.page_flip { "yes" } else { "no" });
     serial::put_str("\n");
+    serial::put_str(
+        "[font] families=console,sans scripts=latin,cyrillic styles=regular,bold,italic sizes=10..48\n",
+    );
     let mut session = DesktopSession::new(
         framebuffer,
         info.total_usable_ram() / (1024 * 1024),
@@ -703,9 +706,9 @@ impl DesktopSession {
             &mut self.framebuffer,
             rect.x + 12,
             rect.y + 11,
-            "RUSTOS TERMINAL",
+            "RUSTOS · ТЕРМИНАЛ",
             Theme::TEXT,
-            1,
+            font::UI_TITLE,
         );
     }
 
@@ -796,7 +799,7 @@ impl DesktopSession {
             branding_y,
             arch::ARCH_NAME,
             Color::rgb(119, 158, 181),
-            1,
+            font::UI_SMALL.italic(),
         );
     }
 
@@ -812,7 +815,7 @@ impl DesktopSession {
             terminal.y + 61,
             "TERMINAL",
             Theme::TEXT,
-            1,
+            font::UI_SMALL,
         );
         let trash = Rect::new(28, 138, 74, 82);
         components::trash_icon(
@@ -825,7 +828,7 @@ impl DesktopSession {
             trash.y + 63,
             "TRASH",
             Theme::TEXT,
-            1,
+            font::UI_SMALL,
         );
     }
 
@@ -865,10 +868,10 @@ impl DesktopSession {
                 Rect::new(rect.x + 8, rect.y + 6, 22, 22),
             );
             Label {
-                rect: Rect::new(rect.x + 38, rect.y + 11, 180, 16),
-                text: "RUSTOS TERMINAL",
+                rect: Rect::new(rect.x + 38, rect.y + 8, 260, 22),
+                text: "RUSTOS · ТЕРМИНАЛ",
                 color: Theme::TEXT,
-                scale: 1,
+                style: font::UI_TITLE,
             }
             .draw(&mut self.framebuffer);
 
@@ -952,7 +955,7 @@ impl DesktopSession {
             start.y + 17,
             "START",
             Theme::TEXT,
-            1,
+            font::UI_NORMAL,
         );
         if !self.window.is_closed() {
             let task = self.task_terminal_button();
@@ -974,7 +977,7 @@ impl DesktopSession {
                 task.y + 17,
                 "TERMINAL",
                 Theme::TEXT,
-                1,
+                font::UI_NORMAL,
             );
         }
         let status_x = self.framebuffer.width() as i32 - 150;
@@ -984,7 +987,7 @@ impl DesktopSession {
             y + 17,
             "CPU0  64-BIT",
             Theme::TEXT_MUTED,
-            1,
+            font::UI_SMALL,
         );
     }
 
@@ -1002,7 +1005,7 @@ impl DesktopSession {
             menu.y + 18,
             "RUSTOS",
             Theme::ACCENT,
-            2,
+            font::UI_LARGE,
         );
         let terminal = self.start_terminal_item();
         self.framebuffer.fill_rect(terminal, Theme::PANEL_LIGHT);
@@ -1016,7 +1019,7 @@ impl DesktopSession {
             terminal.y + 20,
             "TERMINAL",
             Theme::TEXT,
-            1,
+            font::UI_NORMAL,
         );
         let shutdown = self.start_shutdown_item();
         self.framebuffer.fill_rect(shutdown, Color::rgb(45, 31, 39));
@@ -1026,7 +1029,7 @@ impl DesktopSession {
             shutdown.y + 17,
             "SHUTDOWN",
             Color::rgb(245, 151, 157),
-            1,
+            font::UI_NORMAL,
         );
     }
 

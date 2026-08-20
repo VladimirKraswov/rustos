@@ -230,6 +230,25 @@ impl Framebuffer {
         self.write_raw(x as u32, y as u32, self.pack(color));
     }
 
+    /// Смешивает пиксель текста/иконки с уже нарисованным фоном.
+    ///
+    /// `coverage=0` не меняет framebuffer, `coverage=255` полностью заменяет
+    /// пиксель. Метод нужен сглаженным системным шрифтам и намеренно живёт
+    /// здесь: только framebuffer знает фактический RGB/BGR/565/gray формат.
+    pub fn blend_pixel(&mut self, x: i32, y: i32, foreground: Color, coverage: u8) {
+        if coverage == 0 || x < 0 || y < 0 || x >= self.width as i32 || y >= self.height as i32 {
+            return;
+        }
+        if coverage == u8::MAX {
+            self.put_pixel(x, y, foreground);
+            return;
+        }
+        let raw = self.read_raw(x as u32, y as u32);
+        let background = self.render_format.unpack(raw);
+        let background = Color::rgb(background.r, background.g, background.b);
+        self.put_pixel(x, y, background.mix(foreground, coverage));
+    }
+
     /// Заливает весь кадр одним цветом (очистка сцены).
     pub fn fill(&mut self, color: Color) {
         self.fill_rect(Rect::new(0, 0, self.width, self.height), color);

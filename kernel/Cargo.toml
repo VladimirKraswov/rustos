@@ -16,6 +16,9 @@ rustos-abi = { path = "../abi" }
 rustos-microkernel = { path = "../microkernel" }
 rustos-rune-format = { path = "../rune-format" }
 rustos-video = { path = "../video" }
+embedded-graphics = { version = "=0.8.2", default-features = false }
+mplusfonts = { version = "=0.3.4" }
+u8g2-fonts = { version = "=0.8.0" }
 
 [features]
 default = []
