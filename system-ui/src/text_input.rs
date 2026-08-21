@@ -8,10 +8,13 @@
 //!
 //! Результат предназначен для будущих TextField, Terminal, inline rename
 //! Проводника и редактора. Selection задаётся `anchor` и `cursor` как byte
-//! offsets на границах extended grapheme cluster. Намеренно не реализованы
-//! multiline, clipboard, IME, shaping, undo и event handling — это забота
+//! offsets на границах extended grapheme cluster. `apply_key` применяет один
+//! renderer-neutral `KeyEvent` (только key-down) к модели, соблюдая
+//! selection и grapheme boundaries. Намеренно не реализованы multiline,
+//! clipboard, IME, shaping, undo и интеграция с `Runtime` — это забота
 //! контролов и event routing.
 
+use crate::{modifiers, Key, KeyEvent};
 use unicode_segmentation::UnicodeSegmentation;
 
 /// Ошибки текстового буфера.
@@ -21,6 +24,51 @@ pub enum TextInputError {
     Capacity,
     /// Позиция не находится на границе grapheme cluster.
     InvalidPosition,
+}
+
+/// Bounded result применения одного `KeyEvent` к буферу.
+///
+/// Позволяет runtime различить четыре исхода без panic и исключений:
+/// проигнорированное событие, обработанное без изменения, обработанное с
+/// изменением и обработанное с ошибкой (например, `Capacity`), при которой
+/// состояние буфера остаётся атомарным.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct KeyResult {
+    /// Событие обработано буфером и не должно передаваться дальше.
+    pub consumed: bool,
+    /// Состояние буфера (текст, курсор, selection) изменилось.
+    pub changed: bool,
+    /// Ошибка применения; `None` для успешного или проигнорированного события.
+    pub error: Option<TextInputError>,
+}
+
+impl KeyResult {
+    /// Событие проигнорировано: не обработано и не изменило состояние.
+    pub const fn ignored() -> Self {
+        Self {
+            consumed: false,
+            changed: false,
+            error: None,
+        }
+    }
+
+    /// Событие обработано; `changed` — изменилось ли состояние буфера.
+    pub const fn consumed(changed: bool) -> Self {
+        Self {
+            consumed: true,
+            changed,
+            error: None,
+        }
+    }
+
+    /// Событие обработано с ошибкой; состояние буфера не изменилось.
+    pub const fn error(error: TextInputError) -> Self {
+        Self {
+            consumed: true,
+            changed: false,
+            error: Some(error),
+        }
+    }
 }
 
 /// Однострочный буфер фиксированной ёмкости `N` байт UTF-8.
@@ -192,7 +240,10 @@ impl<const N: usize> TextInputBuffer<N> {
         // Записываем новый текст на начало диапазона.
         self.bytes[start..start + insert_len].copy_from_slice(text.as_bytes());
         self.len = new_len;
-        self.cursor = start + insert_len;
+        // Unicode segmentation зависит от соседнего контекста. Например,
+        // вставленный ZWJ между двумя emoji объединяет их в одну grapheme, и
+        // номинальная позиция сразу после ZWJ перестаёт быть допустимой.
+        self.cursor = self.grapheme_boundary_at_or_after(start + insert_len);
         self.anchor = self.cursor;
         Ok(())
     }
@@ -284,6 +335,118 @@ impl<const N: usize> TextInputBuffer<N> {
         self.anchor = self.len;
     }
 
+    /// Применяет один `KeyEvent` к буферу и возвращает bounded result.
+    ///
+    /// Обрабатываются только key-down (`pressed == true`):
+    /// - `Character` и `Space` без Control/Alt/System вставляют символ или
+    ///   заменяют selection;
+    /// - `Backspace`/`Delete` удаляют grapheme или selection;
+    /// - Left/Right/Home/End двигают по границам extended grapheme;
+    /// - Shift+навигация расширяет selection, сохраняя `anchor`;
+    /// - навигация без Shift при активном selection сворачивает его: Left — в
+    ///   начало, Right — в конец, Home/End — в начало/конец строки;
+    /// - Control+A и Control+a выполняют `select_all`;
+    /// - Enter, Tab, Up/Down/PageUp/PageDown, Escape, остальные
+    ///   Control-символы, Alt/System-комбинации и key-up игнорируются.
+    ///
+    /// Операция атомарна: при `Capacity` ни текст, ни курсор, ни selection не
+    /// меняются, ошибка возвращается в `KeyResult::error`.
+    pub fn apply_key(&mut self, event: KeyEvent) -> KeyResult {
+        if !event.pressed {
+            // Key-up не меняет модель однострочного поля.
+            return KeyResult::ignored();
+        }
+        // `KeyEvent::shift` — legacy поле обратного Tab; dispatcher считает
+        // Shift по нему или по modifier bit, поэтому здесь то же правило.
+        let shift = event.shift || event.modifiers & modifiers::SHIFT != 0;
+        let control = event.modifiers & modifiers::CONTROL != 0;
+        if event.modifiers & (modifiers::ALT | modifiers::SYSTEM) != 0 {
+            // Alt/System-комбинации принадлежат window manager и IME, а не
+            // буферу: модель не меняем и не объявляем обработанными.
+            return KeyResult::ignored();
+        }
+        if control && !matches!(event.key, Key::Character('a' | 'A')) {
+            // Word navigation/delete и clipboard shortcuts требуют отдельной
+            // policy. Пока модель знает только Control+A и не должна молча
+            // превращать остальные команды в обычную клавишу.
+            return KeyResult::ignored();
+        }
+        let before = (self.len, self.cursor, self.anchor);
+        match event.key {
+            // Control+A/Control+a — select_all. Остальные Control-символы
+            // (clipboard, IME) за пределами модели и игнорируются.
+            Key::Character('a') | Key::Character('A') if control => self.select_all(),
+            Key::Character(ch) if !control => {
+                if let Err(error) = self.insert_char(ch) {
+                    return KeyResult::error(error);
+                }
+            }
+            // Пробел приходит как отдельный вариант `Key::Space`, а не
+            // `Character(' ')`, но для поля это обычный вводимый символ.
+            Key::Space if !control => {
+                if let Err(error) = self.insert_char(' ') {
+                    return KeyResult::error(error);
+                }
+            }
+            Key::Backspace => self.backspace(),
+            Key::Delete => self.delete_forward(),
+            Key::Left | Key::Right | Key::Home | Key::End => self.navigate(event.key, shift),
+            // Enter, Tab, Up/Down/PageUp/PageDown, Escape и Control-символы
+            // не являются поведением однострочного поля.
+            _ => return KeyResult::ignored(),
+        }
+        // Любая мутация меняет хотя бы один из (len, cursor, anchor),
+        // поэтому snapshot достаточно для определения `changed`.
+        KeyResult::consumed((self.len, self.cursor, self.anchor) != before)
+    }
+
+    /// Навигация по границам grapheme с учётом selection.
+    ///
+    /// Без Shift: при активном selection Left сворачивает его в начало,
+    /// Right — в конец, Home/End — в начало/конец строки; иначе cursor
+    /// двигается на одну grapheme. С Shift: `anchor` сохраняется, а cursor
+    /// двигается, поэтому selection расширяется или сужается.
+    fn navigate(&mut self, key: Key, shift: bool) {
+        let (start, end) = self.selection_range().unwrap_or((self.cursor, self.cursor));
+        if shift {
+            let anchor = self.anchor;
+            match key {
+                Key::Left => self.move_left(),
+                Key::Right => self.move_right(),
+                Key::Home => {
+                    self.cursor = 0;
+                    self.anchor = anchor;
+                    return;
+                }
+                Key::End => {
+                    self.cursor = self.len;
+                    self.anchor = anchor;
+                    return;
+                }
+                _ => unreachable!("navigate вызывается только для Left/Right/Home/End"),
+            }
+            // move_left/move_right сворачивают selection; восстанавливаем
+            // сохранённый anchor, чтобы расширение не теряло начало.
+            self.anchor = anchor;
+            return;
+        }
+        match key {
+            Key::Left if self.has_selection() => {
+                self.cursor = start;
+                self.anchor = start;
+            }
+            Key::Right if self.has_selection() => {
+                self.cursor = end;
+                self.anchor = end;
+            }
+            Key::Left => self.move_left(),
+            Key::Right => self.move_right(),
+            Key::Home => self.move_home(),
+            Key::End => self.move_end(),
+            _ => unreachable!("navigate вызывается только для Left/Right/Home/End"),
+        }
+    }
+
     /// Проверяет, что `offset` находится в `0..=len` на границе extended
     /// grapheme cluster.
     fn is_grapheme_boundary(&self, offset: usize) -> bool {
@@ -295,6 +458,18 @@ impl<const N: usize> TextInputBuffer<N> {
                     .any(|(boundary, _)| boundary == offset))
     }
 
+    /// Возвращает первую grapheme boundary не раньше `preferred`.
+    ///
+    /// Мутация уже проверила byte capacity, поэтому helper только восстанавливает
+    /// cursor invariant после возможного объединения соседних grapheme.
+    fn grapheme_boundary_at_or_after(&self, preferred: usize) -> usize {
+        self.as_str()
+            .grapheme_indices(true)
+            .map(|(boundary, _)| boundary)
+            .find(|boundary| *boundary >= preferred)
+            .unwrap_or(self.len)
+    }
+
     /// Удаляет диапазон `[start, end)` и сдвигает хвост влево.
     ///
     /// `start` и `end` — границы grapheme cluster в `0..=len`. Cursor и
@@ -302,8 +477,8 @@ impl<const N: usize> TextInputBuffer<N> {
     fn delete_range(&mut self, start: usize, end: usize) {
         self.bytes.copy_within(end..self.len, start);
         self.len -= end - start;
-        self.cursor = start;
-        self.anchor = start;
+        self.cursor = self.grapheme_boundary_at_or_after(start);
+        self.anchor = self.cursor;
     }
 }
 
@@ -807,5 +982,364 @@ mod tests {
         assert_eq!(buf.cursor(), 1);
         assert_eq!(buf.anchor(), 1);
         assert!(!buf.has_selection());
+    }
+
+    /// Key-down event с заданными modifiers.
+    fn key_down(key: Key, modifiers: u16) -> KeyEvent {
+        KeyEvent {
+            key,
+            pressed: true,
+            modifiers,
+            shift: false,
+        }
+    }
+
+    #[test]
+    fn apply_key_ascii_insert_backspace_delete_and_movement() {
+        let mut buf = TextInputBuffer::<16>::new();
+
+        // Вставка ASCII через Character.
+        for ch in ['h', 'e', 'l', 'l', 'o'] {
+            let result = buf.apply_key(key_down(Key::Character(ch), 0));
+            assert!(result.consumed && result.changed && result.error.is_none());
+        }
+        assert_eq!(buf.as_str(), "hello");
+        assert_eq!(buf.cursor(), 5);
+
+        // Space вставляет пробел.
+        let result = buf.apply_key(key_down(Key::Space, 0));
+        assert!(result.consumed && result.changed);
+        assert_eq!(buf.as_str(), "hello ");
+
+        // Backspace удаляет пробел.
+        let result = buf.apply_key(key_down(Key::Backspace, 0));
+        assert!(result.consumed && result.changed);
+        assert_eq!(buf.as_str(), "hello");
+
+        // Delete в конце — no-op, но событие обработано.
+        let result = buf.apply_key(key_down(Key::Delete, 0));
+        assert!(result.consumed && !result.changed && result.error.is_none());
+        assert_eq!(buf.as_str(), "hello");
+
+        // Home + Delete удаляет 'h'.
+        buf.apply_key(key_down(Key::Home, 0));
+        let result = buf.apply_key(key_down(Key::Delete, 0));
+        assert!(result.consumed && result.changed);
+        assert_eq!(buf.as_str(), "ello");
+
+        // End + Left двигает на одну grapheme.
+        buf.apply_key(key_down(Key::End, 0));
+        let result = buf.apply_key(key_down(Key::Left, 0));
+        assert!(result.consumed && result.changed);
+        assert_eq!(buf.cursor(), 3);
+    }
+
+    #[test]
+    fn apply_key_cyrillic_moves_and_deletes_on_utf8_boundaries() {
+        let mut buf = TextInputBuffer::<32>::new();
+        for ch in "Привет".chars() {
+            buf.apply_key(key_down(Key::Character(ch), 0));
+        }
+        assert_eq!(buf.as_str(), "Привет");
+        assert_eq!(buf.cursor(), 12);
+
+        // Backspace в конце удаляет целый code point (2 байта).
+        let result = buf.apply_key(key_down(Key::Backspace, 0));
+        assert!(result.consumed && result.changed);
+        assert_eq!(buf.as_str(), "Приве");
+        assert_eq!(buf.cursor(), 10);
+
+        // Left по границам code point: 10 -> 8 -> 6.
+        buf.apply_key(key_down(Key::Left, 0));
+        assert_eq!(buf.cursor(), 8);
+        buf.apply_key(key_down(Key::Left, 0));
+        assert_eq!(buf.cursor(), 6);
+
+        // Home + Delete удаляет grapheme после курсора.
+        buf.apply_key(key_down(Key::Home, 0));
+        let result = buf.apply_key(key_down(Key::Delete, 0));
+        assert!(result.consumed && result.changed);
+        assert_eq!(buf.as_str(), "риве");
+        assert_eq!(buf.cursor(), 0);
+    }
+
+    #[test]
+    fn apply_key_combining_and_zwj_graphemes() {
+        let mut buf = TextInputBuffer::<64>::new();
+
+        // «e» + combining acute — одна extended grapheme (3 байта).
+        buf.apply_key(key_down(Key::Character('e'), 0));
+        buf.apply_key(key_down(Key::Character('\u{301}'), 0));
+        assert_eq!(buf.as_str(), "e\u{301}");
+        assert_eq!(buf.len_bytes(), 3);
+
+        // Left от конца проходит всю combining grapheme за один шаг.
+        let result = buf.apply_key(key_down(Key::Left, 0));
+        assert!(result.consumed && result.changed);
+        assert_eq!(buf.cursor(), 0);
+
+        // Delete удаляет combining grapheme целиком.
+        let result = buf.apply_key(key_down(Key::Delete, 0));
+        assert!(result.consumed && result.changed);
+        assert!(buf.is_empty());
+
+        // ZWJ family emoji — одна grapheme из 7 code points (25 байт).
+        let family = "👩‍👩‍👧‍👦";
+        buf.apply_key(key_down(Key::Character('a'), 0));
+        for ch in family.chars() {
+            buf.apply_key(key_down(Key::Character(ch), 0));
+        }
+        buf.apply_key(key_down(Key::Character('b'), 0));
+        assert_eq!(buf.as_str(), "a👩‍👩‍👧‍👦b");
+        assert_eq!(buf.len_bytes(), 27);
+
+        // Left от конца: 27 -> 26 -> 1, emoji не делится.
+        buf.apply_key(key_down(Key::Left, 0));
+        assert_eq!(buf.cursor(), 26);
+        buf.apply_key(key_down(Key::Left, 0));
+        assert_eq!(buf.cursor(), 1);
+
+        // Right возвращает курсор за emoji: 1 -> 26.
+        buf.apply_key(key_down(Key::Right, 0));
+        assert_eq!(buf.cursor(), 26);
+
+        // Backspace удаляет весь emoji одним нажатием.
+        let result = buf.apply_key(key_down(Key::Backspace, 0));
+        assert!(result.consumed && result.changed);
+        assert_eq!(buf.as_str(), "ab");
+        assert_eq!(buf.cursor(), 1);
+    }
+
+    #[test]
+    fn insertion_that_joins_neighbouring_graphemes_keeps_cursor_valid() {
+        let mut buf = TextInputBuffer::<32>::new();
+        buf.set_text("👩👩").unwrap();
+        buf.set_cursor("👩".len()).unwrap();
+
+        let result = buf.apply_key(key_down(Key::Character('\u{200d}'), 0));
+        assert!(result.consumed && result.changed && result.error.is_none());
+        assert_eq!(buf.as_str(), "👩‍👩");
+        // Позиция сразу после ZWJ находится внутри новой grapheme. Модель
+        // сдвигает caret к её концу и сохраняет заявленный invariant.
+        assert_eq!(buf.cursor(), "👩‍👩".len());
+        assert_eq!(buf.set_cursor(buf.cursor()), Ok(()));
+        buf.move_left();
+        assert_eq!(buf.cursor(), 0);
+    }
+
+    #[test]
+    fn apply_key_shift_navigation_extends_selection() {
+        let mut buf = TextInputBuffer::<16>::new();
+        buf.insert_str("hello").unwrap(); // cursor=5, anchor=5
+        let shift = modifiers::SHIFT;
+
+        // Shift+Left расширяет влево, anchor остаётся в 5: (4,5) -> (3,5).
+        buf.apply_key(key_down(Key::Left, shift));
+        assert_eq!(buf.selection_range(), Some((4, 5)));
+        assert_eq!(buf.anchor(), 5);
+        assert_eq!(buf.cursor(), 4);
+        buf.apply_key(key_down(Key::Left, shift));
+        assert_eq!(buf.selection_range(), Some((3, 5)));
+
+        // Shift+Home: cursor в начало, anchor=5.
+        let result = buf.apply_key(key_down(Key::Home, shift));
+        assert!(result.consumed && result.changed);
+        assert_eq!(buf.selection_range(), Some((0, 5)));
+        assert_eq!(buf.anchor(), 5);
+        assert_eq!(buf.cursor(), 0);
+
+        // Shift+Right сужает selection, anchor сохраняется: (0,5) -> (2,5).
+        buf.apply_key(key_down(Key::Right, shift));
+        assert_eq!(buf.selection_range(), Some((1, 5)));
+        buf.apply_key(key_down(Key::Right, shift));
+        assert_eq!(buf.selection_range(), Some((2, 5)));
+
+        // Свёрнутый selection: Shift+Right создаёт (0,1) с anchor=0.
+        buf.apply_key(key_down(Key::Home, 0));
+        assert!(!buf.has_selection());
+        buf.apply_key(key_down(Key::Right, shift));
+        assert_eq!(buf.selection_range(), Some((0, 1)));
+        assert_eq!(buf.anchor(), 0);
+
+        // Shift+End: cursor в конец, anchor=0.
+        let result = buf.apply_key(key_down(Key::End, shift));
+        assert!(result.consumed && result.changed);
+        assert_eq!(buf.selection_range(), Some((0, 5)));
+        assert_eq!(buf.anchor(), 0);
+        assert_eq!(buf.cursor(), 5);
+
+        // Legacy поле `KeyEvent::shift` эквивалентно modifier bit.
+        buf.apply_key(key_down(Key::Home, 0));
+        let legacy = KeyEvent {
+            key: Key::Right,
+            pressed: true,
+            modifiers: 0,
+            shift: true,
+        };
+        buf.apply_key(legacy);
+        assert_eq!(buf.selection_range(), Some((0, 1)));
+    }
+
+    #[test]
+    fn apply_key_navigation_without_shift_collapses_selection() {
+        let mut buf = TextInputBuffer::<16>::new();
+        buf.insert_str("hello").unwrap();
+        buf.set_selection(1, 4).unwrap(); // "ell", anchor=1, cursor=4
+
+        // Left сворачивает selection в начало.
+        let result = buf.apply_key(key_down(Key::Left, 0));
+        assert!(result.consumed && result.changed);
+        assert_eq!(buf.cursor(), 1);
+        assert_eq!(buf.anchor(), 1);
+        assert!(!buf.has_selection());
+
+        // Right сворачивает selection в конец.
+        buf.set_selection(1, 4).unwrap();
+        let result = buf.apply_key(key_down(Key::Right, 0));
+        assert!(result.consumed && result.changed);
+        assert_eq!(buf.cursor(), 4);
+        assert_eq!(buf.anchor(), 4);
+        assert!(!buf.has_selection());
+
+        // Home/End идут в начало/конец строки.
+        buf.set_selection(1, 4).unwrap();
+        buf.apply_key(key_down(Key::Home, 0));
+        assert_eq!(buf.cursor(), 0);
+        assert!(!buf.has_selection());
+        buf.set_selection(1, 4).unwrap();
+        buf.apply_key(key_down(Key::End, 0));
+        assert_eq!(buf.cursor(), 5);
+        assert!(!buf.has_selection());
+
+        // Без selection Left/Right двигают на одну grapheme.
+        buf.apply_key(key_down(Key::Left, 0));
+        assert_eq!(buf.cursor(), 4);
+        buf.apply_key(key_down(Key::Right, 0));
+        assert_eq!(buf.cursor(), 5);
+    }
+
+    #[test]
+    fn apply_key_control_a_replacement_and_capacity() {
+        let mut buf = TextInputBuffer::<8>::new();
+        buf.insert_str("абв").unwrap(); // 6 байт, cursor=6
+
+        // Control+A выделяет весь текст.
+        let result = buf.apply_key(key_down(Key::Character('a'), modifiers::CONTROL));
+        assert!(result.consumed && result.changed && result.error.is_none());
+        assert_eq!(buf.selection_range(), Some((0, 6)));
+
+        // Control+A в верхнем регистре тоже выполняет select_all.
+        buf.clear_selection();
+        let result = buf.apply_key(key_down(Key::Character('A'), modifiers::CONTROL));
+        assert!(result.consumed && result.changed);
+        assert_eq!(buf.selection_range(), Some((0, 6)));
+
+        // Вставка заменяет selection: «абв» -> «г».
+        let result = buf.apply_key(key_down(Key::Character('г'), 0));
+        assert!(result.consumed && result.changed);
+        assert_eq!(buf.as_str(), "г");
+        assert!(!buf.has_selection());
+
+        // Заполненный буфер без selection: вставка не помещается.
+        buf.set_text("абвг").unwrap(); // 8 байт = capacity, cursor=8
+        let result = buf.apply_key(key_down(Key::Character('д'), 0));
+        assert!(result.consumed && !result.changed);
+        assert_eq!(result.error, Some(TextInputError::Capacity));
+        assert_eq!(buf.as_str(), "абвг");
+        assert_eq!(buf.cursor(), 8);
+
+        // Замена selection, не укладывающаяся в лимит, атомарна:
+        // 8 - 2 + 4 = 10 > 8.
+        buf.set_selection(0, 2).unwrap(); // «а»
+        let result = buf.apply_key(key_down(Key::Character('\u{1F44D}'), 0));
+        assert!(result.consumed && !result.changed);
+        assert_eq!(result.error, Some(TextInputError::Capacity));
+        assert_eq!(buf.as_str(), "абвг");
+        assert_eq!(buf.selection_range(), Some((0, 2)));
+
+        // Control+C — за пределами модели (clipboard), игнорируется.
+        let result = buf.apply_key(key_down(Key::Character('c'), modifiers::CONTROL));
+        assert!(!result.consumed && !result.changed && result.error.is_none());
+        let result = buf.apply_key(key_down(Key::Backspace, modifiers::CONTROL));
+        assert_eq!(result, KeyResult::ignored());
+        let result = buf.apply_key(key_down(Key::Left, modifiers::CONTROL));
+        assert_eq!(result, KeyResult::ignored());
+        assert_eq!(buf.as_str(), "абвг");
+        assert_eq!(buf.selection_range(), Some((0, 2)));
+    }
+
+    #[test]
+    fn apply_key_ignores_keyup_enter_and_alt_system() {
+        let mut buf = TextInputBuffer::<16>::new();
+        buf.insert_str("hi").unwrap();
+
+        // Key-up не меняет модель и не объявляется обработанным.
+        let key_up = KeyEvent {
+            key: Key::Character('x'),
+            pressed: false,
+            modifiers: 0,
+            shift: false,
+        };
+        let result = buf.apply_key(key_up);
+        assert!(!result.consumed && !result.changed && result.error.is_none());
+        assert_eq!(buf.as_str(), "hi");
+
+        // Enter, Tab, Up/Down/PageUp/PageDown, Escape игнорируются.
+        for key in [
+            Key::Enter,
+            Key::Tab,
+            Key::Up,
+            Key::Down,
+            Key::PageUp,
+            Key::PageDown,
+            Key::Escape,
+        ] {
+            let result = buf.apply_key(key_down(key, 0));
+            assert!(
+                !result.consumed && !result.changed && result.error.is_none(),
+                "{key:?} должен игнорироваться"
+            );
+        }
+        assert_eq!(buf.as_str(), "hi");
+        assert_eq!(buf.cursor(), 2);
+
+        // Alt/System-комбинации игнорируются, даже для Character и навигации.
+        let result = buf.apply_key(key_down(Key::Character('x'), modifiers::ALT));
+        assert!(!result.consumed && !result.changed);
+        let result = buf.apply_key(key_down(Key::Left, modifiers::SYSTEM));
+        assert!(!result.consumed && !result.changed);
+        let result = buf.apply_key(key_down(Key::Backspace, modifiers::ALT | modifiers::SYSTEM));
+        assert!(!result.consumed && !result.changed);
+        assert_eq!(buf.as_str(), "hi");
+        assert_eq!(buf.cursor(), 2);
+    }
+
+    #[test]
+    fn apply_key_result_distinguishes_outcomes() {
+        let mut buf = TextInputBuffer::<4>::new();
+
+        // Ignored: не consumed, не changed, нет error.
+        let ignored = buf.apply_key(key_down(Key::Enter, 0));
+        assert_eq!(ignored, KeyResult::ignored());
+
+        // Consumed без изменения: Backspace в начале пустого буфера.
+        let consumed_noop = buf.apply_key(key_down(Key::Backspace, 0));
+        assert!(consumed_noop.consumed);
+        assert!(!consumed_noop.changed);
+        assert_eq!(consumed_noop.error, None);
+
+        // Consumed с изменением: вставка «а» (2 байта).
+        let changed = buf.apply_key(key_down(Key::Character('а'), 0));
+        assert!(changed.consumed && changed.changed);
+        assert_eq!(changed.error, None);
+
+        // Error: consumed, не changed, Some(Capacity); состояние атомарно.
+        buf.apply_key(key_down(Key::Character('б'), 0)); // 4 байта = capacity
+        let error = buf.apply_key(key_down(Key::Character('в'), 0));
+        assert!(error.consumed);
+        assert!(!error.changed);
+        assert_eq!(error.error, Some(TextInputError::Capacity));
+        assert_eq!(buf.as_str(), "аб");
+        assert_eq!(buf.cursor(), 4);
     }
 }

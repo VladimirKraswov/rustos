@@ -93,6 +93,10 @@ pub enum Key {
     Home = 11,
     /// К концу строки/коллекции.
     End = 12,
+    /// Удаление перед курсором.
+    Backspace = 13,
+    /// Удаление после курсора.
+    Delete = 14,
     /// Unicode scalar value.
     Character(char) = 256,
 }

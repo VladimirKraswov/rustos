@@ -63,7 +63,7 @@ pub use text_engine::{
     CompositionEvent, TextCommand, TextCommandError, TextDocument, TextEditorController, TextError,
     TextLocation, TextRange, TextSelection,
 };
-pub use text_input::{TextInputBuffer, TextInputError};
+pub use text_input::{KeyResult, TextInputBuffer, TextInputError};
 pub use tree::{
     CommandId, ComponentKind, Content, DirtyFlags, Node, NodeId, NodeSpec, NodeState, ResourceId,
     Tree, TreeError,
