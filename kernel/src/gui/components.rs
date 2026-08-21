@@ -10,22 +10,25 @@ use crate::{
     graphics::{Color, Framebuffer, Rect},
 };
 
-/// Тёмная палитра desktop v0.1 (см. docs/GUI.md, «Дизайн»): все цвета —
-/// константы, чтобы скриншот-тесты были воспроизводимыми.
+/// Современная desktop-палитра v2: глубокий нейтральный chrome, спокойные
+/// границы и насыщенный blue accent. Все токены остаются константами для
+/// воспроизводимых screenshot-тестов.
 pub struct Theme;
 
 impl Theme {
-    pub const DESKTOP_TOP: Color = Color::rgb(10, 24, 52);
-    pub const DESKTOP_BOTTOM: Color = Color::rgb(23, 52, 82);
-    pub const ACCENT: Color = Color::rgb(80, 196, 220);
-    pub const ACCENT_HOVER: Color = Color::rgb(114, 222, 238);
+    pub const DESKTOP_TOP: Color = Color::rgb(18, 37, 70);
+    pub const DESKTOP_BOTTOM: Color = Color::rgb(25, 65, 91);
+    pub const ACCENT: Color = Color::rgb(45, 124, 246);
+    pub const ACCENT_HOVER: Color = Color::rgb(75, 148, 255);
+    pub const ACCENT_SOFT: Color = Color::rgb(28, 57, 99);
     pub const PANEL: Color = Color::rgb(20, 28, 42);
-    pub const PANEL_LIGHT: Color = Color::rgb(35, 46, 64);
-    pub const SURFACE: Color = Color::rgb(13, 18, 29);
-    pub const BORDER: Color = Color::rgb(75, 92, 116);
-    pub const TEXT: Color = Color::rgb(232, 239, 247);
-    pub const TEXT_MUTED: Color = Color::rgb(154, 172, 194);
-    pub const DANGER: Color = Color::rgb(224, 86, 94);
+    pub const PANEL_LIGHT: Color = Color::rgb(31, 42, 59);
+    pub const SURFACE: Color = Color::rgb(12, 18, 28);
+    pub const BORDER: Color = Color::rgb(58, 73, 96);
+    pub const TEXT: Color = Color::rgb(241, 246, 253);
+    pub const TEXT_MUTED: Color = Color::rgb(155, 169, 190);
+    pub const DANGER: Color = Color::rgb(239, 82, 91);
+    pub const RADIUS: u8 = 12;
 }
 
 /// Рендерящийся компонент: знает свои границы и умеет отрисовать себя.
@@ -56,9 +59,9 @@ impl Widget for Panel {
     }
 
     fn draw(&self, fb: &mut Framebuffer) {
-        fb.fill_rect(self.rect, self.color);
+        fb.fill_rounded_rect(self.rect, Theme::RADIUS, self.color);
         if let Some(color) = self.border {
-            fb.border(self.rect, color);
+            fb.rounded_border(self.rect, Theme::RADIUS, 1, color);
         }
     }
 }
@@ -105,10 +108,10 @@ impl Widget for Button<'_> {
     }
 
     fn draw(&self, fb: &mut Framebuffer) {
-        let base = if self.danger {
+        let base = if self.danger && self.hovered {
             Theme::DANGER
         } else if self.hovered {
-            Theme::ACCENT_HOVER
+            Theme::ACCENT_SOFT
         } else {
             Theme::PANEL_LIGHT
         };
@@ -117,8 +120,19 @@ impl Widget for Button<'_> {
         } else {
             base
         };
-        fb.fill_rect(self.rect, color);
-        fb.border(self.rect, Theme::BORDER);
+        fb.fill_rounded_rect(self.rect, 8, color);
+        if self.hovered || self.danger {
+            fb.rounded_border(
+                self.rect,
+                8,
+                1,
+                if self.danger && self.hovered {
+                    Theme::DANGER
+                } else {
+                    Theme::BORDER
+                },
+            );
+        }
         let style = font::UI_TITLE;
         let metrics = font::measure_text(self.label, style);
         let x = self.rect.x + (self.rect.width as i32 - metrics.width as i32) / 2;
@@ -141,11 +155,12 @@ impl Widget for Checkbox<'_> {
 
     fn draw(&self, fb: &mut Framebuffer) {
         let box_rect = Rect::new(self.rect.x, self.rect.y, 18, 18);
-        fb.fill_rect(box_rect, Theme::SURFACE);
-        fb.border(box_rect, Theme::BORDER);
+        fb.fill_rounded_rect(box_rect, 5, Theme::SURFACE);
+        fb.rounded_border(box_rect, 5, 1, Theme::BORDER);
         if self.checked {
-            fb.fill_rect(
+            fb.fill_rounded_rect(
                 Rect::new(self.rect.x + 4, self.rect.y + 4, 10, 10),
+                3,
                 Theme::ACCENT,
             );
         }
@@ -160,8 +175,7 @@ impl Widget for Checkbox<'_> {
     }
 }
 
-/// Радио-кнопка: ромб 16×18 + подпись (появится круг — заменится на circle
-/// primitive в graphics).
+/// Радио-кнопка с круглым indicator и подписью.
 pub struct RadioButton<'a> {
     pub rect: Rect,
     pub label: &'a str,
@@ -174,21 +188,14 @@ impl Widget for RadioButton<'_> {
     }
 
     fn draw(&self, fb: &mut Framebuffer) {
-        // До появления circle primitive radio рисуется компактным ромбом.
-        for i in 0..8 {
-            let width = if i < 4 { i * 2 + 2 } else { (7 - i) * 2 + 2 };
-            fb.fill_rect(
-                Rect::new(
-                    self.rect.x + 8 - width as i32 / 2,
-                    self.rect.y + i as i32 + 2,
-                    width,
-                    1,
-                ),
-                if self.selected {
-                    Theme::ACCENT
-                } else {
-                    Theme::BORDER
-                },
+        let indicator = Rect::new(self.rect.x, self.rect.y + 1, 18, 18);
+        fb.fill_rounded_rect(indicator, 9, Theme::SURFACE);
+        fb.rounded_border(indicator, 9, 1, Theme::BORDER);
+        if self.selected {
+            fb.fill_rounded_rect(
+                Rect::new(self.rect.x + 5, self.rect.y + 6, 8, 8),
+                4,
+                Theme::ACCENT,
             );
         }
         font::draw_text(
@@ -216,8 +223,9 @@ impl Widget for Toggle<'_> {
 
     fn draw(&self, fb: &mut Framebuffer) {
         let track = Rect::new(self.rect.x, self.rect.y, 36, 18);
-        fb.fill_rect(
+        fb.fill_rounded_rect(
             track,
+            9,
             if self.enabled {
                 Theme::ACCENT
             } else {
@@ -229,7 +237,7 @@ impl Widget for Toggle<'_> {
         } else {
             self.rect.x + 2
         };
-        fb.fill_rect(Rect::new(knob_x, self.rect.y + 2, 14, 14), Theme::TEXT);
+        fb.fill_rounded_rect(Rect::new(knob_x, self.rect.y + 2, 14, 14), 7, Theme::TEXT);
         font::draw_text(
             fb,
             self.rect.x + 44,
@@ -255,9 +263,11 @@ impl Widget for TextEdit<'_> {
     }
 
     fn draw(&self, fb: &mut Framebuffer) {
-        fb.fill_rect(self.rect, Theme::SURFACE);
-        fb.border(
+        fb.fill_rounded_rect(self.rect, 8, Theme::SURFACE);
+        fb.rounded_border(
             self.rect,
+            8,
+            1,
             if self.focused {
                 Theme::ACCENT
             } else {
@@ -283,7 +293,7 @@ pub type Tabs = Panel;
 pub type Image = Panel;
 pub type IconButton<'a> = Button<'a>;
 
-/// Логотип «start» (четыре цветных квадранта 2×2, шаг 12px, размер 10px).
+/// Логотип Start: четыре мягких цветных плитки.
 pub fn start_icon(fb: &mut Framebuffer, x: i32, y: i32) {
     let colors = [
         Color::rgb(80, 196, 220),
@@ -293,8 +303,9 @@ pub fn start_icon(fb: &mut Framebuffer, x: i32, y: i32) {
     ];
     for row in 0..2 {
         for column in 0..2 {
-            fb.fill_rect(
+            fb.fill_rounded_rect(
                 Rect::new(x + column * 12, y + row * 12, 10, 10),
+                3,
                 colors[(row * 2 + column) as usize],
             );
         }

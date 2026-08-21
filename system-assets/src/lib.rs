@@ -18,8 +18,8 @@ pub use cursor::{
     LIGHT_CURSOR_PACK, MIDNIGHT_CURSOR_PACK,
 };
 pub use icon::{
-    icon_for_path, IconKind, IconPack, IconPalette, IconTarget, CLASSIC_ICON_PACK,
-    MIDNIGHT_ICON_PACK, MONO_ICON_PACK,
+    icon_for_path, IconKind, IconPack, IconPalette, IconTarget, AURORA_ICON_PACK,
+    CLASSIC_ICON_PACK, MIDNIGHT_ICON_PACK, MONO_ICON_PACK,
 };
 pub use registry::{PackId, PackMetadata, PackRegistry, RegistryError, ResourcePack};
 pub use wallpaper::{wallpaper, Wallpaper, WallpaperId, WALLPAPERS};

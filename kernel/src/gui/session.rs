@@ -20,7 +20,7 @@ use crate::{
     arch, font,
     graphics::{Color, Framebuffer, Rect},
     gui::{
-        components::{self, Button, Label, Panel, Theme, Widget},
+        components::{Button, Label, Panel, Theme, Widget},
         cursor::Cursor,
     },
     input::{self, Event, Key, MouseEvent, PlatformInput},
@@ -38,7 +38,7 @@ use rustos_abi::{
 };
 use rustos_system_assets::{
     wallpaper, IconKind, IconPack, PackId, PackRegistry, ResourcePack, WallpaperId,
-    CLASSIC_ICON_PACK, MIDNIGHT_ICON_PACK, MONO_ICON_PACK,
+    AURORA_ICON_PACK, CLASSIC_ICON_PACK, MIDNIGHT_ICON_PACK, MONO_ICON_PACK,
 };
 use rustos_system_ui::{Key as UiKey, PointerKind as UiPointerKind};
 use rustos_video::{
@@ -49,8 +49,8 @@ use rustos_video::{
 const TASKBAR_HEIGHT: u32 = 46;
 const TITLE_HEIGHT: u32 = 34;
 const RESIZE_BORDER: u32 = 6;
-const WINDOW_SHADOW_RIGHT: u32 = 7;
-const WINDOW_SHADOW_BOTTOM: u32 = 8;
+const WINDOW_SHADOW_RIGHT: u32 = 10;
+const WINDOW_SHADOW_BOTTOM: u32 = 12;
 const TERMINAL_MIN_WIDTH: u32 = 480;
 const TERMINAL_MIN_HEIGHT: u32 = 300;
 const GALLERY_MIN_WIDTH: u32 = 560;
@@ -150,13 +150,23 @@ enum ApplicationKind {
 impl ApplicationKind {
     const fn title(self) -> &'static str {
         match self {
-            Self::Terminal => "RUSTOS · ТЕРМИНАЛ",
-            Self::UiShowcase => "RUSTOS · SYSTEM UI GALLERY",
-            Self::DesktopSettings => "RUSTOS · СВОЙСТВА РАБОЧЕГО СТОЛА",
+            Self::Terminal => "RustOS · Терминал",
+            Self::UiShowcase => "RustOS · Библиотека компонентов",
+            Self::DesktopSettings => "RustOS · Параметры рабочего стола",
         }
     }
 
     const fn task_label(self) -> &'static str {
+        match self {
+            Self::Terminal => "Терминал",
+            Self::UiShowcase => "Компоненты",
+            Self::DesktopSettings => "Параметры",
+        }
+    }
+
+    /// Стабильный ASCII label машинного журнала. В отличие от локализованной
+    /// подписи taskbar он является частью интеграционных test markers.
+    const fn log_label(self) -> &'static str {
         match self {
             Self::Terminal => "TERMINAL",
             Self::UiShowcase => "UI GALLERY",
@@ -333,6 +343,7 @@ impl DesktopSession {
         let screen_width = framebuffer.width();
         let screen_height = framebuffer.height();
         let mut icon_packs = PackRegistry::new();
+        let _ = icon_packs.install(AURORA_ICON_PACK);
         let _ = icon_packs.install(CLASSIC_ICON_PACK);
         let _ = icon_packs.install(MIDNIGHT_ICON_PACK);
         let _ = icon_packs.install(MONO_ICON_PACK);
@@ -934,6 +945,7 @@ impl DesktopSession {
             }
             TerminalAction::Icons(theme) => {
                 let pack = match theme {
+                    IconThemeName::Aurora => PackId(0x2004),
                     IconThemeName::Classic => PackId(0x2001),
                     IconThemeName::Midnight => PackId(0x2002),
                     IconThemeName::Mono => PackId(0x2003),
@@ -1388,7 +1400,7 @@ impl DesktopSession {
         serial::put_str("[app] spawn id=0x");
         serial::put_hex(id.0);
         serial::put_str(" kind=");
-        serial::put_str(kind.task_label());
+        serial::put_str(kind.log_label());
         serial::put_str(" private-frames=");
         serial::put_u32(frames as u32);
         serial::put_str(" windows=");
@@ -1455,7 +1467,7 @@ impl DesktopSession {
         serial::put_str("[app] exit id=0x");
         serial::put_hex(id.0);
         serial::put_str(" kind=");
-        serial::put_str(kind.task_label());
+        serial::put_str(kind.log_label());
         serial::put_str(" released-frames=");
         serial::put_u32(frames as u32);
         serial::put_str(" windows=");
@@ -1798,11 +1810,13 @@ impl DesktopSession {
         let title = self
             .window_kind(window)
             .map_or("RUSTOS", ApplicationKind::title);
-        self.framebuffer.fill_rect(
+        self.framebuffer.fill_rounded_rect(
             Rect::new(rect.x, rect.y, rect.width, TITLE_HEIGHT),
+            10,
             Color::rgb(28, 43, 62),
         );
-        self.framebuffer.border(rect, Theme::ACCENT);
+        self.framebuffer
+            .rounded_border(rect, Theme::RADIUS, 1, Theme::ACCENT);
         font::draw_text(
             &mut self.framebuffer,
             rect.x + 12,
@@ -1898,8 +1912,9 @@ impl DesktopSession {
         let terminal = self.desktop_terminal_icon();
         if self.desktop_icon_selected {
             self.framebuffer
-                .fill_rect(terminal, Color::rgb(35, 81, 105));
-            self.framebuffer.border(terminal, Theme::ACCENT);
+                .fill_rounded_rect(terminal, 10, Theme::ACCENT_SOFT);
+            self.framebuffer
+                .rounded_border(terminal, 10, 1, Theme::ACCENT);
         }
         self.draw_system_icon(
             IconKind::Terminal,
@@ -1909,7 +1924,7 @@ impl DesktopSession {
             &mut self.framebuffer,
             terminal.x + 5,
             terminal.y + 61,
-            "TERMINAL",
+            "Терминал",
             Theme::TEXT,
             font::UI_SMALL.bold().scaled(self.ui_scale_milli),
         );
@@ -1922,7 +1937,7 @@ impl DesktopSession {
             &mut self.framebuffer,
             trash.x + 16,
             trash.y + 63,
-            "TRASH",
+            "Корзина",
             Theme::TEXT,
             font::UI_SMALL.bold().scaled(self.ui_scale_milli),
         );
@@ -1946,24 +1961,8 @@ impl DesktopSession {
         let kind = slot.kind();
         let focused = self.focused == Some(id);
 
-        self.framebuffer.fill_rect(
-            Rect::new(
-                rect.x + rect.width as i32,
-                rect.y + 8,
-                WINDOW_SHADOW_RIGHT,
-                rect.height,
-            ),
-            Color::rgb(7, 12, 20),
-        );
-        self.framebuffer.fill_rect(
-            Rect::new(
-                rect.x + 7,
-                rect.y + rect.height as i32,
-                rect.width,
-                WINDOW_SHADOW_BOTTOM,
-            ),
-            Color::rgb(7, 12, 20),
-        );
+        let screen = Rect::new(0, 0, self.framebuffer.width(), self.framebuffer.height());
+        self.framebuffer.soft_shadow(rect, Theme::RADIUS, screen);
         Panel {
             rect,
             color: Theme::PANEL,
@@ -1975,14 +1974,28 @@ impl DesktopSession {
         }
         .draw(&mut self.framebuffer);
         if style.contains(WindowStyle::TITLE_BAR) {
-            self.framebuffer.horizontal_gradient(
-                Rect::new(rect.x + 1, rect.y + 1, rect.width - 2, TITLE_HEIGHT - 1),
-                if focused {
-                    Color::rgb(38, 62, 86)
-                } else {
-                    Color::rgb(30, 40, 54)
-                },
-                Color::rgb(19, 28, 42),
+            let title_color = if focused {
+                Color::rgb(24, 38, 59)
+            } else {
+                Color::rgb(25, 33, 47)
+            };
+            let title = Rect::new(rect.x + 1, rect.y + 1, rect.width - 2, TITLE_HEIGHT - 1);
+            self.framebuffer
+                .fill_rounded_rect(title, Theme::RADIUS.saturating_sub(1), title_color);
+            // У title bar скруглены только верхние углы: нижняя полоса
+            // перекрывает нижние corner cut-outs тем же токеном поверхности.
+            self.framebuffer.fill_rect(
+                Rect::new(
+                    title.x,
+                    title.y + Theme::RADIUS as i32,
+                    title.width,
+                    title.height.saturating_sub(u32::from(Theme::RADIUS)),
+                ),
+                title_color,
+            );
+            self.framebuffer.fill_rect(
+                Rect::new(title.x, title.bottom().saturating_sub(1), title.width, 1),
+                Theme::BORDER,
             );
             match kind {
                 ApplicationKind::Terminal => self.draw_system_icon(
@@ -1990,7 +2003,7 @@ impl DesktopSession {
                     Rect::new(rect.x + 8, rect.y + 6, 22, 22),
                 ),
                 ApplicationKind::UiShowcase => {
-                    components::start_icon(&mut self.framebuffer, rect.x + 8, rect.y + 6)
+                    self.draw_system_icon(IconKind::Grid, Rect::new(rect.x + 8, rect.y + 6, 22, 22))
                 }
                 ApplicationKind::DesktopSettings => self.draw_system_icon(
                     IconKind::Settings,
@@ -2012,48 +2025,62 @@ impl DesktopSession {
             if let Some(control) = minimize {
                 Button {
                     rect: control,
-                    label: "-",
+                    label: "",
                     hovered: focused && control.contains(self.mouse_x, self.mouse_y),
                     pressed: false,
                     danger: false,
                 }
                 .draw(&mut self.framebuffer);
+                MIDNIGHT_ICON_PACK.draw(
+                    &mut self.framebuffer,
+                    IconKind::Minimize,
+                    inset_rect(control, 5),
+                );
             }
             if let Some(control) = maximize {
                 Button {
                     rect: control,
-                    label: if maximized { "[]" } else { "+" },
+                    label: "",
                     hovered: focused && control.contains(self.mouse_x, self.mouse_y),
                     pressed: false,
                     danger: false,
                 }
                 .draw(&mut self.framebuffer);
+                MIDNIGHT_ICON_PACK.draw(
+                    &mut self.framebuffer,
+                    if maximized {
+                        IconKind::Restore
+                    } else {
+                        IconKind::Maximize
+                    },
+                    inset_rect(control, 5),
+                );
             }
             if let Some(control) = close {
                 Button {
                     rect: control,
-                    label: "X",
+                    label: "",
                     hovered: focused && control.contains(self.mouse_x, self.mouse_y),
                     pressed: false,
                     danger: true,
                 }
                 .draw(&mut self.framebuffer);
+                MIDNIGHT_ICON_PACK.draw(
+                    &mut self.framebuffer,
+                    IconKind::Close,
+                    inset_rect(control, 5),
+                );
             }
         }
         if style.contains(WindowStyle::BORDER)
             && style.contains(WindowStyle::RESIZABLE)
             && !maximized
         {
-            for inset in [4, 8, 12] {
-                self.framebuffer.fill_rect(
-                    Rect::new(
-                        rect.x + rect.width as i32 - inset,
-                        rect.y + rect.height as i32 - 2,
-                        2,
-                        2,
-                    ),
-                    Theme::ACCENT,
-                );
+            let x = rect.right().saturating_sub(13);
+            let y = rect.bottom().saturating_sub(6);
+            for offset in [0, 4, 8] {
+                self.framebuffer
+                    .fill_rect(Rect::new(x + offset, y - offset, 5, 1), Theme::TEXT_MUTED);
             }
         }
 
@@ -2092,9 +2119,10 @@ impl DesktopSession {
 
     fn render_taskbar(&mut self) {
         let y = self.framebuffer.height() as i32 - TASKBAR_HEIGHT as i32;
-        self.framebuffer.fill_rect(
+        self.framebuffer.horizontal_gradient(
             Rect::new(0, y, self.framebuffer.width(), TASKBAR_HEIGHT),
             Color::rgb(13, 19, 30),
+            Color::rgb(18, 26, 40),
         );
         self.framebuffer
             .fill_rect(Rect::new(0, y, self.framebuffer.width(), 1), Theme::BORDER);
@@ -2112,10 +2140,11 @@ impl DesktopSession {
                 continue;
             };
             let task = self.task_button(index, self.window_count);
-            self.framebuffer.fill_rect(
+            self.framebuffer.fill_rounded_rect(
                 task,
+                9,
                 if self.focused == Some(id) && !minimized {
-                    Theme::PANEL_LIGHT
+                    Theme::ACCENT_SOFT
                 } else {
                     Theme::PANEL
                 },
@@ -2126,7 +2155,7 @@ impl DesktopSession {
                     Rect::new(task.x + 6, task.y + 6, 26, 26),
                 ),
                 ApplicationKind::UiShowcase => {
-                    components::start_icon(&mut self.framebuffer, task.x + 7, task.y + 8)
+                    self.draw_system_icon(IconKind::Grid, Rect::new(task.x + 6, task.y + 6, 26, 26))
                 }
                 ApplicationKind::DesktopSettings => self.draw_system_icon(
                     IconKind::Settings,
@@ -2279,10 +2308,22 @@ fn place_window_control(enabled: bool, right: &mut i32, y: i32) -> Option<Rect> 
 
 fn window_damage(rect: Rect) -> Rect {
     Rect::new(
-        rect.x,
-        rect.y,
-        rect.width.saturating_add(WINDOW_SHADOW_RIGHT),
-        rect.height.saturating_add(WINDOW_SHADOW_BOTTOM),
+        rect.x.saturating_sub(WINDOW_SHADOW_RIGHT as i32),
+        rect.y.saturating_sub(WINDOW_SHADOW_RIGHT as i32),
+        rect.width
+            .saturating_add(WINDOW_SHADOW_RIGHT.saturating_mul(2)),
+        rect.height
+            .saturating_add(WINDOW_SHADOW_RIGHT)
+            .saturating_add(WINDOW_SHADOW_BOTTOM),
+    )
+}
+
+const fn inset_rect(rect: Rect, amount: u32) -> Rect {
+    Rect::new(
+        rect.x.saturating_add(amount as i32),
+        rect.y.saturating_add(amount as i32),
+        rect.width.saturating_sub(amount.saturating_mul(2)),
+        rect.height.saturating_sub(amount.saturating_mul(2)),
     )
 }
 

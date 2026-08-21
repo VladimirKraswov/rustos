@@ -168,6 +168,8 @@ pub enum CursorThemeName {
 /// Имена встроенных icon packs.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum IconThemeName {
+    /// Современная системная тема по умолчанию.
+    Aurora,
     /// Классическая, с жёлтыми папками.
     Classic,
     /// Тёмная.
@@ -618,7 +620,10 @@ impl Terminal {
     fn command_icons(&mut self, command: &str) -> TerminalAction {
         let arguments = command.get(5..).unwrap_or("").trim();
         let value = strip_prefix_ascii_case(arguments, "theme ").unwrap_or(arguments);
-        let theme = if value.eq_ignore_ascii_case("classic") {
+        let theme = if value.eq_ignore_ascii_case("aurora") || value.eq_ignore_ascii_case("modern")
+        {
+            Some(IconThemeName::Aurora)
+        } else if value.eq_ignore_ascii_case("classic") {
             Some(IconThemeName::Classic)
         } else if value.eq_ignore_ascii_case("midnight") || value.eq_ignore_ascii_case("dark") {
             Some(IconThemeName::Midnight)
@@ -630,7 +635,7 @@ impl Terminal {
         if let Some(theme) = theme {
             TerminalAction::Icons(theme)
         } else {
-            self.print("ICONS THEME CLASSIC|MIDNIGHT|MONO\n", YELLOW);
+            self.print("ICONS THEME AURORA|CLASSIC|MIDNIGHT|MONO\n", YELLOW);
             TerminalAction::None
         }
     }

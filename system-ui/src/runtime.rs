@@ -394,6 +394,14 @@ mod tests {
     }
 
     impl RenderBackend for Snapshot {
+        fn shadow(&mut self, rect: Rect, radius: u8, color: Color, clip: Rect) {
+            self.word(7);
+            self.rect(rect);
+            self.word(u64::from(radius));
+            self.color(color);
+            self.rect(clip);
+        }
+
         fn fill(&mut self, rect: Rect, color: Color, clip: Rect) {
             self.word(1);
             self.rect(rect);
@@ -425,6 +433,8 @@ mod tests {
             self.word(u64::from(font.bold));
             self.word(u64::from(font.italic));
             self.word(u64::from(font.monospace));
+            self.word(font.align as u8 as u64);
+            self.word(u64::from(font.vertical_center));
             self.rect(clip);
         }
 
@@ -433,6 +443,23 @@ mod tests {
             self.rect(rect);
             self.word(u64::from(resource.0));
             self.color(color);
+            self.rect(clip);
+        }
+
+        fn rounded_fill(&mut self, rect: Rect, color: Color, radius: u8, clip: Rect) {
+            self.word(5);
+            self.rect(rect);
+            self.color(color);
+            self.word(u64::from(radius));
+            self.rect(clip);
+        }
+
+        fn rounded_border(&mut self, rect: Rect, color: Color, width: u8, radius: u8, clip: Rect) {
+            self.word(6);
+            self.rect(rect);
+            self.color(color);
+            self.word(u64::from(width));
+            self.word(u64::from(radius));
             self.rect(clip);
         }
     }
@@ -455,7 +482,7 @@ mod tests {
         // Snapshot включает порядок primitives, geometry, theme tokens,
         // font contract и damage clip. Намеренное изменение любого из них
         // требует визуальной проверки и явного обновления hash.
-        assert_eq!(snapshot.0, 3_014_990_075_872_956_862);
+        assert_eq!(snapshot.0, 18_073_759_078_714_162_449);
     }
 
     #[test]

@@ -6,14 +6,14 @@
 //! UI-клиент не получает прямой доступ к framebuffer или display device.
 
 use crate::{
-    font,
+    apps::draw_system_ui_text,
     graphics::{Color, Framebuffer, Rect},
 };
 use rustos_system_assets::{wallpaper, WallpaperId};
 use rustos_system_ui::{
-    CommandId, ComponentKind, DispatchResult, Edges, FontSpec, FrameResult, InputEvent, Key,
-    KeyEvent, LayoutSpec, Length, NodeId, NodeSpec, NodeState, PointerEvent, PointerKind,
-    RenderBackend, ResourceId, Runtime, Theme,
+    style_class, CommandId, ComponentKind, Content, DispatchResult, Edges, FontSpec, FrameResult,
+    InputEvent, Key, KeyEvent, LayoutSpec, Length, NodeId, NodeSpec, NodeState, PointerEvent,
+    PointerKind, RenderBackend, ResourceId, Runtime, SemanticRole, Theme,
 };
 use rustos_video::ColorMode;
 
@@ -225,8 +225,8 @@ fn build_tree(
     let Ok(page) = ui.component(root, page) else {
         return;
     };
-    add_text(&mut ui, page, TEXT_TITLE, 34);
-    add_text(&mut ui, page, TEXT_SUBTITLE, 24);
+    add_text(&mut ui, page, TEXT_TITLE, 34, style_class::HEADING);
+    add_text(&mut ui, page, TEXT_SUBTITLE, 24, style_class::CAPTION);
     let _ = ui.image(
         page,
         IMAGE_WALLPAPER,
@@ -237,7 +237,7 @@ fn build_tree(
             ..LayoutSpec::default()
         },
     );
-    add_text(&mut ui, page, TEXT_RESOLUTION, 24);
+    add_text(&mut ui, page, TEXT_RESOLUTION, 24, style_class::HEADING);
     *resolution = add_choices(
         &mut ui,
         page,
@@ -247,7 +247,7 @@ fn build_tree(
             (TEXT_1600_900, COMMAND_RESOLUTION_900),
         ],
     );
-    add_text(&mut ui, page, TEXT_COLOR, 24);
+    add_text(&mut ui, page, TEXT_COLOR, 24, style_class::HEADING);
     *colors = add_choices(
         &mut ui,
         page,
@@ -257,7 +257,7 @@ fn build_tree(
             (TEXT_COLOR_GRAY, COMMAND_COLOR_GRAY),
         ],
     );
-    add_text(&mut ui, page, TEXT_WALLPAPER, 24);
+    add_text(&mut ui, page, TEXT_WALLPAPER, 24, style_class::HEADING);
     *wallpapers = add_choices(
         &mut ui,
         page,
@@ -267,7 +267,7 @@ fn build_tree(
             (TEXT_WINTER, COMMAND_WALLPAPER_WINTER),
         ],
     );
-    add_text(&mut ui, page, TEXT_SCALE, 24);
+    add_text(&mut ui, page, TEXT_SCALE, 24, style_class::HEADING);
     *scales = add_choices(
         &mut ui,
         page,
@@ -284,16 +284,22 @@ fn add_text<const N: usize>(
     parent: NodeId,
     resource: ResourceId,
     height: u16,
+    style: u16,
 ) {
-    let _ = ui.text(
-        parent,
-        resource,
-        LayoutSpec {
-            width: Length::Fill(1),
-            height: Length::Px(height),
-            ..LayoutSpec::default()
-        },
-    );
+    let mut spec = NodeSpec::new(ComponentKind::Text);
+    spec.layout = LayoutSpec {
+        width: Length::Fill(1),
+        height: Length::Px(height),
+        ..LayoutSpec::default()
+    };
+    spec.content = Content::Text(resource);
+    spec.role = if style == style_class::HEADING {
+        SemanticRole::Heading
+    } else {
+        SemanticRole::Text
+    };
+    spec.style = style;
+    let _ = ui.component(parent, spec);
 }
 
 fn add_choices<const N: usize>(
@@ -374,7 +380,7 @@ fn action_for(result: DispatchResult) -> DesktopSettingsAction {
 }
 
 fn theme(scale_milli: u16) -> Theme {
-    let mut theme = Theme::dark();
+    let mut theme = Theme::light();
     theme.scale_milli = scale_milli;
     theme
 }
@@ -385,6 +391,10 @@ struct SettingsBackend<'a> {
 }
 
 impl RenderBackend for SettingsBackend<'_> {
+    fn shadow(&mut self, rect: Rect, radius: u8, color: Color, clip: Rect) {
+        self.framebuffer.surface_shadow(rect, radius, color, clip);
+    }
+
     fn fill(&mut self, rect: Rect, color: Color, clip: Rect) {
         self.framebuffer.fill_rect(rect.intersection(clip), color);
     }
@@ -401,32 +411,31 @@ impl RenderBackend for SettingsBackend<'_> {
         }
     }
 
+    fn rounded_fill(&mut self, rect: Rect, color: Color, radius: u8, clip: Rect) {
+        self.framebuffer
+            .fill_rounded_rect_clipped(rect, radius, color, clip);
+    }
+
+    fn rounded_border(&mut self, rect: Rect, color: Color, width: u8, radius: u8, clip: Rect) {
+        self.framebuffer
+            .rounded_border_clipped(rect, radius, width, color, clip);
+    }
+
     fn text(&mut self, rect: Rect, resource: ResourceId, color: Color, spec: FontSpec, clip: Rect) {
         if rect.intersection(clip).is_empty() {
             return;
         }
-        let mut style = font::FontStyle::sans(spec.size.clamp(10, 48));
-        if spec.bold {
-            style = style.bold();
-        }
-        if spec.italic {
-            style = style.italic();
-        }
-        font::draw_text(
-            self.framebuffer,
-            rect.x,
-            rect.y,
-            text_resource(resource),
-            color,
-            style,
-        );
+        draw_system_ui_text(self.framebuffer, rect, text_resource(resource), color, spec);
     }
 
     fn image(&mut self, rect: Rect, resource: ResourceId, _: Color, clip: Rect) {
         if resource == IMAGE_WALLPAPER && !rect.intersection(clip).is_empty() {
             self.framebuffer
                 .draw_wallpaper(rect, wallpaper(self.wallpaper));
-            self.framebuffer.border(rect, Color::rgb(75, 92, 116));
+            self.framebuffer
+                .mask_rounded_corners(rect, 12, Color::rgb(244, 247, 252));
+            self.framebuffer
+                .rounded_border(rect, 12, 1, Color::rgb(205, 216, 232));
         }
     }
 }
@@ -447,21 +456,21 @@ fn draw_border(framebuffer: &mut Framebuffer, rect: Rect, color: Color, clip: Re
 
 fn text_resource(resource: ResourceId) -> &'static str {
     match resource {
-        TEXT_TITLE => "СВОЙСТВА РАБОЧЕГО СТОЛА",
-        TEXT_SUBTITLE => "ИЗМЕНЕНИЯ ПРИМЕНЯЮТСЯ СРАЗУ",
-        TEXT_RESOLUTION => "РАЗРЕШЕНИЕ ЭКРАНА",
+        TEXT_TITLE => "Параметры рабочего стола",
+        TEXT_SUBTITLE => "Изменения применяются сразу",
+        TEXT_RESOLUTION => "Разрешение экрана",
         TEXT_1280_720 => "1280 × 720",
         TEXT_1280_800 => "1280 × 800",
         TEXT_1600_900 => "1600 × 900",
-        TEXT_COLOR => "ГЛУБИНА ЦВЕТА",
-        TEXT_COLOR_24 => "24 БИТА",
-        TEXT_COLOR_16 => "16 БИТ",
-        TEXT_COLOR_GRAY => "СЕРЫЙ 8",
-        TEXT_WALLPAPER => "ОБОИ",
-        TEXT_SPRING => "ВЕСНА",
-        TEXT_AUTUMN => "ОСЕНЬ",
-        TEXT_WINTER => "ЗИМА",
-        TEXT_SCALE => "РАЗМЕР СИСТЕМНОГО ШРИФТА",
+        TEXT_COLOR => "Глубина цвета",
+        TEXT_COLOR_24 => "24 бита",
+        TEXT_COLOR_16 => "16 бит",
+        TEXT_COLOR_GRAY => "Серый · 8 бит",
+        TEXT_WALLPAPER => "Обои",
+        TEXT_SPRING => "Весна",
+        TEXT_AUTUMN => "Осень",
+        TEXT_WINTER => "Зима",
+        TEXT_SCALE => "Размер системного шрифта",
         TEXT_SCALE_100 => "100%",
         TEXT_SCALE_125 => "125%",
         TEXT_SCALE_150 => "150%",

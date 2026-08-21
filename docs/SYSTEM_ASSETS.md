@@ -18,7 +18,8 @@ service выбирает активный пакет. Поэтому смена 
 - 8-кадровый loader, который compositor обновляет маленьким damage даже без
   движения мыши;
 - темы курсоров `light`, `midnight`, `contrast`;
-- icon packs `classic`, `midnight`, `mono` и 15 семантических типов;
+- icon packs `aurora` (по умолчанию), `classic`, `midnight`, `mono` и более
+  тридцати семантических типов;
 - три природных RGB565-фона: spring, autumn и winter;
 - bounded-реестр `install/remove/select` без heap.
 
@@ -98,7 +99,7 @@ CURSOR PREVIEW ARROW|TEXT|LINK|GRAB|GRABBING|BUSY
 CURSOR PREVIEW CROSSHAIR|FORBIDDEN|HRESIZE|VRESIZE|NWSE|NESW
 CURSOR AUTO
 
-ICONS THEME CLASSIC|MIDNIGHT|MONO
+ICONS THEME AURORA|CLASSIC|MIDNIGHT|MONO
 ```
 
 Crate `rustos-system-assets` не зависит от kernel. Новый пакет создаётся через
@@ -109,11 +110,18 @@ bootstrap desktop регистрирует встроенные пакеты. П
 эти же дескрипторы будут указывать на проверенные read-only страницы RUNE
 resource package; ABI приложения от этого не изменится.
 
-`IconTarget` содержит только `fill/stroke`. Поэтому один пакет работает с
-текущим framebuffer, будущим GPU command buffer и headless snapshot test.
-Стандартная тема включает жёлтые закрытые/открытые папки, обычный и текстовый
-файл, Rust source, RUNE DLL, executable, image, audio, video, archive, drive,
-settings, trash и новую многослойную terminal icon.
+Современная `aurora`-тема включает жёлтые закрытые/открытые папки, обычный и
+текстовый файл, Rust source, RUNE DLL, executable, image, audio, video,
+archive, drive, settings, trash и многослойную terminal icon. Тот же словарь
+содержит UI-действия Home, Search, Menu, Grid, Power, Info, Success, Warning,
+Minimize, Maximize, Restore, Close и навигационные chevrons. Window manager и
+приложения запрашивают именно `IconKind`, поэтому сменный пакет не меняет их
+логику.
+
+`IconTarget` предоставляет прямоугольные и скруглённые fill/stroke primitives.
+Старый backend автоматически получает прямоугольный fallback, а framebuffer и
+будущий GPU backend рисуют современную rounded geometry. Команда терминала
+`ICONS THEME AURORA|CLASSIC|MIDNIGHT|MONO` переключает пакет без перезапуска.
 
 `icon_for_path` знает основные расширения (`txt`, `md`, `rs`, `dll`, `rdll`,
 `rune`, `elf`, изображения, звук, видео и архивы), но неизвестное расширение

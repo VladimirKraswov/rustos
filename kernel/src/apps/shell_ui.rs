@@ -5,15 +5,15 @@
 //! возвращает только типизированные команды оконному серверу.
 
 use crate::{
-    font,
+    apps::draw_system_ui_text,
     graphics::{Color, Framebuffer, Rect},
     time::SystemClock,
 };
 use rustos_system_assets::{IconKind, IconPack, IconTarget, CLASSIC_ICON_PACK};
 use rustos_system_ui::{
-    Align, CommandId, ComponentKind, DispatchResult, Edges, FontSpec, FrameResult, InputEvent, Key,
-    KeyEvent, LayoutSpec, Length, NodeSpec, PointerEvent, PointerKind, RenderBackend, ResourceId,
-    Runtime, Theme,
+    style_class, Align, CommandId, ComponentKind, Content, DispatchResult, Edges, FontSpec,
+    FrameResult, InputEvent, Key, KeyEvent, LayoutSpec, Length, NodeSpec, PointerEvent,
+    PointerKind, RenderBackend, ResourceId, Runtime, SemanticRole, Theme,
 };
 
 const COMMAND_START: CommandId = CommandId(1);
@@ -375,8 +375,15 @@ impl ShellUi {
 fn build_launcher(runtime: &mut LauncherRuntime) {
     let root = runtime.tree().root();
     let mut ui = runtime.builder();
+    let mut spec = NodeSpec::new(ComponentKind::Button);
+    spec.layout = LayoutSpec::fill();
+    spec.content = Content::Text(TEXT_START);
+    spec.accessible_name = TEXT_START;
+    spec.command = COMMAND_START;
+    spec.role = SemanticRole::Button;
+    spec.style = style_class::PRIMARY;
     let button = ui
-        .button(root, TEXT_START, COMMAND_START, LayoutSpec::fill())
+        .component(root, spec)
         .unwrap_or(rustos_system_ui::NodeId::NONE);
     if !button.is_none() {
         let image = LayoutSpec {
@@ -416,8 +423,10 @@ fn build_menu(runtime: &mut MenuRuntime) {
         height: Length::Px(44),
         gap: 10,
         align: Align::Center,
+        padding: Edges::symmetric(8, 4),
         ..LayoutSpec::default()
     };
+    header.style = style_class::SUBTLE;
     if let Ok(header) = ui.component(column, header) {
         let icon = LayoutSpec {
             width: Length::Px(34),
@@ -440,7 +449,11 @@ fn build_menu(runtime: &mut MenuRuntime) {
         height: Length::Px(26),
         ..LayoutSpec::default()
     };
-    let _ = ui.text(column, TEXT_APPLICATIONS, heading);
+    let mut heading_spec = NodeSpec::new(ComponentKind::Text);
+    heading_spec.layout = heading;
+    heading_spec.content = Content::Text(TEXT_APPLICATIONS);
+    heading_spec.style = style_class::HEADING;
+    let _ = ui.component(column, heading_spec);
     add_menu_button(
         &mut ui,
         column,
@@ -466,17 +479,17 @@ fn build_menu(runtime: &mut MenuRuntime) {
     };
     let _ = ui.component(column, spacer);
 
+    let mut clock_spec = NodeSpec::new(ComponentKind::Panel);
+    clock_spec.layout = LayoutSpec {
+        width: Length::Fill(1),
+        height: Length::Px(42),
+        padding: Edges::symmetric(4, 2),
+        gap: 2,
+        ..LayoutSpec::default()
+    };
+    clock_spec.style = style_class::SUBTLE;
     let clock_panel = ui
-        .panel(
-            column,
-            LayoutSpec {
-                width: Length::Fill(1),
-                height: Length::Px(42),
-                padding: Edges::symmetric(4, 2),
-                gap: 2,
-                ..LayoutSpec::default()
-            },
-        )
+        .component(column, clock_spec)
         .unwrap_or(rustos_system_ui::NodeId::NONE);
     if !clock_panel.is_none() {
         for resource in [TEXT_TIME, TEXT_DATE] {
@@ -719,16 +732,16 @@ struct ShellResources<'a> {
 impl ShellResources<'_> {
     fn text(&self, resource: ResourceId) -> &str {
         match resource {
-            TEXT_START => "START",
-            TEXT_RUSTOS => "RUSTOS",
-            TEXT_TERMINAL => "NEW TERMINAL",
-            TEXT_GALLERY => "UI GALLERY",
-            TEXT_SHUTDOWN => "SHUTDOWN",
+            TEXT_START => "Пуск",
+            TEXT_RUSTOS => "RustOS",
+            TEXT_TERMINAL => "Новый терминал",
+            TEXT_GALLERY => "Компоненты UI",
+            TEXT_SHUTDOWN => "Завершить работу",
             TEXT_TIME => self.clock.time_text(),
             TEXT_DATE => self.clock.date_text(),
-            TEXT_APPLICATIONS => "APPLICATIONS",
-            TEXT_ARRANGE_DESKTOP => "ARRANGE ICONS",
-            TEXT_DESKTOP_PROPERTIES => "PROPERTIES",
+            TEXT_APPLICATIONS => "Приложения",
+            TEXT_ARRANGE_DESKTOP => "Упорядочить значки",
+            TEXT_DESKTOP_PROPERTIES => "Параметры рабочего стола",
             _ => "",
         }
     }
@@ -740,6 +753,10 @@ struct ShellBackend<'framebuffer, 'resources, 'clock> {
 }
 
 impl RenderBackend for ShellBackend<'_, '_, '_> {
+    fn shadow(&mut self, rect: Rect, radius: u8, color: Color, clip: Rect) {
+        self.framebuffer.surface_shadow(rect, radius, color, clip);
+    }
+
     fn fill(&mut self, rect: Rect, color: Color, clip: Rect) {
         self.framebuffer.fill_rect(rect.intersection(clip), color);
     }
@@ -756,6 +773,16 @@ impl RenderBackend for ShellBackend<'_, '_, '_> {
         }
     }
 
+    fn rounded_fill(&mut self, rect: Rect, color: Color, radius: u8, clip: Rect) {
+        self.framebuffer
+            .fill_rounded_rect_clipped(rect, radius, color, clip);
+    }
+
+    fn rounded_border(&mut self, rect: Rect, color: Color, width: u8, radius: u8, clip: Rect) {
+        self.framebuffer
+            .rounded_border_clipped(rect, radius, width, color, clip);
+    }
+
     fn text(&mut self, rect: Rect, resource: ResourceId, color: Color, spec: FontSpec, clip: Rect) {
         if rect.intersection(clip).is_empty() {
             return;
@@ -767,23 +794,14 @@ impl RenderBackend for ShellBackend<'_, '_, '_> {
         } else {
             spec.size
         };
-        let mut style = font::FontStyle::sans(size.clamp(10, 48));
-        if spec.bold {
-            style = style.bold();
-        }
-        if spec.italic {
-            style = style.italic();
-        }
-        if spec.monospace {
-            style = font::FontStyle::console(spec.size.clamp(10, 48));
-        }
-        font::draw_text(
+        let mut spec = spec;
+        spec.size = size;
+        draw_system_ui_text(
             self.framebuffer,
-            rect.x,
-            rect.y,
+            rect,
             self.resources.text(resource),
             color,
-            style,
+            spec,
         );
     }
 
@@ -792,17 +810,24 @@ impl RenderBackend for ShellBackend<'_, '_, '_> {
             return;
         }
         match resource {
-            IMAGE_RUSTOS | IMAGE_GALLERY => draw_rustos_logo(self.framebuffer, rect),
+            IMAGE_RUSTOS => draw_rustos_logo(self.framebuffer, rect),
+            IMAGE_GALLERY => self
+                .resources
+                .icon_pack
+                .draw(self.framebuffer, IconKind::Grid, rect),
             IMAGE_TERMINAL => {
                 self.resources
                     .icon_pack
                     .draw(self.framebuffer, IconKind::Terminal, rect);
             }
-            IMAGE_POWER => draw_power(self.framebuffer, rect),
+            IMAGE_POWER => self
+                .resources
+                .icon_pack
+                .draw(self.framebuffer, IconKind::Power, rect),
             IMAGE_ARRANGE => {
                 self.resources
                     .icon_pack
-                    .draw(self.framebuffer, IconKind::Folder, rect);
+                    .draw(self.framebuffer, IconKind::Grid, rect);
             }
             IMAGE_SETTINGS => {
                 self.resources
@@ -841,7 +866,7 @@ fn draw_rustos_logo(framebuffer: &mut Framebuffer, rect: Rect) {
     ];
     for row in 0..2u32 {
         for column in 0..2u32 {
-            IconTarget::fill(
+            IconTarget::rounded_fill(
                 framebuffer,
                 Rect::new(
                     x + (column * (cell + 2)) as i32,
@@ -849,24 +874,11 @@ fn draw_rustos_logo(framebuffer: &mut Framebuffer, rect: Rect) {
                     cell,
                     cell,
                 ),
+                4,
                 colors[(row * 2 + column) as usize],
             );
         }
     }
-}
-
-fn draw_power(framebuffer: &mut Framebuffer, rect: Rect) {
-    let color = Color::rgb(245, 151, 157);
-    let center_x = rect.x + rect.width as i32 / 2;
-    let top = rect.y + 4;
-    framebuffer.fill_rect(Rect::new(center_x - 1, top, 3, rect.height / 2), color);
-    let inset = Rect::new(
-        rect.x + 5,
-        rect.y + 8,
-        rect.width.saturating_sub(10),
-        rect.height.saturating_sub(13),
-    );
-    draw_clipped_border(framebuffer, inset, color, rect);
 }
 
 /// Active icon pack передаётся значением: pack содержит только metadata,

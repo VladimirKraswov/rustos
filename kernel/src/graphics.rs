@@ -257,6 +257,249 @@ impl Framebuffer {
         }
     }
 
+    /// Заливает скруглённый прямоугольник. Геометрия вычисляется целыми
+    /// числами и ограничивается небольшим радиусом, поэтому primitive пригоден
+    /// для CPU renderer без FPU и heap.
+    pub fn fill_rounded_rect(&mut self, rect: Rect, radius: u8, color: Color) {
+        let clip = Rect::new(0, 0, self.width, self.height);
+        self.fill_rounded_rect_clipped(rect, radius, color, clip);
+    }
+
+    /// Версия [`Self::fill_rounded_rect`] для display-list damage clip. Corner
+    /// geometry считается от исходного `rect`, а не от intersection: иначе
+    /// частичная перерисовка меняла бы форму control.
+    pub fn fill_rounded_rect_clipped(&mut self, rect: Rect, radius: u8, color: Color, clip: Rect) {
+        if rect.is_empty() || clip.is_empty() {
+            return;
+        }
+        let radius = rounded_radius(rect, radius);
+        if radius == 0 {
+            self.fill_rect(rect.intersection(clip), color);
+            return;
+        }
+
+        let middle = Rect::new(
+            rect.x,
+            rect.y.saturating_add(radius as i32),
+            rect.width,
+            rect.height.saturating_sub(radius.saturating_mul(2)),
+        );
+        self.fill_rect(middle.intersection(clip), color);
+        for row in 0..radius {
+            let inset = rounded_row_inset(row, radius);
+            let width = rect.width.saturating_sub(inset.saturating_mul(2));
+            self.fill_horizontal_clipped(
+                rect.x.saturating_add(inset as i32),
+                rect.y.saturating_add(row as i32),
+                width,
+                color,
+                clip,
+            );
+            let bottom = rect.bottom().saturating_sub(row as i32 + 1);
+            if bottom != rect.y.saturating_add(row as i32) {
+                self.fill_horizontal_clipped(
+                    rect.x.saturating_add(inset as i32),
+                    bottom,
+                    width,
+                    color,
+                    clip,
+                );
+            }
+        }
+    }
+
+    /// Маскирует углы уже нарисованного прямоугольного bitmap системным
+    /// фоном. Это дешёвый путь для wallpaper/image preview без alpha-канала:
+    /// само изображение остаётся обычным быстрым blit, а округляются только
+    /// несколько строк по углам.
+    pub fn mask_rounded_corners(&mut self, rect: Rect, radius: u8, background: Color) {
+        let radius = rounded_radius(rect, radius);
+        for row in 0..radius {
+            let inset = rounded_row_inset(row, radius);
+            if inset == 0 {
+                continue;
+            }
+            let top = rect.y.saturating_add(row as i32);
+            let bottom = rect.bottom().saturating_sub(row as i32 + 1);
+            for y in [top, bottom] {
+                self.fill_rect(Rect::new(rect.x, y, inset, 1), background);
+                self.fill_rect(
+                    Rect::new(rect.right().saturating_sub(inset as i32), y, inset, 1),
+                    background,
+                );
+            }
+        }
+    }
+
+    /// Скруглённая рамка произвольной толщины. Внутренность не заливается,
+    /// поэтому primitive можно накладывать поверх gradient/image surface.
+    pub fn rounded_border(&mut self, rect: Rect, radius: u8, width: u8, color: Color) {
+        let clip = Rect::new(0, 0, self.width, self.height);
+        self.rounded_border_clipped(rect, radius, width, color, clip);
+    }
+
+    /// Скруглённая рамка с сохранением исходной corner geometry при damage.
+    pub fn rounded_border_clipped(
+        &mut self,
+        rect: Rect,
+        radius: u8,
+        width: u8,
+        color: Color,
+        clip: Rect,
+    ) {
+        let border = u32::from(width.max(1));
+        if rect.is_empty() || clip.is_empty() || rect.width <= border || rect.height <= border {
+            return;
+        }
+        let radius = rounded_radius(rect, radius);
+        if radius == 0 {
+            for inset in 0..border {
+                let current = Rect::new(
+                    rect.x.saturating_add(inset as i32),
+                    rect.y.saturating_add(inset as i32),
+                    rect.width.saturating_sub(inset.saturating_mul(2)),
+                    rect.height.saturating_sub(inset.saturating_mul(2)),
+                );
+                for edge in rectangular_border(current) {
+                    self.fill_rect(edge.intersection(clip), color);
+                }
+            }
+            return;
+        }
+
+        let inner_width = rect.width.saturating_sub(border.saturating_mul(2));
+        let inner_height = rect.height.saturating_sub(border.saturating_mul(2));
+        let inner_radius = radius.saturating_sub(border);
+        for row in 0..rect.height {
+            let outer_inset = rounded_inset_for_height(row, rect.height, radius);
+            let outer_left = outer_inset;
+            let outer_right = rect.width.saturating_sub(outer_inset);
+            if row < border || row >= rect.height.saturating_sub(border) || inner_height == 0 {
+                self.fill_horizontal_clipped(
+                    rect.x.saturating_add(outer_left as i32),
+                    rect.y.saturating_add(row as i32),
+                    outer_right.saturating_sub(outer_left),
+                    color,
+                    clip,
+                );
+                continue;
+            }
+            let inner_row = row.saturating_sub(border);
+            let inner_inset = rounded_inset_for_height(inner_row, inner_height, inner_radius);
+            let inner_left = border.saturating_add(inner_inset);
+            let inner_right = border.saturating_add(inner_width.saturating_sub(inner_inset));
+            self.fill_horizontal_clipped(
+                rect.x.saturating_add(outer_left as i32),
+                rect.y.saturating_add(row as i32),
+                inner_left.saturating_sub(outer_left),
+                color,
+                clip,
+            );
+            self.fill_horizontal_clipped(
+                rect.x.saturating_add(inner_right as i32),
+                rect.y.saturating_add(row as i32),
+                outer_right.saturating_sub(inner_right),
+                color,
+                clip,
+            );
+        }
+    }
+
+    /// Мягкая CPU-тень окна: несколько полупрозрачных скруглённых контуров
+    /// вместо прежних сплошных чёрных полос справа и снизу. Стоимость зависит
+    /// от периметра, а не от площади окна.
+    pub fn soft_shadow(&mut self, rect: Rect, radius: u8, clip: Rect) {
+        // Три контура визуально дают достаточную глубину на 24/16-bit
+        // framebuffer и ограничивают стоимость первого сложного кадра. Восемь
+        // полупрозрачных слоёв не давали заметной пользы, но умножали read/
+        // blend/write операции для каждой карточки component tree.
+        for (spread, coverage) in [(9u32, 18u8), (6, 28), (3, 42)] {
+            let shadow = Rect::new(
+                rect.x.saturating_sub(spread as i32),
+                rect.y.saturating_sub(spread as i32).saturating_add(3),
+                rect.width.saturating_add(spread.saturating_mul(2)),
+                rect.height.saturating_add(spread.saturating_mul(2)),
+            );
+            self.blended_rounded_border_clipped(
+                shadow,
+                radius.saturating_add(spread as u8),
+                Color::rgb(5, 10, 20),
+                coverage,
+                clip,
+            );
+        }
+    }
+
+    /// Дешёвая тень карточки/меню. Renderer сначала рисует слегка смещённую
+    /// семантическую поверхность, затем обычная карточка закрывает её центр.
+    /// В результате остаётся единый мягкий силуэт без концентрических линий
+    /// и без дорогого alpha read-modify-write для каждого пикселя.
+    pub fn surface_shadow(&mut self, rect: Rect, radius: u8, color: Color, clip: Rect) {
+        let shadow = Rect::new(
+            rect.x.saturating_sub(3),
+            rect.y.saturating_add(4),
+            rect.width.saturating_add(6),
+            rect.height.saturating_add(4),
+        );
+        self.fill_rounded_rect_clipped(shadow, radius.saturating_add(3), color, clip);
+    }
+
+    fn fill_horizontal_clipped(&mut self, x: i32, y: i32, width: u32, color: Color, clip: Rect) {
+        if width == 0 {
+            return;
+        }
+        self.fill_rect(Rect::new(x, y, width, 1).intersection(clip), color);
+    }
+
+    fn blended_rounded_border_clipped(
+        &mut self,
+        rect: Rect,
+        radius: u8,
+        color: Color,
+        coverage: u8,
+        clip: Rect,
+    ) {
+        if rect.is_empty() || clip.is_empty() {
+            return;
+        }
+        let radius = rounded_radius(rect, radius);
+        for row in 0..rect.height {
+            let inset = rounded_inset_for_height(row, rect.height, radius);
+            let left = rect.x.saturating_add(inset as i32);
+            let right = rect.right().saturating_sub(inset as i32).saturating_sub(1);
+            let y = rect.y.saturating_add(row as i32);
+            if row == 0 || row + 1 == rect.height {
+                self.blend_horizontal_clipped(left, right, y, color, coverage, clip);
+            } else {
+                if clip.contains(left, y) {
+                    self.blend_pixel(left, y, color, coverage);
+                }
+                if right != left && clip.contains(right, y) {
+                    self.blend_pixel(right, y, color, coverage);
+                }
+            }
+        }
+    }
+
+    fn blend_horizontal_clipped(
+        &mut self,
+        left: i32,
+        right: i32,
+        y: i32,
+        color: Color,
+        coverage: u8,
+        clip: Rect,
+    ) {
+        if y < clip.y || y >= clip.bottom() {
+            return;
+        }
+        let first = left.max(clip.x);
+        let last = right.min(clip.right().saturating_sub(1));
+        for x in first..=last {
+            self.blend_pixel(x, y, color, coverage);
+        }
+    }
+
     /// Рисует рамку толщиной 1 px по периметру `rect`.
     pub fn border(&mut self, rect: Rect, color: Color) {
         if rect.width == 0 || rect.height == 0 {
@@ -472,6 +715,52 @@ impl IconTarget for Framebuffer {
     fn stroke(&mut self, rect: Rect, color: Color) {
         self.border(rect, color);
     }
+
+    fn rounded_fill(&mut self, rect: Rect, radius: u8, color: Color) {
+        self.fill_rounded_rect(rect, radius, color);
+    }
+
+    fn rounded_stroke(&mut self, rect: Rect, radius: u8, color: Color) {
+        self.rounded_border(rect, radius, 1, color);
+    }
+}
+
+fn rounded_radius(rect: Rect, requested: u8) -> u32 {
+    u32::from(requested)
+        .min(rect.width / 2)
+        .min(rect.height / 2)
+}
+
+fn rounded_row_inset(row: u32, radius: u32) -> u32 {
+    if radius == 0 || row >= radius {
+        return 0;
+    }
+    let distance = radius.saturating_sub(row + 1);
+    let remaining = radius
+        .saturating_mul(radius)
+        .saturating_sub(distance.saturating_mul(distance));
+    let mut horizontal = radius;
+    while horizontal.saturating_mul(horizontal) > remaining {
+        horizontal = horizontal.saturating_sub(1);
+    }
+    radius.saturating_sub(horizontal)
+}
+
+fn rounded_inset_for_height(row: u32, height: u32, radius: u32) -> u32 {
+    if radius == 0 || height == 0 {
+        return 0;
+    }
+    let edge = row.min(height.saturating_sub(row + 1));
+    rounded_row_inset(edge, radius)
+}
+
+fn rectangular_border(rect: Rect) -> [Rect; 4] {
+    [
+        Rect::new(rect.x, rect.y, rect.width, 1),
+        Rect::new(rect.x, rect.bottom().saturating_sub(1), rect.width, 1),
+        Rect::new(rect.x, rect.y, 1, rect.height),
+        Rect::new(rect.right().saturating_sub(1), rect.y, 1, rect.height),
+    ]
 }
 
 impl Scanout for Framebuffer {

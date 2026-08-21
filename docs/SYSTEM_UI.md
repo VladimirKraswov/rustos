@@ -10,13 +10,17 @@
 - Row, Column, Stack, Grid и container breakpoint;
 - типизированные размеры, constraints, padding, gap и alignment;
 - тёмная, светлая и high-contrast темы;
+- дизайн-токены Aurora v2: радиусы, light/dark surfaces, primary/ghost/danger,
+  muted captions, cards, hover/focus/disabled и выбранные состояния;
 - renderer-neutral display list и сменный render backend;
+- CPU primitives для скруглённых заливок/рамок и bounded-теней без FPU/heap;
 - dirty rectangles и раздельная invalidation layout/paint/semantics;
 - hit testing, pointer capture, focus, Tab и Enter/Space activation;
 - capture/target/bubble route и отдельное accessibility tree;
 - bounded virtual-list range для десятков тысяч items;
 - стабильный wire ABI приложения к будущему `uid`;
-- AOT-компилятор `rustos-rui`, headless-тесты и UI Gallery в desktop.
+- AOT-компилятор `rustos-rui`, headless-тесты и современная светлая UI Gallery
+  с cards, tabs, buttons, fields, choices, progress, list и status surfaces.
 - компонентный desktop shell: Start `Button` + `Image`, `Menu`, пункты-команды,
   taskbar clock/date и keyboard focus без ручного hit-test пунктов.
 - desktop context menu и отдельное Settings-приложение с selected controls,
@@ -170,9 +174,23 @@ worker над immutable snapshot.
 
 ## Render pipeline
 
-Компоненты создают `Fill`, `Border`, `Text`, `Image`, `Fraction` и
-`SelectionMark`; они не получают framebuffer. `RenderBackend` реализует эти
-операции для CPU, GPU, remote или headless target.
+Компоненты создают `Shadow`, `Fill`, `Border`, `Text`, `Image`, `Fraction` и
+`SelectionMark`; они не получают framebuffer. Каждый primitive несёт radius и
+семантический цвет, когда они нужны. `RenderBackend` реализует операции для
+CPU, GPU, remote или headless target; backend без curved/shadow acceleration
+имеет корректный прямоугольный/no-op fallback.
+
+CPU backend использует целочисленную геометрию: середина rounded surface
+заливается одним прямоугольником, отдельно обрабатываются только несколько
+строк углов. Тень карточки — одна смещённая системная поверхность, закрываемая
+самой карточкой. Тень окна использует три полупрозрачных perimeter contour.
+Такой budget выбран по GUI regression: восемь alpha-контуров на каждую
+карточку заметно задерживали первый сложный кадр под TCG, не улучшая вид.
+
+Встроенные style classes стабильны и не требуют копирования цветов в код
+приложения: `PRIMARY`, `DANGER`, `GHOST`, `CARD`, `SUBTLE`, `HEADING` и
+`CAPTION`. Обычный control должен выбирать семантический класс, а не менять
+palette вручную.
 
 Runtime хранит три независимых dirty flags. Изменение hover кнопки:
 

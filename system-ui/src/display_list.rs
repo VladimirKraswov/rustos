@@ -15,15 +15,43 @@ pub struct FontSpec {
     pub italic: bool,
     /// Моноширинное семейство.
     pub monospace: bool,
+    /// Горизонтальное выравнивание внутри bounds компонента.
+    pub align: TextAlign,
+    /// Центрировать строку по вертикали внутри bounds.
+    pub vertical_center: bool,
+}
+
+/// Выравнивание текста, независимое от конкретной font-библиотеки.
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum TextAlign {
+    /// От начала строки.
+    #[default]
+    Start = 0,
+    /// По центру.
+    Center = 1,
+    /// К правому краю.
+    End = 2,
 }
 
 /// Один визуальный primitive. Компоненты не видят методы framebuffer.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum VisualPrimitive {
+    /// Мягкая тень поднятой поверхности.
+    Shadow {
+        /// Исходная поверхность: bounds команды шире и покрывают размытие.
+        surface: Rect,
+        /// Радиус поверхности.
+        radius: u8,
+        /// Семантический цвет тени, согласованный со светлой/тёмной темой.
+        color: Color,
+    },
     /// Непрозрачная заливка.
     Fill {
         /// Цвет заливки.
         color: Color,
+        /// Скругление.
+        radius: u8,
     },
     /// Прямоугольная рамка.
     Border {
@@ -31,6 +59,8 @@ pub enum VisualPrimitive {
         color: Color,
         /// Толщина в логических пикселях.
         width: u8,
+        /// Скругление, совпадающее с surface.
+        radius: u8,
     },
     /// Текст из package resource table.
     Text {
@@ -54,11 +84,15 @@ pub enum VisualPrimitive {
         color: Color,
         /// Доля 0..=1000.
         value: u16,
+        /// Pill/rounded geometry заполнения.
+        radius: u8,
     },
     /// Галочка/точка выбора без отдельного bitmap resource.
     SelectionMark {
         /// Цвет отметки.
         color: Color,
+        /// Скругление отметки.
+        radius: u8,
     },
 }
 
@@ -79,6 +113,7 @@ impl DisplayCommand {
         bounds: Rect::EMPTY,
         primitive: VisualPrimitive::Fill {
             color: Color::rgb(0, 0, 0),
+            radius: 0,
         },
     };
 }
@@ -94,6 +129,22 @@ pub trait RenderBackend {
     fn text(&mut self, rect: Rect, resource: ResourceId, color: Color, font: FontSpec, clip: Rect);
     /// Нарисовать image/icon resource.
     fn image(&mut self, rect: Rect, resource: ResourceId, tint: Color, clip: Rect);
+
+    /// Нарисовать тень поверхности. Простые/headless backend могут ничего не
+    /// делать, не меняя функциональную семантику интерфейса.
+    fn shadow(&mut self, _rect: Rect, _radius: u8, _color: Color, _clip: Rect) {}
+
+    /// Скруглённая заливка с обязательным прямоугольным fallback.
+    fn rounded_fill(&mut self, rect: Rect, color: Color, radius: u8, clip: Rect) {
+        let _ = radius;
+        self.fill(rect, color, clip);
+    }
+
+    /// Скруглённая рамка с обязательным прямоугольным fallback.
+    fn rounded_border(&mut self, rect: Rect, color: Color, width: u8, radius: u8, clip: Rect) {
+        let _ = radius;
+        self.border(rect, color, width, clip);
+    }
 }
 
 /// Bounded display list. При переполнении frame считается неготовым: runtime
@@ -158,11 +209,27 @@ impl<const C: usize> DisplayList<C> {
                 continue;
             }
             let style = theme.resolve(node.kind, node.state, node.style);
+            if node.style == crate::style_class::CARD
+                || matches!(node.kind, ComponentKind::Menu | ComponentKind::Dialog)
+            {
+                self.push(DisplayCommand {
+                    owner: id,
+                    bounds: shadow_bounds(node.rect),
+                    primitive: VisualPrimitive::Shadow {
+                        surface: node.rect,
+                        radius: style.radius,
+                        color: theme.palette.border.mix(theme.palette.window, 160),
+                    },
+                });
+            }
             if let Some(color) = style.background {
                 self.push(DisplayCommand {
                     owner: id,
                     bounds: node.rect,
-                    primitive: VisualPrimitive::Fill { color },
+                    primitive: VisualPrimitive::Fill {
+                        color,
+                        radius: style.radius,
+                    },
                 });
             }
             if style.border_width != 0 && node.kind != ComponentKind::Root {
@@ -172,6 +239,7 @@ impl<const C: usize> DisplayList<C> {
                     primitive: VisualPrimitive::Border {
                         color: style.border,
                         width: style.border_width,
+                        radius: style.radius,
                     },
                 });
             }
@@ -187,6 +255,14 @@ impl<const C: usize> DisplayList<C> {
                             bold: style.bold,
                             italic: false,
                             monospace: false,
+                            align: if node.kind == ComponentKind::Button
+                                && node.role != crate::SemanticRole::MenuItem
+                            {
+                                TextAlign::Center
+                            } else {
+                                TextAlign::Start
+                            },
+                            vertical_center: node.kind != ComponentKind::Text,
                         },
                     },
                 }),
@@ -210,24 +286,13 @@ impl<const C: usize> DisplayList<C> {
                         primitive: VisualPrimitive::Fraction {
                             color: theme.palette.accent,
                             value: value.min(1000),
+                            radius: style.radius,
                         },
                     });
                 }
                 _ => {}
             }
-            if matches!(
-                node.kind,
-                ComponentKind::CheckBox | ComponentKind::RadioButton | ComponentKind::Switch
-            ) && node.state.contains(NodeState::CHECKED)
-            {
-                self.push(DisplayCommand {
-                    owner: id,
-                    bounds: selection_bounds(node.rect, node.kind),
-                    primitive: VisualPrimitive::SelectionMark {
-                        color: theme.palette.accent,
-                    },
-                });
-            }
+            self.push_choice_indicator(id, node, theme);
             if node.state.contains(NodeState::FOCUSED) {
                 self.push(DisplayCommand {
                     owner: id,
@@ -235,6 +300,7 @@ impl<const C: usize> DisplayList<C> {
                     primitive: VisualPrimitive::Border {
                         color: style.focus,
                         width: 2,
+                        radius: style.radius,
                     },
                 });
             }
@@ -257,10 +323,19 @@ impl<const C: usize> DisplayList<C> {
                 executed = executed.saturating_add(1);
                 pixels = pixels.saturating_add(visible.area());
                 match command.primitive {
-                    VisualPrimitive::Fill { color } => backend.fill(command.bounds, color, clip),
-                    VisualPrimitive::Border { color, width } => {
-                        backend.border(command.bounds, color, width, clip)
+                    VisualPrimitive::Shadow {
+                        surface,
+                        radius,
+                        color,
+                    } => backend.shadow(surface, radius, color, clip),
+                    VisualPrimitive::Fill { color, radius } => {
+                        backend.rounded_fill(command.bounds, color, radius, clip)
                     }
+                    VisualPrimitive::Border {
+                        color,
+                        width,
+                        radius,
+                    } => backend.rounded_border(command.bounds, color, width, radius, clip),
                     VisualPrimitive::Text {
                         resource,
                         color,
@@ -269,22 +344,111 @@ impl<const C: usize> DisplayList<C> {
                     VisualPrimitive::Image { resource, tint } => {
                         backend.image(command.bounds, resource, tint, clip)
                     }
-                    VisualPrimitive::Fraction { color, value } => {
+                    VisualPrimitive::Fraction {
+                        color,
+                        value,
+                        radius,
+                    } => {
                         let inner = Rect::new(
                             command.bounds.x,
                             command.bounds.y,
                             command.bounds.width.saturating_mul(u32::from(value)) / 1000,
                             command.bounds.height,
                         );
-                        backend.fill(inner, color, clip);
+                        backend.rounded_fill(inner, color, radius, clip);
                     }
-                    VisualPrimitive::SelectionMark { color } => {
-                        backend.fill(command.bounds, color, clip)
+                    VisualPrimitive::SelectionMark { color, radius } => {
+                        backend.rounded_fill(command.bounds, color, radius, clip)
                     }
                 }
             }
         }
         (executed, pixels)
+    }
+}
+
+impl<const C: usize> DisplayList<C> {
+    fn push_choice_indicator(&mut self, owner: NodeId, node: &crate::Node, theme: Theme) {
+        let checked = node.state.contains(NodeState::CHECKED);
+        match node.kind {
+            ComponentKind::CheckBox | ComponentKind::RadioButton => {
+                let bounds = choice_bounds(node.rect);
+                let radius = if node.kind == ComponentKind::RadioButton {
+                    u8::MAX
+                } else {
+                    5
+                };
+                self.push(DisplayCommand {
+                    owner,
+                    bounds,
+                    primitive: VisualPrimitive::Fill {
+                        color: if checked {
+                            theme.palette.accent
+                        } else {
+                            theme.palette.raised
+                        },
+                        radius,
+                    },
+                });
+                self.push(DisplayCommand {
+                    owner,
+                    bounds,
+                    primitive: VisualPrimitive::Border {
+                        color: if checked {
+                            theme.palette.accent
+                        } else {
+                            theme.palette.border
+                        },
+                        width: 1,
+                        radius,
+                    },
+                });
+                if checked {
+                    self.push(DisplayCommand {
+                        owner,
+                        bounds: inset(bounds, 5, 5),
+                        primitive: VisualPrimitive::SelectionMark {
+                            color: Color::rgb(255, 255, 255),
+                            radius: if node.kind == ComponentKind::RadioButton {
+                                u8::MAX
+                            } else {
+                                2
+                            },
+                        },
+                    });
+                }
+            }
+            ComponentKind::Switch => {
+                let track = switch_bounds(node.rect);
+                self.push(DisplayCommand {
+                    owner,
+                    bounds: track,
+                    primitive: VisualPrimitive::Fill {
+                        color: if checked {
+                            theme.palette.accent
+                        } else {
+                            theme.palette.border
+                        },
+                        radius: u8::MAX,
+                    },
+                });
+                let knob_size = track.height.saturating_sub(4);
+                let knob_x = if checked {
+                    track.right().saturating_sub(knob_size as i32 + 2)
+                } else {
+                    track.x.saturating_add(2)
+                };
+                self.push(DisplayCommand {
+                    owner,
+                    bounds: Rect::new(knob_x, track.y.saturating_add(2), knob_size, knob_size),
+                    primitive: VisualPrimitive::SelectionMark {
+                        color: Color::rgb(255, 255, 255),
+                        radius: u8::MAX,
+                    },
+                });
+            }
+            _ => {}
+        }
     }
 }
 
@@ -303,16 +467,36 @@ fn inset(rect: Rect, horizontal: u32, vertical: u32) -> Rect {
     )
 }
 
-fn selection_bounds(rect: Rect, kind: ComponentKind) -> Rect {
-    match kind {
-        ComponentKind::Switch => Rect::new(
-            rect.x.saturating_add(rect.width.saturating_sub(22) as i32),
-            rect.y.saturating_add(4),
-            16,
-            rect.height.saturating_sub(8),
-        ),
-        _ => Rect::new(rect.x.saturating_add(5), rect.y.saturating_add(5), 12, 12),
-    }
+fn shadow_bounds(rect: Rect) -> Rect {
+    Rect::new(
+        rect.x.saturating_sub(9),
+        rect.y.saturating_sub(6),
+        rect.width.saturating_add(18),
+        rect.height.saturating_add(18),
+    )
+}
+
+fn choice_bounds(rect: Rect) -> Rect {
+    let size = rect.height.saturating_sub(10).min(20);
+    Rect::new(
+        rect.x.saturating_add(4),
+        rect.y
+            .saturating_add((rect.height.saturating_sub(size) / 2) as i32),
+        size,
+        size,
+    )
+}
+
+fn switch_bounds(rect: Rect) -> Rect {
+    let height = rect.height.saturating_sub(10).clamp(16, 22);
+    let width = height.saturating_mul(2);
+    Rect::new(
+        rect.right().saturating_sub(width as i32 + 5),
+        rect.y
+            .saturating_add((rect.height.saturating_sub(height) / 2) as i32),
+        width,
+        height,
+    )
 }
 
 fn text_bounds(rect: Rect, kind: ComponentKind) -> Rect {
@@ -368,5 +552,52 @@ mod tests {
         let mut counter = Counter(0);
         list.execute(&mut counter, &damage);
         assert_eq!(counter.0, 1); // only root background intersects
+    }
+
+    #[test]
+    fn card_emits_theme_aware_shadow_before_surface() {
+        let mut tree = Tree::<4>::new();
+        let mut spec = NodeSpec::new(ComponentKind::Panel);
+        spec.style = crate::style_class::CARD;
+        spec.layout = LayoutSpec {
+            width: crate::Length::Px(100),
+            height: crate::Length::Px(60),
+            ..LayoutSpec::default()
+        };
+        let card = tree.create(tree.root(), spec).unwrap();
+        crate::layout::perform(&mut tree, Rect::new(0, 0, 200, 100), |_| {});
+
+        let theme = Theme::light();
+        let mut list = DisplayList::<16>::new();
+        list.rebuild(&tree, theme);
+        let card_commands: [Option<VisualPrimitive>; 3] = [
+            list.as_slice()
+                .iter()
+                .find(|command| command.owner == card)
+                .map(|command| command.primitive),
+            list.as_slice()
+                .iter()
+                .filter(|command| command.owner == card)
+                .nth(1)
+                .map(|command| command.primitive),
+            list.as_slice()
+                .iter()
+                .filter(|command| command.owner == card)
+                .nth(2)
+                .map(|command| command.primitive),
+        ];
+        assert!(matches!(
+            card_commands[0],
+            Some(VisualPrimitive::Shadow { color, .. })
+                if color == theme.palette.border.mix(theme.palette.window, 160)
+        ));
+        assert!(matches!(
+            card_commands[1],
+            Some(VisualPrimitive::Fill { .. })
+        ));
+        assert!(matches!(
+            card_commands[2],
+            Some(VisualPrimitive::Border { .. })
+        ));
     }
 }

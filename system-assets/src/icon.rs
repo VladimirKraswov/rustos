@@ -38,6 +38,34 @@ pub enum IconKind {
     Settings,
     /// Корзина.
     Trash,
+    /// Домашняя/обзорная страница.
+    Home,
+    /// Поиск.
+    Search,
+    /// Главное меню.
+    Menu,
+    /// Сетка приложений.
+    Grid,
+    /// Завершение работы.
+    Power,
+    /// Информация.
+    Info,
+    /// Успешное действие.
+    Success,
+    /// Предупреждение.
+    Warning,
+    /// Свернуть окно.
+    Minimize,
+    /// Развернуть окно.
+    Maximize,
+    /// Восстановить окно.
+    Restore,
+    /// Закрыть окно.
+    Close,
+    /// Стрелка назад.
+    ChevronLeft,
+    /// Стрелка вперёд.
+    ChevronRight,
 }
 
 /// Минимальный raster API. Он умышленно не зависит от kernel framebuffer:
@@ -48,6 +76,17 @@ pub trait IconTarget {
     fn fill(&mut self, rect: Rect, color: Color);
     /// Нарисовать однопиксельную рамку.
     fn stroke(&mut self, rect: Rect, color: Color);
+
+    /// Скруглённая заливка. Backend без curved primitive корректно использует
+    /// прямоугольный fallback; CPU/GPU backend может дать современную форму.
+    fn rounded_fill(&mut self, rect: Rect, _radius: u8, color: Color) {
+        self.fill(rect, color);
+    }
+
+    /// Скруглённая однопиксельная рамка с прямоугольным fallback.
+    fn rounded_stroke(&mut self, rect: Rect, _radius: u8, color: Color) {
+        self.stroke(rect, color);
+    }
 }
 
 /// Цвета стандартной геометрии иконок.
@@ -101,6 +140,26 @@ impl ResourcePack for IconPack {
         self.metadata
     }
 }
+
+/// Современный системный пакет: яркий синий акцент, мягкие поверхности и
+/// чистая line/filled geometry. Он используется desktop по умолчанию, а
+/// classic/midnight/mono остаются переключаемыми темами совместимости.
+pub const AURORA_ICON_PACK: IconPack = IconPack {
+    metadata: PackMetadata {
+        id: PackId(0x2004),
+        name: "aurora",
+        version: 1,
+    },
+    palette: IconPalette {
+        surface: Color::rgb(239, 245, 255),
+        surface_light: Color::rgb(255, 255, 255),
+        outline: Color::rgb(35, 52, 78),
+        accent: Color::rgb(29, 112, 246),
+        ink: Color::rgb(20, 31, 49),
+        folder: Color::rgb(255, 187, 63),
+    },
+    renderer: standard_icon,
+};
 
 /// Классическая тема с жёлтыми папками.
 pub const CLASSIC_ICON_PACK: IconPack = IconPack {
@@ -232,13 +291,27 @@ fn standard_icon(target: &mut dyn IconTarget, kind: IconKind, rect: Rect, p: Ico
         IconKind::Video => document(target, rect, p, DocumentMark::Video),
         IconKind::Archive => document(target, rect, p, DocumentMark::Archive),
         IconKind::File => document(target, rect, p, DocumentMark::None),
+        IconKind::Home
+        | IconKind::Search
+        | IconKind::Menu
+        | IconKind::Grid
+        | IconKind::Power
+        | IconKind::Info
+        | IconKind::Success
+        | IconKind::Warning
+        | IconKind::Minimize
+        | IconKind::Maximize
+        | IconKind::Restore
+        | IconKind::Close
+        | IconKind::ChevronLeft
+        | IconKind::ChevronRight => ui_icon(target, kind, rect, p),
     }
 }
 
 fn folder(target: &mut dyn IconTarget, rect: Rect, p: IconPalette, open: bool) {
-    cell(target, rect, 2, 6, 10, 4, p.folder);
-    cell(target, rect, 2, 8, 20, 13, p.outline);
-    cell(target, rect, 3, 9, 18, 11, p.folder);
+    rounded_cell(target, rect, 2, 6, 10, 5, 2, p.folder);
+    rounded_cell(target, rect, 2, 8, 20, 13, 3, p.outline);
+    rounded_cell(target, rect, 3, 9, 18, 11, 2, p.folder);
     cell(target, rect, 4, 10, 16, 2, p.surface_light);
     if open {
         cell(target, rect, 1, 13, 21, 8, p.outline);
@@ -318,10 +391,10 @@ fn document(target: &mut dyn IconTarget, rect: Rect, p: IconPalette, mark: Docum
 }
 
 fn terminal(target: &mut dyn IconTarget, rect: Rect, p: IconPalette) {
-    // Тень, корпус, title strip и экран дают читаемый силуэт даже в 24 px.
-    cell(target, rect, 4, 5, 18, 17, Color::rgb(5, 10, 16));
-    cell(target, rect, 2, 2, 19, 18, p.outline);
-    cell(target, rect, 3, 3, 17, 16, p.surface);
+    // Мягкий корпус и чистый prompt сохраняют силуэт в диапазоне 16..64 px.
+    rounded_cell(target, rect, 4, 5, 18, 17, 3, Color::rgb(5, 10, 16));
+    rounded_cell(target, rect, 2, 2, 19, 18, 4, p.outline);
+    rounded_cell(target, rect, 3, 3, 17, 16, 3, p.surface);
     cell(target, rect, 3, 3, 17, 4, p.surface_light);
     for x in [5, 8, 11] {
         cell(target, rect, x, 4, 2, 2, p.accent);
@@ -334,18 +407,18 @@ fn terminal(target: &mut dyn IconTarget, rect: Rect, p: IconPalette) {
 }
 
 fn trash(target: &mut dyn IconTarget, rect: Rect, p: IconPalette) {
-    cell(target, rect, 6, 7, 12, 15, p.outline);
-    cell(target, rect, 7, 8, 10, 13, p.surface);
-    cell(target, rect, 4, 5, 16, 3, p.outline);
-    cell(target, rect, 9, 3, 6, 2, p.outline);
+    rounded_cell(target, rect, 6, 7, 12, 15, 3, p.outline);
+    rounded_cell(target, rect, 7, 8, 10, 13, 2, p.surface);
+    rounded_cell(target, rect, 4, 5, 16, 3, 2, p.outline);
+    rounded_cell(target, rect, 9, 3, 6, 2, 1, p.outline);
     for x in [9, 12, 15] {
         cell(target, rect, x, 10, 1, 8, p.accent);
     }
 }
 
 fn drive(target: &mut dyn IconTarget, rect: Rect, p: IconPalette) {
-    cell(target, rect, 2, 7, 20, 12, p.outline);
-    cell(target, rect, 3, 8, 18, 9, p.surface);
+    rounded_cell(target, rect, 2, 7, 20, 12, 4, p.outline);
+    rounded_cell(target, rect, 3, 8, 18, 9, 3, p.surface);
     cell(target, rect, 3, 14, 18, 3, p.surface_light);
     cell(target, rect, 16, 15, 3, 1, p.accent);
 }
@@ -354,8 +427,105 @@ fn settings(target: &mut dyn IconTarget, rect: Rect, p: IconPalette) {
     cell(target, rect, 10, 2, 4, 20, p.outline);
     cell(target, rect, 2, 10, 20, 4, p.outline);
     cell(target, rect, 5, 5, 14, 14, p.outline);
-    cell(target, rect, 7, 7, 10, 10, p.surface);
-    cell(target, rect, 10, 10, 4, 4, p.accent);
+    rounded_cell(target, rect, 7, 7, 10, 10, 5, p.surface);
+    rounded_cell(target, rect, 10, 10, 4, 4, 2, p.accent);
+}
+
+fn ui_icon(target: &mut dyn IconTarget, kind: IconKind, rect: Rect, p: IconPalette) {
+    match kind {
+        IconKind::Home => {
+            for row in 0..7 {
+                let width = 3 + row * 2;
+                cell(target, rect, 12 - width / 2, 4 + row, width, 1, p.accent);
+            }
+            rounded_cell(target, rect, 6, 10, 12, 10, 2, p.accent);
+            cell(target, rect, 11, 15, 3, 5, p.surface_light);
+        }
+        IconKind::Search => {
+            rounded_stroke_cell(target, rect, 4, 3, 13, 13, 7, p.ink);
+            diagonal(target, rect, 15, 15, 5, true, p.ink);
+        }
+        IconKind::Menu => {
+            for y in [6, 11, 16] {
+                rounded_cell(target, rect, 4, y, 16, 2, 1, p.ink);
+            }
+        }
+        IconKind::Grid => {
+            for (x, y) in [(4, 4), (13, 4), (4, 13), (13, 13)] {
+                rounded_cell(target, rect, x, y, 7, 7, 2, p.accent);
+            }
+        }
+        IconKind::Power => {
+            rounded_stroke_cell(target, rect, 4, 5, 16, 16, 8, p.accent);
+            rounded_cell(target, rect, 11, 2, 3, 10, 2, p.accent);
+            rounded_cell(target, rect, 9, 2, 7, 5, 2, p.surface);
+            rounded_cell(target, rect, 11, 2, 3, 9, 2, p.accent);
+        }
+        IconKind::Info => {
+            rounded_cell(target, rect, 2, 2, 20, 20, 10, p.accent);
+            rounded_cell(target, rect, 11, 9, 3, 9, 1, p.surface_light);
+            rounded_cell(target, rect, 11, 5, 3, 3, 2, p.surface_light);
+        }
+        IconKind::Success => {
+            rounded_cell(target, rect, 2, 2, 20, 20, 10, Color::rgb(34, 179, 119));
+            diagonal(target, rect, 6, 12, 5, true, p.surface_light);
+            diagonal(target, rect, 10, 16, 8, false, p.surface_light);
+        }
+        IconKind::Warning => {
+            for row in 0..18 {
+                let width = 2 + row;
+                cell(
+                    target,
+                    rect,
+                    12 - width / 2,
+                    3 + row,
+                    width,
+                    1,
+                    Color::rgb(246, 174, 45),
+                );
+            }
+            rounded_cell(target, rect, 11, 8, 3, 7, 1, p.ink);
+            rounded_cell(target, rect, 11, 17, 3, 3, 2, p.ink);
+        }
+        IconKind::Minimize => rounded_cell(target, rect, 5, 16, 14, 2, 1, p.ink),
+        IconKind::Maximize => rounded_stroke_cell(target, rect, 5, 5, 14, 14, 3, p.ink),
+        IconKind::Restore => {
+            rounded_stroke_cell(target, rect, 7, 4, 13, 13, 3, p.ink);
+            rounded_stroke_cell(target, rect, 4, 7, 13, 13, 3, p.ink);
+        }
+        IconKind::Close => {
+            diagonal(target, rect, 6, 6, 12, true, p.ink);
+            diagonal(target, rect, 17, 6, 12, false, p.ink);
+        }
+        IconKind::ChevronLeft => {
+            diagonal(target, rect, 14, 5, 7, false, p.ink);
+            diagonal(target, rect, 8, 11, 7, true, p.ink);
+        }
+        IconKind::ChevronRight => {
+            diagonal(target, rect, 9, 5, 7, true, p.ink);
+            diagonal(target, rect, 15, 11, 7, false, p.ink);
+        }
+        _ => {}
+    }
+}
+
+fn diagonal(
+    target: &mut dyn IconTarget,
+    rect: Rect,
+    start_x: u32,
+    start_y: u32,
+    length: u32,
+    down_right: bool,
+    color: Color,
+) {
+    for step in 0..length {
+        let x = if down_right {
+            start_x.saturating_add(step)
+        } else {
+            start_x.saturating_sub(step)
+        };
+        rounded_cell(target, rect, x, start_y + step, 2, 2, 1, color);
+    }
 }
 
 fn cell(
@@ -380,6 +550,51 @@ fn cell(
         ),
         color,
     );
+}
+
+fn rounded_cell(
+    target: &mut dyn IconTarget,
+    rect: Rect,
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+    radius: u8,
+    color: Color,
+) {
+    let scaled = scaled_cell(rect, x, y, width, height);
+    let scale = rect.width.min(rect.height).max(1);
+    let scaled_radius = ((u32::from(radius) * scale + 23) / 24).clamp(1, u32::from(u8::MAX));
+    target.rounded_fill(scaled, scaled_radius as u8, color);
+}
+
+fn rounded_stroke_cell(
+    target: &mut dyn IconTarget,
+    rect: Rect,
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+    radius: u8,
+    color: Color,
+) {
+    let scaled = scaled_cell(rect, x, y, width, height);
+    let scale = rect.width.min(rect.height).max(1);
+    let scaled_radius = ((u32::from(radius) * scale + 23) / 24).clamp(1, u32::from(u8::MAX));
+    target.rounded_stroke(scaled, scaled_radius as u8, color);
+}
+
+fn scaled_cell(rect: Rect, x: u32, y: u32, width: u32, height: u32) -> Rect {
+    let left = rect.x + ((u64::from(x) * u64::from(rect.width)) / 24) as i32;
+    let top = rect.y + ((u64::from(y) * u64::from(rect.height)) / 24) as i32;
+    let right = rect.x + ((u64::from(x + width) * u64::from(rect.width) + 23) / 24) as i32;
+    let bottom = rect.y + ((u64::from(y + height) * u64::from(rect.height) + 23) / 24) as i32;
+    Rect::new(
+        left,
+        top,
+        (right - left).max(1) as u32,
+        (bottom - top).max(1) as u32,
+    )
 }
 
 fn stroke_cell(
@@ -455,11 +670,27 @@ mod tests {
             IconKind::Terminal,
             IconKind::Settings,
             IconKind::Trash,
+            IconKind::Home,
+            IconKind::Search,
+            IconKind::Menu,
+            IconKind::Grid,
+            IconKind::Power,
+            IconKind::Info,
+            IconKind::Success,
+            IconKind::Warning,
+            IconKind::Minimize,
+            IconKind::Maximize,
+            IconKind::Restore,
+            IconKind::Close,
+            IconKind::ChevronLeft,
+            IconKind::ChevronRight,
         ];
         for kind in icons {
-            let mut counter = Counter::default();
-            CLASSIC_ICON_PACK.draw(&mut counter, kind, Rect::new(0, 0, 48, 48));
-            assert!(counter.0 > 0, "empty icon {kind:?}");
+            for pack in [AURORA_ICON_PACK, CLASSIC_ICON_PACK] {
+                let mut counter = Counter::default();
+                pack.draw(&mut counter, kind, Rect::new(0, 0, 48, 48));
+                assert!(counter.0 > 0, "empty icon {kind:?}");
+            }
         }
     }
 }

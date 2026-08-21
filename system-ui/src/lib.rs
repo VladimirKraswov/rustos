@@ -27,7 +27,9 @@ mod tree;
 
 pub use collections::{VirtualList, VisibleRange};
 pub use controls::UiBuilder;
-pub use display_list::{DisplayCommand, DisplayList, FontSpec, RenderBackend, VisualPrimitive};
+pub use display_list::{
+    DisplayCommand, DisplayList, FontSpec, RenderBackend, TextAlign, VisualPrimitive,
+};
 pub use event::{
     route, DispatchResult, EventPhase, EventRoute, InputEvent, Key, KeyEvent, PointerEvent,
     PointerKind, RoutedEvent,
@@ -37,7 +39,7 @@ pub use layout::{Align, Edges, LayoutSpec, Length};
 pub use runtime::{FrameResult, PerformanceCounters, Runtime, RuntimeError};
 pub use rustos_video::{Color, Rect};
 pub use semantics::{SemanticAction, SemanticNode, SemanticRole, SemanticsTree};
-pub use style::{ComputedStyle, Palette, Theme, ThemeKind};
+pub use style::{style_class, ComputedStyle, Palette, Theme, ThemeKind};
 pub use tree::{
     CommandId, ComponentKind, Content, DirtyFlags, Node, NodeId, NodeSpec, NodeState, ResourceId,
     Tree, TreeError,
@@ -46,8 +48,9 @@ pub use tree::{
 /// Наиболее употребимые типы для приложения.
 pub mod prelude {
     pub use crate::{
-        Align, CommandId, ComponentKind, Content, Edges, InputEvent, Key, LayoutSpec, Length,
-        NodeId, NodeSpec, NodeState, ResourceId, Runtime, SemanticRole, Theme, UiBuilder,
+        style_class, Align, CommandId, ComponentKind, Content, Edges, InputEvent, Key, LayoutSpec,
+        Length, NodeId, NodeSpec, NodeState, ResourceId, Runtime, SemanticRole, TextAlign, Theme,
+        UiBuilder,
     };
 }
 
