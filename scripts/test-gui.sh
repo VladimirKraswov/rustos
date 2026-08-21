@@ -162,6 +162,8 @@ done
 grep -q '\[microkernel\] RING3_MILESTONE_OK' "$RUN_DIR/serial.log"
 grep -Eq '\[video\] scanout=virtio-gpu mode=1280x800 format=bgr888 present=immediate page-flip=no' \
     "$RUN_DIR/serial.log"
+grep -q '\[display-metrics\] logical=1280x800 physical=1280x800 device-scale-milli=1000 framebuffer=1280x800 compositor-scale-milli=1000' \
+    "$RUN_DIR/serial.log"
 grep -q '\[isolation\] user #UD contained; kernel and GUI continue' "$RUN_DIR/serial.log"
 grep -q '\[memory\] user address spaces reclaimed' "$RUN_DIR/serial.log"
 grep -Eq '\[smp\] discovery=ACPI MADT discovered=2 online=2 APs parked safely' "$RUN_DIR/serial.log"

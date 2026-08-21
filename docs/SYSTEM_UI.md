@@ -164,15 +164,23 @@ bindings `state -> property`. Dependency graph строится AOT, циклы 
 
 ## Layout
 
-Layout использует логические целочисленные пиксели и поддерживает Auto, Px,
+Layout использует логические целочисленные единицы и поддерживает Auto, Px,
 Percent (0..1000), weighted Fill, min/max, padding, gap, alignment, Row,
 Column, Stack, Grid, resize окна и container breakpoint. Breakpoint зависит от
 места внутри родителя, а не от глобальной ширины экрана.
 
-DPI и пользовательский scale находятся в `Theme::scale_milli`; применение ко
-всем метрикам станет отдельным проходом, чтобы физические пиксели не попадали
-в API приложения. Будущий measure cache получает ключ `(component,
-constraints, text/font version)`; независимые subtree смогут layout'иться на
+`WindowMetrics` разделяет logical size, physical raster surface и
+`device_scale_milli`. Например, поверхность 2048×1280 при scale 1600 даёт
+layout 1280×800; кнопка шириной 120 logical units растрируется сразу в 192
+physical pixels. Compositor получает эту поверхность в её настоящем размере и
+копирует `1:1`, поэтому готовый bitmap никогда не интерполируется.
+
+`Theme::scale_milli` имеет другое назначение: это выбранное пользователем
+accessibility-увеличение компонентов. Смешивать его с DPI нельзя, иначе смена
+монитора неожиданно изменит layout preference. Оба коэффициента представлены
+fixed-point значением с тремя десятичными знаками; kernel и `no_std` runtime не
+зависят от FPU. Будущий measure cache получает ключ `(component, constraints,
+text/font version, device scale)`; независимые subtree смогут layout'иться на
 worker над immutable snapshot.
 
 ## Render pipeline

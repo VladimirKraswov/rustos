@@ -55,7 +55,10 @@ pub struct Theme {
     pub kind: ThemeKind,
     /// Цвета.
     pub palette: Palette,
-    /// UI scale в тысячных.
+    /// Пользовательский accessibility scale в тысячных.
+    ///
+    /// Это увеличение самих компонентов, а не device scale монитора. Связь
+    /// logical/physical surface хранится отдельно в `WindowMetrics`.
     pub scale_milli: u16,
     /// Отключить/сократить движение.
     pub reduced_motion: bool,

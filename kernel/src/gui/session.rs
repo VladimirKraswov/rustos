@@ -41,7 +41,7 @@ use rustos_system_assets::{
     wallpaper, IconKind, IconPack, PackId, PackRegistry, ResourcePack, WallpaperId,
     AURORA_ICON_PACK, CLASSIC_ICON_PACK, MIDNIGHT_ICON_PACK, MONO_ICON_PACK,
 };
-use rustos_system_ui::{FrameResult, Key as UiKey, PointerKind as UiPointerKind};
+use rustos_system_ui::{FrameResult, Key as UiKey, PointerKind as UiPointerKind, WindowMetrics};
 use rustos_video::{
     hit_test_resize, resize_from_edges, ColorMode, DamageRegion, DisplayDriver, DisplayMode,
     ManagedWindow, ModeSetError, PixelFormat, ResizeEdges, Scanout, WindowEventQueue,
@@ -117,6 +117,7 @@ pub fn run(info: &BootInfo) -> ! {
         info.total_usable_ram() / (1024 * 1024),
         info.initramfs,
     );
+    session.log_display_metrics();
     let _ = session.spawn_application(ApplicationKind::Terminal);
     serial::put_str("[ui] window server ready capacity=");
     serial::put_u32(MAX_WINDOWS as u32);
@@ -354,6 +355,12 @@ struct DesktopSession {
     desktop_terminal_y: i32,
     desktop_trash_x: i32,
     desktop_trash_y: i32,
+    /// Геометрия layout и raster surface разделена даже в текущем режиме 1:1.
+    /// Это не даёт compositor'у незаметно растягивать уже готовый bitmap и
+    /// оставляет прямой путь к fractional HiDPI rasterization.
+    display_metrics: WindowMetrics,
+    /// Пользовательское увеличение элементов интерфейса. Это accessibility
+    /// scale, а не device scale монитора.
     ui_scale_milli: u16,
     click_tracker: ClickTracker,
 }
@@ -362,6 +369,7 @@ impl DesktopSession {
     fn new(framebuffer: Framebuffer, usable_ram_mib: u64, initramfs: BootInitramfs) -> Self {
         let screen_width = framebuffer.width();
         let screen_height = framebuffer.height();
+        let display_metrics = WindowMetrics::one_to_one(screen_width, screen_height);
         let mut icon_packs = PackRegistry::new();
         let _ = icon_packs.install(AURORA_ICON_PACK);
         let _ = icon_packs.install(CLASSIC_ICON_PACK);
@@ -414,9 +422,30 @@ impl DesktopSession {
             desktop_terminal_y: 35,
             desktop_trash_x: 28,
             desktop_trash_y: 138,
+            display_metrics,
             ui_scale_milli: 1_000,
             click_tracker: ClickTracker::new(),
         }
+    }
+
+    fn log_display_metrics(&self) {
+        serial::put_str("[display-metrics] logical=");
+        serial::put_u32(self.display_metrics.logical_width());
+        serial::put_str("x");
+        serial::put_u32(self.display_metrics.logical_height());
+        serial::put_str(" physical=");
+        serial::put_u32(self.display_metrics.physical_width());
+        serial::put_str("x");
+        serial::put_u32(self.display_metrics.physical_height());
+        serial::put_str(" device-scale-milli=");
+        serial::put_u32(u32::from(self.display_metrics.device_scale_milli()));
+        serial::put_str(" framebuffer=");
+        serial::put_u32(self.framebuffer.width());
+        serial::put_str("x");
+        serial::put_u32(self.framebuffer.height());
+        serial::put_str(" compositor-scale-milli=");
+        serial::put_u32(u32::from(self.display_metrics.compositor_scale_milli()));
+        serial::put_str("\n");
     }
 
     fn event_loop(&mut self) -> ! {
@@ -866,6 +895,7 @@ impl DesktopSession {
                 let connector = self.framebuffer.connector();
                 let driver = self.framebuffer.driver_name();
                 let color = self.framebuffer.color_mode();
+                let metrics = self.display_metrics;
                 serial::put_str("[display] info driver=");
                 serial::put_str(driver);
                 serial::put_str(" mode=");
@@ -881,6 +911,10 @@ impl DesktopSession {
                         connector.width_mm,
                         connector.height_mm,
                         color,
+                        metrics.logical_width(),
+                        metrics.logical_height(),
+                        metrics.device_scale_milli(),
+                        metrics.compositor_scale_milli(),
                     );
                 }
                 Redraw::Scene
@@ -1844,6 +1878,10 @@ impl DesktopSession {
     fn relayout_after_mode_set(&mut self) {
         let screen_width = self.framebuffer.width();
         let screen_height = self.framebuffer.height();
+        // До включения отдельного HiDPI raster surface любой mode-set остаётся
+        // честным 1:1: layout и framebuffer одного размера, bitmap не тянется.
+        self.display_metrics = WindowMetrics::one_to_one(screen_width, screen_height);
+        self.log_display_metrics();
         self.cursor.invalidate();
         self.mouse_x = self.mouse_x.clamp(0, screen_width.saturating_sub(1) as i32);
         self.mouse_y = self

@@ -21,6 +21,13 @@ firmware linear framebuffer. В этом режиме смена разреше�
 возвращает `RequiresReboot`: уже переданный firmware framebuffer не
 имеет runtime mode-set API.
 
+Host display frontend не является частью scanout contract. `scripts/run.sh`
+по умолчанию отключает QEMU `zoom-to-fit`, поэтому один уже отрисованный guest
+pixel не масштабируется compositor'ом VM с дробным коэффициентом. Опция
+`RUSTOS_FIT_TO_WINDOW=1` предназначена только для явно выбранного preview.
+Настоящий HiDPI выполняется до rasterization через `WindowMetrics`; scanout и
+compositor по-прежнему получают physical surface и публикуют её `1:1`.
+
 ## Virtio-gpu 2D
 
 Драйвер разделён на независимые уровни:

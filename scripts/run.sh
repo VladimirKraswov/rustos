@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Интерактивный графический запуск RustOS. Serial остаётся в терминале,
-# framebuffer показывается отдельным масштабируемым окном QEMU. virtio-vga
-# публикует современный wide EDID; GRUB выбирает его preferred mode.
+# framebuffer показывается отдельным окном QEMU без масштабирования готового
+# bitmap. virtio-vga публикует современный wide EDID; GRUB выбирает его mode.
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
@@ -12,22 +12,33 @@ cp -f build/ovmf/OVMF_VARS.fd build/ovmf/OVMF_VARS_RUNTIME.fd
 
 ACCEL=tcg
 [[ -w /dev/kvm ]] && ACCEL=kvm
-DISPLAY_ARGS=(-display gtk,zoom-to-fit=on)
+FIT_TO_WINDOW="${RUSTOS_FIT_TO_WINDOW:-0}"
+FULLSCREEN="${RUSTOS_FULLSCREEN:-0}"
+[[ "$FIT_TO_WINDOW" =~ ^[01]$ && "$FULLSCREEN" =~ ^[01]$ ]] || {
+    echo "RUSTOS_FIT_TO_WINDOW и RUSTOS_FULLSCREEN должны быть 0 или 1" >&2
+    exit 2
+}
+
+# 1:1 является безопасным режимом по умолчанию: QEMU меняет размер host window
+# под гостевой framebuffer и не интерполирует уже отрисованные glyph/границы.
+# Fit-to-window оставлен явной диагностической опцией, когда резкость не важна.
+ZOOM_TO_FIT=off
+[[ "$FIT_TO_WINDOW" == "1" ]] && ZOOM_TO_FIT=on
+DISPLAY_ARGS=(-display "gtk,zoom-to-fit=$ZOOM_TO_FIT")
 if [[ "$(uname -s)" == "Darwin" ]]; then
-    DISPLAY_ARGS=(-display cocoa,zoom-to-fit=on,show-cursor=on)
-    # На Retina-экранах обычное окно QEMU получается слишком мелким. По
-    # умолчанию открываем VM во весь экран; RUSTOS_FULLSCREEN=0 это отключает.
-    if [[ "${RUSTOS_FULLSCREEN:-1}" != "0" ]]; then
-        DISPLAY_ARGS=(-display cocoa,zoom-to-fit=on,show-cursor=on,full-screen=on)
-    fi
+    COCOA_OPTIONS="cocoa,zoom-to-fit=$ZOOM_TO_FIT,show-cursor=on"
+    [[ "$FULLSCREEN" == "1" ]] && COCOA_OPTIONS+=",full-screen=on"
+    DISPLAY_ARGS=(-display "$COCOA_OPTIONS")
 fi
-WIDTH="${RUSTOS_DISPLAY_WIDTH:-1600}"
-HEIGHT="${RUSTOS_DISPLAY_HEIGHT:-900}"
+WIDTH="${RUSTOS_DISPLAY_WIDTH:-1280}"
+HEIGHT="${RUSTOS_DISPLAY_HEIGHT:-800}"
 [[ "$WIDTH" =~ ^[1-9][0-9]*$ && "$HEIGHT" =~ ^[1-9][0-9]*$ ]] || {
     echo "RUSTOS_DISPLAY_WIDTH/HEIGHT должны быть положительными числами" >&2
     exit 2
 }
-echo "[run] qemu accel=$ACCEL, GRUB/Multiboot2, EDID request=${WIDTH}x${HEIGHT}, serial=console"
+MAPPING="1:1"
+[[ "$FIT_TO_WINDOW" == "1" ]] && MAPPING="fit-to-window (bitmap scaling)"
+echo "[run] qemu accel=$ACCEL, EDID=${WIDTH}x${HEIGHT}, output=$MAPPING, fullscreen=$FULLSCREEN, serial=console"
 
 exec qemu-system-x86_64 \
     -machine q35 -cpu max -smp 2 -m 512 \

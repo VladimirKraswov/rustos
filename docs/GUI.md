@@ -30,6 +30,36 @@ layout/event/display-list pipeline и UI Gallery описаны в
 Для monitor меньше лимита сохраняется его preferred mode; после загрузки любой
 поддержанный режим по-прежнему выбирается командой `DISPLAY MODE WxH`.
 
+## Pixel mapping и HiDPI
+
+Интерактивный `make run` теперь запрашивает 1280×800 и открывает QEMU с
+`zoom-to-fit=off`, без fullscreen. Host window подстраивается под framebuffer,
+а не растягивает его до произвольного размера: это режим отладки `1:1`, в
+котором шрифт, линия и checkbox не проходят вторую интерполяцию. Старое
+поведение можно включить явно, когда важнее заполнить окно, чем получить
+эталонную резкость:
+
+```sh
+RUSTOS_FIT_TO_WINDOW=1 RUSTOS_FULLSCREEN=1 make run
+```
+
+EDID-размер задаётся независимо:
+
+```sh
+RUSTOS_DISPLAY_WIDTH=1920 RUSTOS_DISPLAY_HEIGHT=1080 make run
+```
+
+На уровне UI уже действует отдельный `WindowMetrics`: logical size, physical
+raster surface и `device_scale_milli`. Значение хранится как fixed-point
+(`1600` = `1.600`), а compositor scale остаётся `1.000`. Сейчас bootstrap
+desktop честно работает в 1:1; fractional constructor и conversions покрыты
+host-тестами и являются границей следующего этапа — применения scale ко всем
+display primitives и glyph rasterization, а не растяжения готового кадра.
+
+Команда `DISPLAY` выводит диагностику `LOGICAL RESOLUTION`, `PHYSICAL SURFACE`,
+`DEVICE SCALE`, `FRAMEBUFFER` и `COMPOSITOR SCALE`. Те же значения доступны в
+serial marker `[display-metrics]`, который проверяет GUI regression test.
+
 Подробный контракт scanout/surfaces/compositor и путь к software OpenGL описан
 в [VIDEO.md](VIDEO.md). Команды, события, style-флаги и state machine окон
 описаны отдельно в [WINDOWS.md](WINDOWS.md), а семейства, размеры и

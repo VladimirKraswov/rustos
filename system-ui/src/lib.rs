@@ -20,6 +20,7 @@ mod display_list;
 mod event;
 mod ir;
 mod layout;
+mod metrics;
 mod runtime;
 mod semantics;
 mod style;
@@ -37,6 +38,7 @@ pub use event::{
 };
 pub use ir::{load_ir, validate_ir, IrError, UiIrHeader, UiIrNode, UI_IR_MAGIC};
 pub use layout::{Align, Edges, LayoutSpec, Length};
+pub use metrics::{WindowMetrics, SCALE_MILLI_ONE};
 pub use runtime::{FrameResult, PerformanceCounters, Runtime, RuntimeError};
 pub use rustos_video::{Color, Rect};
 pub use semantics::{SemanticAction, SemanticNode, SemanticRole, SemanticsTree};
@@ -52,7 +54,7 @@ pub mod prelude {
     pub use crate::{
         style_class, Align, CommandId, ComponentKind, Content, Edges, InputEvent, Key, LayoutSpec,
         Length, NodeId, NodeSpec, NodeState, ResourceId, Runtime, SemanticRole, TextAlign, Theme,
-        UiBuilder,
+        UiBuilder, WindowMetrics,
     };
 }
 

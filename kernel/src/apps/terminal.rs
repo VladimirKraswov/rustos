@@ -766,19 +766,35 @@ impl Terminal {
     pub fn report_display_info(
         &mut self,
         driver: &str,
-        width: u32,
-        height: u32,
+        physical_width: u32,
+        physical_height: u32,
         width_mm: u16,
         height_mm: u16,
         color: ColorMode,
+        logical_width: u32,
+        logical_height: u32,
+        device_scale_milli: u16,
+        compositor_scale_milli: u16,
     ) {
         self.print("DISPLAY DRIVER: ", GREEN);
         self.print(driver, WHITE);
-        self.print("\nPHYSICAL MODE: ", GREEN);
-        self.print_number(u64::from(width));
+        self.print("\nLOGICAL RESOLUTION: ", GREEN);
+        self.print_number(u64::from(logical_width));
         self.print("x", WHITE);
-        self.print_number(u64::from(height));
-        self.print("x32 (24 COLOR BITS)\nRENDER COLOR: ", WHITE);
+        self.print_number(u64::from(logical_height));
+        self.print("\nPHYSICAL SURFACE: ", GREEN);
+        self.print_number(u64::from(physical_width));
+        self.print("x", WHITE);
+        self.print_number(u64::from(physical_height));
+        self.print("x32 (24 COLOR BITS)\nDEVICE SCALE: ", WHITE);
+        self.print_scale_milli(device_scale_milli);
+        self.print("\nFRAMEBUFFER: ", GREEN);
+        self.print_number(u64::from(physical_width));
+        self.print("x", WHITE);
+        self.print_number(u64::from(physical_height));
+        self.print("\nCOMPOSITOR SCALE: ", GREEN);
+        self.print_scale_milli(compositor_scale_milli);
+        self.print("\nRENDER COLOR: ", GREEN);
         self.print_color_mode(color);
         if width_mm != 0 && height_mm != 0 {
             self.print("\nMONITOR SIZE: ", GREEN);
@@ -1307,6 +1323,16 @@ impl Terminal {
             count -= 1;
             self.put(char::from(digits[count]), GREEN);
         }
+    }
+
+    /// Печатает fixed-point scale как привычное значение с тремя знаками.
+    fn print_scale_milli(&mut self, scale_milli: u16) {
+        self.print_number(u64::from(scale_milli / 1_000));
+        self.put('.', WHITE);
+        let fraction = scale_milli % 1_000;
+        self.put(char::from(b'0' + (fraction / 100) as u8), GREEN);
+        self.put(char::from(b'0' + ((fraction / 10) % 10) as u8), GREEN);
+        self.put(char::from(b'0' + (fraction % 10) as u8), GREEN);
     }
 
     fn print(&mut self, text: &str, color: Color) {
