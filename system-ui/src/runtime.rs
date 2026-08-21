@@ -4,7 +4,8 @@ use rustos_video::{DamageRegion, Rect};
 
 use crate::{
     display_list::RenderBackend, event, Content, DirtyFlags, DispatchResult, DisplayList,
-    InputEvent, NodeId, NodeState, SemanticsTree, Theme, Tree, TreeError, UiBuilder,
+    InputEvent, ListViewState, NodeId, NodeState, PointerKind, ScrollAxis, ScrollConfig,
+    SelectionMode, SemanticsTree, Theme, Tree, TreeError, UiBuilder,
 };
 
 /// Диагностические счётчики, доступные inspector'у без включения логирования
@@ -25,6 +26,10 @@ pub struct PerformanceCounters {
     pub nodes: u32,
     /// Последнее число display commands.
     pub display_commands: u32,
+    /// Нормализованные wheel/trackpad events, реально изменившие runtime.
+    pub scroll_events: u64,
+    /// Logical items во всех ListView текущего viewport с overscan.
+    pub visible_items: u32,
 }
 
 /// Damage и counters одного кадра. Rectangle-ы копируются до очистки
@@ -182,6 +187,100 @@ impl<const N: usize, const C: usize, const D: usize> Runtime<N, C, D> {
         Ok(())
     }
 
+    /// Настраивает scroll policy публичного ScrollView/ListView.
+    pub fn set_scroll_config(
+        &mut self,
+        id: NodeId,
+        config: ScrollConfig,
+    ) -> Result<(), RuntimeError> {
+        let rect = self.tree.set_scroll_config(id, config)?;
+        self.damage.add(rect);
+        self.display_valid = false;
+        Ok(())
+    }
+
+    /// Связывает ListView с logical collection source. Число живых nodes от
+    /// `item_count` не зависит.
+    pub fn configure_list_view(
+        &mut self,
+        id: NodeId,
+        item_count: u32,
+        item_extent: u32,
+        selection: SelectionMode,
+    ) -> Result<(), RuntimeError> {
+        let rect = self
+            .tree
+            .configure_list_view(id, item_count, item_extent, selection)?;
+        self.damage.add(rect);
+        self.display_valid = false;
+        Ok(())
+    }
+
+    /// Связывает самостоятельный ScrollBar с существующим ScrollModel.
+    pub fn bind_scroll_bar(
+        &mut self,
+        bar: NodeId,
+        target: NodeId,
+        axis: ScrollAxis,
+    ) -> Result<(), RuntimeError> {
+        let rect = self.tree.bind_scroll_bar(bar, target, axis)?;
+        self.damage.add(rect);
+        self.display_valid = false;
+        Ok(())
+    }
+
+    /// Snapshot logical ListView state для delegate/data binding.
+    pub fn list_view_state(&self, id: NodeId) -> Option<&ListViewState> {
+        self.tree
+            .get(id)
+            .and_then(|node| (node.kind == crate::ComponentKind::ListView).then_some(&node.list))
+    }
+
+    /// Программная мгновенная прокрутка.
+    pub fn scroll_to(
+        &mut self,
+        id: NodeId,
+        axis: ScrollAxis,
+        offset: u64,
+    ) -> Result<bool, RuntimeError> {
+        let node = self
+            .tree
+            .get_mut_internal(id)
+            .ok_or(RuntimeError::Tree(TreeError::InvalidNode))?;
+        let changed = node.scroll.model_mut(axis).scroll_to(offset);
+        let rect = node.rect;
+        if changed {
+            node.dirty.insert(DirtyFlags::LAYOUT);
+            node.dirty.insert(DirtyFlags::PAINT);
+            self.damage.add(rect);
+            self.display_valid = false;
+        }
+        Ok(changed)
+    }
+
+    /// Минимально сдвигает viewport так, чтобы диапазон content был виден.
+    pub fn ensure_visible(
+        &mut self,
+        id: NodeId,
+        axis: ScrollAxis,
+        start: u64,
+        end: u64,
+    ) -> Result<bool, RuntimeError> {
+        let node = self
+            .tree
+            .get_mut_internal(id)
+            .ok_or(RuntimeError::Tree(TreeError::InvalidNode))?;
+        let changed = node.scroll.model_mut(axis).ensure_visible(start, end);
+        let rect = node.rect;
+        if changed {
+            node.dirty.insert(DirtyFlags::LAYOUT);
+            node.dirty.insert(DirtyFlags::PAINT);
+            self.damage.add(rect);
+            self.display_valid = false;
+        }
+        Ok(changed)
+    }
+
     /// Повреждает bounds узла, содержимое внешнего ресурса которого изменилось
     /// без смены `ResourceId`. Это штатный путь для terminal lines, часов и
     /// других динамических provider'ов: display list остаётся пригодным, layout
@@ -202,7 +301,50 @@ impl<const N: usize, const C: usize, const D: usize> Runtime<N, C, D> {
     /// попадёт тому же component даже после выхода указателя за его bounds.
     pub fn dispatch(&mut self, input: InputEvent) -> DispatchResult {
         let (tree, state, damage) = (&mut self.tree, &mut self.input, &mut self.damage);
-        event::dispatch(tree, state, input, |rect| damage.add(rect))
+        let result = event::dispatch(tree, state, input, |rect| damage.add(rect));
+        if matches!(input, InputEvent::Pointer(pointer) if pointer.kind == PointerKind::Scroll)
+            && result.changed
+        {
+            self.counters.scroll_events = self.counters.scroll_events.saturating_add(1);
+        }
+        if result.changed {
+            self.display_valid = false;
+        }
+        result
+    }
+
+    /// Один шаг smooth scrolling. Frame scheduler вызывает метод не чаще
+    /// одного раза на frame; reduced-motion завершает переход сразу.
+    pub fn advance_scroll_frame(&mut self) -> bool {
+        let response = if self.theme.reduced_motion {
+            1_000
+        } else {
+            280
+        };
+        let mut ids = [NodeId::NONE; N];
+        let mut len = 0usize;
+        for id in self.tree.ids() {
+            ids[len] = id;
+            len += 1;
+        }
+        let mut changed = false;
+        for id in ids.into_iter().take(len) {
+            let Some(node) = self.tree.get_mut_internal(id) else {
+                continue;
+            };
+            let node_changed = node.scroll.horizontal.advance_frame(response)
+                | node.scroll.vertical.advance_frame(response);
+            if node_changed {
+                node.dirty.insert(DirtyFlags::LAYOUT);
+                node.dirty.insert(DirtyFlags::PAINT);
+                self.damage.add(node.rect);
+                changed = true;
+            }
+        }
+        if changed {
+            self.display_valid = false;
+        }
+        changed
     }
 
     /// Выполняет только необходимые стадии и raster только внутри damage.
@@ -248,6 +390,16 @@ impl<const N: usize, const C: usize, const D: usize> Runtime<N, C, D> {
         self.counters.rasterized_pixels = self.counters.rasterized_pixels.saturating_add(pixels);
         self.counters.nodes = self.tree.len() as u32;
         self.counters.display_commands = self.display_list.len() as u32;
+        self.counters.visible_items = self
+            .tree
+            .ids()
+            .filter_map(|id| {
+                let node = self.tree.get(id)?;
+                node.list
+                    .is_configured()
+                    .then_some(node.list.visible_range(node.scroll.vertical).len())
+            })
+            .fold(0u32, u32::saturating_add);
         Ok(frame)
     }
 }
@@ -286,9 +438,11 @@ mod tests {
         let button = {
             let root = runtime.tree().root();
             let mut builder = runtime.builder();
-            let mut layout = LayoutSpec::default();
-            layout.width = Length::Px(120);
-            layout.height = Length::Px(40);
+            let layout = LayoutSpec {
+                width: Length::Px(120),
+                height: Length::Px(40),
+                ..LayoutSpec::default()
+            };
             builder
                 .button(root, ResourceId(1), CommandId(7), layout)
                 .unwrap()
@@ -310,9 +464,11 @@ mod tests {
         let text = {
             let root = runtime.tree().root();
             let mut builder = runtime.builder();
-            let mut layout = LayoutSpec::default();
-            layout.width = Length::Px(320);
-            layout.height = Length::Px(24);
+            let layout = LayoutSpec {
+                width: Length::Px(320),
+                height: Length::Px(24),
+                ..LayoutSpec::default()
+            };
             builder.text(root, ResourceId(7), layout).unwrap()
         };
         let mut backend = Headless::default();
@@ -512,5 +668,216 @@ mod tests {
         assert!(
             runtime.tree().get(right).unwrap().rect.y > runtime.tree().get(left).unwrap().rect.y
         );
+    }
+
+    #[test]
+    fn wheel_chains_only_unused_delta_to_parent_scroll_view() {
+        let mut runtime = Runtime::<12, 96, 12>::new(Rect::new(0, 0, 300, 300), Theme::light());
+        let (outer, inner) = {
+            let root = runtime.tree().root();
+            let mut ui = runtime.builder();
+            let outer = ui
+                .scroll_view(root, ScrollConfig::VERTICAL, LayoutSpec::fill())
+                .unwrap();
+            let inner_layout = LayoutSpec {
+                width: Length::Fill(1),
+                height: Length::Px(100),
+                ..LayoutSpec::default()
+            };
+            let inner = ui
+                .scroll_view(outer, ScrollConfig::VERTICAL, inner_layout)
+                .unwrap();
+            let mut tall = NodeSpec::new(ComponentKind::Panel);
+            tall.layout.width = Length::Fill(1);
+            tall.layout.height = Length::Px(300);
+            ui.component(inner, tall).unwrap();
+            let mut tail = NodeSpec::new(ComponentKind::Panel);
+            tail.layout.width = Length::Fill(1);
+            tail.layout.height = Length::Px(400);
+            ui.component(outer, tail).unwrap();
+            (outer, inner)
+        };
+        runtime.render(&mut Headless::default()).unwrap();
+        let inner_rect = runtime.tree().get(inner).unwrap().rect;
+        let mut wheel = PointerEvent::at(PointerKind::Scroll, inner_rect.x + 10, inner_rect.y + 10);
+        wheel.scroll_y = 250;
+        let result = runtime.dispatch(InputEvent::Pointer(wheel));
+        assert!(result.changed && result.consumed);
+        assert_eq!(
+            runtime.tree().get(inner).unwrap().scroll.vertical.offset(),
+            200
+        );
+        assert_eq!(
+            runtime.tree().get(outer).unwrap().scroll.vertical.offset(),
+            50
+        );
+        assert_eq!(runtime.counters().scroll_events, 1);
+    }
+
+    #[test]
+    fn horizontal_scroll_view_consumes_trackpad_delta_without_focus() {
+        let mut runtime = Runtime::<6, 48, 8>::new(Rect::new(0, 0, 240, 120), Theme::light());
+        let scroll = {
+            let root = runtime.tree().root();
+            let mut ui = runtime.builder();
+            let scroll = ui
+                .scroll_view(root, ScrollConfig::BOTH, LayoutSpec::fill())
+                .unwrap();
+            let mut content = NodeSpec::new(ComponentKind::Panel);
+            content.layout.width = Length::Px(600);
+            content.layout.height = Length::Px(80);
+            ui.component(scroll, content).unwrap();
+            scroll
+        };
+        runtime.render(&mut Headless::default()).unwrap();
+        let mut wheel = PointerEvent::at(PointerKind::Scroll, 20, 20);
+        wheel.scroll_x = 90;
+        let result = runtime.dispatch(InputEvent::Pointer(wheel));
+        assert!(result.changed);
+        assert_eq!(
+            runtime
+                .tree()
+                .get(scroll)
+                .unwrap()
+                .scroll
+                .horizontal
+                .offset(),
+            90
+        );
+    }
+
+    #[test]
+    fn list_keyboard_navigation_selects_and_ensures_visible() {
+        let mut runtime = Runtime::<6, 48, 8>::new(Rect::new(0, 0, 260, 160), Theme::light());
+        let list = {
+            let root = runtime.tree().root();
+            runtime
+                .builder()
+                .list_view(root, LayoutSpec::fill())
+                .unwrap()
+        };
+        runtime
+            .configure_list_view(list, 50_000, 24, SelectionMode::Extended)
+            .unwrap();
+        runtime.render(&mut Headless::default()).unwrap();
+        runtime.dispatch(InputEvent::Pointer(PointerEvent::at(
+            PointerKind::Down,
+            10,
+            10,
+        )));
+        let result = runtime.dispatch(InputEvent::Key(crate::KeyEvent {
+            key: crate::Key::End,
+            pressed: true,
+            modifiers: 0,
+            shift: false,
+        }));
+        assert!(result.changed && result.consumed);
+        let state = runtime.list_view_state(list).unwrap();
+        assert_eq!(state.selection().current(), Some(49_999));
+        assert_eq!(
+            runtime.tree().get(list).unwrap().scroll.vertical.offset(),
+            runtime.tree().get(list).unwrap().scroll.vertical.maximum()
+        );
+        assert!(
+            state
+                .visible_range(runtime.tree().get(list).unwrap().scroll.vertical)
+                .len()
+                < 20
+        );
+    }
+
+    #[test]
+    fn focus_ring_is_visible_for_keyboard_but_not_pointer_focus() {
+        let mut runtime = Runtime::<4, 32, 8>::new(Rect::new(0, 0, 160, 80), Theme::light());
+        let button = {
+            let root = runtime.tree().root();
+            runtime
+                .builder()
+                .button(root, ResourceId(1), CommandId(1), LayoutSpec::fill())
+                .unwrap()
+        };
+        runtime.render(&mut Headless::default()).unwrap();
+        runtime.dispatch(InputEvent::Pointer(PointerEvent::at(
+            PointerKind::Down,
+            10,
+            10,
+        )));
+        assert!(runtime
+            .tree()
+            .get(button)
+            .unwrap()
+            .state
+            .contains(NodeState::FOCUSED));
+        assert!(!runtime
+            .tree()
+            .get(button)
+            .unwrap()
+            .state
+            .contains(NodeState::FOCUS_VISIBLE));
+        runtime.dispatch(InputEvent::Key(crate::KeyEvent {
+            key: crate::Key::Tab,
+            pressed: true,
+            modifiers: 0,
+            shift: false,
+        }));
+        assert!(runtime
+            .tree()
+            .get(button)
+            .unwrap()
+            .state
+            .contains(NodeState::FOCUS_VISIBLE));
+    }
+
+    #[test]
+    fn standalone_scrollbar_drags_the_bound_scroll_model() {
+        let mut runtime = Runtime::<8, 64, 8>::new(Rect::new(0, 0, 240, 180), Theme::light());
+        let (scroll, bar) = {
+            let root = runtime.tree().root();
+            let mut ui = runtime.builder();
+            let scroll = ui
+                .scroll_view(root, ScrollConfig::VERTICAL, LayoutSpec::fill())
+                .unwrap();
+            let mut content = NodeSpec::new(ComponentKind::Panel);
+            content.layout.height = Length::Px(720);
+            ui.component(scroll, content).unwrap();
+            let bar_layout = LayoutSpec {
+                width: Length::Px(14),
+                height: Length::Fill(1),
+                align: crate::Align::End,
+                ..LayoutSpec::default()
+            };
+            let bar = ui.scroll_bar(root, bar_layout).unwrap();
+            (scroll, bar)
+        };
+        runtime
+            .bind_scroll_bar(bar, scroll, ScrollAxis::Vertical)
+            .unwrap();
+        runtime.render(&mut Headless::default()).unwrap();
+        let bar_rect = runtime.tree().get(bar).unwrap().rect;
+        let model = runtime.tree().get(scroll).unwrap().scroll.vertical;
+        let geometry = crate::ScrollbarGeometry::with_visibility(
+            bar_rect,
+            model,
+            ScrollAxis::Vertical,
+            bar_rect.width,
+            24,
+            true,
+        );
+        runtime.dispatch(InputEvent::Pointer(PointerEvent::at(
+            PointerKind::Down,
+            geometry.thumb.x + 2,
+            geometry.thumb.y + 2,
+        )));
+        runtime.dispatch(InputEvent::Pointer(PointerEvent::at(
+            PointerKind::Move,
+            geometry.thumb.x + 2,
+            geometry.thumb.y + 60,
+        )));
+        runtime.dispatch(InputEvent::Pointer(PointerEvent::at(
+            PointerKind::Up,
+            geometry.thumb.x + 2,
+            geometry.thumb.y + 60,
+        )));
+        assert!(runtime.tree().get(scroll).unwrap().scroll.vertical.offset() > 0);
     }
 }

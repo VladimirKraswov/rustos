@@ -2,7 +2,7 @@
 //!
 //! `TextInputBuffer<N>` — renderer-neutral модель однострочного поля: валидный
 //! UTF-8 текст длиной не более `N` байт и курсор как byte offset на границе
-//! code point. Модель не использует heap, `alloc`, `unsafe` и зависимости:
+//! extended grapheme cluster. Модель не использует heap, `alloc` и `unsafe`:
 //! вместимость задаёт владелец через const generic, а каждая мутация сначала
 //! проверяет лимит и не публикует частичное состояние при ошибке.
 //!
@@ -11,19 +11,21 @@
 //! clipboard, IME, shaping, undo и event handling — это забота контролов и
 //! event routing.
 
+use unicode_segmentation::UnicodeSegmentation;
+
 /// Ошибки текстового буфера.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TextInputError {
     /// Вставка превышает лимит `N` байтов.
     Capacity,
-    /// Позиция не находится на границе code point.
+    /// Позиция не находится на границе grapheme cluster.
     InvalidPosition,
 }
 
 /// Однострочный буфер фиксированной ёмкости `N` байт UTF-8.
 ///
 /// Invariant: `bytes[..len]` всегда валидный UTF-8, а `cursor` — byte offset
-/// на границе code point в диапазоне `0..=len`. Все мутаторы сохраняют
+/// на границе extended grapheme cluster в `0..=len`. Все мутаторы сохраняют
 /// invariant; при ошибке ни `bytes`, ни `cursor` не меняются.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TextInputBuffer<const N: usize> {
@@ -71,23 +73,27 @@ impl<const N: usize> TextInputBuffer<N> {
         self.len == 0
     }
 
-    /// Позиция курсора как byte offset на границе code point.
+    /// Позиция курсора как byte offset на границе grapheme cluster.
     pub const fn cursor(&self) -> usize {
         self.cursor
     }
 
     /// Атомарно перемещает курсор на `offset` байт.
     ///
-    /// Принимает только `0..=len` на границе UTF-8 code point. Позиция за
-    /// концом текста или внутри code point (на continuation byte) отклоняется
+    /// Принимает только `0..=len` на границе extended grapheme cluster.
+    /// Позиция за концом текста, внутри code point или между code points одной
+    /// видимой grapheme отклоняется
     /// с `InvalidPosition`, не меняя ни `bytes`, ни `cursor`.
     pub fn set_cursor(&mut self, offset: usize) -> Result<(), TextInputError> {
         if offset > self.len {
             return Err(TextInputError::InvalidPosition);
         }
-        // 0 и len — всегда границы. Для внутренней позиции байт по `offset`
-        // обязан быть стартовым, а не continuation byte.
-        if (0..self.len).contains(&offset) && (self.bytes[offset] & 0xC0) == 0x80 {
+        let is_grapheme_boundary = offset == self.len
+            || self
+                .as_str()
+                .grapheme_indices(true)
+                .any(|(boundary, _)| boundary == offset);
+        if !is_grapheme_boundary {
             return Err(TextInputError::InvalidPosition);
         }
         self.cursor = offset;
@@ -132,60 +138,55 @@ impl<const N: usize> TextInputBuffer<N> {
         self.insert_str(ch.encode_utf8(&mut buf))
     }
 
-    /// Удаляет code point перед курсором. На позиции 0 — no-op.
+    /// Удаляет видимую grapheme перед курсором. На позиции 0 — no-op.
     pub fn backspace(&mut self) {
         if self.cursor == 0 {
             return;
         }
-        // Идём назад до стартового байта code point, заканчивающегося на
-        // курсоре. Валидный UTF-8 гарантирует, что такой байт найдётся.
-        let mut start = self.cursor;
-        loop {
-            start -= 1;
-            if (self.bytes[start] & 0xC0) != 0x80 {
-                break;
-            }
-        }
-        // Удаляем code point [start, cursor) и сдвигаем хвост влево.
+        let start = self.as_str()[..self.cursor]
+            .grapheme_indices(true)
+            .next_back()
+            .map_or(0, |(boundary, _)| boundary);
         self.bytes.copy_within(self.cursor..self.len, start);
         self.len -= self.cursor - start;
         self.cursor = start;
     }
 
-    /// Удаляет code point после курсора. В конце текста — no-op.
+    /// Удаляет видимую grapheme после курсора. В конце — no-op.
     pub fn delete_forward(&mut self) {
         if self.cursor >= self.len {
             return;
         }
-        // Определяем ширину code point, начинающегося на курсоре.
-        let width = utf8_char_width(self.bytes[self.cursor]);
+        let width = self.as_str()[self.cursor..]
+            .graphemes(true)
+            .next()
+            .map_or(0, str::len);
         let end = self.cursor + width;
         // Удаляем code point [cursor, end) и сдвигаем хвост влево.
         self.bytes.copy_within(end..self.len, self.cursor);
         self.len -= width;
     }
 
-    /// Сдвигает курсор на один code point влево. На позиции 0 — no-op.
+    /// Сдвигает курсор на одну видимую grapheme влево.
     pub fn move_left(&mut self) {
         if self.cursor == 0 {
             return;
         }
-        let mut pos = self.cursor;
-        loop {
-            pos -= 1;
-            if (self.bytes[pos] & 0xC0) != 0x80 {
-                self.cursor = pos;
-                return;
-            }
-        }
+        self.cursor = self.as_str()[..self.cursor]
+            .grapheme_indices(true)
+            .next_back()
+            .map_or(0, |(boundary, _)| boundary);
     }
 
-    /// Сдвигает курсор на один code point вправо. В конце текста — no-op.
+    /// Сдвигает курсор на одну видимую grapheme вправо.
     pub fn move_right(&mut self) {
         if self.cursor >= self.len {
             return;
         }
-        let width = utf8_char_width(self.bytes[self.cursor]);
+        let width = self.as_str()[self.cursor..]
+            .graphemes(true)
+            .next()
+            .map_or(0, str::len);
         self.cursor = (self.cursor + width).min(self.len);
     }
 
@@ -204,19 +205,6 @@ impl<const N: usize> Default for TextInputBuffer<N> {
     /// Пустой буфер — то же состояние, что даёт `new()`.
     fn default() -> Self {
         Self::new()
-    }
-}
-
-/// Ширина code point в байтах по стартовому байту UTF-8.
-const fn utf8_char_width(lead: u8) -> usize {
-    if lead < 0x80 {
-        1
-    } else if lead & 0xE0 == 0xC0 {
-        2
-    } else if lead & 0xF0 == 0xE0 {
-        3
-    } else {
-        4
     }
 }
 
@@ -303,6 +291,25 @@ mod tests {
         assert_eq!(buf.as_str(), "риве");
         assert_eq!(buf.len_bytes(), 8);
         assert_eq!(buf.cursor(), 0);
+    }
+
+    #[test]
+    fn cursor_and_delete_follow_visible_graphemes() {
+        let mut buf = TextInputBuffer::<64>::new();
+        let family = "👩‍👩‍👧‍👦";
+        buf.set_text(family).unwrap();
+        buf.move_left();
+        assert_eq!(buf.cursor(), 0);
+        buf.move_right();
+        assert_eq!(buf.cursor(), family.len());
+        buf.backspace();
+        assert!(buf.is_empty());
+
+        buf.set_text("e\u{301}!").unwrap();
+        assert_eq!(buf.set_cursor(1), Err(TextInputError::InvalidPosition));
+        buf.move_home();
+        buf.delete_forward();
+        assert_eq!(buf.as_str(), "!");
     }
 
     #[test]

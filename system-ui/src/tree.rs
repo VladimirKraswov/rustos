@@ -2,7 +2,7 @@
 
 use rustos_video::Rect;
 
-use crate::{LayoutSpec, SemanticRole};
+use crate::{collections::ListViewState, LayoutSpec, ScrollConfig, ScrollState, SemanticRole};
 
 /// Непрозрачный идентификатор узла: старшие 16 бит — generation, младшие —
 /// индекс. Удалённый ID не начинает указывать на новый компонент того же slot.
@@ -95,6 +95,8 @@ pub enum ComponentKind {
     Menu = 22,
     /// Dialog overlay.
     Dialog = 23,
+    /// Самостоятельная полоса прокрутки, связанная с внешней моделью.
+    ScrollBar = 24,
 }
 
 impl ComponentKind {
@@ -110,6 +112,7 @@ impl ComponentKind {
                 | Self::TextArea
                 | Self::Slider
                 | Self::Select
+                | Self::ScrollBar
                 | Self::ListView
                 | Self::TabView
                 | Self::Menu
@@ -120,9 +123,10 @@ impl ComponentKind {
 /// Небольшой payload компонента. Строки и изображения лежат в package
 /// resources; дерево хранит только ID и не копирует приватные данные в cache.
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum Content {
     /// Нет содержимого.
+    #[default]
     None,
     /// Текстовый ресурс.
     Text(ResourceId),
@@ -130,12 +134,6 @@ pub enum Content {
     Resource(ResourceId),
     /// Число в диапазоне 0..=1000 (progress/slider).
     Value(u16),
-}
-
-impl Default for Content {
-    fn default() -> Self {
-        Self::None
-    }
 }
 
 /// Состояния компонента, независимо комбинируемые системой стилей.
@@ -162,6 +160,10 @@ impl NodeState {
     pub const INVALID: Self = Self(1 << 7);
     /// Значение доступно только для чтения.
     pub const READ_ONLY: Self = Self(1 << 8);
+    /// Focus получен клавиатурой и должен иметь видимый focus ring.
+    pub const FOCUS_VISIBLE: Self = Self(1 << 9);
+    /// Узел исключён из layout, hit-test и accessibility.
+    pub const HIDDEN: Self = Self(1 << 10);
 
     /// Проверяет все указанные биты.
     pub const fn contains(self, flags: Self) -> bool {
@@ -212,7 +214,7 @@ impl DirtyFlags {
 
 /// Типизированное описание нового узла. Rust builder и `.rui` decoder
 /// создают именно `NodeSpec`, поэтому не образуют две разные UI-системы.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct NodeSpec {
     /// Тип компонента.
     pub kind: ComponentKind,
@@ -232,6 +234,8 @@ pub struct NodeSpec {
     pub accessible_name: ResourceId,
     /// Явный Tab-order; отрицательное значение исключает из Tab traversal.
     pub tab_index: i16,
+    /// Политика прокрутки. Обычные controls получают `ScrollConfig::NONE`.
+    pub scroll: ScrollConfig,
 }
 
 impl NodeSpec {
@@ -247,7 +251,18 @@ impl NodeSpec {
             role: SemanticRole::None,
             accessible_name: ResourceId(0),
             tab_index: if kind.focusable() { 0 } else { -1 },
+            scroll: if matches!(kind, ComponentKind::ScrollView | ComponentKind::ListView) {
+                ScrollConfig::VERTICAL
+            } else {
+                ScrollConfig::NONE
+            },
         }
+    }
+}
+
+impl Default for NodeSpec {
+    fn default() -> Self {
+        Self::new(ComponentKind::Root)
     }
 }
 
@@ -280,6 +295,14 @@ pub struct Node {
     pub accessible_name: ResourceId,
     /// Порядок Tab.
     pub tab_index: i16,
+    /// Прокрутка принадлежит компоненту, а не визуальной полосе.
+    pub scroll: ScrollState,
+    /// Logical list state переживает recycling видимых delegates.
+    pub(crate) list: ListViewState,
+    /// Source модели standalone ScrollBar; `NONE` для встроенной полосы.
+    pub(crate) scroll_target: NodeId,
+    /// Ось standalone ScrollBar.
+    pub(crate) scroll_axis: crate::ScrollAxis,
     pub(crate) dirty: DirtyFlags,
 }
 
@@ -300,6 +323,10 @@ impl Node {
         role: SemanticRole::None,
         accessible_name: ResourceId(0),
         tab_index: -1,
+        scroll: ScrollState::disabled(),
+        list: ListViewState::disabled(),
+        scroll_target: NodeId::NONE,
+        scroll_axis: crate::ScrollAxis::Vertical,
         dirty: DirtyFlags::ALL,
     };
 
@@ -320,6 +347,10 @@ impl Node {
             role: spec.role,
             accessible_name: spec.accessible_name,
             tab_index: spec.tab_index,
+            scroll: ScrollState::new(spec.scroll),
+            list: ListViewState::disabled(),
+            scroll_target: NodeId::NONE,
+            scroll_axis: crate::ScrollAxis::Vertical,
             dirty: DirtyFlags::ALL,
         }
     }
@@ -334,6 +365,8 @@ pub enum TreeError {
     InvalidNode,
     /// Root нельзя удалить или добавить самому себе.
     InvalidHierarchy,
+    /// Операция неприменима к типу компонента.
+    InvalidComponent,
 }
 
 /// Дерево фиксированной ёмкости.
@@ -462,6 +495,117 @@ impl<const N: usize> Tree<N> {
             node.dirty.insert(DirtyFlags::SEMANTICS);
         }
         Ok(node.rect)
+    }
+
+    /// Меняет scroll policy и сбрасывает offset отключённых осей.
+    pub fn set_scroll_config(
+        &mut self,
+        id: NodeId,
+        config: ScrollConfig,
+    ) -> Result<Rect, TreeError> {
+        let node = self.get_mut_internal(id).ok_or(TreeError::InvalidNode)?;
+        if node.scroll.config == config {
+            return Ok(node.rect);
+        }
+        node.scroll.config = config;
+        if config.horizontal == crate::ScrollBarPolicy::Hidden {
+            node.scroll.horizontal.scroll_to(0);
+        }
+        if config.vertical == crate::ScrollBarPolicy::Hidden {
+            node.scroll.vertical.scroll_to(0);
+        }
+        node.dirty.insert(DirtyFlags::LAYOUT);
+        node.dirty.insert(DirtyFlags::PAINT);
+        Ok(node.rect)
+    }
+
+    /// Настраивает collection source ListView. Metadata имеет O(1) размер и
+    /// не создаёт визуальный узел на каждый item.
+    pub fn configure_list_view(
+        &mut self,
+        id: NodeId,
+        item_count: u32,
+        item_extent: u32,
+        selection: crate::SelectionMode,
+    ) -> Result<Rect, TreeError> {
+        let node = self.get_mut_internal(id).ok_or(TreeError::InvalidNode)?;
+        if node.kind != ComponentKind::ListView {
+            return Err(TreeError::InvalidComponent);
+        }
+        node.list.configure(item_count, item_extent, selection);
+        node.scroll
+            .vertical
+            .set_extents(node.rect.height, node.list.content_extent());
+        node.dirty.insert(DirtyFlags::LAYOUT);
+        node.dirty.insert(DirtyFlags::PAINT);
+        node.dirty.insert(DirtyFlags::SEMANTICS);
+        Ok(node.rect)
+    }
+
+    /// Связывает самостоятельный ScrollBar с моделью другого scrollable
+    /// компонента. Владелец модели остаётся target.
+    pub fn bind_scroll_bar(
+        &mut self,
+        bar: NodeId,
+        target: NodeId,
+        axis: crate::ScrollAxis,
+    ) -> Result<Rect, TreeError> {
+        if self.get(target).is_none() {
+            return Err(TreeError::InvalidNode);
+        }
+        let node = self.get_mut_internal(bar).ok_or(TreeError::InvalidNode)?;
+        if node.kind != ComponentKind::ScrollBar {
+            return Err(TreeError::InvalidComponent);
+        }
+        node.scroll_target = target;
+        node.scroll_axis = axis;
+        node.dirty.insert(DirtyFlags::PAINT);
+        node.dirty.insert(DirtyFlags::SEMANTICS);
+        Ok(node.rect)
+    }
+
+    pub(crate) fn set_scroll_extents_internal(
+        &mut self,
+        id: NodeId,
+        viewport_width: u32,
+        content_width: u64,
+        viewport_height: u32,
+        content_height: u64,
+    ) {
+        let Some(node) = self.get_mut_internal(id) else {
+            return;
+        };
+        node.scroll
+            .horizontal
+            .set_extents(viewport_width, content_width);
+        let vertical_content = if node.list.is_configured() {
+            node.list.content_extent().max(content_height)
+        } else {
+            content_height
+        };
+        node.scroll
+            .vertical
+            .set_extents(viewport_height, vertical_content);
+    }
+
+    /// Clip узла учитывает все scrollable-предки, но не обрезает рамку
+    /// самого ScrollView.
+    pub(crate) fn paint_clip(&self, id: NodeId) -> Rect {
+        let Some(node) = self.get(id) else {
+            return Rect::EMPTY;
+        };
+        let mut clip = self.get(self.root).map_or(Rect::EMPTY, |root| root.rect);
+        let mut parent = node.parent;
+        while let Some(ancestor) = self.get(parent) {
+            if matches!(
+                ancestor.kind,
+                ComponentKind::ScrollView | ComponentKind::ListView
+            ) {
+                clip = clip.intersection(ancestor.rect);
+            }
+            parent = ancestor.parent;
+        }
+        clip
     }
 
     /// Первый дочерний элемент.

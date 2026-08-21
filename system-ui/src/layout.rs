@@ -6,9 +6,10 @@ use crate::{ComponentKind, NodeId, Tree};
 
 /// Размер по одной оси.
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum Length {
     /// Размер определяется содержимым или minimum.
+    #[default]
     Auto,
     /// Фиксированное число логических пикселей.
     Px(u16),
@@ -16,12 +17,6 @@ pub enum Length {
     Percent(u16),
     /// Доля оставшегося пространства. Ноль трактуется как вес 1.
     Fill(u16),
-}
-
-impl Default for Length {
-    fn default() -> Self {
-        Self::Auto
-    }
 }
 
 /// Отступы в логических пикселях.
@@ -174,10 +169,7 @@ where
 
     match kind {
         ComponentKind::Row => linear(tree, parent, content, true, parent_node.layout.gap, damaged),
-        ComponentKind::Column
-        | ComponentKind::Panel
-        | ComponentKind::ScrollView
-        | ComponentKind::ListView => linear(
+        ComponentKind::Column | ComponentKind::Panel => linear(
             tree,
             parent,
             content,
@@ -185,8 +177,141 @@ where
             parent_node.layout.gap,
             damaged,
         ),
+        ComponentKind::ScrollView | ComponentKind::ListView => {
+            scroll_container(tree, parent, content, parent_node, damaged)
+        }
         ComponentKind::Grid => grid(tree, parent, content, parent_node.layout, damaged),
         _ => stack(tree, parent, content, damaged),
+    }
+}
+
+fn scroll_container<const N: usize, F>(
+    tree: &mut Tree<N>,
+    parent: NodeId,
+    mut viewport: Rect,
+    parent_node: crate::Node,
+    damaged: &mut F,
+) where
+    F: FnMut(Rect),
+{
+    // Inset scrollbar резервирует место до layout содержимого. Для Auto
+    // используется состояние предыдущего frame; после первого measure оно
+    // стабилизируется без изменения публичной геометрии.
+    if parent_node.scroll.config.bar_layout == crate::ScrollBarLayout::Inset {
+        let reserve_vertical = parent_node.scroll.config.vertical == crate::ScrollBarPolicy::Always
+            || parent_node.scroll.vertical.can_scroll();
+        let reserve_horizontal = parent_node.scroll.config.horizontal
+            == crate::ScrollBarPolicy::Always
+            || parent_node.scroll.horizontal.can_scroll();
+        if reserve_vertical {
+            viewport.width = viewport.width.saturating_sub(12);
+        }
+        if reserve_horizontal {
+            viewport.height = viewport.height.saturating_sub(12);
+        }
+    }
+
+    let horizontal_scroll = parent_node.scroll.config.horizontal != crate::ScrollBarPolicy::Hidden;
+    let vertical_scroll = parent_node.scroll.config.vertical != crate::ScrollBarPolicy::Hidden;
+    let mut content_width = 0u64;
+    let mut content_height = 0u64;
+    let mut visible_children = 0u32;
+    let mut child = tree.first_child(parent);
+    while let Some(id) = child {
+        let node = *tree.get(id).expect("child ID belongs to tree");
+        child = tree.next_sibling(id);
+        if node.state.contains(crate::NodeState::HIDDEN) {
+            set_rect(tree, id, Rect::EMPTY, damaged);
+            continue;
+        }
+        let width = scroll_child_extent(node, viewport.width, true, horizontal_scroll);
+        let height = if parent_node.list.is_configured() {
+            parent_node.list.item_extent()
+        } else {
+            scroll_child_extent(node, viewport.height, false, vertical_scroll)
+        };
+        content_width = content_width.max(u64::from(width));
+        content_height = content_height.saturating_add(u64::from(height));
+        visible_children = visible_children.saturating_add(1);
+    }
+    content_height = content_height.saturating_add(
+        u64::from(parent_node.layout.gap)
+            .saturating_mul(u64::from(visible_children.saturating_sub(1))),
+    );
+    content_width = content_width.max(u64::from(viewport.width));
+    content_height = content_height.max(u64::from(viewport.height));
+    tree.set_scroll_extents_internal(
+        parent,
+        viewport.width,
+        content_width,
+        viewport.height,
+        content_height,
+    );
+
+    let Some(measured) = tree.get(parent).copied() else {
+        return;
+    };
+    let offset_x = measured.scroll.horizontal.offset().min(i32::MAX as u64) as i32;
+    let offset_y = measured.scroll.vertical.offset().min(i32::MAX as u64) as i32;
+    let first_item_offset = if measured.list.is_configured() {
+        u64::from(measured.list.visible_range(measured.scroll.vertical).start)
+            .saturating_mul(u64::from(measured.list.item_extent()))
+            .min(i32::MAX as u64) as i32
+    } else {
+        0
+    };
+    let mut cursor_y = viewport
+        .y
+        .saturating_add(first_item_offset)
+        .saturating_sub(offset_y);
+    child = tree.first_child(parent);
+    while let Some(id) = child {
+        let node = *tree.get(id).expect("child ID belongs to tree");
+        child = tree.next_sibling(id);
+        if node.state.contains(crate::NodeState::HIDDEN) {
+            continue;
+        }
+        let width = scroll_child_extent(node, viewport.width, true, horizontal_scroll);
+        let height = if measured.list.is_configured() {
+            measured.list.item_extent()
+        } else {
+            scroll_child_extent(node, viewport.height, false, vertical_scroll)
+        };
+        let x = align_origin(
+            viewport.x.saturating_sub(offset_x),
+            viewport.width.max(width),
+            width,
+            node.layout.align,
+        );
+        let rect = Rect::new(x, cursor_y, width, height);
+        set_rect(tree, id, rect, damaged);
+        layout_children(tree, id, damaged);
+        cursor_y = cursor_y
+            .saturating_add(height.min(i32::MAX as u32) as i32)
+            .saturating_add(i32::from(parent_node.layout.gap));
+    }
+}
+
+fn scroll_child_extent(
+    node: crate::Node,
+    viewport_extent: u32,
+    horizontal: bool,
+    can_overflow: bool,
+) -> u32 {
+    let length = if horizontal {
+        node.layout.width
+    } else {
+        node.layout.height
+    };
+    let value = constrain(
+        resolve(length, viewport_extent, minimum(node, horizontal)),
+        node,
+        horizontal,
+    );
+    if can_overflow {
+        value
+    } else {
+        value.min(viewport_extent)
     }
 }
 

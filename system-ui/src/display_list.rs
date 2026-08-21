@@ -101,6 +101,8 @@ pub enum VisualPrimitive {
 pub struct DisplayCommand {
     /// Компонент-источник.
     pub owner: NodeId,
+    /// Clip, накопленный от scrollable-предков владельца.
+    pub clip: Rect,
     /// Bounds primitive в координатах surface.
     pub bounds: Rect,
     /// Primitive.
@@ -110,6 +112,7 @@ pub struct DisplayCommand {
 impl DisplayCommand {
     const EMPTY: Self = Self {
         owner: NodeId::NONE,
+        clip: Rect::EMPTY,
         bounds: Rect::EMPTY,
         primitive: VisualPrimitive::Fill {
             color: Color::rgb(0, 0, 0),
@@ -205,15 +208,17 @@ impl<const C: usize> DisplayList<C> {
         self.clear();
         for id in tree.ids() {
             let node = tree.get(id).expect("iterator yields live nodes");
-            if node.rect.is_empty() {
+            if node.rect.is_empty() || node.state.contains(NodeState::HIDDEN) {
                 continue;
             }
+            let clip = tree.paint_clip(id);
             let style = theme.resolve(node.kind, node.state, node.style);
             if node.style == crate::style_class::CARD
                 || matches!(node.kind, ComponentKind::Menu | ComponentKind::Dialog)
             {
                 self.push(DisplayCommand {
                     owner: id,
+                    clip,
                     bounds: shadow_bounds(node.rect),
                     primitive: VisualPrimitive::Shadow {
                         surface: node.rect,
@@ -225,6 +230,7 @@ impl<const C: usize> DisplayList<C> {
             if let Some(color) = style.background {
                 self.push(DisplayCommand {
                     owner: id,
+                    clip,
                     bounds: node.rect,
                     primitive: VisualPrimitive::Fill {
                         color,
@@ -235,6 +241,7 @@ impl<const C: usize> DisplayList<C> {
             if style.border_width != 0 && node.kind != ComponentKind::Root {
                 self.push(DisplayCommand {
                     owner: id,
+                    clip,
                     bounds: node.rect,
                     primitive: VisualPrimitive::Border {
                         color: style.border,
@@ -246,6 +253,7 @@ impl<const C: usize> DisplayList<C> {
             match node.content {
                 Content::Text(resource) => self.push(DisplayCommand {
                     owner: id,
+                    clip,
                     bounds: text_bounds(node.rect, node.kind),
                     primitive: VisualPrimitive::Text {
                         resource,
@@ -268,6 +276,7 @@ impl<const C: usize> DisplayList<C> {
                 }),
                 Content::Resource(resource) => self.push(DisplayCommand {
                     owner: id,
+                    clip,
                     bounds: inset(node.rect, 5, 5),
                     primitive: VisualPrimitive::Image {
                         resource,
@@ -282,6 +291,7 @@ impl<const C: usize> DisplayList<C> {
                 {
                     self.push(DisplayCommand {
                         owner: id,
+                        clip,
                         bounds: inset(node.rect, 2, 2),
                         primitive: VisualPrimitive::Fraction {
                             color: theme.palette.accent,
@@ -292,10 +302,11 @@ impl<const C: usize> DisplayList<C> {
                 }
                 _ => {}
             }
-            self.push_choice_indicator(id, node, theme);
-            if node.state.contains(NodeState::FOCUSED) {
+            self.push_choice_indicator(id, node, theme, clip);
+            if node.state.contains(NodeState::FOCUS_VISIBLE) {
                 self.push(DisplayCommand {
                     owner: id,
+                    clip,
                     bounds: node.rect,
                     primitive: VisualPrimitive::Border {
                         color: style.focus,
@@ -303,6 +314,14 @@ impl<const C: usize> DisplayList<C> {
                         radius: style.radius,
                     },
                 });
+            }
+        }
+        // Overlay scrollbars должны быть поверх дочернего содержимого, поэтому
+        // формируются отдельным проходом после обычных primitives.
+        for id in tree.ids() {
+            let node = tree.get(id).expect("iterator yields live nodes");
+            if !node.state.contains(NodeState::HIDDEN) {
+                self.push_scrollbars(id, node, theme, tree.paint_clip(id), tree);
             }
         }
     }
@@ -316,7 +335,8 @@ impl<const C: usize> DisplayList<C> {
         let mut pixels = 0u64;
         for clip in damage.iter().copied() {
             for command in self.as_slice() {
-                let visible = command.bounds.intersection(clip);
+                let command_clip = command.clip.intersection(clip);
+                let visible = command.bounds.intersection(command_clip);
                 if visible.is_empty() {
                     continue;
                 }
@@ -327,22 +347,22 @@ impl<const C: usize> DisplayList<C> {
                         surface,
                         radius,
                         color,
-                    } => backend.shadow(surface, radius, color, clip),
+                    } => backend.shadow(surface, radius, color, command_clip),
                     VisualPrimitive::Fill { color, radius } => {
-                        backend.rounded_fill(command.bounds, color, radius, clip)
+                        backend.rounded_fill(command.bounds, color, radius, command_clip)
                     }
                     VisualPrimitive::Border {
                         color,
                         width,
                         radius,
-                    } => backend.rounded_border(command.bounds, color, width, radius, clip),
+                    } => backend.rounded_border(command.bounds, color, width, radius, command_clip),
                     VisualPrimitive::Text {
                         resource,
                         color,
                         font,
-                    } => backend.text(command.bounds, resource, color, font, clip),
+                    } => backend.text(command.bounds, resource, color, font, command_clip),
                     VisualPrimitive::Image { resource, tint } => {
-                        backend.image(command.bounds, resource, tint, clip)
+                        backend.image(command.bounds, resource, tint, command_clip)
                     }
                     VisualPrimitive::Fraction {
                         color,
@@ -355,10 +375,10 @@ impl<const C: usize> DisplayList<C> {
                             command.bounds.width.saturating_mul(u32::from(value)) / 1000,
                             command.bounds.height,
                         );
-                        backend.rounded_fill(inner, color, radius, clip);
+                        backend.rounded_fill(inner, color, radius, command_clip);
                     }
                     VisualPrimitive::SelectionMark { color, radius } => {
-                        backend.rounded_fill(command.bounds, color, radius, clip)
+                        backend.rounded_fill(command.bounds, color, radius, command_clip)
                     }
                 }
             }
@@ -368,7 +388,13 @@ impl<const C: usize> DisplayList<C> {
 }
 
 impl<const C: usize> DisplayList<C> {
-    fn push_choice_indicator(&mut self, owner: NodeId, node: &crate::Node, theme: Theme) {
+    fn push_choice_indicator(
+        &mut self,
+        owner: NodeId,
+        node: &crate::Node,
+        theme: Theme,
+        clip: Rect,
+    ) {
         let checked = node.state.contains(NodeState::CHECKED);
         match node.kind {
             ComponentKind::CheckBox | ComponentKind::RadioButton => {
@@ -380,6 +406,7 @@ impl<const C: usize> DisplayList<C> {
                 };
                 self.push(DisplayCommand {
                     owner,
+                    clip,
                     bounds,
                     primitive: VisualPrimitive::Fill {
                         color: if checked {
@@ -392,6 +419,7 @@ impl<const C: usize> DisplayList<C> {
                 });
                 self.push(DisplayCommand {
                     owner,
+                    clip,
                     bounds,
                     primitive: VisualPrimitive::Border {
                         color: if checked {
@@ -406,6 +434,7 @@ impl<const C: usize> DisplayList<C> {
                 if checked {
                     self.push(DisplayCommand {
                         owner,
+                        clip,
                         bounds: inset(bounds, 5, 5),
                         primitive: VisualPrimitive::SelectionMark {
                             color: Color::rgb(255, 255, 255),
@@ -422,6 +451,7 @@ impl<const C: usize> DisplayList<C> {
                 let track = switch_bounds(node.rect);
                 self.push(DisplayCommand {
                     owner,
+                    clip,
                     bounds: track,
                     primitive: VisualPrimitive::Fill {
                         color: if checked {
@@ -440,6 +470,7 @@ impl<const C: usize> DisplayList<C> {
                 };
                 self.push(DisplayCommand {
                     owner,
+                    clip,
                     bounds: Rect::new(knob_x, track.y.saturating_add(2), knob_size, knob_size),
                     primitive: VisualPrimitive::SelectionMark {
                         color: Color::rgb(255, 255, 255),
@@ -449,6 +480,90 @@ impl<const C: usize> DisplayList<C> {
             }
             _ => {}
         }
+    }
+
+    fn push_scrollbars<const N: usize>(
+        &mut self,
+        owner: NodeId,
+        node: &crate::Node,
+        theme: Theme,
+        clip: Rect,
+        tree: &Tree<N>,
+    ) {
+        if node.kind == ComponentKind::ScrollBar {
+            let Some(target) = tree.get(node.scroll_target) else {
+                return;
+            };
+            let model = target.scroll.model(node.scroll_axis);
+            let thickness = match node.scroll_axis {
+                crate::ScrollAxis::Horizontal => node.rect.height,
+                crate::ScrollAxis::Vertical => node.rect.width,
+            };
+            let geometry = crate::ScrollbarGeometry::with_visibility(
+                node.rect,
+                model,
+                node.scroll_axis,
+                thickness,
+                24,
+                true,
+            );
+            self.push_scrollbar_geometry(owner, node, theme, clip, geometry);
+            return;
+        }
+        for axis in [crate::ScrollAxis::Horizontal, crate::ScrollAxis::Vertical] {
+            let policy = match axis {
+                crate::ScrollAxis::Horizontal => node.scroll.config.horizontal,
+                crate::ScrollAxis::Vertical => node.scroll.config.vertical,
+            };
+            if policy == crate::ScrollBarPolicy::Hidden {
+                continue;
+            }
+            let model = node.scroll.model(axis);
+            let geometry = crate::ScrollbarGeometry::with_visibility(
+                node.rect,
+                model,
+                axis,
+                10,
+                24,
+                model.can_scroll() || policy == crate::ScrollBarPolicy::Always,
+            );
+            if !geometry.visible {
+                continue;
+            }
+            self.push_scrollbar_geometry(owner, node, theme, clip, geometry);
+        }
+    }
+
+    fn push_scrollbar_geometry(
+        &mut self,
+        owner: NodeId,
+        node: &crate::Node,
+        theme: Theme,
+        clip: Rect,
+        geometry: crate::ScrollbarGeometry,
+    ) {
+        self.push(DisplayCommand {
+            owner,
+            clip,
+            bounds: geometry.track,
+            primitive: VisualPrimitive::Fill {
+                color: theme.palette.border.mix(theme.palette.window, 208),
+                radius: u8::MAX,
+            },
+        });
+        self.push(DisplayCommand {
+            owner,
+            clip,
+            bounds: geometry.thumb,
+            primitive: VisualPrimitive::Fill {
+                color: if node.state.contains(NodeState::HOVERED) {
+                    theme.palette.accent
+                } else {
+                    theme.palette.text_muted
+                },
+                radius: u8::MAX,
+            },
+        });
     }
 }
 

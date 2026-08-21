@@ -41,6 +41,8 @@ pub enum SemanticRole {
     Progress = 14,
     /// Изображение со смыслом.
     Image = 15,
+    /// Полоса прокрутки.
+    ScrollBar = 16,
 }
 
 /// Доступные assistive-действия.
@@ -115,7 +117,10 @@ impl<const N: usize> SemanticsTree<N> {
         self.len = 0;
         for id in tree.ids() {
             let node = tree.get(id).expect("iterator yields live nodes");
-            if node.role == SemanticRole::None || self.len == N {
+            if node.role == SemanticRole::None
+                || node.state.contains(NodeState::HIDDEN)
+                || self.len == N
+            {
                 continue;
             }
             self.nodes[self.len] = SemanticNode {
@@ -164,7 +169,7 @@ fn actions_for(role: SemanticRole, state: NodeState) -> SemanticAction {
             actions.0 |= SemanticAction::TOGGLE.0
         }
         SemanticRole::TextField => actions.0 |= SemanticAction::SET_VALUE.0,
-        SemanticRole::List => {
+        SemanticRole::List | SemanticRole::ScrollBar => {
             actions.0 |= SemanticAction::SCROLL_FORWARD.0 | SemanticAction::SCROLL_BACKWARD.0
         }
         _ => {}

@@ -13,3 +13,4 @@ path = "src/lib.rs"
 [dependencies]
 rustos-abi = { path = "../abi" }
 rustos-video = { path = "../video" }
+unicode-segmentation = { version = "=1.13.3", default-features = false }

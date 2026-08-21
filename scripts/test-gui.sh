@@ -89,6 +89,21 @@ move_mouse() {
         sent_y=$((sent_y + part_y))
         sleep 0.1
     done
+    # `mouse_move` подтверждается QEMU monitor'ом до того, как
+    # guest успеет вычитать последний PS/2 packet. Под TCG без settle
+    # mouse-down изредка приходил в предыдущую координату и ложно
+    # ломал double-click/close lifecycle checks.
+    sleep "${GUI_MOUSE_SETTLE_SECONDS:-0.25}"
+}
+
+# Критичные lifecycle-clicks не должны зависеть от накопленного
+# relative PS/2 remainder. Снача гарантированно упираемся в (0, 0),
+# затем идём в абсолютную guest-координату малыми пакетами.
+move_mouse_to() {
+    local x="$1"
+    local y="$2"
+    move_mouse -2048 -2048 20
+    move_mouse "$x" "$y" 12
 }
 
 wait_for_serial() {
@@ -199,7 +214,7 @@ sleep 0.2
 
 # Проверяем настоящий double-click и создание второго независимого экземпляра:
 # стартовая точка курсора детерминирована (640,400), icon — около (65,78).
-move_mouse -575 -322 4
+move_mouse_to 65 78
 sleep 0.4
 printf 'mouse_button 1\n' | hmp
 sleep 0.08
@@ -222,7 +237,7 @@ wait_for_serial '[vfs] CHDIR path=/src value=0'
 send_command 'write /lifecycle shared'
 wait_for_serial '[vfs] WRITE path=/lifecycle value=6'
 # id=2: rect≈(148,85,1040,640), close center≈(1170,102).
-move_mouse 530 -298 4
+move_mouse_to 1170 102
 sleep 0.15
 printf 'mouse_button 1\n' | hmp
 sleep 0.08
@@ -230,7 +245,7 @@ printf 'mouse_button 0\n' | hmp
 wait_for_serial '[app] exit id=0x02 kind=TERMINAL released-frames='
 grep -q 'windows=1' "$RUN_DIR/serial.log"
 # Снова double-click по desktop icon; ID не переиспользуется.
-move_mouse -1105 -24 7
+move_mouse_to 65 78
 printf 'mouse_button 1\n' | hmp
 sleep 0.08
 printf 'mouse_button 0\n' | hmp
@@ -359,7 +374,7 @@ printf 'screendump %s/ui-gallery.ppm\n' "$RUN_DIR" | hmp
 # живым и независимым; дальнейшие drag/resize/minimize проверяют именно его.
 # UI создаётся уже после mode round-trip: rect≈(204,106,1040,640),
 # close center≈(1226,123).
-move_mouse 586 -277 4
+move_mouse_to 1226 123
 printf 'mouse_button 1\n' | hmp
 sleep 0.08
 printf 'mouse_button 0\n' | hmp
@@ -372,7 +387,7 @@ send_command 'explorer'
 wait_for_serial '[app] spawn id=0x05 kind=EXPLORER'
 wait_for_serial '[explorer] operation=READY path=/'
 # id=5: rect≈(232,104,1040,640), центр «Новая папка»≈(719,165).
-move_mouse -507 42 4
+move_mouse_to 719 165
 # Первый переход hover после полного кадра обязан пройти application-local
 # damage path. При 1280×800 полный кадр равен 1024 kpx; лимит 299 kpx ловит
 # возврат регрессии «один control → present всего framebuffer».
@@ -391,7 +406,7 @@ printf 'screendump %s/explorer.ppm\n' "$RUN_DIR" | hmp
 }
 # Закрытие освобождает application frames. Возвращаем cursor в прежнюю точку,
 # чтобы оставшаяся geometry-regression не зависела от нового сценария.
-move_mouse 535 -44 4
+move_mouse_to 1254 121
 printf 'mouse_button 1\n' | hmp
 sleep 0.08
 printf 'mouse_button 0\n' | hmp

@@ -205,6 +205,30 @@ impl<'a, const N: usize> UiBuilder<'a, N> {
         self.component(parent, spec)
     }
 
+    /// Универсальный ScrollView. Конфигурация принадлежит viewport и не
+    /// зависит от наличия визуальной полосы прокрутки.
+    pub fn scroll_view(
+        &mut self,
+        parent: NodeId,
+        config: crate::ScrollConfig,
+        layout: LayoutSpec,
+    ) -> Result<NodeId, TreeError> {
+        let mut spec = NodeSpec::new(ComponentKind::ScrollView);
+        spec.layout = layout;
+        spec.scroll = config;
+        spec.role = SemanticRole::Group;
+        self.component(parent, spec)
+    }
+
+    /// Самостоятельное scrollbar-представление. Приложение связывает его с
+    /// `ScrollModel`; полоса не владеет content/offset.
+    pub fn scroll_bar(&mut self, parent: NodeId, layout: LayoutSpec) -> Result<NodeId, TreeError> {
+        let mut spec = NodeSpec::new(ComponentKind::ScrollBar);
+        spec.layout = layout;
+        spec.role = SemanticRole::ScrollBar;
+        self.component(parent, spec)
+    }
+
     /// Виртуализируемый ListView container. Item creation должен ограничивать
     /// caller видимым диапазоном, который runtime сообщает через ABI event.
     pub fn list_view(&mut self, parent: NodeId, layout: LayoutSpec) -> Result<NodeId, TreeError> {

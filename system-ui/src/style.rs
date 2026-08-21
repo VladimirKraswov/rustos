@@ -231,13 +231,12 @@ impl Theme {
             ComponentKind::ProgressBar | ComponentKind::Slider => u8::MAX,
             _ => self.radius,
         };
-        let border_width = if compact_choice || kind == ComponentKind::Switch {
-            0
-        } else if style == style_class::GHOST {
-            0
-        } else {
-            u8::from(interactive || background.is_some())
-        };
+        let border_width =
+            if compact_choice || kind == ComponentKind::Switch || style == style_class::GHOST {
+                0
+            } else {
+                u8::from(interactive || background.is_some())
+            };
         ComputedStyle {
             background,
             foreground,

@@ -560,7 +560,19 @@ impl Framebuffer {
     /// Декодер не требует heap: исходник memory-mapped в read-only секцию, а
     /// каждый пиксель сразу преобразуется в активный render format.
     pub fn draw_wallpaper(&mut self, rect: Rect, image: Wallpaper) {
+        self.draw_wallpaper_clipped(rect, rect, image);
+    }
+
+    /// Растеризует только `clip`, но сохраняет масштаб и crop полного
+    /// `rect`. Иначе локальная перерисовка ярлыка показала бы уменьшенную
+    /// копию всех обоев вместо исходных пикселей этой области.
+    pub fn draw_wallpaper_clipped(&mut self, rect: Rect, clip: Rect, image: Wallpaper) {
         if rect.width == 0 || rect.height == 0 || image.width == 0 || image.height == 0 {
+            return;
+        }
+        let surface = Rect::new(0, 0, self.width, self.height);
+        let clipped = rect.intersection(clip).intersection(surface);
+        if clipped.is_empty() {
             return;
         }
         let destination_ratio_wide = u64::from(rect.width) * u64::from(image.height)
@@ -580,19 +592,13 @@ impl Framebuffer {
         };
         let crop_x = image.width.saturating_sub(sample_width) / 2;
         let crop_y = image.height.saturating_sub(sample_height) / 2;
-        for destination_y in 0..rect.height {
-            let screen_y = rect.y + destination_y as i32;
-            if screen_y < 0 || screen_y >= self.height as i32 {
-                continue;
-            }
+        for screen_y in clipped.y..clipped.bottom() {
+            let destination_y = screen_y.saturating_sub(rect.y) as u32;
             let source_y = crop_y
                 + (u64::from(destination_y) * u64::from(sample_height) / u64::from(rect.height))
                     as u32;
-            for destination_x in 0..rect.width {
-                let screen_x = rect.x + destination_x as i32;
-                if screen_x < 0 || screen_x >= self.width as i32 {
-                    continue;
-                }
+            for screen_x in clipped.x..clipped.right() {
+                let destination_x = screen_x.saturating_sub(rect.x) as u32;
                 let source_x = crop_x
                     + (u64::from(destination_x) * u64::from(sample_width) / u64::from(rect.width))
                         as u32;
@@ -650,6 +656,32 @@ impl Framebuffer {
         // SAFETY: оба буфера выделены frame allocator'ом на back_bytes,
         // не пересекаются и принадлежат единственной GUI-сессии CPU0.
         unsafe { core::ptr::copy_nonoverlapping(self.back, self.background, pixels) };
+        true
+    }
+
+    /// Обновляет только изменившуюся часть desktop-слоя.
+    /// Это не заставляет копировать весь framebuffer при selection одного
+    /// ярлыка. Caller обязан вызвать метод до отрисовки окон и cursor.
+    pub fn cache_background_rect(&mut self, rect: Rect) -> bool {
+        if self.background.is_null() {
+            return false;
+        }
+        let Some((x0, y0, x1, y1)) = self.clipped(rect) else {
+            return true;
+        };
+        let count = (x1 - x0) as usize;
+        for y in y0..y1 {
+            let index = y as usize * self.width as usize + x0 as usize;
+            // SAFETY: clipped гарантирует одинаковые valid ranges в обоих
+            // непересекающих framebuffer layers.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    self.back.add(index),
+                    self.background.add(index),
+                    count,
+                )
+            };
+        }
         true
     }
 

@@ -476,6 +476,9 @@ impl DesktopSession {
                     Redraw::Shell => {
                         incremental_damage = Some(self.render_shell_incremental());
                     }
+                    Redraw::DesktopIcon => {
+                        incremental_damage = Some(self.render_desktop_icon_incremental());
+                    }
                     Redraw::DragMove {
                         window,
                         previous,
@@ -508,7 +511,10 @@ impl DesktopSession {
                         }
                         self.framebuffer.present_rect(self.cursor.rect());
                     }
-                    Redraw::Application(_) | Redraw::Ui(_) | Redraw::Shell => {
+                    Redraw::Application(_)
+                    | Redraw::Ui(_)
+                    | Redraw::Shell
+                    | Redraw::DesktopIcon => {
                         let bounds =
                             Rect::new(0, 0, self.framebuffer.width(), self.framebuffer.height());
                         let mut damage = incremental_damage.unwrap_or_else(|| {
@@ -1316,8 +1322,9 @@ impl DesktopSession {
             if click == ClickKind::Double {
                 let _ = self.spawn_application(ApplicationKind::Terminal);
                 serial::put_str("[desktop] new terminal requested by double-click\n");
+                return Redraw::Scene;
             }
-            return Redraw::Scene;
+            return Redraw::DesktopIcon;
         }
         self.desktop_icon_selected = false;
 
@@ -1992,6 +1999,42 @@ impl DesktopSession {
         damage
     }
 
+    /// Изменение selection desktop icon не должно повторно растеризовать
+    /// обои, taskbar и все окна: на медленном CPU backend это ломало даже
+    /// double click. После обновления base layer восстанавливаем только окна,
+    /// которые действительно перекрывают ярлык.
+    fn render_desktop_icon_incremental(&mut self) -> DamageRegion<INCREMENTAL_DAMAGE_CAPACITY> {
+        let bounds = Rect::new(0, 0, self.framebuffer.width(), self.framebuffer.height());
+        let mut damage = DamageRegion::new(bounds);
+        let icon = self.desktop_terminal_icon();
+        let desktop = Rect::new(
+            0,
+            0,
+            self.framebuffer.width(),
+            self.framebuffer.height().saturating_sub(TASKBAR_HEIGHT),
+        );
+        self.framebuffer
+            .draw_wallpaper_clipped(desktop, icon, wallpaper(self.wallpaper));
+        self.render_terminal_desktop_icon();
+        let _ = self.framebuffer.cache_background_rect(icon);
+
+        for index in 0..self.window_count {
+            let id = self.z_order[index];
+            if self.window_is_visible(id)
+                && self
+                    .window_rect(id)
+                    .is_some_and(|window| !window.intersection(icon).is_empty())
+            {
+                self.render_window(id);
+                if let Some(window) = self.window_rect(id) {
+                    damage.add(window_damage(window));
+                }
+            }
+        }
+        damage.add(icon);
+        damage
+    }
+
     fn render_all(&mut self) {
         self.render_scene();
         self.cursor
@@ -2155,6 +2198,23 @@ impl DesktopSession {
     }
 
     fn render_desktop_icons(&mut self) {
+        self.render_terminal_desktop_icon();
+        let trash = self.desktop_trash_icon();
+        self.draw_system_icon(
+            IconKind::Trash,
+            Rect::new(trash.x + 12, trash.y + 2, 48, 52),
+        );
+        font::draw_text(
+            &mut self.framebuffer,
+            trash.x + 16,
+            trash.y + 63,
+            "Корзина",
+            Theme::TEXT,
+            font::UI_SMALL.bold().scaled(self.ui_scale_milli),
+        );
+    }
+
+    fn render_terminal_desktop_icon(&mut self) {
         let terminal = self.desktop_terminal_icon();
         if self.desktop_icon_selected {
             self.framebuffer
@@ -2171,19 +2231,6 @@ impl DesktopSession {
             terminal.x + 5,
             terminal.y + 61,
             "Терминал",
-            Theme::TEXT,
-            font::UI_SMALL.bold().scaled(self.ui_scale_milli),
-        );
-        let trash = self.desktop_trash_icon();
-        self.draw_system_icon(
-            IconKind::Trash,
-            Rect::new(trash.x + 12, trash.y + 2, 48, 52),
-        );
-        font::draw_text(
-            &mut self.framebuffer,
-            trash.x + 16,
-            trash.y + 63,
-            "Корзина",
             Theme::TEXT,
             font::UI_SMALL.bold().scaled(self.ui_scale_milli),
         );
@@ -2506,6 +2553,8 @@ enum Redraw {
     Ui(WindowId),
     /// Перерисовать только dirty controls taskbar/Start/context menu.
     Shell,
+    /// Локально обновить selection ярлыка на desktop base layer.
+    DesktopIcon,
     Scene,
     DragMove {
         window: WindowId,

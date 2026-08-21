@@ -18,6 +18,17 @@
 - hit testing, pointer capture, focus, Tab и Enter/Space activation;
 - capture/target/bubble route и отдельное accessibility tree;
 - bounded virtual-list range для десятков тысяч items;
+- единая двухосная scroll architecture: `ScrollModel`, `ScrollController`,
+  `ScrollView`, встроенный и самостоятельный `ScrollBar`, wheel chaining,
+  pixel/line/page delta, instant/smooth mode и clipping вложенных viewport;
+- общий bounded `SelectionModel` и runtime `ListViewState`: single/multiple/
+  extended selection, Home/End/PageUp/PageDown, ensure-visible и 50 000 items
+  без 50 000 component nodes;
+- системный UTF-8 text contract: piece-table `TextDocument`, byte/scalar/
+  grapheme positions, UAX #29 для cursor/delete, bounded `TextEditorController`,
+  grouped undo/redo, command model и атомарный clipboard API;
+- разделение keyboard focus и `focus-visible`, hidden/disabled исключаются из
+  focus, hit-test и semantics;
 - стабильный wire ABI приложения к будущему `uid`;
 - AOT-компилятор `rustos-rui`, headless-тесты и современная светлая UI Gallery
   с cards, tabs, buttons, fields, choices, progress, list и status surfaces.
@@ -29,8 +40,9 @@
   status pagination, inline rename и вложенные component popup без отдельного
   ручного hit-test.
 
-Это фундамент, а не заявление, что весь каталог controls готов. Text editing,
-shaping, popup/portal, animations, persisted state и IPC-сервис расширяются
+Это фундамент, а не заявление, что весь каталог controls готов. Shaping,
+bidirectional layout, popup/portal, variable-height virtualization, persisted
+state и IPC-сервис расширяются
 поверх зафиксированных границ ниже.
 
 ## Выбранная архитектура
@@ -233,6 +245,27 @@ Demo использует итоговый `DispatchResult`; полный мар
 behaviours, inspector и recorder. Focus переходит по стабильному
 `(tab_index, document_order)`. Disabled controls исключены из hit test и Tab.
 
+Mouse wheel не требует focus: hit-test выбирает самый глубокий scrollable
+viewport под указателем. Каждая ось потребляет только помещающуюся часть delta;
+остаток в logical pixels идёт scrollable-предку, если policy не равна
+`Contain`. Window/input adapter обязан указать единицу `Pixel`, `Line` или
+`Page` и не может предполагать аппаратный шаг 120. Smooth policy меняет target,
+а `advance_scroll_frame` двигает current offset ровно один раз на frame.
+
+Scroll state принадлежит viewport, а не полосе. Встроенная overlay/inset полоса
+и отдельный `ScrollBar`, связанный через `bind_scroll_bar`, отображают одну
+модель. Drag thumb, click track, programmatic `scroll_to`, `ensure_visible`,
+Home/End/PageUp/PageDown используют тот же bounded controller. Display command
+несёт clip, накопленный от scrollable-предков, поэтому ушедший за viewport
+delegate не попадает в raster даже при пересечении общего damage rectangle.
+
+`ListViewState` хранит logical indices и selection ranges, а не `NodeId`.
+Gallery связывает 50 000 logical rows с десятью recyclable delegates; wheel и
+keyboard больше не обрабатываются отдельным кодом приложения. Текущая fixed-
+extent реализация уже ограничивает live visuals величиной viewport + overscan.
+Variable extents требуют отдельного measurement index и остаются следующим
+collection milestone.
+
 `CommandId` связывает кнопку, menu item, toolbar, shortcut и command palette.
 Control не содержит application callback: runtime возвращает command event,
 приложение обновляет state. Следующий `CommandRegistry` добавит общие
@@ -252,6 +285,28 @@ Start menu является проверкой этого контракта н�
 снимок display/appearance state, показывает варианты через `SELECTED` и
 возвращает команды сервису. При отказе mode-set приложение синхронизируется с
 фактическим состоянием и не изображает несуществующее разрешение активным.
+
+## UTF-8 и text engine
+
+Текстом RustOS на границах process/service/API считает валидный UTF-8.
+Проверка выполняется до публикации state: невалидный clipboard payload,
+process arguments, VFS path и resource string отклоняются. Внутри renderer
+не должен «чинить» байты или молча заменять их ASCII.
+
+`TextDocument` хранит offsets в байтах: такой offset стабилен для IPC,
+piece table и file I/O. Публичная `TextLocation` явно различает
+byte, Unicode scalar и grapheme columns. Cursor, Backspace и Delete ходят
+по extended grapheme clusters Unicode UAX #29: combining mark, emoji ZWJ sequence
+и conjunct не разрезаются на части. `GraphemeCursor` работает прямо
+по фрагментам piece table без сборки всего документа в один buffer.
+
+`TextEditorController` объединяет document, directed selection, две оси
+scroll, visible line range, bounded undo/redo и один `TextCommand` для menu,
+toolbar и shortcuts. `ClipboardFormat::TEXT` атомарно принимает только
+валидный UTF-8. IME events уже разделены на Start/Update/Commit/Cancel;
+следующий срез передаст composition через `uid` и научит layout
+shaping, bidi и fallback fonts. Полный общесистемный контракт описан в
+[`TEXT_ENCODING.md`](TEXT_ENCODING.md).
 
 ## Accessibility
 
@@ -337,7 +392,8 @@ cargo run -p rustos-rui -- check sdk/ui/gallery.rui
 ```
 
 `PerformanceCounters` считает frames, layout passes, display-list rebuilds,
-backend commands, rasterized pixels, nodes и commands. Следующий inspector
+backend commands, rasterized pixels, nodes, commands, scroll events и число
+видимых logical items. Следующий inspector
 добавит monotonic time и budgets. Цели CPU backend для 1280×720:
 
 - pointer hover без смены target: ноль UI redraw;
@@ -356,8 +412,10 @@ Snapshot backend обязан исполнять те же display commands.
 
 1. Вынести `uid` и displayd в ring 3; подключить ABI queue.
 2. Добавить resource table, локализацию, fallback fonts, shaping и bidi.
-3. Реализовать TextEditor: selection, IME, clipboard, undo/redo.
-4. Добавить ScrollView physics, recycled delegates и variable extents.
+3. Вынести готовые TextDocument/editor/clipboard в ring-3 `uid`,
+   подключить shared-memory text batches и composition от IME service.
+4. Добавить variable extents measurement index, delegate rebinding и scroll
+   anchoring; fixed-extent recycling уже является рабочей базой.
 5. Ввести popup/portal, focus scopes, modal barriers, menu/dialog/tooltip.
 6. Добавить typed property schema, AOT bindings и command registry.
 7. Добавить compositor animations, reduced motion и frame clock.

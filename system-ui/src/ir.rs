@@ -152,7 +152,9 @@ pub fn load_ir<const N: usize>(bytes: &[u8], tree: &mut Tree<N>) -> Result<UiIrH
             .create(parent, to_spec(record)?)
             .map_err(|error| match error {
                 TreeError::Capacity => IrError::Capacity,
-                TreeError::InvalidNode | TreeError::InvalidHierarchy => IrError::InvalidHierarchy,
+                TreeError::InvalidNode
+                | TreeError::InvalidHierarchy
+                | TreeError::InvalidComponent => IrError::InvalidHierarchy,
             })?;
         ids[index] = id;
     }
@@ -280,6 +282,11 @@ fn to_spec(record: UiIrNode) -> Result<NodeSpec, IrError> {
         role,
         accessible_name: ResourceId(record.accessible_name),
         tab_index: record.tab_index,
+        scroll: if matches!(kind, ComponentKind::ScrollView | ComponentKind::ListView) {
+            crate::ScrollConfig::VERTICAL
+        } else {
+            crate::ScrollConfig::NONE
+        },
     })
 }
 
@@ -319,6 +326,7 @@ fn component_kind(value: u16) -> Option<ComponentKind> {
         21 => ComponentKind::TabView,
         22 => ComponentKind::Menu,
         23 => ComponentKind::Dialog,
+        24 => ComponentKind::ScrollBar,
         _ => return None,
     })
 }
@@ -341,6 +349,7 @@ fn semantic_role(value: u16) -> Option<SemanticRole> {
         13 => SemanticRole::Dialog,
         14 => SemanticRole::Progress,
         15 => SemanticRole::Image,
+        16 => SemanticRole::ScrollBar,
         _ => return None,
     })
 }

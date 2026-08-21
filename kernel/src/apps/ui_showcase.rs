@@ -12,8 +12,8 @@ use rustos_system_assets::{IconKind, IconPack, AURORA_ICON_PACK};
 use rustos_system_ui::{
     style_class, Align, CommandId, ComponentKind, Content, DispatchResult, Edges, FontSpec,
     FrameResult, InputEvent, Key, KeyEvent, LayoutSpec, Length, NodeId, NodeSpec, NodeState,
-    PointerEvent, PointerKind, RenderBackend, ResourceId, Runtime, SemanticRole, Theme, ThemeKind,
-    VirtualList,
+    PointerEvent, PointerKind, RenderBackend, ResourceId, Runtime, SelectionMode, SemanticRole,
+    Theme, ThemeKind,
 };
 
 const COMMAND_THEME: CommandId = CommandId(1);
@@ -36,7 +36,6 @@ pub struct UiShowcase {
     counter_button: NodeId,
     theme_switch: NodeId,
     check_box: NodeId,
-    virtual_list: VirtualList,
     counter: u16,
 }
 
@@ -49,6 +48,7 @@ impl UiShowcase {
         let mut counter_button = NodeId::NONE;
         let mut theme_switch = NodeId::NONE;
         let mut check_box = NodeId::NONE;
+        let mut list_view = NodeId::NONE;
 
         {
             let root = runtime.tree().root();
@@ -191,29 +191,27 @@ impl UiShowcase {
                     style_class::DEFAULT,
                 );
                 if let Some(bottom) = bottom {
-                    build_list_card(&mut ui, bottom);
+                    list_view = build_list_card(&mut ui, bottom);
                     build_status_card(&mut ui, bottom);
                 }
             }
         }
 
-        let mut virtual_list = VirtualList::new(50_000, 30);
-        virtual_list.set_viewport(viewport.height.saturating_sub(360));
+        if !list_view.is_none() {
+            let _ = runtime.configure_list_view(list_view, 50_000, 30, SelectionMode::Extended);
+        }
         Self {
             runtime,
             progress,
             counter_button,
             theme_switch,
             check_box,
-            virtual_list,
             counter: 350,
         }
     }
 
     pub fn resize(&mut self, viewport: Rect) {
         self.runtime.resize(viewport);
-        self.virtual_list
-            .set_viewport(viewport.height.saturating_sub(360));
     }
 
     pub fn set_scale(&mut self, scale_milli: u16) {
@@ -223,11 +221,9 @@ impl UiShowcase {
     }
 
     pub fn pointer(&mut self, kind: PointerKind, x: i32, y: i32, scroll_y: i16) -> bool {
-        if kind == PointerKind::Scroll {
-            self.virtual_list.scroll_by(i64::from(scroll_y) * 30);
-        }
         let mut event = PointerEvent::at(kind, x, y);
         event.scroll_y = scroll_y;
+        event.scroll_unit = rustos_system_ui::ScrollUnit::Line;
         let result = self.runtime.dispatch(InputEvent::Pointer(event));
         self.apply(result)
     }
@@ -337,9 +333,12 @@ fn build_header<const N: usize>(ui: &mut rustos_system_ui::UiBuilder<'_, N>, pag
     add_caption(ui, texts, ResourceId(2));
 }
 
-fn build_list_card<const N: usize>(ui: &mut rustos_system_ui::UiBuilder<'_, N>, parent: NodeId) {
+fn build_list_card<const N: usize>(
+    ui: &mut rustos_system_ui::UiBuilder<'_, N>,
+    parent: NodeId,
+) -> NodeId {
     let Some(card) = add_card(ui, parent, 2) else {
-        return;
+        return NodeId::NONE;
     };
     add_heading(ui, card, ResourceId(17));
     let Ok(list) = ui.list_view(
@@ -352,9 +351,12 @@ fn build_list_card<const N: usize>(ui: &mut rustos_system_ui::UiBuilder<'_, N>, 
             ..LayoutSpec::default()
         },
     ) else {
-        return;
+        return NodeId::NONE;
     };
-    for resource in 18..=22 {
+    // Десять recyclable delegates покрывают viewport + overscan. Logical
+    // source при этом содержит 50 000 items и не создаёт 50 000 nodes.
+    for index in 0..10 {
+        let resource = 18 + index % 5;
         let mut row = NodeSpec::new(ComponentKind::Text);
         row.layout = line(29);
         row.content = Content::Text(ResourceId(resource));
@@ -364,6 +366,7 @@ fn build_list_card<const N: usize>(ui: &mut rustos_system_ui::UiBuilder<'_, N>, 
         }
         let _ = ui.component(list, row);
     }
+    list
 }
 
 fn build_status_card<const N: usize>(ui: &mut rustos_system_ui::UiBuilder<'_, N>, parent: NodeId) {

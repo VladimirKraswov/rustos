@@ -291,11 +291,12 @@ fn component(name: &str) -> Option<u16> {
         "TabView" => 21,
         "Menu" => 22,
         "Dialog" => 23,
+        "ScrollBar" => 24,
         _ => return None,
     })
 }
 fn focusable(kind: u16) -> bool {
-    matches!(kind, 9..=18 | 21 | 22)
+    matches!(kind, 9..=18 | 21 | 22 | 24)
 }
 fn align(name: &str) -> Option<u8> {
     Some(match name {
@@ -324,6 +325,7 @@ fn role(name: &str) -> Option<u16> {
         "dialog" => 13,
         "progress" => 14,
         "image" => 15,
+        "scrollbar" => 16,
         _ => return None,
     })
 }
