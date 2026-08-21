@@ -23,6 +23,7 @@ mod layout;
 mod runtime;
 mod semantics;
 mod style;
+mod text_input;
 mod tree;
 
 pub use collections::{VirtualList, VisibleRange};
@@ -40,6 +41,7 @@ pub use runtime::{FrameResult, PerformanceCounters, Runtime, RuntimeError};
 pub use rustos_video::{Color, Rect};
 pub use semantics::{SemanticAction, SemanticNode, SemanticRole, SemanticsTree};
 pub use style::{style_class, ComputedStyle, Palette, Theme, ThemeKind};
+pub use text_input::{TextInputBuffer, TextInputError};
 pub use tree::{
     CommandId, ComponentKind, Content, DirtyFlags, Node, NodeId, NodeSpec, NodeState, ResourceId,
     Tree, TreeError,

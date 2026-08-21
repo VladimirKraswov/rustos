@@ -1,0 +1,85 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "default_agent": "rustos-module",
+  "share": "disabled",
+  "snapshot": true,
+  "instructions": [
+    "docs/OPENCODE.md"
+  ],
+  "agent": {
+    "rustos-module": {
+      "description": "Реализует один небольшой проверяемый модуль RustOS в явно заданных границах",
+      "mode": "primary",
+      "temperature": 0.2,
+      "steps": 180,
+      "prompt": "{file:./docs/OPENCODE_AGENT.md}",
+      "permission": {
+        "read": {
+          "*": "allow",
+          ".opencode/**": "deny",
+          "**/.opencode/**": "deny"
+        },
+        "edit": {
+          "*": "allow",
+          ".opencode/**": "deny",
+          "**/.opencode/**": "deny"
+        },
+        "glob": "allow",
+        "grep": "allow",
+        "list": "allow",
+        "bash": {
+          "*": "allow",
+          "git commit*": "deny",
+          "git push*": "deny",
+          "git reset*": "deny",
+          "git checkout*": "deny",
+          "git switch*": "deny",
+          "git clean*": "deny",
+          "git restore*": "deny",
+          "make clean*": "deny",
+          "rm *": "deny",
+          "sudo *": "deny",
+          "*.opencode*": "deny"
+        },
+        "task": "deny",
+        "skill": "deny",
+        "webfetch": "deny",
+        "websearch": "deny",
+        "external_directory": "deny",
+        "lsp": "allow",
+        "todowrite": "allow",
+        "question": "allow",
+        "doom_loop": "deny"
+      }
+    },
+    "rustos-review": {
+      "description": "Проверяет малый change RustOS без изменения файлов",
+      "mode": "subagent",
+      "temperature": 0.1,
+      "steps": 60,
+      "prompt": "Проверь только заявленную задачу, diff и результаты тестов. Ищи нарушение границ, неатомарное состояние, ошибки capacity/UTF-8, регрессии no_std и недостающие негативные тесты. Выдай сначала конкретные замечания с файлами, затем PASS, если блокирующих замечаний нет. Не редактируй файлы.",
+      "permission": {
+        "read": "allow",
+        "edit": "deny",
+        "glob": "allow",
+        "grep": "allow",
+        "list": "allow",
+        "bash": {
+          "*": "deny",
+          "git status*": "allow",
+          "git diff*": "allow",
+          "git show*": "allow"
+        },
+        "task": "deny",
+        "skill": "deny",
+        "webfetch": "deny",
+        "websearch": "deny",
+        "external_directory": "deny",
+        "lsp": "allow",
+        "todowrite": "deny",
+        "question": "deny",
+        "doom_loop": "deny"
+      }
+    }
+  }
+}
