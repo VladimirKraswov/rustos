@@ -233,7 +233,7 @@ fn scroll_container<const N: usize, F>(
         let node = *tree.get(id).expect("child ID belongs to tree");
         child = tree.next_sibling(id);
         if node.state.contains(crate::NodeState::HIDDEN) {
-            set_rect(tree, id, Rect::EMPTY, damaged);
+            set_rect_clipped(tree, id, Rect::EMPTY, parent_node.rect, damaged);
             continue;
         }
         let width = scroll_child_extent(node, viewport.width, true, horizontal_scroll);
@@ -272,15 +272,31 @@ fn scroll_container<const N: usize, F>(
     } else {
         0
     };
+    // Damage дочерних элементов обрезается до видимой области контейнера,
+    // чтобы прокрутка не затрагивала соседние control за его пределами.
+    let clip = parent_node.rect;
+    // Делегаты сверх visible_range не должны оставаться hit-testable как
+    // фантомные строки за концом списка.
+    let max_visible = if measured.list.is_configured() {
+        measured.list.visible_range(measured.scroll.vertical).len() as usize
+    } else {
+        usize::MAX
+    };
     let mut cursor_y = viewport
         .y
         .saturating_add(first_item_offset)
         .saturating_sub(offset_y);
+    let mut placed = 0usize;
     child = tree.first_child(parent);
     while let Some(id) = child {
         let node = *tree.get(id).expect("child ID belongs to tree");
         child = tree.next_sibling(id);
         if node.state.contains(crate::NodeState::HIDDEN) {
+            continue;
+        }
+        if placed >= max_visible {
+            set_rect_clipped(tree, id, Rect::EMPTY, clip, damaged);
+            placed += 1;
             continue;
         }
         let width = scroll_child_extent(node, viewport.width, true, horizontal_scroll);
@@ -296,11 +312,12 @@ fn scroll_container<const N: usize, F>(
             node.layout.align,
         );
         let rect = Rect::new(x, cursor_y, width, height);
-        set_rect(tree, id, rect, damaged);
+        set_rect_clipped(tree, id, rect, clip, damaged);
         layout_children(tree, id, damaged);
         cursor_y = cursor_y
             .saturating_add(height.min(i32::MAX as u32) as i32)
             .saturating_add(i32::from(parent_node.layout.gap));
+        placed += 1;
     }
 }
 
@@ -502,6 +519,35 @@ where
         if node.rect != rect {
             damaged(node.rect);
             damaged(rect);
+            node.rect = rect;
+            node.dirty.insert(crate::DirtyFlags::PAINT);
+        }
+    }
+}
+
+/// Вариант `set_rect` для дочерних элементов scroll контейнера. Сам rect
+/// хранится без обрезки (renderer clip'ит через paint_clip), но damage
+/// ограничивается видимой областью контейнера, чтобы прокрутка не
+/// затрагивала соседние control за его пределами.
+fn set_rect_clipped<const N: usize, F>(
+    tree: &mut Tree<N>,
+    id: NodeId,
+    rect: Rect,
+    clip: Rect,
+    damaged: &mut F,
+) where
+    F: FnMut(Rect),
+{
+    if let Some(node) = tree.get_mut_internal(id) {
+        if node.rect != rect {
+            let old = node.rect.intersection(clip);
+            if !old.is_empty() {
+                damaged(old);
+            }
+            let new = rect.intersection(clip);
+            if !new.is_empty() {
+                damaged(new);
+            }
             node.rect = rect;
             node.dirty.insert(crate::DirtyFlags::PAINT);
         }

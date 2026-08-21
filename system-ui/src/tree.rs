@@ -637,8 +637,11 @@ impl<const N: usize> Tree<N> {
         node.scroll
             .horizontal
             .set_extents(viewport_width, content_width);
+        // Для configured ListView логическая длина — единственный источник
+        // истины: measured pool delegates и viewport не должны раздувать
+        // content extent, когда item_count меньше materialized pool.
         let vertical_content = if node.list.is_configured() {
-            node.list.content_extent().max(content_height)
+            node.list.content_extent()
         } else {
             content_height
         };

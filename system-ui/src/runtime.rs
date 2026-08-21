@@ -829,6 +829,207 @@ mod tests {
         );
     }
 
+    /// Строит ListView с фиксированным пулом из `count` recycled Text-delegates.
+    /// Возвращает ID списка и массив delegates в порядке создания.
+    fn build_list_with_delegates<const N: usize, const C: usize, const D: usize>(
+        runtime: &mut Runtime<N, C, D>,
+        count: usize,
+    ) -> (NodeId, [NodeId; 16]) {
+        assert!(count <= 16, "delegate pool is bounded to 16 in tests");
+        let root = runtime.tree().root();
+        let mut ui = runtime.builder();
+        let list = ui.list_view(root, LayoutSpec::fill()).unwrap();
+        let mut delegates = [NodeId::NONE; 16];
+        for slot in delegates.iter_mut().take(count) {
+            let mut row = NodeSpec::new(ComponentKind::Text);
+            row.layout = LayoutSpec {
+                width: Length::Fill(1),
+                height: Length::Px(24),
+                ..LayoutSpec::default()
+            };
+            row.content = Content::Text(ResourceId(1));
+            *slot = ui.component(list, row).unwrap();
+        }
+        (list, delegates)
+    }
+
+    #[test]
+    fn list_view_wheel_over_delegate_advances_offset_and_range() {
+        let mut runtime = Runtime::<20, 64, 16>::new(Rect::new(0, 0, 320, 240), Theme::light());
+        let (list, _delegates) = build_list_with_delegates(&mut runtime, 16);
+        runtime
+            .configure_list_view(list, 50_000, 24, SelectionMode::Extended)
+            .unwrap();
+        runtime.render(&mut Headless::default()).unwrap();
+        // Wheel над дочерним delegate (y=120..144) обязан найти ListView ancestor.
+        let mut wheel = PointerEvent::at(PointerKind::Scroll, 5, 130);
+        wheel.scroll_y = 100;
+        let result = runtime.dispatch(InputEvent::Pointer(wheel));
+        assert!(result.consumed && result.changed);
+        assert_eq!(result.target, list);
+        let model = runtime.tree().get(list).unwrap().scroll.vertical;
+        assert_eq!(model.offset(), 100);
+        let range = runtime.list_view_state(list).unwrap().visible_range(model);
+        assert_eq!(range.start, 2);
+        assert_eq!(range.end, 17);
+    }
+
+    #[test]
+    fn list_view_scroll_to_max_clamps_and_includes_last_item() {
+        let mut runtime = Runtime::<20, 64, 16>::new(Rect::new(0, 0, 320, 240), Theme::light());
+        let (list, _delegates) = build_list_with_delegates(&mut runtime, 16);
+        runtime
+            .configure_list_view(list, 50_000, 24, SelectionMode::Extended)
+            .unwrap();
+        runtime.render(&mut Headless::default()).unwrap();
+        runtime
+            .scroll_to(list, ScrollAxis::Vertical, u64::MAX)
+            .unwrap();
+        runtime.render(&mut Headless::default()).unwrap();
+        let model = runtime.tree().get(list).unwrap().scroll.vertical;
+        assert_eq!(model.offset(), 1_199_760);
+        let range = runtime.list_view_state(list).unwrap().visible_range(model);
+        assert_eq!(range.end, 50_000);
+    }
+
+    #[test]
+    fn list_view_wheel_back_to_start() {
+        let mut runtime = Runtime::<20, 64, 16>::new(Rect::new(0, 0, 320, 240), Theme::light());
+        let (list, _delegates) = build_list_with_delegates(&mut runtime, 16);
+        runtime
+            .configure_list_view(list, 50_000, 24, SelectionMode::Extended)
+            .unwrap();
+        runtime.render(&mut Headless::default()).unwrap();
+        runtime
+            .scroll_to(list, ScrollAxis::Vertical, u64::MAX)
+            .unwrap();
+        runtime.render(&mut Headless::default()).unwrap();
+        // Wheel назад до начала: i16 delta ограничен, поэтому несколько событий.
+        while runtime.tree().get(list).unwrap().scroll.vertical.offset() > 0 {
+            let mut wheel = PointerEvent::at(PointerKind::Scroll, 5, 130);
+            wheel.scroll_y = -32_768;
+            runtime.dispatch(InputEvent::Pointer(wheel));
+        }
+        runtime.render(&mut Headless::default()).unwrap();
+        let model = runtime.tree().get(list).unwrap().scroll.vertical;
+        assert_eq!(model.offset(), 0);
+        let range = runtime.list_view_state(list).unwrap().visible_range(model);
+        assert_eq!(range.start, 0);
+    }
+
+    #[test]
+    fn list_view_reconfigure_and_resize_clamp_offset() {
+        let mut runtime = Runtime::<20, 64, 16>::new(Rect::new(0, 0, 320, 240), Theme::light());
+        let (list, _delegates) = build_list_with_delegates(&mut runtime, 16);
+        runtime
+            .configure_list_view(list, 50_000, 24, SelectionMode::Extended)
+            .unwrap();
+        runtime.render(&mut Headless::default()).unwrap();
+        runtime
+            .scroll_to(list, ScrollAxis::Vertical, u64::MAX)
+            .unwrap();
+        runtime.render(&mut Headless::default()).unwrap();
+        assert_eq!(
+            runtime.tree().get(list).unwrap().scroll.vertical.offset(),
+            1_199_760
+        );
+        // Resize 240 -> 400: offset clamps к новому maximum.
+        runtime.resize(Rect::new(0, 0, 320, 400));
+        runtime.render(&mut Headless::default()).unwrap();
+        assert_eq!(
+            runtime.tree().get(list).unwrap().scroll.vertical.offset(),
+            1_199_600
+        );
+        // Reconfigure 50_000 -> 3: offset/target clamps к 0, content = 72.
+        runtime
+            .configure_list_view(list, 3, 24, SelectionMode::Extended)
+            .unwrap();
+        runtime.render(&mut Headless::default()).unwrap();
+        let model = runtime.tree().get(list).unwrap().scroll.vertical;
+        assert_eq!(model.offset(), 0);
+        assert_eq!(model.target(), 0);
+        assert_eq!(model.content_size(), 72);
+    }
+
+    #[test]
+    fn list_view_extra_recycled_delegates_get_empty_bounds() {
+        let mut runtime = Runtime::<20, 64, 16>::new(Rect::new(0, 0, 320, 240), Theme::light());
+        let (list, delegates) = build_list_with_delegates(&mut runtime, 16);
+        runtime
+            .configure_list_view(list, 50_000, 24, SelectionMode::Extended)
+            .unwrap();
+        runtime.render(&mut Headless::default()).unwrap();
+        let range = runtime
+            .list_view_state(list)
+            .unwrap()
+            .visible_range(runtime.tree().get(list).unwrap().scroll.vertical);
+        let expected = range.len() as usize;
+        // Первые `expected` delegates имеют non-empty bounds.
+        for delegate in &delegates[..expected] {
+            let rect = runtime.tree().get(*delegate).unwrap().rect;
+            assert!(!rect.is_empty());
+        }
+        // Делегаты сверх visible_range.len() получают пустые bounds.
+        for delegate in &delegates[expected..] {
+            let rect = runtime.tree().get(*delegate).unwrap().rect;
+            assert!(rect.is_empty());
+        }
+    }
+
+    #[test]
+    fn list_view_wheel_damages_only_list_and_scrollbar() {
+        let mut runtime = Runtime::<20, 64, 16>::new(Rect::new(0, 0, 320, 240), Theme::light());
+        let (list, _delegates, sibling) = {
+            let root = runtime.tree().root();
+            let mut ui = runtime.builder();
+            let column = ui
+                .component(root, NodeSpec::new(ComponentKind::Column))
+                .unwrap();
+            let list_layout = LayoutSpec {
+                width: Length::Fill(1),
+                height: Length::Px(200),
+                ..LayoutSpec::default()
+            };
+            let list = ui.list_view(column, list_layout).unwrap();
+            let mut delegates = [NodeId::NONE; 16];
+            for slot in delegates.iter_mut() {
+                let mut row = NodeSpec::new(ComponentKind::Text);
+                row.layout = LayoutSpec {
+                    width: Length::Fill(1),
+                    height: Length::Px(24),
+                    ..LayoutSpec::default()
+                };
+                row.content = Content::Text(ResourceId(1));
+                *slot = ui.component(list, row).unwrap();
+            }
+            let sibling_layout = LayoutSpec {
+                width: Length::Fill(1),
+                height: Length::Px(40),
+                ..LayoutSpec::default()
+            };
+            let sibling = ui
+                .button(column, ResourceId(2), CommandId(1), sibling_layout)
+                .unwrap();
+            (list, delegates, sibling)
+        };
+        runtime
+            .configure_list_view(list, 50_000, 24, SelectionMode::Extended)
+            .unwrap();
+        runtime.render(&mut Headless::default()).unwrap();
+        let mut wheel = PointerEvent::at(PointerKind::Scroll, 5, 130);
+        wheel.scroll_y = 100;
+        runtime.dispatch(InputEvent::Pointer(wheel));
+        let frame = runtime.render(&mut Headless::default()).unwrap();
+        // Соседний control и полный viewport не получают лишний damage.
+        let sibling_rect = runtime.tree().get(sibling).unwrap().rect;
+        let sibling_center_x = sibling_rect.x + sibling_rect.width as i32 / 2;
+        let sibling_center_y = sibling_rect.y + sibling_rect.height as i32 / 2;
+        for rect in frame.damage() {
+            assert!(!rect.contains(sibling_center_x, sibling_center_y));
+            assert!(rect.area() < 320 * 240);
+        }
+    }
+
     #[test]
     fn page_down_scrolls_focused_controls_scroll_view_ancestor() {
         let mut runtime = Runtime::<8, 64, 8>::new(Rect::new(0, 0, 260, 160), Theme::light());
