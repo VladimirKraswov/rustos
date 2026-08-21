@@ -1,5 +1,10 @@
 # VaraniaFS v1: формат и восстановление
 
+Это описание стабильного legacy-формата. Архитектура масштабируемого и более
+надёжного преемника находится в [VARANIAFS_V2.md](VARANIAFS_V2.md). V1 остаётся
+доступен до завершения migration/power-loss gates и не будет молча прочитан как
+v2.
+
 VaraniaFS — собственный постоянный формат RustOS. Его структуры вынесены в
 отдельный `no_std` crate [`varaniafs`](../varaniafs/src/lib.rs): один и тот же
 код использует ring-3 `vfsd` и host-утилита `rustos-vfs-image` на macOS/Linux.
