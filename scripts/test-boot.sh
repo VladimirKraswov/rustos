@@ -48,7 +48,9 @@ cp -f build/ovmf/OVMF_VARS.fd "$VARS"
 QPID=""
 WATCHDOG=""
 # Функция вызывается косвенно через `trap`; ShellCheck не строит такой edge.
-# shellcheck disable=SC2329
+# SC2329/SC2317: функция и её тело вызываются косвенно через `trap`.
+# Старый ShellCheck 0.9 в Ubuntu не связывает регистрацию trap с вызовом.
+# shellcheck disable=SC2317,SC2329
 cleanup() {
     trap - EXIT INT TERM HUP
     if [[ -n "$WATCHDOG" ]]; then

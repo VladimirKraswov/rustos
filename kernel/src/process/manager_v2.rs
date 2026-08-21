@@ -3314,6 +3314,11 @@ impl ProcessManager {
         let _ = self.timelines.signal(pending.timeline, pending.value);
         let _ = self.timelines.release(pending.timeline);
         self.gpu_submission = None;
+        // Сигнал от устройства приходит из kernel completion path, а не из
+        // пользовательского SYNC_TIMELINE_SIGNAL syscall. Поэтому именно
+        // здесь нужно выполнить ту же операцию пробуждения: иначе renderd
+        // навсегда остаётся blocked, хотя значение timeline уже достигнуто.
+        self.wake_ready_sync_waiters();
     }
 
     /// Bootstrap scheduler пока не имеет отдельного kernel idle thread. Если
