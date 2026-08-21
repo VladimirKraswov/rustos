@@ -480,8 +480,13 @@ drag_commands=""
 for _ in $(seq 1 4); do
     drag_commands="${drag_commands}mouse_move 30 20\n"
 done
-printf '%b' "$drag_commands" | hmp 30
-sleep 0.2
+# На TCG monitor подтверждает command раньше, чем все три байта PS/2 packet
+# дошли до 8042. Частые HMP-команды могут поставить release между байтами
+# последнего движения и превратить корректный guest decoder в ложный timeout.
+# 100 ms всё ещё намного быстрее человеческого drag, но сохраняет packet
+# boundary и проверяет именно четыре независимых movement event.
+printf '%b' "$drag_commands" | hmp 100
+sleep 0.5
 printf 'mouse_button 0\n' | hmp
 wait_for_serial_count '[wm] drag finished id=0x03' "$((drag_finished_before + 1))"
 grep -Eq '\[wm\] drag finished id=0x03 frames=[1-9][0-9]* packets=[1-9][0-9]* present-kpx=[1-9][0-9]* compositor=layer-cache' \

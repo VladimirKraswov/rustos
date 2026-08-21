@@ -1,13 +1,13 @@
 //! Контракт между compositor'ом и конкретным display/scanout driver.
 
-use crate::{PixelFormat, Rect, Surface};
+use crate::{CpuPixelFormat, CpuSurface, Rect};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DisplayMode {
     pub width: u32,
     pub height: u32,
     pub stride_pixels: u32,
-    pub format: PixelFormat,
+    pub format: CpuPixelFormat,
     /// 0 означает, что firmware/driver не сообщил refresh rate.
     pub refresh_millihertz: u32,
 }
@@ -31,11 +31,11 @@ pub enum ColorMode {
 }
 
 impl ColorMode {
-    pub const fn pixel_format(self) -> PixelFormat {
+    pub const fn pixel_format(self) -> CpuPixelFormat {
         match self {
-            Self::TrueColor24 => PixelFormat::Rgb888,
-            Self::HighColor16 => PixelFormat::Rgb565,
-            Self::Grayscale8 => PixelFormat::Grayscale8,
+            Self::TrueColor24 => CpuPixelFormat::Rgb888,
+            Self::HighColor16 => CpuPixelFormat::Rgb565,
+            Self::Grayscale8 => CpuPixelFormat::Grayscale8,
         }
     }
 }
@@ -95,7 +95,7 @@ pub trait Scanout {
     fn capabilities(&self) -> ScanoutCapabilities;
     fn present(
         &mut self,
-        source: Surface<'_>,
+        source: CpuSurface<'_>,
         damage: &[Rect],
         sequence: u64,
     ) -> Result<PresentStats, ScanoutError>;

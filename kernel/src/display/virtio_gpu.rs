@@ -9,8 +9,8 @@
 use core::ptr;
 
 use rustos_video::{
-    ConnectorInfo, ConnectorKind, DisplayMode, ModeSetError, PixelFormat, PresentStats, Rect,
-    ScanoutCapabilities, ScanoutError, Surface,
+    ConnectorInfo, ConnectorKind, CpuPixelFormat, CpuSurface, DisplayMode, ModeSetError,
+    PresentStats, Rect, ScanoutCapabilities, ScanoutError,
 };
 
 use crate::memory::{self, FrameBlock};
@@ -262,12 +262,12 @@ impl VirtioGpu {
                 width,
                 height,
                 stride_pixels: width,
-                format: PixelFormat::Bgr888,
+                format: CpuPixelFormat::Bgr888,
                 refresh_millihertz: 60_000,
             });
         }
         let connector_preferred = DisplayMode {
-            format: PixelFormat::Bgr888,
+            format: CpuPixelFormat::Bgr888,
             stride_pixels: preferred.width,
             ..preferred
         };
@@ -320,7 +320,7 @@ impl VirtioGpu {
         if requested.width == self.mode.width && requested.height == self.mode.height {
             return Ok(self.mode);
         }
-        if requested.format != PixelFormat::Bgr888
+        if requested.format != CpuPixelFormat::Bgr888
             || !self.modes[..self.mode_count]
                 .iter()
                 .any(|mode| mode.width == requested.width && mode.height == requested.height)
@@ -329,7 +329,7 @@ impl VirtioGpu {
         }
         let requested = DisplayMode {
             stride_pixels: requested.width,
-            format: PixelFormat::Bgr888,
+            format: CpuPixelFormat::Bgr888,
             ..requested
         };
         let replacement = self.allocate_resource(requested)?;
@@ -355,7 +355,7 @@ impl VirtioGpu {
 
     pub fn present(
         &mut self,
-        source: Surface<'_>,
+        source: CpuSurface<'_>,
         damage: &[Rect],
         sequence: u64,
     ) -> Result<PresentStats, ScanoutError> {
@@ -377,11 +377,11 @@ impl VirtioGpu {
                     .ok_or(ScanoutError::InvalidSurface)?;
                 let destination =
                     unsafe { target.add(y as usize * self.mode.width as usize + rect.x as usize) };
-                if source.format() == PixelFormat::Bgr888 {
+                if source.format() == CpuPixelFormat::Bgr888 {
                     unsafe { ptr::copy_nonoverlapping(row.as_ptr(), destination, row.len()) };
                 } else {
                     for (offset, raw) in row.iter().copied().enumerate() {
-                        let converted = PixelFormat::Bgr888.pack(source.format().unpack(raw));
+                        let converted = CpuPixelFormat::Bgr888.pack(source.format().unpack(raw));
                         unsafe { destination.add(offset).write(converted) };
                     }
                 }
@@ -414,7 +414,7 @@ impl VirtioGpu {
                         width: display.rect.width,
                         height: display.rect.height,
                         stride_pixels: display.rect.width,
-                        format: PixelFormat::Bgr888,
+                        format: CpuPixelFormat::Bgr888,
                         refresh_millihertz: 0,
                     },
                 ));
@@ -449,7 +449,7 @@ impl VirtioGpu {
                 width: mode.width,
                 height: mode.height,
                 stride_pixels: mode.width,
-                format: PixelFormat::Bgr888,
+                format: CpuPixelFormat::Bgr888,
                 refresh_millihertz: mode.refresh_millihertz,
             });
         }
@@ -469,7 +469,7 @@ impl VirtioGpu {
         if self.mode_count < MAX_MODES {
             self.modes[self.mode_count] = DisplayMode {
                 stride_pixels: mode.width,
-                format: PixelFormat::Bgr888,
+                format: CpuPixelFormat::Bgr888,
                 ..mode
             };
             self.mode_count += 1;
@@ -627,7 +627,7 @@ fn startup_mode(preferred: DisplayMode, fallback: DisplayMode) -> DisplayMode {
                 width,
                 height,
                 stride_pixels: width,
-                format: PixelFormat::Bgr888,
+                format: CpuPixelFormat::Bgr888,
                 refresh_millihertz: preferred.refresh_millihertz.max(60_000),
             };
         }
@@ -647,7 +647,7 @@ fn startup_mode(preferred: DisplayMode, fallback: DisplayMode) -> DisplayMode {
         width,
         height,
         stride_pixels: width,
-        format: PixelFormat::Bgr888,
+        format: CpuPixelFormat::Bgr888,
         refresh_millihertz: preferred.refresh_millihertz.max(60_000),
     }
 }

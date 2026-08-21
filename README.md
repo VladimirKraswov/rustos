@@ -35,6 +35,9 @@ RustOS — учебная 64-битная микроядерная операц�
   driver priority;
 - wide-screen GOP/virtio-gpu scanout поверх PCI (AMD64) и MMIO (AArch64),
   выбор режима и CPU back buffer с damage;
+- современный graphics ABI: capability buffers, packed/multi-plane RGB/YUV,
+  color metadata, explicit timeline sync, surface queues и presentation
+  feedback;
 - PS/2 input на PC и virtio-input keyboard/mouse на ARM VM;
 - desktop, taskbar, Start menu и icons;
 - window manager: drag, minimize, maximize, restore и close;
@@ -133,6 +136,7 @@ runtime, interrupt routing, TLB shootdown и work stealing. Затем display/i
 
 Подробнее: [архитектуры CPU](docs/ARCHITECTURES.md), [архитектура системы](docs/ARCHITECTURE.md),
 [графическая подсистема](docs/GUI.md), [видеосистема](docs/VIDEO.md), [VFS](docs/VFS.md),
+[ADR современной графической архитектуры](docs/adr/0001-modern-graphics-architecture.md),
 [микроядро](docs/MICROKERNEL.md), [DLL](docs/DYNAMIC_LIBRARIES.md),
 [IPC](docs/IPC.md), [процессы и память ABI v4](docs/PROCESS_MEMORY_ABI.md),
 [self-hosting Rust](docs/SELF_HOSTING.md),

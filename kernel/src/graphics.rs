@@ -18,9 +18,9 @@ use rustos_abi::{
 use rustos_system_assets::{IconTarget, Wallpaper};
 pub use rustos_video::{Color, Rect};
 use rustos_video::{
-    ColorMode, ConnectorInfo, ConnectorKind, DamageRegion, DisplayDriver, DisplayMode,
-    ModeSetError, PixelFormat, PresentStats, Scanout, ScanoutCapabilities, ScanoutError, Surface,
-    SurfaceMut,
+    ColorMode, ConnectorInfo, ConnectorKind, CpuPixelFormat, CpuSurface, CpuSurfaceMut,
+    DamageRegion, DisplayDriver, DisplayMode, ModeSetError, PresentStats, Scanout,
+    ScanoutCapabilities, ScanoutError,
 };
 
 use crate::{
@@ -53,10 +53,10 @@ pub struct Framebuffer {
     height: u32,
     stride: u32,
     /// Формат физической scanout-памяти, выбранный GRUB/firmware.
-    scanout_format: PixelFormat,
+    scanout_format: CpuPixelFormat,
     /// Формат software surface. Может переключаться между true-color,
     /// RGB565 и grayscale без packed/unaligned framebuffer writes.
-    render_format: PixelFormat,
+    render_format: CpuPixelFormat,
     source: u32,
     present_sequence: u64,
 }
@@ -70,8 +70,8 @@ impl Framebuffer {
     pub fn from_boot(boot: &BootInfo) -> Option<Self> {
         let info = &boot.framebuffer;
         let firmware_format = match info.format {
-            FRAMEBUFFER_FORMAT_RGB => Some(PixelFormat::Rgb888),
-            FRAMEBUFFER_FORMAT_BGR => Some(PixelFormat::Bgr888),
+            FRAMEBUFFER_FORMAT_RGB => Some(CpuPixelFormat::Rgb888),
+            FRAMEBUFFER_FORMAT_BGR => Some(CpuPixelFormat::Bgr888),
             _ => None,
         };
         let firmware_valid = info.phys_addr != 0
@@ -89,7 +89,7 @@ impl Framebuffer {
             } else {
                 1280
             },
-            format: firmware_format.unwrap_or(PixelFormat::Bgr888),
+            format: firmware_format.unwrap_or(CpuPixelFormat::Bgr888),
             refresh_millihertz: 0,
         };
         let gpu = match VirtioGpu::initialize(fallback) {
@@ -112,7 +112,7 @@ impl Framebuffer {
         let width = selected.width;
         let height = selected.height;
         let scanout_format = if gpu.is_some() {
-            PixelFormat::Bgr888
+            CpuPixelFormat::Bgr888
         } else {
             firmware_format?
         };
@@ -203,8 +203,8 @@ impl Framebuffer {
 
     pub const fn color_mode(&self) -> ColorMode {
         match self.render_format {
-            PixelFormat::Rgb565 => ColorMode::HighColor16,
-            PixelFormat::Grayscale8 => ColorMode::Grayscale8,
+            CpuPixelFormat::Rgb565 => ColorMode::HighColor16,
+            CpuPixelFormat::Grayscale8 => ColorMode::Grayscale8,
             _ => ColorMode::TrueColor24,
         }
     }
@@ -215,8 +215,8 @@ impl Framebuffer {
     pub fn set_color_mode(&mut self, mode: ColorMode) {
         self.render_format = match mode {
             ColorMode::TrueColor24 => self.scanout_format,
-            ColorMode::HighColor16 => PixelFormat::Rgb565,
-            ColorMode::Grayscale8 => PixelFormat::Grayscale8,
+            ColorMode::HighColor16 => CpuPixelFormat::Rgb565,
+            ColorMode::Grayscale8 => CpuPixelFormat::Grayscale8,
         };
     }
 
@@ -633,12 +633,12 @@ impl Framebuffer {
         unsafe { self.back.add(index).write(value) };
     }
 
-    fn back_surface(&mut self) -> Option<SurfaceMut<'_>> {
+    fn back_surface(&mut self) -> Option<CpuSurfaceMut<'_>> {
         let pixels = (self.back_bytes / 4) as usize;
         // SAFETY: `back` принадлежит этому Framebuffer на весь срок GUI;
         // &mut self гарантирует единственное mutable представление.
         let storage = unsafe { core::slice::from_raw_parts_mut(self.back, pixels) };
-        SurfaceMut::new(
+        CpuSurfaceMut::new(
             storage,
             self.width,
             self.height,
@@ -741,7 +741,7 @@ impl Framebuffer {
         // SAFETY: source читает только back, а Scanout::present пишет только
         // отдельный front. Эксклюзивный &mut self не покидает вызов.
         let storage = unsafe { core::slice::from_raw_parts(self.back, pixels) };
-        let Ok(source) = Surface::new(
+        let Ok(source) = CpuSurface::new(
             storage,
             self.width,
             self.height,
@@ -907,7 +907,7 @@ impl Scanout for Framebuffer {
 
     fn present(
         &mut self,
-        source: Surface<'_>,
+        source: CpuSurface<'_>,
         damage: &[Rect],
         sequence: u64,
     ) -> Result<PresentStats, ScanoutError> {
@@ -1062,12 +1062,12 @@ impl DisplayDriver for Framebuffer {
         self.width = requested.width;
         self.height = requested.height;
         self.stride = requested.width * 4;
-        self.scanout_format = PixelFormat::Bgr888;
+        self.scanout_format = CpuPixelFormat::Bgr888;
         if matches!(
             self.render_format,
-            PixelFormat::Rgb888 | PixelFormat::Bgr888
+            CpuPixelFormat::Rgb888 | CpuPixelFormat::Bgr888
         ) {
-            self.render_format = PixelFormat::Bgr888;
+            self.render_format = CpuPixelFormat::Bgr888;
         }
         let _ = memory::free(old_back);
         if let Some(block) = old_background {

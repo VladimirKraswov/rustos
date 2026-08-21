@@ -22,6 +22,7 @@
 pub mod block;
 pub mod bootinfo;
 pub mod dll;
+pub mod graphics_buffer;
 pub mod handle;
 pub mod input;
 pub mod ipc;
@@ -29,6 +30,8 @@ pub mod memmap;
 pub mod memory;
 pub mod pipe;
 pub mod process;
+pub mod surface;
+pub mod sync;
 pub mod syscall;
 pub mod ui;
 pub mod vfs;

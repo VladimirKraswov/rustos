@@ -25,7 +25,8 @@ GRUB 2 / Multiboot2 --> BootInfo v3 --> kernel
                                   |-- local-APIC preemptive process manager
                                   |-- endpoint IPC + capability transfer
                                   |-- MADT + AP long-mode trampoline
-                                  |-- GRUB framebuffer + rustos-video surfaces
+                                  |-- GRUB/virtio scanout + CPU fallback
+                                  |-- graphics-buffer/surface/sync ABI
                                   |-- damage/layer CPU compositor
                                   |-- PS/2 input
                                   |-- bootstrap RIFS + RAM overlay
@@ -59,12 +60,15 @@ AMD64/AArch64. Дальний произвольный fault, protection fault �
 по-прежнему завершает только виновный процесс. Поэтому крупные scratch frames
 сервисов не требуют заранее закреплять мегабайты RAM за каждым процессом.
 
-Platform-independent `rustos-video` задаёт безопасные pixel surfaces,
-RGB/BGR/ARGB/RGB565/grayscale formats, span fill, blit, alpha composition,
-bounded damage и
-неограниченный slice layers. Kernel desktop уже использует его raster/damage
-часть поверх firmware scanout; тот же контракт предназначен будущему ring-3
-`displayd` и native/virtio display driver'ам.
+Platform-independent `rustos-video` разделяет локальные
+`CpuSurface`/`CpuPixelFormat` для software fallback и межпроцессный graphics
+contract. `GraphicsBufferDesc` описывает packed/multi-plane память, color,
+usage/domain и modifier; `SyncPoint` и `SurfaceCommit` задают явное владение
+кадром, damage, buffer release и presentation feedback. Kernel desktop пока
+использует только CPU raster/damage часть поверх firmware/virtio scanout.
+Новые renderer/display/media процессы будут использовать capability buffers,
+а не заимствованные slices. Решение описано в
+[ADR-0001](adr/0001-modern-graphics-architecture.md).
 
 MADT перечисляет CPU, BSP последовательно выполняет INIT–SIPI–SIPI. AP
 проходит 16 -> 32 -> 64 bit trampoline, получает отдельный stack, включает

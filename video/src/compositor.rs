@@ -1,11 +1,11 @@
 //! Многослойная CPU-композиция по damage rectangles.
 
-use crate::{DamageRegion, PixelFormat, Point, Rect, Surface, SurfaceMut};
+use crate::{CpuPixelFormat, CpuSurface, CpuSurfaceMut, DamageRegion, Point, Rect};
 
 /// Окно, курсор, overlay или видеокадр как независимый surface-слой.
 #[derive(Clone, Copy)]
 pub struct Layer<'a> {
-    pub surface: Surface<'a>,
+    pub surface: CpuSurface<'a>,
     pub position: Point,
     pub opacity: u8,
     pub visible: bool,
@@ -25,8 +25,8 @@ impl Layer<'_> {
 /// Пересобирает только повреждённые части target: сначала background, затем
 /// видимые layers в порядке снизу вверх. Число окон не зашито в API.
 pub fn composite<const CAPACITY: usize>(
-    target: &mut SurfaceMut<'_>,
-    background: Surface<'_>,
+    target: &mut CpuSurfaceMut<'_>,
+    background: CpuSurface<'_>,
     layers: &[Layer<'_>],
     damage: &DamageRegion<CAPACITY>,
 ) -> u64 {
@@ -48,7 +48,7 @@ pub fn composite<const CAPACITY: usize>(
                 visible.width,
                 visible.height,
             );
-            if layer.opacity == 255 && layer.surface.format() != PixelFormat::Argb8888 {
+            if layer.opacity == 255 && layer.surface.format() != CpuPixelFormat::Argb8888 {
                 written = written.saturating_add(target.blit(
                     layer.surface,
                     source_rect,
@@ -74,12 +74,13 @@ mod tests {
 
     #[test]
     fn compositor_respects_z_order_alpha_and_damage() {
-        let background_pixels = [PixelFormat::Rgb888.pack_color(Color::rgb(0, 0, 20)); 16];
-        let background = Surface::new(&background_pixels, 4, 4, 4, PixelFormat::Rgb888).unwrap();
-        let opaque_pixels = [PixelFormat::Rgb888.pack_color(Color::rgb(20, 0, 0)); 4];
-        let opaque = Surface::new(&opaque_pixels, 2, 2, 2, PixelFormat::Rgb888).unwrap();
-        let alpha_pixels = [PixelFormat::Argb8888.pack(Rgba::new(0, 200, 0, 128))];
-        let alpha = Surface::new(&alpha_pixels, 1, 1, 1, PixelFormat::Argb8888).unwrap();
+        let background_pixels = [CpuPixelFormat::Rgb888.pack_color(Color::rgb(0, 0, 20)); 16];
+        let background =
+            CpuSurface::new(&background_pixels, 4, 4, 4, CpuPixelFormat::Rgb888).unwrap();
+        let opaque_pixels = [CpuPixelFormat::Rgb888.pack_color(Color::rgb(20, 0, 0)); 4];
+        let opaque = CpuSurface::new(&opaque_pixels, 2, 2, 2, CpuPixelFormat::Rgb888).unwrap();
+        let alpha_pixels = [CpuPixelFormat::Argb8888.pack(Rgba::new(0, 200, 0, 128))];
+        let alpha = CpuSurface::new(&alpha_pixels, 1, 1, 1, CpuPixelFormat::Argb8888).unwrap();
         let layers = [
             Layer {
                 surface: opaque,
@@ -95,12 +96,13 @@ mod tests {
             },
         ];
         let mut target_pixels = [0u32; 16];
-        let mut target = SurfaceMut::new(&mut target_pixels, 4, 4, 4, PixelFormat::Rgb888).unwrap();
+        let mut target =
+            CpuSurfaceMut::new(&mut target_pixels, 4, 4, 4, CpuPixelFormat::Rgb888).unwrap();
         let mut damage = DamageRegion::<4>::new(Rect::new(0, 0, 4, 4));
         damage.add(Rect::new(1, 1, 2, 2));
         assert_eq!(composite(&mut target, background, &layers, &damage), 9);
         assert_eq!(
-            PixelFormat::Rgb888.unpack(target_pixels[2 * 4 + 2]),
+            CpuPixelFormat::Rgb888.unpack(target_pixels[2 * 4 + 2]),
             Rgba::new(10, 100, 0, 255)
         );
         assert_eq!(target_pixels[0], 0);

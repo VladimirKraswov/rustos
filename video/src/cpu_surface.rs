@@ -1,32 +1,36 @@
-//! Безопасные представления pixel surfaces и CPU raster operations.
+//! Mapped CPU surfaces для software fallback и bootstrap compositor'а.
+//!
+//! Эти типы заимствуют локальный `u32` slice и никогда не пересекают границу
+//! процесса. Общий display/render/media contract использует вместо них
+//! [`crate::buffer::GraphicsBufferDesc`] и capability handle.
 
-use crate::{pixel::blend, Color, PixelFormat, Point, Rect};
+use crate::{pixel::blend, Color, CpuPixelFormat, Point, Rect};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum SurfaceError {
+pub enum CpuSurfaceError {
     Empty,
     InvalidStride,
     StorageTooSmall,
 }
 
-/// Read-only surface. Stride измеряется в 32-bit пикселях, не в байтах.
+/// Read-only CPU surface. Stride измеряется в 32-bit slots, не в байтах.
 #[derive(Clone, Copy)]
-pub struct Surface<'a> {
+pub struct CpuSurface<'a> {
     pixels: &'a [u32],
     width: u32,
     height: u32,
     stride: u32,
-    format: PixelFormat,
+    format: CpuPixelFormat,
 }
 
-impl<'a> Surface<'a> {
+impl<'a> CpuSurface<'a> {
     pub fn new(
         pixels: &'a [u32],
         width: u32,
         height: u32,
         stride: u32,
-        format: PixelFormat,
-    ) -> Result<Self, SurfaceError> {
+        format: CpuPixelFormat,
+    ) -> Result<Self, CpuSurfaceError> {
         validate(pixels.len(), width, height, stride)?;
         Ok(Self {
             pixels,
@@ -45,8 +49,13 @@ impl<'a> Surface<'a> {
         self.height
     }
 
-    pub const fn format(self) -> PixelFormat {
+    pub const fn format(self) -> CpuPixelFormat {
         self.format
+    }
+
+    /// Расстояние между началами соседних строк в 32-bit slots.
+    pub const fn stride_pixels(self) -> u32 {
+        self.stride
     }
 
     pub const fn bounds(self) -> Rect {
@@ -79,24 +88,24 @@ impl<'a> Surface<'a> {
     }
 }
 
-/// Mutable surface. Конструктор один раз доказывает все bounds, после чего
+/// Mutable CPU surface. Конструктор один раз доказывает все bounds, после чего
 /// fill/blit не содержат unsafe и не проверяют каждый пиксель отдельно.
-pub struct SurfaceMut<'a> {
+pub struct CpuSurfaceMut<'a> {
     pixels: &'a mut [u32],
     width: u32,
     height: u32,
     stride: u32,
-    format: PixelFormat,
+    format: CpuPixelFormat,
 }
 
-impl<'a> SurfaceMut<'a> {
+impl<'a> CpuSurfaceMut<'a> {
     pub fn new(
         pixels: &'a mut [u32],
         width: u32,
         height: u32,
         stride: u32,
-        format: PixelFormat,
-    ) -> Result<Self, SurfaceError> {
+        format: CpuPixelFormat,
+    ) -> Result<Self, CpuSurfaceError> {
         validate(pixels.len(), width, height, stride)?;
         Ok(Self {
             pixels,
@@ -115,16 +124,21 @@ impl<'a> SurfaceMut<'a> {
         self.height
     }
 
-    pub const fn format(&self) -> PixelFormat {
+    pub const fn format(&self) -> CpuPixelFormat {
         self.format
+    }
+
+    /// Расстояние между началами соседних строк в 32-bit slots.
+    pub const fn stride_pixels(&self) -> u32 {
+        self.stride
     }
 
     pub const fn bounds(&self) -> Rect {
         Rect::new(0, 0, self.width, self.height)
     }
 
-    pub fn as_surface(&self) -> Surface<'_> {
-        Surface {
+    pub fn as_surface(&self) -> CpuSurface<'_> {
+        CpuSurface {
             pixels: self.pixels,
             width: self.width,
             height: self.height,
@@ -150,7 +164,7 @@ impl<'a> SurfaceMut<'a> {
 
     /// Opaque blit с clipping. При одинаковом формате копирует целые spans;
     /// конвертация каналов выполняется только когда это действительно нужно.
-    pub fn blit(&mut self, source: Surface<'_>, source_rect: Rect, destination: Point) -> u64 {
+    pub fn blit(&mut self, source: CpuSurface<'_>, source_rect: Rect, destination: Point) -> u64 {
         let Some((source_rect, destination_rect)) =
             clip_blit(source.bounds(), source_rect, self.bounds(), destination)
         else {
@@ -186,7 +200,7 @@ impl<'a> SurfaceMut<'a> {
     /// собственный alpha каждого пикселя; GOP RGB/BGR считается непрозрачным.
     pub fn blend(
         &mut self,
-        source: Surface<'_>,
+        source: CpuSurface<'_>,
         source_rect: Rect,
         destination: Point,
         opacity: u8,
@@ -231,7 +245,7 @@ impl<'a> SurfaceMut<'a> {
     /// качественный bilinear/SIMD scaler сможет иметь тот же surface API.
     pub fn blit_scaled_nearest(
         &mut self,
-        source: Surface<'_>,
+        source: CpuSurface<'_>,
         source_rect: Rect,
         destination_rect: Rect,
         opacity: u8,
@@ -278,19 +292,24 @@ impl<'a> SurfaceMut<'a> {
     }
 }
 
-fn validate(storage_len: usize, width: u32, height: u32, stride: u32) -> Result<(), SurfaceError> {
+fn validate(
+    storage_len: usize,
+    width: u32,
+    height: u32,
+    stride: u32,
+) -> Result<(), CpuSurfaceError> {
     if width == 0 || height == 0 {
-        return Err(SurfaceError::Empty);
+        return Err(CpuSurfaceError::Empty);
     }
     if stride < width {
-        return Err(SurfaceError::InvalidStride);
+        return Err(CpuSurfaceError::InvalidStride);
     }
     let required = (height as usize - 1)
         .checked_mul(stride as usize)
         .and_then(|offset| offset.checked_add(width as usize))
-        .ok_or(SurfaceError::StorageTooSmall)?;
+        .ok_or(CpuSurfaceError::StorageTooSmall)?;
     if required > storage_len {
-        return Err(SurfaceError::StorageTooSmall);
+        return Err(CpuSurfaceError::StorageTooSmall);
     }
     Ok(())
 }
@@ -340,17 +359,17 @@ mod tests {
     fn fill_and_blit_clip_without_touching_padding() {
         let mut source_pixels = [0u32; 12];
         let mut source =
-            SurfaceMut::new(&mut source_pixels, 3, 3, 4, PixelFormat::Argb8888).unwrap();
+            CpuSurfaceMut::new(&mut source_pixels, 3, 3, 4, CpuPixelFormat::Argb8888).unwrap();
         source.fill(Rect::new(0, 0, 3, 3), Color::rgb(10, 20, 30));
         let mut destination_pixels = [0xdead_beefu32; 20];
         let mut destination =
-            SurfaceMut::new(&mut destination_pixels, 4, 4, 5, PixelFormat::Bgr888).unwrap();
+            CpuSurfaceMut::new(&mut destination_pixels, 4, 4, 5, CpuPixelFormat::Bgr888).unwrap();
         assert_eq!(
             destination.blit(source.as_surface(), Rect::new(0, 0, 3, 3), Point::new(3, 2)),
             2
         );
         assert_eq!(
-            PixelFormat::Bgr888.unpack(destination_pixels[2 * 5 + 3]),
+            CpuPixelFormat::Bgr888.unpack(destination_pixels[2 * 5 + 3]),
             crate::Rgba::new(10, 20, 30, 255)
         );
         assert_eq!(destination_pixels[2 * 5 + 4], 0xdead_beef);
@@ -358,14 +377,14 @@ mod tests {
 
     #[test]
     fn argb_blend_is_source_over() {
-        let source_pixels = [PixelFormat::Argb8888.pack(crate::Rgba::new(255, 0, 0, 128))];
-        let source = Surface::new(&source_pixels, 1, 1, 1, PixelFormat::Argb8888).unwrap();
-        let mut destination_pixels = [PixelFormat::Rgb888.pack_color(Color::rgb(0, 0, 255))];
+        let source_pixels = [CpuPixelFormat::Argb8888.pack(crate::Rgba::new(255, 0, 0, 128))];
+        let source = CpuSurface::new(&source_pixels, 1, 1, 1, CpuPixelFormat::Argb8888).unwrap();
+        let mut destination_pixels = [CpuPixelFormat::Rgb888.pack_color(Color::rgb(0, 0, 255))];
         let mut destination =
-            SurfaceMut::new(&mut destination_pixels, 1, 1, 1, PixelFormat::Rgb888).unwrap();
+            CpuSurfaceMut::new(&mut destination_pixels, 1, 1, 1, CpuPixelFormat::Rgb888).unwrap();
         destination.blend(source, source.bounds(), Point::new(0, 0), 255);
         assert_eq!(
-            PixelFormat::Rgb888.unpack(destination_pixels[0]),
+            CpuPixelFormat::Rgb888.unpack(destination_pixels[0]),
             crate::Rgba::new(128, 0, 127, 255)
         );
     }
@@ -373,15 +392,15 @@ mod tests {
     #[test]
     fn nearest_scaler_preserves_source_quadrants() {
         let source_pixels = [
-            PixelFormat::Rgb888.pack_color(Color::rgb(1, 0, 0)),
-            PixelFormat::Rgb888.pack_color(Color::rgb(2, 0, 0)),
-            PixelFormat::Rgb888.pack_color(Color::rgb(3, 0, 0)),
-            PixelFormat::Rgb888.pack_color(Color::rgb(4, 0, 0)),
+            CpuPixelFormat::Rgb888.pack_color(Color::rgb(1, 0, 0)),
+            CpuPixelFormat::Rgb888.pack_color(Color::rgb(2, 0, 0)),
+            CpuPixelFormat::Rgb888.pack_color(Color::rgb(3, 0, 0)),
+            CpuPixelFormat::Rgb888.pack_color(Color::rgb(4, 0, 0)),
         ];
-        let source = Surface::new(&source_pixels, 2, 2, 2, PixelFormat::Rgb888).unwrap();
+        let source = CpuSurface::new(&source_pixels, 2, 2, 2, CpuPixelFormat::Rgb888).unwrap();
         let mut destination_pixels = [0u32; 16];
         let mut destination =
-            SurfaceMut::new(&mut destination_pixels, 4, 4, 4, PixelFormat::Rgb888).unwrap();
+            CpuSurfaceMut::new(&mut destination_pixels, 4, 4, 4, CpuPixelFormat::Rgb888).unwrap();
         assert_eq!(
             destination.blit_scaled_nearest(source, source.bounds(), Rect::new(0, 0, 4, 4), 255),
             16

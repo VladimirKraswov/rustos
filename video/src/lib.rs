@@ -7,23 +7,25 @@
 
 #![no_std]
 
+pub mod buffer;
 mod compositor;
+mod cpu_surface;
 mod damage;
 mod geometry;
 mod pixel;
+pub mod protocol;
 mod scanout;
-mod surface;
 mod window;
 
 pub use compositor::{composite, Layer};
+pub use cpu_surface::{CpuSurface, CpuSurfaceError, CpuSurfaceMut};
 pub use damage::DamageRegion;
 pub use geometry::{Point, Rect};
-pub use pixel::{Color, PixelFormat, Rgba};
+pub use pixel::{Color, CpuPixelFormat, Rgba};
 pub use scanout::{
     ColorMode, ConnectorInfo, ConnectorKind, DisplayDriver, DisplayMode, ModeSetError,
     PresentStats, Scanout, ScanoutCapabilities, ScanoutError,
 };
-pub use surface::{Surface, SurfaceError, SurfaceMut};
 pub use window::{
     hit_test_resize, resize_from_edges, ManagedWindow, ResizeEdges, WindowError, WindowEventQueue,
 };

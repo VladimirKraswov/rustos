@@ -1,5 +1,10 @@
 # Видеосистема RustOS
 
+Архитектурные границы современного display/render/media stack зафиксированы в
+[ADR-0001](adr/0001-modern-graphics-architecture.md). Текущий CPU/virtio 2D
+путь остаётся только bootstrap и аварийным backend'ом; новые процессы не
+получают его slices или физический framebuffer.
+
 ## Цель и границы
 
 Видеосистема строится не вокруг конкретного firmware framebuffer, а вокруг трёх
@@ -78,7 +83,12 @@ Policy `actual` сохраняет строгое окно 1:1 для pixel-leve
 
 - `Scanout`, `DisplayDriver`, `DisplayMode` и mode-set contract для
   firmware/virtio/GPU drivers;
-- `Surface`/`SurfaceMut` с явными width, height, stride и pixel format;
+- локальные `CpuSurface`/`CpuSurfaceMut` с явными width, height, stride и
+  `CpuPixelFormat` для software fallback;
+- `GraphicsBufferDesc` с capability ownership, четырьмя planes, byte strides,
+  offsets, format modifier, usage/memory domains и color metadata;
+- surface buffer queue ABI: immutable commit, acquire/release timeline points,
+  bounded shared-memory damage и presentation feedback;
 - RGB, BGR, ARGB8888, RGB565 и grayscale8 с корректной конвертацией;
 - span-based fill и opaque blit с clipping;
 - source-over alpha composition с global opacity;
@@ -115,6 +125,38 @@ Drag в TCG работает в preview-режиме. На первом движ
 устаревших координат. При нехватке непрерывной RAM сохраняется корректный, но
 медленный full-redraw fallback.
 
+## Graphics buffers и явная синхронизация
+
+`CpuSurface` никогда не пересекает границу процесса. Общий контракт находится
+в `rustos-abi` и повторно экспортируется `rustos-video::buffer` и
+`rustos-video::protocol`:
+
+```text
+client renderer
+      | GraphicsBuffer capability + acquire SyncPoint
+      v
+SurfaceCommit --> compositord --> displayd
+      ^                  |
+      | BufferReleased   `--> PresentationFeedback
+      +--- release SyncPoint
+```
+
+Версия descriptor'а проверяется до mapping. Неизвестные format/usage/domain
+коды и ненулевые reserved fields отклоняются. Linear planes проверяются на
+переполнение, недостаточный stride, выход за memory object и перекрытие.
+Поддержаны packed RGB, 10-bit/float RGB и multi-plane NV12/P010/YUV420, поэтому
+video decoder не обязан предварительно превращать каждый кадр в RGB.
+
+Timeline point `NONE` означает уже завершённую зависимость; частично
+заполненная пустая point запрещена. `SyncWaitMany` атомарно ждёт `ALL`/`ANY`
+из bounded shared-memory массива, не заставляя CPU spin'иться. Surface commit несёт monotonically
+increasing `frame_id`, режим FIFO/mailbox/immediate/adaptive, logical/physical
+size, fractional scale и target presentation time. ABI проверяет
+`physical = ceil(logical × scale)`, поэтому растягивание уже растрированного
+bitmap нельзя случайно выдать за HiDPI. Реализация kernel objects и
+ring-3 сервиса является следующим отдельным этапом; наличие ABI не объявляет
+их готовыми.
+
 ## Много окон и изоляция
 
 `Layer` не ограничивает число окон константой compositor'а: caller передаёт
@@ -122,10 +164,10 @@ slice видимых layers. Bounded только список damage rectangles
 переполнение никогда не теряет картинку — области объединяются в более дорогой
 bounding rectangle.
 
-Следующий шаг изоляции — user-space `displayd`. Приложение получит shared-memory
-surface capability и право отправлять commit/damage; только displayd получит
-scanout capability. Падение клиента удалит его layers, но не остановит desktop.
-Координаты, размеры и buffer generation должны проверяться до отображения.
+Следующий шаг изоляции — реализация user-space `displayd`/`compositord` поверх
+готового surface protocol. Только displayd получит scanout capability. Падение
+клиента удалит его buffer queue и layers, но не остановит desktop. Координаты,
+размеры, planes, поколение capability и sync points проверяются до отображения.
 
 ## Software OpenGL и видео
 

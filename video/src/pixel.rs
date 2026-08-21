@@ -43,7 +43,7 @@ impl Rgba {
 
 /// 32-bit форматы, достаточные для GOP scanout, окон и изображений с alpha.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum PixelFormat {
+pub enum CpuPixelFormat {
     /// Байты в памяти: R, G, B, reserved (UEFI PixelRedGreenBlueReserved8Bit).
     Rgb888,
     /// Байты в памяти: B, G, R, reserved (UEFI PixelBlueGreenRedReserved8Bit).
@@ -57,7 +57,7 @@ pub enum PixelFormat {
     Grayscale8,
 }
 
-impl PixelFormat {
+impl CpuPixelFormat {
     pub const fn pack(self, value: Rgba) -> u32 {
         match self {
             Self::Rgb888 => value.r as u32 | ((value.g as u32) << 8) | ((value.b as u32) << 16),
@@ -133,12 +133,12 @@ mod tests {
     #[test]
     fn formats_round_trip_channels() {
         let pixel = Rgba::new(12, 34, 56, 78);
-        for format in [PixelFormat::Rgb888, PixelFormat::Bgr888] {
+        for format in [CpuPixelFormat::Rgb888, CpuPixelFormat::Bgr888] {
             let unpacked = format.unpack(format.pack(pixel));
             assert_eq!(unpacked, Rgba::new(12, 34, 56, 255));
         }
         assert_eq!(
-            PixelFormat::Argb8888.unpack(PixelFormat::Argb8888.pack(pixel)),
+            CpuPixelFormat::Argb8888.unpack(CpuPixelFormat::Argb8888.pack(pixel)),
             pixel
         );
     }
@@ -146,12 +146,12 @@ mod tests {
     #[test]
     fn reduced_colour_profiles_are_explicit_and_aligned() {
         let source = Rgba::new(240, 128, 16, 255);
-        let rgb565 = PixelFormat::Rgb565.unpack(PixelFormat::Rgb565.pack(source));
+        let rgb565 = CpuPixelFormat::Rgb565.unpack(CpuPixelFormat::Rgb565.pack(source));
         assert!(rgb565.r.abs_diff(source.r) <= 8);
         assert!(rgb565.g.abs_diff(source.g) <= 4);
         assert!(rgb565.b.abs_diff(source.b) <= 8);
 
-        let gray = PixelFormat::Grayscale8.unpack(PixelFormat::Grayscale8.pack(source));
+        let gray = CpuPixelFormat::Grayscale8.unpack(CpuPixelFormat::Grayscale8.pack(source));
         assert_eq!(gray.r, gray.g);
         assert_eq!(gray.g, gray.b);
     }

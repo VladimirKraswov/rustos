@@ -43,8 +43,8 @@ use rustos_system_assets::{
 };
 use rustos_system_ui::{FrameResult, Key as UiKey, PointerKind as UiPointerKind, WindowMetrics};
 use rustos_video::{
-    hit_test_resize, resize_from_edges, ColorMode, DamageRegion, DisplayDriver, DisplayMode,
-    ManagedWindow, ModeSetError, PixelFormat, ResizeEdges, Scanout, WindowEventQueue,
+    hit_test_resize, resize_from_edges, ColorMode, CpuPixelFormat, DamageRegion, DisplayDriver,
+    DisplayMode, ManagedWindow, ModeSetError, ResizeEdges, Scanout, WindowEventQueue,
 };
 
 const TASKBAR_HEIGHT: u32 = 46;
@@ -102,11 +102,11 @@ pub fn run(info: &BootInfo) -> ! {
     serial::put_u32(mode.height);
     serial::put_str(" format=");
     serial::put_str(match mode.format {
-        PixelFormat::Rgb888 => "rgb888",
-        PixelFormat::Bgr888 => "bgr888",
-        PixelFormat::Argb8888 => "argb8888",
-        PixelFormat::Rgb565 => "rgb565",
-        PixelFormat::Grayscale8 => "gray8",
+        CpuPixelFormat::Rgb888 => "rgb888",
+        CpuPixelFormat::Bgr888 => "bgr888",
+        CpuPixelFormat::Argb8888 => "argb8888",
+        CpuPixelFormat::Rgb565 => "rgb565",
+        CpuPixelFormat::Grayscale8 => "gray8",
     });
     serial::put_str(" present=immediate page-flip=");
     serial::put_str(if capabilities.page_flip { "yes" } else { "no" });
