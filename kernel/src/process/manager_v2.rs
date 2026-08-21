@@ -4093,6 +4093,7 @@ impl ProcessManager {
                 .address_space
                 .contains_user_range(user_buffer, size_of::<Message>(), true)
             {
+                serial::put_str("[ipc-error] receive buffer is not fully writable\n");
                 return BlockingResult::Return(status::INVALID_ARGUMENT);
             }
             match process.resolve_endpoint(handle, Rights::RECEIVE) {
@@ -4110,6 +4111,9 @@ impl ProcessManager {
                 .expect("process")
                 .address_space
                 .copy_to_user(user_buffer, message_bytes(&message));
+            if result.is_err() {
+                serial::put_str("[ipc-error] queued delivery copy_to_user failed\n");
+            }
             return BlockingResult::Return(if result.is_ok() {
                 status::OK
             } else {
@@ -4136,6 +4140,7 @@ impl ProcessManager {
                 .address_space
                 .contains_user_range(user_message, size_of::<Message>(), false)
             {
+                serial::put_str("[ipc-error] send message is not fully readable\n");
                 return status::INVALID_ARGUMENT;
             }
             let endpoint = match sender.resolve_endpoint(handle, Rights::SEND) {
@@ -4162,9 +4167,11 @@ impl ProcessManager {
             .copy_from_user(user_message, bytes)
             .is_err()
         {
+            serial::put_str("[ipc-error] send copy_from_user failed\n");
             return status::INVALID_ARGUMENT;
         }
         if prepare_message(sender_pid, &mut message).is_err() {
+            serial::put_str("[ipc-error] malformed message header\n");
             return status::INVALID_ARGUMENT;
         }
         let receiver_pid = self.endpoints[endpoint_index].receiver;
@@ -4181,6 +4188,9 @@ impl ProcessManager {
             return status::QUEUE_FULL;
         }
         if let Err(error) = self.transfer_handles(sender_index, receiver_index, &mut message) {
+            serial::put_str("[ipc-error] capability transfer rejected status=");
+            serial::put_u32(error.saturating_abs() as u32);
+            serial::put_str("\n");
             return error;
         }
         if let Some(thread_index) = pending_thread {
@@ -4198,6 +4208,7 @@ impl ProcessManager {
                 .copy_to_user(pending.user_buffer, message_bytes(&message))
                 .is_err()
             {
+                serial::put_str("[ipc-error] direct delivery copy_to_user failed\n");
                 return status::INVALID_ARGUMENT;
             }
             let receiver = self.threads[thread_index].as_mut().expect("receiver");
@@ -4635,6 +4646,7 @@ pub(super) fn run_milestone(info: &rustos_abi::BootInfo) -> Result<(), ProcessEr
     serial::put_u32(smp.online_cpus as u32);
     serial::put_str(" APs parked safely\n");
 
+    #[cfg(not(feature = "virgl-test"))]
     let free_before = memory::stats()
         .map_err(|_| ProcessError::AddressSpace)?
         .free_frames;
@@ -4748,37 +4760,50 @@ pub(super) fn run_milestone(info: &rustos_abi::BootInfo) -> Result<(), ProcessEr
         serial::put_str("[graphics] native scanout unavailable; kernel fallback remains active\n");
     }
 
-    run_std_startup_phase(manager)?;
-    serial::put_str("[std-startup] ordinary fn main argv and process-local environment verified\n");
+    // Специализированный VirGL образ проверяет только графический data plane.
+    // Не связываем результат GPU-интеграции с более поздними std/VFS
+    // milestones: они полноценно выполняются обычными boot jobs. После
+    // возврата boot.rs запускает постоянные renderd/compositord/displayd и
+    // делает снимок уже второго, supervisor-managed кадра.
+    #[cfg(feature = "virgl-test")]
+    return Ok(());
 
-    run_vfs_phase(manager, "system/bin/std-smoke.rune", true)?;
-    serial::put_str(
+    #[cfg(not(feature = "virgl-test"))]
+    {
+        run_std_startup_phase(manager)?;
+        serial::put_str(
+            "[std-startup] ordinary fn main argv and process-local environment verified\n",
+        );
+
+        run_vfs_phase(manager, "system/bin/std-smoke.rune", true)?;
+        serial::put_str(
         "[std] allocator fs threads futex process pipes stdio native SDK and VFS executable verified in ring3 RUNE\n",
     );
 
-    // Настоящий VFS vertical slice: filesystem parser и pathname policy живут
-    // в ring 3. Только vfsd получает raw block capability, клиент видит лишь
-    // endpoint и `vfs.dll` API. Второй запуск server доказывает persistence.
-    run_vfs_phase(manager, "system/bin/vfs-test.rune", false)?;
-    serial::put_str(
-        "[vfsd] open/read/write/seek/readdir/create/rename over shared memory verified\n",
-    );
-    run_vfs_phase(manager, "system/bin/vfs-persistence.rune", false)?;
-    serial::put_str("[vfsd] restart recovered committed VaraniaFS metadata and file data\n");
-    run_vfs_phase(manager, "system/bin/loader-test.rune", true)?;
-    serial::put_str(
-        "[loader] RUNE interfaces imports ABI TLS RELRO and cross-process shared RX verified\n",
-    );
+        // Настоящий VFS vertical slice: filesystem parser и pathname policy живут
+        // в ring 3. Только vfsd получает raw block capability, клиент видит лишь
+        // endpoint и `vfs.dll` API. Второй запуск server доказывает persistence.
+        run_vfs_phase(manager, "system/bin/vfs-test.rune", false)?;
+        serial::put_str(
+            "[vfsd] open/read/write/seek/readdir/create/rename over shared memory verified\n",
+        );
+        run_vfs_phase(manager, "system/bin/vfs-persistence.rune", false)?;
+        serial::put_str("[vfsd] restart recovered committed VaraniaFS metadata and file data\n");
+        run_vfs_phase(manager, "system/bin/loader-test.rune", true)?;
+        serial::put_str(
+            "[loader] RUNE interfaces imports ABI TLS RELRO and cross-process shared RX verified\n",
+        );
 
-    let free_after = memory::stats()
-        .map_err(|_| ProcessError::AddressSpace)?
-        .free_frames;
-    if free_after != free_before {
-        return Err(ProcessError::FrameLeak);
+        let free_after = memory::stats()
+            .map_err(|_| ProcessError::AddressSpace)?
+            .free_frames;
+        if free_after != free_before {
+            return Err(ProcessError::FrameLeak);
+        }
+        serial::put_str("[process-manager] dynamic create/exit/reap reclaimed all frames\n");
+        serial::put_str("[process-manager] ABI v4 VM/shared-memory frames reclaimed\n");
+        Ok(())
     }
-    serial::put_str("[process-manager] dynamic create/exit/reap reclaimed all frames\n");
-    serial::put_str("[process-manager] ABI v4 VM/shared-memory frames reclaimed\n");
-    Ok(())
 }
 
 pub(super) fn start_interactive_services() -> Result<(), ProcessError> {
@@ -5076,6 +5101,7 @@ pub(super) fn run_interactive_command(
 /// Запускает программу тем же путём, которым `process_spawn` создаёт обычное
 /// приложение: с versioned ProcessStartInfo вместо приватных boot-регистров.
 /// Благодаря этому тест защищает всю цепочку kernel -> RustOS CRT -> std::rt.
+#[cfg(not(feature = "virgl-test"))]
 fn run_std_startup_phase(manager: &mut ProcessManager) -> Result<(), ProcessError> {
     const ARGUMENTS: &[u8] = b"std-main\0--self-test\0";
     const ENVIRONMENT: &[u8] = b"RUSTOS_MODE=developer\0";
@@ -5116,6 +5142,7 @@ fn run_std_startup_phase(manager: &mut ProcessManager) -> Result<(), ProcessErro
     Ok(())
 }
 
+#[cfg(not(feature = "virgl-test"))]
 fn run_vfs_phase(
     manager: &mut ProcessManager,
     client_image: &str,
