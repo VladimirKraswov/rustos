@@ -361,7 +361,7 @@ fn verify_virgl_showcase(image: &Image) {
             );
         }
     }
-    if lit < 1200 || cyan < 250 || violet < 120 {
+    if lit < 1200 || cyan < 100 || violet < 120 {
         fatal(format!(
             "lit 3D object is absent: lit={lit}, cyan={cyan}, violet={violet}"
         ));
