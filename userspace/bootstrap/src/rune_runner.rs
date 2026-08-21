@@ -99,7 +99,10 @@ pub extern "C" fn _start(start_address: u64, abi_version: u64, _reserved: u64) -
     let application_dir = parent_directory(&target_path).unwrap_or_else(|| process_exit(127));
     let private_directory = format!("{application_dir}/lib");
     let images = preload_graph(&mut vfs, &target_path, &application_dir, &private_directory)
-        .unwrap_or_else(|_| process_exit(128));
+        // Не уничтожаем причинный VFS status: supervisor/serial должен
+        // отличать transport fault, checksum I/O и отсутствующую DLL. Раньше
+        // все эти случаи превращались в неинформативный exit 128.
+        .unwrap_or_else(|error| process_exit(error));
     let mut memory = RuntimeMemory;
     let mut loader = DynamicLoader::new(
         &images,

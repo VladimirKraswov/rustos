@@ -1,10 +1,11 @@
 use std::collections::BTreeMap;
 use varaniafs::{
+    file,
     format::{
         format_empty, object_key, recover_latest, Block, Error, InodeKind, InodeValue, NodeView,
         Superblock, TreeKind, FIRST_ALLOCATABLE_BLOCK, ROOT_COUNT,
     },
-    integrity,
+    integrity, namespace,
     tree::{BlockDevice, Transaction, TransactionWorkspace, MAX_VALUE_BYTES},
     BLOCK_SIZE, MIN_VOLUME_BLOCKS,
 };
@@ -21,8 +22,12 @@ struct MemoryDisk {
 
 impl MemoryDisk {
     fn formatted() -> (Self, Superblock) {
-        let empty = format_empty(MIN_VOLUME_BLOCKS, UUID).unwrap();
-        let mut durable = vec![[0; BLOCK_SIZE]; MIN_VOLUME_BLOCKS as usize];
+        Self::formatted_blocks(MIN_VOLUME_BLOCKS)
+    }
+
+    fn formatted_blocks(blocks: u64) -> (Self, Superblock) {
+        let empty = format_empty(blocks, UUID).unwrap();
+        let mut durable = vec![[0; BLOCK_SIZE]; blocks as usize];
         durable[0] = empty.superblock;
         durable[1] = empty.superblock;
         for (index, root) in empty.roots.into_iter().enumerate() {
@@ -30,7 +35,7 @@ impl MemoryDisk {
             durable[primary] = root;
             durable[primary + 1] = root;
         }
-        let mounted = Superblock::decode(&durable[0], MIN_VOLUME_BLOCKS).unwrap();
+        let mounted = Superblock::decode(&durable[0], blocks).unwrap();
         (
             Self {
                 volatile: durable.clone(),
@@ -56,7 +61,7 @@ impl MemoryDisk {
     }
 
     fn recover(&mut self) -> Superblock {
-        recover_latest(MIN_VOLUME_BLOCKS, |number, output| {
+        recover_latest(self.durable.len() as u64, |number, output| {
             let Some(source) = self.durable.get(number as usize) else {
                 return false;
             };
@@ -270,4 +275,98 @@ fn repeated_single_copy_corruption_is_repaired_without_logical_loss() {
         final_report.primary_failures + final_report.mirror_failures,
         0
     );
+}
+
+#[test]
+fn installed_file_survives_unrelated_cow_lifecycles_and_remounts() {
+    // Отдельный тест integrity использует достаточно большой volume: здесь
+    // проверяется, что reclamation чужого файла не отдаёт allocator'у живые
+    // блоки установленного executable, а не поведение 16-МиБ edge volume.
+    let (mut disk, mut mounted) = MemoryDisk::formatted_blocks(64 * 1024);
+    let mut workspace = TransactionWorkspace::new();
+    let expected = (0..140_403usize)
+        .map(|index| (index.wrapping_mul(37) ^ (index >> 3)) as u8)
+        .collect::<Vec<_>>();
+
+    let stable = {
+        let mut transaction = Transaction::begin(&mut disk, mounted, &mut workspace).unwrap();
+        let object =
+            namespace::create(&mut transaction, b"/std-child.rune", InodeKind::File, 0).unwrap();
+        mounted = transaction.commit().unwrap();
+        object
+    };
+    for (chunk, bytes) in expected.chunks(32 * 1024).enumerate() {
+        let mut transaction = Transaction::begin(&mut disk, mounted, &mut workspace).unwrap();
+        file::write_at(
+            &mut transaction,
+            stable,
+            (chunk * 32 * 1024) as u64,
+            bytes,
+            0,
+        )
+        .unwrap();
+        mounted = transaction.commit().unwrap();
+    }
+
+    for cycle in 0..48u64 {
+        let mut transaction = Transaction::begin(&mut disk, mounted, &mut workspace).unwrap();
+        namespace::create(
+            &mut transaction,
+            b"/std-port-smoke",
+            InodeKind::Directory,
+            cycle,
+        )
+        .unwrap();
+        namespace::create(
+            &mut transaction,
+            b"/std-port-smoke/source.txt",
+            InodeKind::File,
+            cycle,
+        )
+        .unwrap();
+        mounted = transaction.commit().unwrap();
+
+        let temporary = {
+            let mut transaction = Transaction::begin(&mut disk, mounted, &mut workspace).unwrap();
+            let object =
+                namespace::resolve(&mut transaction, b"/std-port-smoke/source.txt").unwrap();
+            let content = [cycle as u8; 8193];
+            file::write_at(&mut transaction, object, 0, &content, cycle).unwrap();
+            mounted = transaction.commit().unwrap();
+            let mut transaction = Transaction::begin(&mut disk, mounted, &mut workspace).unwrap();
+            file::resize(&mut transaction, object, 26, cycle).unwrap();
+            mounted = transaction.commit().unwrap();
+            object
+        };
+
+        let mut transaction = Transaction::begin(&mut disk, mounted, &mut workspace).unwrap();
+        namespace::rename(
+            &mut transaction,
+            b"/std-port-smoke/source.txt",
+            b"/std-port-smoke/result.txt",
+        )
+        .unwrap();
+        mounted = transaction.commit().unwrap();
+
+        let mut transaction = Transaction::begin(&mut disk, mounted, &mut workspace).unwrap();
+        file::resize(&mut transaction, temporary, 0, cycle).unwrap();
+        namespace::unlink(&mut transaction, b"/std-port-smoke/result.txt").unwrap();
+        mounted = transaction
+            .commit()
+            .unwrap_or_else(|error| panic!("unlink file cycle={cycle}: {error:?}"));
+
+        let mut transaction = Transaction::begin(&mut disk, mounted, &mut workspace).unwrap();
+        namespace::unlink(&mut transaction, b"/std-port-smoke").unwrap();
+        transaction.commit().unwrap();
+        mounted = disk.recover();
+
+        let mut actual = vec![0u8; expected.len()];
+        let mut transaction = Transaction::begin(&mut disk, mounted, &mut workspace).unwrap();
+        assert_eq!(
+            file::read_at(&mut transaction, stable, 0, &mut actual).unwrap(),
+            expected.len(),
+            "cycle={cycle}"
+        );
+        assert_eq!(actual, expected, "cycle={cycle}");
+    }
 }
