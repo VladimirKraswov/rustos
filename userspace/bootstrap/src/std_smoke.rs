@@ -11,7 +11,7 @@ use std::{
     collections::{BTreeMap, HashMap},
     fs::{self, OpenOptions},
     hint,
-    io::{Read, Seek, SeekFrom, Write},
+    io::{ErrorKind, Read, Seek, SeekFrom, Write},
     path::Path,
     process::{Command, ExitCode},
     string::String,
@@ -214,16 +214,19 @@ fn verify_std_fs() -> Result<(), u8> {
     const NESTED: &str = "/std-port-smoke/nested";
     const CONTENT: &str = "std::fs over capability IPC";
 
-    let _ = fs::remove_file(FIRST);
-    let _ = fs::remove_file(SECOND);
-    let _ = fs::remove_dir_all(NESTED);
-    let _ = fs::remove_dir(DIRECTORY);
-    if fs::create_dir(DIRECTORY).is_err() {
+    // Предыдущую VM могли остановить между созданием и cleanup. Smoke-тест
+    // владеет всем этим каталогом, поэтому восстанавливает чистое начальное
+    // состояние рекурсивно и остаётся идемпотентным между загрузками одного
+    // persistent volume.
+    let _ = fs::remove_dir_all(DIRECTORY);
+    if fs::create_dir(DIRECTORY).is_err_and(|error| error.kind() != ErrorKind::AlreadyExists) {
         return Err(30);
     }
 
     let result = (|| -> Result<(), u8> {
-        fs::create_dir(NESTED).map_err(|_| 31)?;
+        if fs::create_dir(NESTED).is_err_and(|error| error.kind() != ErrorKind::AlreadyExists) {
+            return Err(31);
+        }
         std::env::set_current_dir(DIRECTORY).map_err(|_| 32)?;
         if std::env::current_dir().map_err(|_| 33)? != Path::new(DIRECTORY)
             || std::env::current_exe().map_err(|_| 33)?.file_name()
