@@ -352,6 +352,23 @@ pub fn synchronize_executable_memory(_address: u64, _length: usize) {
     core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
 }
 
+/// Публикует записи в DMA-кольцо до следующего индекса/MMIO doorbell.
+///
+/// RustOS размещает virtqueue в обычной WB RAM. x86 сохраняет порядок её
+/// stores относительно port/MMIO notify; compiler fence нужен, чтобы такой же
+/// порядок не разрушил оптимизатор Rust.
+#[inline]
+pub fn dma_write_barrier() {
+    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::Release);
+}
+
+/// Не даёт оптимизатору читать DMA payload до device-owned индекса.
+/// Cache-coherent x86 не требует отдельной CPU-инструкции для WB DMA memory.
+#[inline]
+pub fn dma_read_barrier() {
+    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::Acquire);
+}
+
 /// Чтение 8-битного значения из IO-порта (для serial и ранней диагностики).
 ///
 /// # Safety

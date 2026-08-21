@@ -6,14 +6,12 @@
 //! горячем input path. Polling — временная bootstrap-модель; формат очереди и
 //! нормализованные [`Event`] останутся теми же после перехода на GIC IRQ.
 
-use core::{
-    ptr,
-    sync::atomic::{fence, Ordering},
-};
+use core::ptr;
 
 use rustos_abi::input::{MouseCapabilities, MouseSettings};
 
 use crate::{
+    arch,
     input::{Event, Key, MouseEvent},
     memory::{self, FrameBlock},
 };
@@ -167,7 +165,7 @@ impl Device {
             }
             ((queue.phys + available_offset + 2) as *mut u16).write_volatile(queue_size);
         }
-        fence(Ordering::Release);
+        arch::dma_write_barrier();
         write32(base, REG_QUEUE_NUM, u32::from(queue_size));
         write_address(base, REG_QUEUE_DESC_LOW, queue.phys);
         write_address(base, REG_QUEUE_AVAIL_LOW, queue.phys + available_offset);
@@ -193,7 +191,7 @@ impl Device {
         if used_index == self.last_used {
             return None;
         }
-        fence(Ordering::Acquire);
+        arch::dma_read_barrier();
         let slot = usize::from(self.last_used % self.queue_size);
         let used_element = self.queue.phys + self.used_offset + 4 + slot as u64 * 8;
         let descriptor = unsafe { (used_element as *const u32).read_volatile() };
@@ -216,10 +214,11 @@ impl Device {
                 .add(available_slot)
                 .write_volatile(descriptor as u16);
         }
-        fence(Ordering::Release);
+        arch::dma_write_barrier();
         unsafe {
             ((available + 2) as *mut u16).write_volatile(available_index.wrapping_add(1));
         }
+        arch::dma_write_barrier();
         write32(self.base, REG_QUEUE_NOTIFY, u32::from(EVENT_QUEUE));
         Some(event)
     }

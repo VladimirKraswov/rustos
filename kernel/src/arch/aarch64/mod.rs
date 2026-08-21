@@ -28,6 +28,28 @@ const TRAP_SYNC: u64 = 0;
 const TRAP_IRQ: u64 = 1;
 const TRAP_SPURIOUS: u64 = 2;
 
+/// Публикует записи CPU внешнему DMA-устройству.
+///
+/// Rust atomic fences синхронизируют обычные CPU observers, но virtqueue
+/// разделяется ещё и с устройством за пределами inner-shareable domain.
+/// Поэтому AArch64-драйверу нужен именно outer-shareable barrier перед
+/// публикацией индекса и перед MMIO doorbell.
+#[inline]
+pub fn dma_write_barrier() {
+    // SAFETY: `dmb oshst` не обращается к памяти сам и допустим на EL1. Без
+    // `nomem` asm одновременно служит compiler barrier для окружающих DMA
+    // буферов.
+    unsafe { asm!("dmb oshst", options(nostack, preserves_flags)) }
+}
+
+/// Запрещает читать DMA-результат раньше замеченного device-owned индекса.
+#[inline]
+pub fn dma_read_barrier() {
+    // SAFETY: `dmb oshld` — архитектурный load barrier для outer-shareable
+    // domain; инструкция допустима на EL1 и не меняет регистры процесса.
+    unsafe { asm!("dmb oshld", options(nostack, preserves_flags)) }
+}
+
 /// Кадр, который vector stub сохраняет при входе EL0 -> EL1.
 #[repr(C)]
 #[derive(Debug)]

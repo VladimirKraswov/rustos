@@ -8,11 +8,14 @@
 use core::{
     cell::UnsafeCell,
     ptr,
-    sync::atomic::{fence, AtomicBool, Ordering},
+    sync::atomic::{AtomicBool, Ordering},
 };
 
 use super::{BlockError, BlockInfo};
-use crate::memory::{self, FrameBlock};
+use crate::{
+    arch,
+    memory::{self, FrameBlock},
+};
 
 const MMIO_FIRST: u64 = 0x0a00_0000;
 const MMIO_STRIDE: u64 = 0x200;
@@ -310,21 +313,23 @@ impl Device {
                 .cast::<u16>()
                 .write_volatile(head);
         }
-        fence(Ordering::Release);
+        // Дескрипторы и ring entry должны стать видимы DMA-устройству раньше
+        // publication point `avail.idx`.
+        arch::dma_write_barrier();
         unsafe {
             available
                 .add(2)
                 .cast::<u16>()
                 .write_volatile(index.wrapping_add(1));
         }
-        fence(Ordering::SeqCst);
+        // И сам новый индекс обязан стать видим до MMIO doorbell.
+        arch::dma_write_barrier();
         write32(self.base, REG_QUEUE_NOTIFY, 0);
 
         let wanted = self.last_used.wrapping_add(1);
         let used_index = (self.queue.phys + 8192 + 2) as *const u16;
         let mut completed = false;
         for _ in 0..POLL_LIMIT {
-            fence(Ordering::Acquire);
             if unsafe { used_index.read_volatile() } == wanted {
                 completed = true;
                 break;
@@ -334,7 +339,8 @@ impl Device {
         if !completed {
             return Err(BlockError::Timeout);
         }
-        fence(Ordering::Acquire);
+        // `used.idx` — device publication point для used ring, status и data.
+        arch::dma_read_barrier();
         self.last_used = wanted;
         let interrupt = read32(self.base, REG_INTERRUPT_STATUS);
         if interrupt != 0 {

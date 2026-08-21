@@ -7,7 +7,7 @@
 use core::{
     cell::UnsafeCell,
     ptr,
-    sync::atomic::{fence, AtomicBool, Ordering},
+    sync::atomic::{AtomicBool, Ordering},
 };
 
 use super::{BlockError, BlockInfo};
@@ -311,7 +311,7 @@ impl Device {
                 .cast::<u16>()
                 .write_volatile(head)
         };
-        fence(Ordering::Release);
+        arch::dma_write_barrier();
         unsafe {
             available
                 .add(2)
@@ -321,7 +321,7 @@ impl Device {
         // `avail.idx` — publication point драйвера. Устройство не должно
         // увидеть notify раньше обновлённого индекса даже на более слабом
         // transport ordering, а compiler не должен переставить DMA-доступы.
-        fence(Ordering::SeqCst);
+        arch::dma_write_barrier();
         unsafe { arch::outw(self.io + 16, QUEUE_SELECT) };
 
         let used_offset = align_up(descriptor_bytes + 6 + u64::from(self.queue_size) * 2, 4096);
@@ -332,7 +332,6 @@ impl Device {
         let wanted = self.last_used.wrapping_add(1);
         let mut completed = false;
         for _ in 0..POLL_LIMIT {
-            fence(Ordering::Acquire);
             if unsafe { used_index.read_volatile() } == wanted {
                 completed = true;
                 break;
@@ -344,7 +343,7 @@ impl Device {
         }
         // Устройство публикует used.idx только после status/data DMA. Барьер
         // расположен после наблюдения индекса, то есть до чтения результата.
-        fence(Ordering::Acquire);
+        arch::dma_read_barrier();
         self.last_used = wanted;
         let status = unsafe { (self.dma.phys as *const u8).add(4112).read_volatile() };
         if status == 0 {

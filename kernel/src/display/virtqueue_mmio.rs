@@ -6,12 +6,12 @@
 //! Bootstrap использует synchronous wrapper, а ring-3 renderer получает
 //! немедленный возврат и completion через периодический bounded poll.
 
-use core::{
-    mem, ptr,
-    sync::atomic::{fence, Ordering},
-};
+use core::{mem, ptr};
 
-use crate::memory::{self, FrameBlock};
+use crate::{
+    arch,
+    memory::{self, FrameBlock},
+};
 
 use super::TransportError;
 
@@ -331,13 +331,14 @@ impl ModernMmioTransport {
                 .cast::<u16>()
                 .write_volatile(head);
         }
-        fence(Ordering::Release);
+        arch::dma_write_barrier();
         unsafe {
             available
                 .add(2)
                 .cast::<u16>()
                 .write_volatile(available_index.wrapping_add(1));
         }
+        arch::dma_write_barrier();
         write32(self.base, REG_QUEUE_NOTIFY, u32::from(CONTROL_QUEUE));
     }
 
@@ -346,7 +347,7 @@ impl ModernMmioTransport {
         let available = unsafe { used.add(2).cast::<u16>().read_volatile() };
         // `used.idx` является publication point устройства: содержимое ring и
         // response buffer читается только после acquire barrier.
-        fence(Ordering::Acquire);
+        arch::dma_read_barrier();
         while self.device_used != available {
             let ring_index = usize::from(self.device_used % self.queue_size);
             let element = unsafe {

@@ -5,12 +5,12 @@
 //! render submission только публикует chain; timer tick забирает used entry
 //! и fence без многомиллионного busy-spin.
 
-use core::{
-    mem, ptr,
-    sync::atomic::{fence, Ordering},
-};
+use core::{mem, ptr};
 
-use crate::memory::{self, FrameBlock};
+use crate::{
+    arch,
+    memory::{self, FrameBlock},
+};
 
 use super::{pci::VirtioPciRegions, TransportError};
 
@@ -350,12 +350,13 @@ impl ModernTransport {
                 .cast::<u16>()
                 .write_volatile(head);
         }
-        fence(Ordering::Release);
+        arch::dma_write_barrier();
         unsafe {
             available
                 .add(2)
                 .cast::<u16>()
                 .write_volatile(available_index.wrapping_add(1));
+            arch::dma_write_barrier();
             self.notify
                 .add(self.notify_offset as usize)
                 .cast::<u16>()
@@ -369,7 +370,7 @@ impl ModernTransport {
         // Сначала наблюдаем новый used.idx, затем запрещаем процессору читать
         // элементы кольца и response page раньше публикации этого индекса
         // устройством. Это обычная acquire-сторона протокола Virtqueue.
-        fence(Ordering::Acquire);
+        arch::dma_read_barrier();
         while self.device_used != available {
             let ring_index = usize::from(self.device_used % self.queue_size);
             let element = unsafe {
