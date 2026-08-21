@@ -39,7 +39,18 @@ pub struct TrapFrame {
     pub esr_el1: u64,
     pub far_el1: u64,
     pub source: u64,
+    /// Явный padding сохраняет 16-байтное выравнивание Q-регистров.
+    pub simd_padding: u64,
+    /// Полный Advanced SIMD/FP context q0..q31, сохранённый до входа в Rust.
+    pub vector: [[u64; 2]; 32],
+    pub fpcr: u64,
+    pub fpsr: u64,
 }
+
+const _: () = assert!(core::mem::size_of::<TrapFrame>() == 832);
+const _: () = assert!(core::mem::offset_of!(TrapFrame, vector) == 304);
+const _: () = assert!(core::mem::offset_of!(TrapFrame, fpcr) == 816);
+const _: () = assert!(core::mem::offset_of!(TrapFrame, fpsr) == 824);
 
 impl TrapFrame {
     pub const fn is_from_user(&self) -> bool {
@@ -87,10 +98,13 @@ impl TrapFrame {
 #[derive(Clone, Copy)]
 pub struct UserContext {
     x: [u64; 31],
+    vector: [[u64; 2]; 32],
     stack_pointer: u64,
     instruction_pointer: u64,
     processor_state: u64,
     thread_pointer: u64,
+    fpcr: u64,
+    fpsr: u64,
 }
 
 impl UserContext {
@@ -99,11 +113,14 @@ impl UserContext {
         x[..3].copy_from_slice(&arguments);
         Self {
             x,
+            vector: [[0; 2]; 32],
             stack_pointer: stack,
             instruction_pointer: entry,
             // EL0t, interrupts unmasked when `eret` executes.
             processor_state: 0,
             thread_pointer: 0,
+            fpcr: 0,
+            fpsr: 0,
         }
     }
 
@@ -129,16 +146,22 @@ impl UserContext {
 
     pub fn save(&mut self, frame: &TrapFrame) {
         self.x = frame.x;
+        self.vector = frame.vector;
         self.stack_pointer = frame.sp_el0;
         self.instruction_pointer = frame.elr_el1;
         self.processor_state = frame.spsr_el1;
+        self.fpcr = frame.fpcr;
+        self.fpsr = frame.fpsr;
     }
 
     pub fn restore(&self, frame: &mut TrapFrame) {
         frame.x = self.x;
+        frame.vector = self.vector;
         frame.sp_el0 = self.stack_pointer;
         frame.elr_el1 = self.instruction_pointer;
         frame.spsr_el1 = self.processor_state;
+        frame.fpcr = self.fpcr;
+        frame.fpsr = self.fpsr;
     }
 
     pub fn set_syscall_result(&mut self, result: i64) {
@@ -186,9 +209,24 @@ pub fn monotonic_milliseconds() -> u64 {
 
 /// Настраивает VBAR_EL1 и возвращает вершину kernel stack.
 pub fn initialize_early(info: &BootInfo) -> Result<EarlyInit, ArchError> {
-    // Синхронизируем записи загрузчика перед установкой VBAR_EL1.
+    // Rust/LLVM вправе использовать обязательный для AArch64 Advanced SIMD
+    // даже для целочисленных memcpy. Разрешаем FP/SIMD на EL0 и EL1 до
+    // установки vectors: SAVE_FRAME ниже использует q0..q31 немедленно.
     unsafe {
-        asm!("dsb sy", "isb", options(nostack, preserves_flags));
+        let mut control: u64;
+        asm!(
+            "mrs {control}, cpacr_el1",
+            control = out(reg) control,
+            options(nomem, nostack),
+        );
+        control |= 0b11 << 20;
+        asm!(
+            "msr cpacr_el1, {control}",
+            "dsb sy",
+            "isb",
+            control = in(reg) control,
+            options(nostack, preserves_flags),
+        );
     }
     traps::initialize();
     // EL0VCTEN=1: пользовательский runtime читает architected virtual

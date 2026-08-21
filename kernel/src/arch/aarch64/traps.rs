@@ -1,9 +1,10 @@
 //! AArch64 exception vectors, полный `TrapFrame` и синхронный EL0 runner.
 //!
 //! CPU сам не сохраняет general-purpose registers. Каждый рабочий vector
-//! поэтому сначала выделяет 304 байта (296 байт [`super::TrapFrame`] плюс
-//! padding до 16), сохраняет x0..x30 и системные регистры и лишь затем
-//! вызывает переносимый `rustos_handle_trap`.
+//! поэтому сначала выделяет 832 байта, сохраняет x0..x30, q0..q31,
+//! FPCR/FPSR и системные регистры и лишь затем вызывает переносимый
+//! `rustos_handle_trap`. Без SIMD-состояния вытесняемые Rust-процессы
+//! повреждали бы регистры друг друга даже при обычном `memcpy`.
 //!
 //! Синхронный bootstrap runner устроен так же, как AMD64 backend: перед
 //! `eret` он запоминает kernel SP/TTBR0. Нормальный syscall возвращается в
@@ -132,9 +133,9 @@ rustos_park:
     wfi
     b rustos_park
 
-    // Frame size = 304: TrapFrame занимает 296, последние 8 байт padding.
+    // Frame size = 832 и кратен 16. q0 начинается с offset 304.
     .macro SAVE_FRAME source
-    sub sp, sp, #304
+    sub sp, sp, #832
     stp x0,  x1,  [sp, #0]
     stp x2,  x3,  [sp, #16]
     stp x4,  x5,  [sp, #32]
@@ -163,9 +164,50 @@ rustos_park:
     str x9, [sp, #280]
     mov x9, #\source
     str x9, [sp, #288]
+    str xzr, [sp, #296]
+    stp q0,  q1,  [sp, #304]
+    stp q2,  q3,  [sp, #336]
+    stp q4,  q5,  [sp, #368]
+    stp q6,  q7,  [sp, #400]
+    stp q8,  q9,  [sp, #432]
+    stp q10, q11, [sp, #464]
+    stp q12, q13, [sp, #496]
+    stp q14, q15, [sp, #528]
+    stp q16, q17, [sp, #560]
+    stp q18, q19, [sp, #592]
+    stp q20, q21, [sp, #624]
+    stp q22, q23, [sp, #656]
+    stp q24, q25, [sp, #688]
+    stp q26, q27, [sp, #720]
+    stp q28, q29, [sp, #752]
+    stp q30, q31, [sp, #784]
+    mrs x9, fpcr
+    str x9, [sp, #816]
+    mrs x9, fpsr
+    str x9, [sp, #824]
     .endm
 
     .macro RESTORE_FRAME
+    ldr x9, [sp, #816]
+    msr fpcr, x9
+    ldr x9, [sp, #824]
+    msr fpsr, x9
+    ldp q0,  q1,  [sp, #304]
+    ldp q2,  q3,  [sp, #336]
+    ldp q4,  q5,  [sp, #368]
+    ldp q6,  q7,  [sp, #400]
+    ldp q8,  q9,  [sp, #432]
+    ldp q10, q11, [sp, #464]
+    ldp q12, q13, [sp, #496]
+    ldp q14, q15, [sp, #528]
+    ldp q16, q17, [sp, #560]
+    ldp q18, q19, [sp, #592]
+    ldp q20, q21, [sp, #624]
+    ldp q22, q23, [sp, #656]
+    ldp q24, q25, [sp, #688]
+    ldp q26, q27, [sp, #720]
+    ldp q28, q29, [sp, #752]
+    ldp q30, q31, [sp, #784]
     ldr x9, [sp, #248]
     msr sp_el0, x9
     ldr x9, [sp, #256]
@@ -188,7 +230,7 @@ rustos_park:
     ldp x26, x27, [sp, #208]
     ldp x28, x29, [sp, #224]
     ldr x30, [sp, #240]
-    add sp, sp, #304
+    add sp, sp, #832
     eret
     .endm
 

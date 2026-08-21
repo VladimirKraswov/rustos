@@ -73,6 +73,13 @@ fi
 
 printf 'screendump %s/triangle.ppm\n' "$RUN_DIR" | \
     "$HMP_TOOL" "$RUN_DIR/monitor.sock" >/dev/null
+# HMP принимает команду синхронно, но display backend завершает запись PPM
+# асинхронно. Небольшое bounded-ожидание не скрывает ошибку и исключает гонку
+# между закрытием monitor socket и первым write файла.
+for _ in {1..50}; do
+    [[ -s "$RUN_DIR/triangle.ppm" ]] && break
+    sleep 0.1
+done
 [[ -s "$RUN_DIR/triangle.ppm" ]] || { echo "[virgl-test] empty screenshot" >&2; exit 1; }
 "$CHECK_TOOL" --virgl "$RUN_DIR/triangle.ppm"
 grep -Fq '[virgl] ring3 renderd async-fence triangle zero-copy scanout verified' \
