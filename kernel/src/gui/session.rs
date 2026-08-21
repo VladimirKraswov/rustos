@@ -11,6 +11,7 @@ use core::{mem::size_of, ptr};
 use crate::{
     apps::{
         desktop_settings::{DesktopSettings, DesktopSettingsAction, DesktopSettingsSnapshot},
+        file_explorer::FileExplorer,
         shell_ui::{active_icon_or_default, ShellAction, ShellUi},
         terminal::{
             CursorCommand, CursorThemeName, IconThemeName, MouseCommand, Terminal, TerminalAction,
@@ -57,6 +58,8 @@ const GALLERY_MIN_WIDTH: u32 = 560;
 const GALLERY_MIN_HEIGHT: u32 = 360;
 const SETTINGS_MIN_WIDTH: u32 = 620;
 const SETTINGS_MIN_HEIGHT: u32 = 560;
+const EXPLORER_MIN_WIDTH: u32 = 940;
+const EXPLORER_MIN_HEIGHT: u32 = 440;
 
 /// Bounded registry защищает ядро от исчерпания памяти одним GUI-клиентом.
 /// Состояние приложений при этом выделяется динамически из frame allocator,
@@ -143,6 +146,7 @@ enum WindowInteraction {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ApplicationKind {
     Terminal,
+    FileExplorer,
     UiShowcase,
     DesktopSettings,
 }
@@ -151,6 +155,7 @@ impl ApplicationKind {
     const fn title(self) -> &'static str {
         match self {
             Self::Terminal => "RustOS · Терминал",
+            Self::FileExplorer => "RustOS · Проводник",
             Self::UiShowcase => "RustOS · Библиотека компонентов",
             Self::DesktopSettings => "RustOS · Параметры рабочего стола",
         }
@@ -159,6 +164,7 @@ impl ApplicationKind {
     const fn task_label(self) -> &'static str {
         match self {
             Self::Terminal => "Терминал",
+            Self::FileExplorer => "Проводник",
             Self::UiShowcase => "Компоненты",
             Self::DesktopSettings => "Параметры",
         }
@@ -169,6 +175,7 @@ impl ApplicationKind {
     const fn log_label(self) -> &'static str {
         match self {
             Self::Terminal => "TERMINAL",
+            Self::FileExplorer => "EXPLORER",
             Self::UiShowcase => "UI GALLERY",
             Self::DesktopSettings => "SETTINGS",
         }
@@ -177,14 +184,20 @@ impl ApplicationKind {
     const fn minimum_size(self) -> (u32, u32) {
         match self {
             Self::Terminal => (TERMINAL_MIN_WIDTH, TERMINAL_MIN_HEIGHT),
+            Self::FileExplorer => (EXPLORER_MIN_WIDTH, EXPLORER_MIN_HEIGHT),
             Self::UiShowcase => (GALLERY_MIN_WIDTH, GALLERY_MIN_HEIGHT),
             Self::DesktopSettings => (SETTINGS_MIN_WIDTH, SETTINGS_MIN_HEIGHT),
         }
     }
 }
 
+// ApplicationMemory сразу переносит enum в кадры frame allocator'а. Большой
+// retained tree Проводника поэтому не раздувает registry окон и не требует
+// глобального heap/Box; размер enum здесь является явным бюджетом app object.
+#[allow(clippy::large_enum_variant)]
 enum Application {
     Terminal(Terminal),
+    FileExplorer(FileExplorer),
     UiShowcase(UiShowcase),
     DesktopSettings(DesktopSettings),
 }
@@ -193,6 +206,7 @@ impl Application {
     const fn kind(&self) -> ApplicationKind {
         match self {
             Self::Terminal(_) => ApplicationKind::Terminal,
+            Self::FileExplorer(_) => ApplicationKind::FileExplorer,
             Self::UiShowcase(_) => ApplicationKind::UiShowcase,
             Self::DesktopSettings(_) => ApplicationKind::DesktopSettings,
         }
@@ -599,6 +613,21 @@ impl DesktopSession {
                 };
                 self.handle_settings_key(id, key)
             }
+            Some(ApplicationKind::FileExplorer) => {
+                let now_ms = arch::monotonic_milliseconds();
+                let settings = self.input.mouse_settings();
+                let changed = match self.application_mut(id) {
+                    Some(Application::FileExplorer(explorer)) => {
+                        explorer.key(key, now_ms, settings)
+                    }
+                    _ => false,
+                };
+                if changed {
+                    Redraw::Scene
+                } else {
+                    Redraw::None
+                }
+            }
             Some(ApplicationKind::Terminal) => self.handle_terminal_key(id, key),
             None => Redraw::None,
         }
@@ -620,6 +649,12 @@ impl DesktopSession {
                 self.shell.set_open(false);
                 let _ = self.spawn_application(ApplicationKind::Terminal);
                 serial::put_str("[start] command=terminal\n");
+                Redraw::Scene
+            }
+            ShellAction::OpenFileExplorer => {
+                self.shell.set_open(false);
+                let _ = self.spawn_application(ApplicationKind::FileExplorer);
+                serial::put_str("[start] command=explorer\n");
                 Redraw::Scene
             }
             ShellAction::OpenGallery => {
@@ -723,8 +758,14 @@ impl DesktopSession {
                 self.ui_scale_milli = scale_milli.clamp(1_000, 1_500);
                 self.shell.set_scale(self.ui_scale_milli);
                 for slot in self.windows.iter_mut().flatten() {
-                    if let Application::UiShowcase(showcase) = slot.application.get_mut() {
-                        showcase.set_scale(self.ui_scale_milli);
+                    match slot.application.get_mut() {
+                        Application::UiShowcase(showcase) => {
+                            showcase.set_scale(self.ui_scale_milli)
+                        }
+                        Application::FileExplorer(explorer) => {
+                            explorer.set_scale(self.ui_scale_milli)
+                        }
+                        Application::Terminal(_) | Application::DesktopSettings(_) => {}
                     }
                 }
                 serial::put_str("[settings] ui-scale=");
@@ -864,6 +905,11 @@ impl DesktopSession {
             TerminalAction::OpenUiShowcase => {
                 let _ = self.spawn_application(ApplicationKind::UiShowcase);
                 serial::put_str("[ui] Gallery opened runtime=system-ui-v1 independent-window=1\n");
+                Redraw::Scene
+            }
+            TerminalAction::OpenFileExplorer => {
+                let _ = self.spawn_application(ApplicationKind::FileExplorer);
+                serial::put_str("[ui] Explorer opened runtime=system-ui-v1 independent-window=1\n");
                 Redraw::Scene
             }
             TerminalAction::Mouse(command) => {
@@ -1057,6 +1103,22 @@ impl DesktopSession {
         }
 
         if right_pressed {
+            if let Some(id) = self.top_window_at(self.mouse_x, self.mouse_y) {
+                let in_content = self
+                    .window_content_rect(id)
+                    .is_some_and(|rect| rect.contains(self.mouse_x, self.mouse_y));
+                if in_content && self.window_kind(id) == Some(ApplicationKind::FileExplorer) {
+                    self.shell.close_popups();
+                    self.focus_window(id);
+                    let x = self.mouse_x;
+                    let y = self.mouse_y;
+                    if let Some(Application::FileExplorer(explorer)) = self.application_mut(id) {
+                        explorer.open_context_menu(x, y);
+                    }
+                    serial::put_str("[explorer] context-menu opened\n");
+                    return Redraw::Scene;
+                }
+            }
             if self.desktop_background_at(self.mouse_x, self.mouse_y) {
                 self.shell.open_desktop_menu(self.mouse_x, self.mouse_y);
                 serial::put_str("[desktop-menu] opened component-runtime=system-ui-v1 x=");
@@ -1149,6 +1211,19 @@ impl DesktopSession {
                     }
                     Some(ApplicationKind::DesktopSettings) => {
                         return self.handle_settings_pointer(id, kind, x, y);
+                    }
+                    Some(ApplicationKind::FileExplorer) => {
+                        let now_ms = arch::monotonic_milliseconds();
+                        let settings = self.input.mouse_settings();
+                        let changed = match self.application_mut(id) {
+                            Some(Application::FileExplorer(explorer)) => {
+                                explorer.pointer(kind, x, y, now_ms, settings)
+                            }
+                            _ => false,
+                        };
+                        if changed {
+                            return Redraw::Scene;
+                        }
                     }
                     Some(ApplicationKind::Terminal) | None => {}
                 }
@@ -1257,6 +1332,21 @@ impl DesktopSession {
                         Redraw::Scene
                     } else {
                         redraw
+                    };
+                }
+                Some(ApplicationKind::FileExplorer) => {
+                    let now_ms = arch::monotonic_milliseconds();
+                    let settings = self.input.mouse_settings();
+                    let changed = match self.application_mut(id) {
+                        Some(Application::FileExplorer(explorer)) => {
+                            explorer.pointer(UiPointerKind::Down, x, y, now_ms, settings)
+                        }
+                        _ => false,
+                    };
+                    return if changed || focus_changed {
+                        Redraw::Scene
+                    } else {
+                        Redraw::None
                     };
                 }
                 Some(ApplicationKind::Terminal) | None => {}
@@ -1375,6 +1465,11 @@ impl DesktopSession {
             ApplicationKind::Terminal => {
                 Application::Terminal(Terminal::new(self.usable_ram_mib, self.initramfs))
             }
+            ApplicationKind::FileExplorer => Application::FileExplorer(FileExplorer::new(
+                content,
+                self.initramfs,
+                self.ui_scale_milli,
+            )),
             ApplicationKind::UiShowcase => {
                 let mut showcase = UiShowcase::new(content);
                 showcase.set_scale(self.ui_scale_milli);
@@ -1694,6 +1789,7 @@ impl DesktopSession {
                 match self.application_mut(window) {
                     Some(Application::UiShowcase(showcase)) => showcase.resize(content),
                     Some(Application::DesktopSettings(settings)) => settings.resize(content),
+                    Some(Application::FileExplorer(explorer)) => explorer.resize(content),
                     Some(Application::Terminal(_)) | None => {}
                 }
             }
@@ -1725,6 +1821,7 @@ impl DesktopSession {
                 match slot.application.get_mut() {
                     Application::UiShowcase(showcase) => showcase.resize(content),
                     Application::DesktopSettings(settings) => settings.resize(content),
+                    Application::FileExplorer(explorer) => explorer.resize(content),
                     Application::Terminal(_) => {}
                 }
                 Some(event)
@@ -2002,6 +2099,8 @@ impl DesktopSession {
                     IconKind::Terminal,
                     Rect::new(rect.x + 8, rect.y + 6, 22, 22),
                 ),
+                ApplicationKind::FileExplorer => self
+                    .draw_system_icon(IconKind::Folder, Rect::new(rect.x + 8, rect.y + 6, 22, 22)),
                 ApplicationKind::UiShowcase => {
                     self.draw_system_icon(IconKind::Grid, Rect::new(rect.x + 8, rect.y + 6, 22, 22))
                 }
@@ -2088,12 +2187,17 @@ impl DesktopSession {
         let Some(index) = self.window_slot_index(id) else {
             return;
         };
+        let icon_pack = active_icon_or_default(self.icon_packs.active());
         let (framebuffer, windows) = (&mut self.framebuffer, &mut self.windows);
         let Some(slot) = windows[index].as_mut() else {
             return;
         };
         match slot.application.get_mut() {
             Application::Terminal(terminal) => terminal.draw(framebuffer, content),
+            Application::FileExplorer(explorer) => {
+                explorer.resize(content);
+                explorer.draw(framebuffer, icon_pack, true);
+            }
             Application::UiShowcase(showcase) => {
                 showcase.resize(content);
                 let _ = showcase.draw(framebuffer, true);
@@ -2113,7 +2217,9 @@ impl DesktopSession {
         let slot = windows[index].as_mut()?;
         match slot.application.get_mut() {
             Application::Terminal(terminal) => terminal.draw_input_line(framebuffer, content),
-            Application::UiShowcase(_) | Application::DesktopSettings(_) => None,
+            Application::FileExplorer(_)
+            | Application::UiShowcase(_)
+            | Application::DesktopSettings(_) => None,
         }
     }
 
@@ -2154,6 +2260,8 @@ impl DesktopSession {
                     IconKind::Terminal,
                     Rect::new(task.x + 6, task.y + 6, 26, 26),
                 ),
+                ApplicationKind::FileExplorer => self
+                    .draw_system_icon(IconKind::Folder, Rect::new(task.x + 6, task.y + 6, 26, 26)),
                 ApplicationKind::UiShowcase => {
                     self.draw_system_icon(IconKind::Grid, Rect::new(task.x + 6, task.y + 6, 26, 26))
                 }
@@ -2207,7 +2315,7 @@ impl DesktopSession {
         let width = if count == 0 {
             180
         } else {
-            (available / count as u32).min(180).max(22)
+            (available / count as u32).clamp(22, 180)
         };
         Rect::new(
             126 + index as i32 * width as i32,

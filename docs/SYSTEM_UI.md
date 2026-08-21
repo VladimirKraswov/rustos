@@ -25,6 +25,9 @@
   taskbar clock/date и keyboard focus без ручного hit-test пунктов.
 - desktop context menu и отдельное Settings-приложение с selected controls,
   wallpaper preview и общесистемным font scale 100–150%.
+- системный Проводник: toolbar/sidebar, Grid/ListView, read-only path field,
+  status pagination, inline rename и вложенные component popup без отдельного
+  ручного hit-test.
 
 Это фундамент, а не заявление, что весь каталог controls готов. Text editing,
 shaping, popup/portal, animations, persisted state и IPC-сервис расширяются
@@ -226,7 +229,8 @@ enabled/visible/checked/title/icon и shortcut scopes.
 
 Start menu является проверкой этого контракта на системном UI. Window server
 передаёт ему нормализованные `Down/Up/Move`, runtime удерживает pointer capture
-и возвращает `OpenTerminal`, `OpenGallery` либо `Shutdown`. Нажатие не сверяет
+и возвращает `OpenTerminal`, `OpenFileExplorer`, `OpenGallery` либо `Shutdown`.
+Нажатие не сверяет
 ручные прямоугольники пунктов. `Menu` исключён из Tab-порядка как focus scope,
 поэтому первый Tab выбирает первый дочерний `Button`; Escape остаётся глобальной
 командой закрытия popup. Клик не проходит сквозь surface к окну под ним.

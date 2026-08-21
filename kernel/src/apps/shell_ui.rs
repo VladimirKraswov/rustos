@@ -22,6 +22,7 @@ const COMMAND_GALLERY: CommandId = CommandId(3);
 const COMMAND_SHUTDOWN: CommandId = CommandId(4);
 const COMMAND_ARRANGE_DESKTOP: CommandId = CommandId(5);
 const COMMAND_DESKTOP_PROPERTIES: CommandId = CommandId(6);
+const COMMAND_EXPLORER: CommandId = CommandId(7);
 
 const TEXT_START: ResourceId = ResourceId(1);
 const IMAGE_RUSTOS: ResourceId = ResourceId(2);
@@ -39,9 +40,11 @@ const TEXT_ARRANGE_DESKTOP: ResourceId = ResourceId(13);
 const TEXT_DESKTOP_PROPERTIES: ResourceId = ResourceId(14);
 const IMAGE_ARRANGE: ResourceId = ResourceId(15);
 const IMAGE_SETTINGS: ResourceId = ResourceId(16);
+const TEXT_EXPLORER: ResourceId = ResourceId(17);
+const IMAGE_EXPLORER: ResourceId = ResourceId(18);
 
 type LauncherRuntime = Runtime<5, 16, 4>;
-type MenuRuntime = Runtime<18, 48, 8>;
+type MenuRuntime = Runtime<22, 60, 8>;
 type ClockRuntime = Runtime<5, 12, 4>;
 type DesktopMenuRuntime = Runtime<9, 28, 6>;
 
@@ -51,6 +54,7 @@ pub enum ShellAction {
     None,
     ToggleStart,
     OpenTerminal,
+    OpenFileExplorer,
     OpenGallery,
     ArrangeDesktop,
     OpenDesktopProperties,
@@ -457,6 +461,13 @@ fn build_menu(runtime: &mut MenuRuntime) {
     add_menu_button(
         &mut ui,
         column,
+        TEXT_EXPLORER,
+        IMAGE_EXPLORER,
+        COMMAND_EXPLORER,
+    );
+    add_menu_button(
+        &mut ui,
+        column,
         TEXT_TERMINAL,
         IMAGE_TERMINAL,
         COMMAND_TERMINAL,
@@ -642,6 +653,7 @@ const fn action_for(command: CommandId) -> ShellAction {
     match command {
         COMMAND_START => ShellAction::ToggleStart,
         COMMAND_TERMINAL => ShellAction::OpenTerminal,
+        COMMAND_EXPLORER => ShellAction::OpenFileExplorer,
         COMMAND_GALLERY => ShellAction::OpenGallery,
         COMMAND_ARRANGE_DESKTOP => ShellAction::ArrangeDesktop,
         COMMAND_DESKTOP_PROPERTIES => ShellAction::OpenDesktopProperties,
@@ -661,7 +673,7 @@ fn launcher_rect(screen_height: u32, taskbar_height: u32) -> Rect {
 
 fn menu_rect(screen_height: u32, taskbar_height: u32) -> Rect {
     const WIDTH: u32 = 320;
-    const HEIGHT: u32 = 326;
+    const HEIGHT: u32 = 392;
     Rect::new(
         6,
         (screen_height as i32 - taskbar_height as i32 - HEIGHT as i32 - 6).max(6),
@@ -735,6 +747,7 @@ impl ShellResources<'_> {
             TEXT_START => "Пуск",
             TEXT_RUSTOS => "RustOS",
             TEXT_TERMINAL => "Новый терминал",
+            TEXT_EXPLORER => "Проводник",
             TEXT_GALLERY => "Компоненты UI",
             TEXT_SHUTDOWN => "Завершить работу",
             TEXT_TIME => self.clock.time_text(),
@@ -819,6 +832,11 @@ impl RenderBackend for ShellBackend<'_, '_, '_> {
                 self.resources
                     .icon_pack
                     .draw(self.framebuffer, IconKind::Terminal, rect);
+            }
+            IMAGE_EXPLORER => {
+                self.resources
+                    .icon_pack
+                    .draw(self.framebuffer, IconKind::Folder, rect);
             }
             IMAGE_POWER => self
                 .resources

@@ -115,6 +115,13 @@ server process.
 
 ## Честные границы текущего этапа
 
+- Bootstrap GUI terminal и новый Проводник пока подключены к общему
+  `BootstrapFs` namespace (read-only RIFS + 32-node RAM overlay), а не вызывают
+  ring-3 `vfsd`. Для Проводника facade поддерживает validated tree `rename`,
+  bounded recursive copy с rollback destination и recursive remove. Это даёт
+  общий namespace между окнами, но writable данные живут только до выключения
+  и файл ограничен 4 KiB. Перевод GUI-клиентов в ring 3 заменит facade на
+  `vfs.dll`; persistent путь ниже уже работает для RUNE-программ.
 - `vfs-1.rune` уже содержит manifest-backed interface ABI и проверяется
   нативным resolver'ом. `std::fs` пока компилирует тот же client protocol в
   PAL статически; перевод PAL на вызовы общей DLL уберёт это дублирование.

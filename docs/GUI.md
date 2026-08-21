@@ -15,7 +15,9 @@ layout/event/display-list pipeline и UI Gallery описаны в
 - `gui/components.rs` — theme и базовые widgets;
 - `gui/session.rs` — compositor, desktop, taskbar, registry окон и lifecycle
   независимых экземпляров приложений;
-- `apps/terminal.rs` — первый графический клиент.
+- `apps/terminal.rs` — первый графический клиент;
+- `apps/file_explorer.rs` — независимый компонентный Проводник с общим VFS;
+  полный сценарий описан в [FILE_EXPLORER.md](FILE_EXPLORER.md).
 
 На QEMU ядро после GRUB hand-off подключает modern PCI virtio-gpu,
 читает EDID и переводит scanout на выбранный wide mode. GRUB framebuffer
@@ -63,7 +65,7 @@ PS/2 service объединяет накопившиеся движения с �
 - рамка и углы меняют размер окна с соблюдением minimum size;
 - taskbar содержит отдельную кнопку каждого экземпляра, переключает focus и
   восстанавливает свёрнутое окно;
-- Start menu создаёт новый Terminal или UI Gallery, а не заменяет содержимое
+- Start menu создаёт новый Terminal, Проводник или UI Gallery, а не заменяет содержимое
   уже открытого окна;
 - кнопка Start, само меню, его пункты, изображения и часы построены тем же
   `rustos-system-ui`, что интерфейсы приложений: `Button` выдаёт `CommandId`,
@@ -153,7 +155,7 @@ versioned client API без дублирования большого renderer-�
 - software compositor остаётся синхронным и пока не привязан к VSync;
 - PS/2 работает polling-режимом;
 - UTF-8 Latin/Cyrillic работает, но пока нет shaping, bidi и сложных scripts;
-- terminal и UI Gallery уже имеют независимые экземпляры, geometry, focus,
+- terminal, Проводник и UI Gallery уже имеют независимые экземпляры, geometry, focus,
   Z-order и lifecycle, но их event handlers пока исполняются последовательно
   внутри bootstrap window-server loop;
 - parser shell и console bridge ещё находятся в kernel; запускаемые программы

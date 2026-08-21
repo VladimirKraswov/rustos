@@ -126,7 +126,7 @@ stop_qemu() {
 cleanup() {
     trap - EXIT INT TERM HUP
     stop_qemu
-    for file in serial.log qemu-stderr.log start-menu.ppm desktop-menu.ppm desktop-settings.ppm mode-720.ppm fonts.ppm cursor-busy.ppm wallpaper-autumn.ppm lifecycle.ppm terminal.ppm ui-gallery.ppm dragged.ppm resized.ppm minimized.ppm; do
+    for file in serial.log qemu-stderr.log start-menu.ppm desktop-menu.ppm desktop-settings.ppm mode-720.ppm fonts.ppm cursor-busy.ppm wallpaper-autumn.ppm lifecycle.ppm terminal.ppm ui-gallery.ppm explorer.ppm dragged.ppm resized.ppm minimized.ppm; do
         [[ -f "$RUN_DIR/$file" ]] && cp -f "$RUN_DIR/$file" "$RESULT_DIR/$file"
     done
 }
@@ -362,6 +362,34 @@ printf 'mouse_button 1\n' | hmp
 sleep 0.08
 printf 'mouse_button 0\n' | hmp
 wait_for_serial '[app] exit id=0x04 kind=UI GALLERY released-frames='
+
+# Проводник запускается как отдельное приложение через terminal command, а не
+# подменяет содержимое существующего окна. Нажатие toolbar Button создаёт
+# настоящий VFS-каталог; screenshot проверяет системные folder icons и layout.
+send_command 'explorer'
+wait_for_serial '[app] spawn id=0x05 kind=EXPLORER'
+wait_for_serial '[explorer] operation=READY path=/'
+# id=5: rect≈(232,104,1040,640), центр «Новая папка»≈(719,165).
+move_mouse -507 42 4
+printf 'mouse_button 1\n' | hmp
+sleep 0.08
+printf 'mouse_button 0\n' | hmp
+wait_for_serial '[explorer] operation=MKDIR path=/Новая папка'
+sleep 0.25
+printf 'screendump %s/explorer.ppm\n' "$RUN_DIR" | hmp
+[[ -s "$RUN_DIR/explorer.ppm" ]] || {
+    echo "[gui-test] Explorer screenshot is empty" >&2
+    exit 1
+}
+# Закрытие освобождает application frames. Возвращаем cursor в прежнюю точку,
+# чтобы оставшаяся geometry-regression не зависела от нового сценария.
+move_mouse 535 -44 4
+printf 'mouse_button 1\n' | hmp
+sleep 0.08
+printf 'mouse_button 0\n' | hmp
+wait_for_serial '[app] exit id=0x05 kind=EXPLORER released-frames='
+move_mouse -28 2 1
+
 # taskbar id=1 (первая кнопка), затем его close center≈(1142,43).
 move_mouse -1012 656 7
 printf 'mouse_button 1\n' | hmp
@@ -470,12 +498,12 @@ move_mouse 100 84 2
 printf 'mouse_button 1\n' | hmp
 sleep 0.08
 printf 'mouse_button 0\n' | hmp
-wait_for_serial '[app] spawn id=0x05 kind=SETTINGS'
+wait_for_serial '[app] spawn id=0x06 kind=SETTINGS'
 wait_for_serial '[desktop-menu] command=properties'
 
-# Settings rect≈(232,126,760,620): work-area clamp поднимает окно целиком над
+# Settings rect≈(260,134,760,620): work-area clamp поднимает окно целиком над
 # taskbar. Выбираем осенние обои и UI scale 125%.
-move_mouse -189 73 3
+move_mouse -161 81 3
 printf 'mouse_button 1\n' | hmp
 sleep 0.08
 printf 'mouse_button 0\n' | hmp
@@ -499,4 +527,4 @@ for _ in $(seq 1 20); do
     sleep 0.1
 done
 stop_qemu
-echo "[gui-test] PASS: independent windows, desktop popup/settings, lifecycle, VFS + ring3 RUN, buffered drag/resize/minimize"
+echo "[gui-test] PASS: independent windows + Explorer, desktop popup/settings, lifecycle, VFS + ring3 RUN, buffered drag/resize/minimize"

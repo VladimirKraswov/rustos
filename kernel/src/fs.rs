@@ -218,6 +218,69 @@ impl OverlayStorage {
     };
 }
 
+/// Путь в bounded-очереди составной файловой операции. Отдельный тип не даёт
+/// случайно пронести в bootstrap VFS указатель на временную строку UI.
+#[derive(Clone, Copy)]
+struct StoredPath {
+    bytes: [u8; PATH_CAPACITY],
+    len: u8,
+}
+
+impl StoredPath {
+    const EMPTY: Self = Self {
+        bytes: [0; PATH_CAPACITY],
+        len: 0,
+    };
+
+    fn new(path: &str) -> Result<Self, FsError> {
+        if path.is_empty() || path.len() >= PATH_CAPACITY {
+            return Err(FsError::InvalidPath);
+        }
+        let mut result = Self::EMPTY;
+        result.bytes[..path.len()].copy_from_slice(path.as_bytes());
+        result.len = path.len() as u8;
+        Ok(result)
+    }
+
+    fn join(parent: &str, name: &str) -> Result<Self, FsError> {
+        let separator = usize::from(parent != "/");
+        let len = parent
+            .len()
+            .checked_add(separator)
+            .and_then(|value| value.checked_add(name.len()))
+            .filter(|value| *value < PATH_CAPACITY)
+            .ok_or(FsError::InvalidPath)?;
+        let mut result = Self::EMPTY;
+        let mut cursor = 0usize;
+        result.bytes[..parent.len()].copy_from_slice(parent.as_bytes());
+        cursor += parent.len();
+        if separator != 0 {
+            result.bytes[cursor] = b'/';
+            cursor += 1;
+        }
+        result.bytes[cursor..len].copy_from_slice(name.as_bytes());
+        result.len = len as u8;
+        Ok(result)
+    }
+
+    fn as_str(&self) -> &str {
+        str::from_utf8(&self.bytes[..self.len as usize]).unwrap_or("")
+    }
+}
+
+#[derive(Clone, Copy)]
+struct CopyWork {
+    source: StoredPath,
+    target: StoredPath,
+}
+
+impl CopyWork {
+    const EMPTY: Self = Self {
+        source: StoredPath::EMPTY,
+        target: StoredPath::EMPTY,
+    };
+}
+
 // 32 * ~4 KiB живут в kernel BSS, а не на boot stack. До scheduler
 // существует ровно один DesktopSession, поэтому facade BootstrapFs является
 // единственным владельцем storage. После процессов storage исчезнет вместе с
@@ -465,6 +528,153 @@ impl BootstrapFs {
         }
         self.overlay().nodes[index] = Node::EMPTY;
         Ok(())
+    }
+
+    /// Удаляет writable-файл или целое дерево RAM-каталога.
+    ///
+    /// Сначала проверяется корневой объект, затем одним проходом очищаются все
+    /// его descendants. Поэтому ошибка `ReadOnly`/`NotFound` не оставляет
+    /// наполовину удалённое дерево. Persistent `vfsd` позже сохранит ту же
+    /// семантику и заменит этот проход транзакцией файловой системы.
+    pub fn remove_tree(&mut self, path: &str) -> Result<(), FsError> {
+        if path == "/" || path == "/boot" || path.starts_with("/boot/") {
+            return Err(FsError::ReadOnly);
+        }
+        self.find_node_index(path.as_bytes())
+            .ok_or(FsError::NotFound)?;
+        let prefix_len = path.len();
+        for node in &mut self.overlay().nodes {
+            let belongs = node.kind != NodeKind::Empty
+                && (node.path() == path.as_bytes()
+                    || node.path().len() > prefix_len
+                        && node.path().starts_with(path.as_bytes())
+                        && node.path().get(prefix_len) == Some(&b'/'));
+            if belongs {
+                *node = Node::EMPTY;
+            }
+        }
+        Ok(())
+    }
+
+    /// Переименовывает файл или перемещает целое writable-дерево.
+    /// Все новые пути проверяются до первого изменения, так что операция либо
+    /// меняет namespace целиком, либо не меняет его вообще.
+    pub fn rename(&mut self, source: &str, target: &str) -> Result<(), FsError> {
+        if source == target {
+            return Ok(());
+        }
+        if source == "/"
+            || source == "/boot"
+            || source.starts_with("/boot/")
+            || target == "/"
+            || target == "/boot"
+            || target.starts_with("/boot/")
+        {
+            return Err(FsError::ReadOnly);
+        }
+        let source_index = self
+            .find_node_index(source.as_bytes())
+            .ok_or(FsError::NotFound)?;
+        if self.stat(target).is_ok() {
+            return Err(FsError::AlreadyExists);
+        }
+        self.ensure_parent_directory(target)?;
+        let source_is_directory = self.overlay().nodes[source_index].kind == NodeKind::Directory;
+        if source_is_directory
+            && target.len() > source.len()
+            && target.as_bytes().starts_with(source.as_bytes())
+            && target.as_bytes().get(source.len()) == Some(&b'/')
+        {
+            return Err(FsError::InvalidPath);
+        }
+
+        let source_len = source.len();
+        for node in &self.overlay().nodes {
+            if node.kind == NodeKind::Empty || !path_belongs_to(node.path(), source.as_bytes()) {
+                continue;
+            }
+            let suffix_len = node.path().len().saturating_sub(source_len);
+            if target.len().saturating_add(suffix_len) >= PATH_CAPACITY {
+                return Err(FsError::InvalidPath);
+            }
+        }
+
+        for node in &mut self.overlay().nodes {
+            if node.kind == NodeKind::Empty || !path_belongs_to(node.path(), source.as_bytes()) {
+                continue;
+            }
+            let old_len = node.path_len as usize;
+            let suffix_len = old_len - source_len;
+            let mut rewritten = [0u8; PATH_CAPACITY];
+            rewritten[..target.len()].copy_from_slice(target.as_bytes());
+            rewritten[target.len()..target.len() + suffix_len]
+                .copy_from_slice(&node.path[source_len..old_len]);
+            node.path = rewritten;
+            node.path_len = (target.len() + suffix_len) as u8;
+        }
+        Ok(())
+    }
+
+    /// Копирует файл или каталог вместе с содержимым. Bounded FIFO заменяет
+    /// рекурсию: глубоко вложенный каталог не расходует kernel stack, а число
+    /// элементов всё равно ограничено bootstrap-таблицей `MAX_NODES`.
+    pub fn copy_tree(&mut self, source: &str, target: &str) -> Result<(), FsError> {
+        if self.stat(target).is_ok() {
+            return Err(FsError::AlreadyExists);
+        }
+        if source == target
+            || target.len() > source.len()
+                && target.as_bytes().starts_with(source.as_bytes())
+                && target.as_bytes().get(source.len()) == Some(&b'/')
+        {
+            return Err(FsError::InvalidPath);
+        }
+        self.ensure_parent_directory(target)?;
+
+        let mut queue = [CopyWork::EMPTY; MAX_NODES];
+        queue[0] = CopyWork {
+            source: StoredPath::new(source)?,
+            target: StoredPath::new(target)?,
+        };
+        let mut cursor = 0usize;
+        let mut queued = 1usize;
+        let mut data = [0u8; FILE_CAPACITY];
+
+        let result = (|| {
+            while cursor < queued {
+                let work = queue[cursor];
+                cursor += 1;
+                let source = work.source.as_str();
+                let target = work.target.as_str();
+                let stat = self.stat(source)?;
+                if stat.kind == FileKind::File {
+                    let len = self.read(source, &mut data)?;
+                    self.write(target, &data[..len])?;
+                    continue;
+                }
+
+                self.make_dir(target)?;
+                let listing = self.list(source)?;
+                for entry in listing.entries() {
+                    if queued == MAX_NODES {
+                        return Err(FsError::NoSpace);
+                    }
+                    queue[queued] = CopyWork {
+                        source: StoredPath::join(source, entry.name())?,
+                        target: StoredPath::join(target, entry.name())?,
+                    };
+                    queued += 1;
+                }
+            }
+            Ok(())
+        })();
+
+        if result.is_err() {
+            // `target` гарантированно не существовал до операции, поэтому
+            // rollback не затрагивает пользовательские данные.
+            let _ = self.remove_tree(target);
+        }
+        result
     }
 
     fn overlay(&mut self) -> &mut OverlayStorage {
@@ -832,6 +1042,13 @@ fn immediate_child<'a>(parent: &[u8], candidate: &'a [u8]) -> Option<&'a [u8]> {
         .position(|byte| *byte == b'/')
         .unwrap_or(rest.len());
     Some(&rest[..length])
+}
+
+fn path_belongs_to(candidate: &[u8], root: &[u8]) -> bool {
+    candidate == root
+        || candidate.len() > root.len()
+            && candidate.starts_with(root)
+            && candidate.get(root.len()) == Some(&b'/')
 }
 
 fn valid_relative_path(path: &[u8]) -> bool {

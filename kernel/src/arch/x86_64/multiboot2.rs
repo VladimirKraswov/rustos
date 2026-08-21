@@ -664,13 +664,14 @@ rustos_multiboot2_initial_pd3:
 .endr
 .popsection
 
-.section .bss.rustos_multiboot2_stack,"aw",@nobits
+.pushsection .bss.rustos_multiboot2_stack,"aw",@nobits
 .balign 16
 .global rustos_multiboot2_stack_bottom
 rustos_multiboot2_stack_bottom:
     .skip {kernel_stack_size}
 .global rustos_multiboot2_stack_top
 rustos_multiboot2_stack_top:
+.popsection
 .code64
 "#,
     kernel_stack_size = const KERNEL_STACK_SIZE,

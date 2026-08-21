@@ -111,6 +111,8 @@ pub enum TerminalAction {
     DisplayColor(ColorMode),
     /// Открыть системное демонстрационное приложение UI Gallery.
     OpenUiShowcase,
+    /// Открыть новое независимое окно системного Проводника.
+    OpenFileExplorer,
     /// Показать или изменить профиль мыши.
     Mouse(MouseCommand),
     /// Выбрать cursor pack или временно показать конкретный cursor shape.
@@ -384,6 +386,7 @@ impl Terminal {
             self.print("  MEM       USABLE MEMORY\n", WHITE);
             self.print("  GUI       GUI SERVER STATUS\n", WHITE);
             self.print("  UIDEMO    OPEN SYSTEM UI GALLERY\n", WHITE);
+            self.print("  EXPLORER  OPEN SYSTEM FILE EXPLORER\n", WHITE);
             self.print("  DISPLAY   MONITOR/MODE/COLOR SETTINGS\n", WHITE);
             self.print("  FONT      FAMILY/SIZE/STYLE SETTINGS\n", WHITE);
             self.print("  MOUSE     RATE/SENSITIVITY/CLICK SETTINGS\n", WHITE);
@@ -423,6 +426,8 @@ impl Terminal {
             TerminalAction::None
         } else if command.eq_ignore_ascii_case("uidemo") {
             TerminalAction::OpenUiShowcase
+        } else if command.eq_ignore_ascii_case("explorer") {
+            TerminalAction::OpenFileExplorer
         } else if command.eq_ignore_ascii_case("display")
             || command
                 .get(..8)
@@ -485,6 +490,7 @@ impl Terminal {
             | TerminalAction::DisplayMode { .. }
             | TerminalAction::DisplayColor(_)
             | TerminalAction::OpenUiShowcase
+            | TerminalAction::OpenFileExplorer
             | TerminalAction::Mouse(_)
             | TerminalAction::Cursor(_)
             | TerminalAction::Icons(_)
