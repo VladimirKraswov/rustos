@@ -23,8 +23,8 @@ pub extern "C" fn _start(server: u64, reply: u64, abi_version: u64) -> ! {
     let _ = client.unlink("/tmp/vfsd-test/vfsd-stream-renamed.bin");
     let _ = client.unlink("/tmp/vfsd-test/vfsd-stream.bin");
     let _ = client.unlink("/tmp/vfsd-test");
-    if client.make_dir("/tmp/vfsd-test").is_err() {
-        process_exit(168);
+    if let Err(error) = client.make_dir("/tmp/vfsd-test") {
+        process_exit(600 + error.saturating_abs());
     }
     let file = match client.open(
         "/tmp/vfsd-test/vfsd-stream.bin",
@@ -48,15 +48,14 @@ pub extern "C" fn _start(server: u64, reply: u64, abi_version: u64) -> ! {
     if client.read(file, read) != Ok(read.len()) || read != &WRITE_DATA {
         process_exit(165);
     }
-    if client.close(file).is_err()
-        || client
-            .rename(
-                "/tmp/vfsd-test/vfsd-stream.bin",
-                "/tmp/vfsd-test/vfsd-stream-renamed.bin",
-            )
-            .is_err()
-    {
-        process_exit(166);
+    if let Err(error) = client.close(file) {
+        process_exit(700 + error.saturating_abs());
+    }
+    if let Err(error) = client.rename(
+        "/tmp/vfsd-test/vfsd-stream.bin",
+        "/tmp/vfsd-test/vfsd-stream-renamed.bin",
+    ) {
+        process_exit(800 + error.saturating_abs());
     }
     let directory = match client.open("/tmp/vfsd-test", open_flags::READ | open_flags::DIRECTORY) {
         Ok(directory) => directory,
@@ -69,12 +68,17 @@ pub extern "C" fn _start(server: u64, reply: u64, abi_version: u64) -> ! {
             found = true;
         }
     }
-    if !found
-        || client.close(directory).is_err()
-        || client.sync().is_err()
-        || client.shutdown_service().is_err()
-    {
-        process_exit(168);
+    if !found {
+        process_exit(170);
+    }
+    if let Err(error) = client.close(directory) {
+        process_exit(900 + error.saturating_abs());
+    }
+    if let Err(error) = client.sync() {
+        process_exit(1000 + error.saturating_abs());
+    }
+    if let Err(error) = client.shutdown_service() {
+        process_exit(1100 + error.saturating_abs());
     }
     process_exit(0)
 }

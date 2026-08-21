@@ -139,12 +139,16 @@ pub extern "C" fn _start(frame_endpoint: u64, render_capability: u64, abi_versio
     frame.handles[0] = TransferredHandle {
         handle: buffer,
         reserved: 0,
-        rights: Rights::READ,
+        // compositord не читает pixels, но является capability broker'ом и
+        // должен один раз передать read-only buffer дальше в displayd.
+        rights: Rights::READ.union(Rights::TRANSFER),
     };
     frame.handles[1] = TransferredHandle {
         handle: timeline,
         reserved: 0,
-        rights: Rights::WAIT,
+        // TRANSFER сохраняем только до compositord; displayd уже получает
+        // окончательно ослабленный WAIT handle без права делегирования.
+        rights: Rights::WAIT.union(Rights::TRANSFER),
     };
     if ipc_send(frame_endpoint, &frame) != syscall::status::OK
         || handle_close(buffer) != syscall::status::OK
