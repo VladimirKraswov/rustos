@@ -559,6 +559,13 @@ pub fn monotonic_counter() -> u64 {
     arch::monotonic_counter()
 }
 
+/// Тестирует сохранение расширенного CPU-контекста при аппаратном вытеснении.
+/// Это диагностический primitive bootstrap-тестов, не стабильная часть SDK.
+#[doc(hidden)]
+pub fn extended_state_preemption_probe(low: u64, high: u64, cycles: u64) -> bool {
+    arch::extended_state_preemption_probe(low, high, cycles)
+}
+
 /// Намеренно создаёт illegal-instruction fault для проверки изоляции.
 pub fn trigger_test_fault() -> ! {
     arch::trigger_test_fault()
