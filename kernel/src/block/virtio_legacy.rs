@@ -318,6 +318,10 @@ impl Device {
                 .cast::<u16>()
                 .write_volatile(available_index.wrapping_add(1))
         };
+        // `avail.idx` — publication point драйвера. Устройство не должно
+        // увидеть notify раньше обновлённого индекса даже на более слабом
+        // transport ordering, а compiler не должен переставить DMA-доступы.
+        fence(Ordering::SeqCst);
         unsafe { arch::outw(self.io + 16, QUEUE_SELECT) };
 
         let used_offset = align_up(descriptor_bytes + 6 + u64::from(self.queue_size) * 2, 4096);
@@ -338,6 +342,9 @@ impl Device {
         if !completed {
             return Err(BlockError::Timeout);
         }
+        // Устройство публикует used.idx только после status/data DMA. Барьер
+        // расположен после наблюдения индекса, то есть до чтения результата.
+        fence(Ordering::Acquire);
         self.last_used = wanted;
         let status = unsafe { (self.dma.phys as *const u8).add(4112).read_volatile() };
         if status == 0 {

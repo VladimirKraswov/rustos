@@ -9,11 +9,15 @@ use core::{
 use super::{
     apic::{SPURIOUS_VECTOR, TIMER_VECTOR},
     segmentation::{KERNEL_CODE_SELECTOR, USER_CODE_SELECTOR, USER_DATA_SELECTOR},
+    FxState,
 };
 
 #[repr(C)]
 #[derive(Debug)]
 pub struct TrapFrame {
+    /// FXSAVE64-образ создаётся assembly stub до вызова Rust, поэтому kernel
+    /// не успевает затереть пользовательские x87/MMX/XMM-регистры.
+    pub fx: FxState,
     pub r15: u64,
     pub r14: u64,
     pub r13: u64,
@@ -39,6 +43,11 @@ pub struct TrapFrame {
     /// User stack selector; существует в frame только для user trap.
     pub ss: u64,
 }
+
+const _: () = assert!(core::mem::offset_of!(TrapFrame, fx) == 0);
+const _: () = assert!(core::mem::offset_of!(TrapFrame, r15) == 512);
+const _: () = assert!(core::mem::offset_of!(TrapFrame, vector) == 632);
+const _: () = assert!(core::mem::size_of::<TrapFrame>() == 688);
 
 impl TrapFrame {
     pub const fn is_from_user(&self) -> bool {
@@ -354,10 +363,19 @@ rustos_trap_common:
     push r13
     push r14
     push r15
+    /*
+     * После пятнадцати push RSP выровнен на 16 байт. FXSAVE выполняется до
+     * первого Rust-вызова: даже автоматически векторизованный пролог больше
+     * не может повредить пользовательский SIMD-контекст.
+     */
+    sub rsp, 512
+    fxsave64 [rsp]
     mov rdi, rsp
     call rustos_handle_trap
     test rax, rax
     jnz rustos_abort_user
+    fxrstor64 [rsp]
+    add rsp, 512
     pop r15
     pop r14
     pop r13

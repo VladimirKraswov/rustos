@@ -133,7 +133,7 @@ patterns=(
     "\[memory\] user address spaces reclaimed"
     "\[irq\] controller=(xAPIC|x2APIC) boot-cpu=[0-9]+ counter-MHz=[1-9][0-9]* timer=(periodic|tsc-deadline)"
     "\[smp\] discovery=ACPI MADT discovered=${CPUS} online=${CPUS} APs parked safely"
-    "\[preempt\] timer ticks=[1-9][0-9]* context-switches=[1-9][0-9]*"
+    "\[preempt\] timer ticks=[1-9][0-9]* context-switches=[1-9][0-9]* extended-state=preserved"
     "\[isolation\] concurrent #UD terminated one process; survivor exited=22"
     "\[ipc\] queued block/wake and attenuated VFS capability verified"
     "\[abi-v4\] spawn/wait/kill threads VM shared-memory TLS clock verified"

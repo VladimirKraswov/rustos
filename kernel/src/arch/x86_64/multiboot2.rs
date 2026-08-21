@@ -578,8 +578,13 @@ rustos_multiboot2_entry:
     lgdt [rustos_multiboot2_gdt_pointer]
 
     mov eax, cr4
-    or eax, (1 << 4) | (1 << 5)
+    /* PSE/PAE плюс обязательная поддержка FXSAVE/XMM для Rust ring 3. */
+    or eax, (1 << 4) | (1 << 5) | (1 << 9) | (1 << 10)
     mov cr4, eax
+    mov eax, cr0
+    and eax, ~(1 << 2)
+    or eax, (1 << 1)
+    mov cr0, eax
     mov eax, offset rustos_multiboot2_initial_pml4
     mov cr3, eax
 

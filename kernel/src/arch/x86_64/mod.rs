@@ -23,6 +23,30 @@ pub const ARCH_NAME: &str = "x86-64";
 /// `#UD` — архитектурная причина тестового illegal instruction.
 pub const ILLEGAL_INSTRUCTION_EXCEPTION: u16 = 6;
 
+/// Архитектурное состояние x87/MMX/SSE, сохраняемое инструкцией FXSAVE64.
+///
+/// Сохранять его только в Rust-обработчике уже поздно: компилятор вправе
+/// использовать XMM-регистры в прологе функции. Поэтому trap stub кладёт этот
+/// блок на стек до первого вызова Rust, а scheduler копирует готовый снимок.
+#[repr(C, align(16))]
+#[derive(Clone, Copy, Debug)]
+pub struct FxState {
+    bytes: [u8; 512],
+}
+
+impl FxState {
+    /// Состояние нового потока соответствует аппаратному `FNINIT`: все
+    /// исключения x87 замаскированы, SSE использует стандартный MXCSR.
+    const fn initial() -> Self {
+        let mut bytes = [0u8; 512];
+        bytes[0] = 0x7f;
+        bytes[1] = 0x03;
+        bytes[24] = 0x80;
+        bytes[25] = 0x1f;
+        Self { bytes }
+    }
+}
+
 /// Частота invariant TSC калибруется APIC backend'ом. Значение 1 ГГц —
 /// безопасный ранний fallback до scheduler milestone.
 static MONOTONIC_HZ: AtomicU64 = AtomicU64::new(1_000_000_000);
@@ -32,6 +56,7 @@ static MONOTONIC_HZ: AtomicU64 = AtomicU64::new(1_000_000_000);
 #[derive(Clone, Copy)]
 pub struct UserContext {
     registers: [u64; 15],
+    fx: FxState,
     instruction_pointer: u64,
     flags: u64,
     stack_pointer: u64,
@@ -48,6 +73,7 @@ impl UserContext {
         registers[11] = arguments[2];
         Self {
             registers,
+            fx: FxState::initial(),
             instruction_pointer: entry,
             flags: 0x202,
             stack_pointer: stack,
@@ -77,6 +103,7 @@ impl UserContext {
 
     pub fn save(&mut self, frame: &TrapFrame) {
         self.registers = frame.general_registers();
+        self.fx = frame.fx;
         self.instruction_pointer = frame.instruction_pointer();
         self.flags = frame.rflags;
         self.stack_pointer = frame.rsp;
@@ -84,6 +111,7 @@ impl UserContext {
 
     pub fn restore(&self, frame: &mut TrapFrame) {
         frame.set_general_registers(self.registers);
+        frame.fx = self.fx;
         frame.rip = self.instruction_pointer;
         frame.cs = u64::from(segmentation::USER_CODE_SELECTOR);
         frame.rflags = self.flags | 0x202;
@@ -288,8 +316,15 @@ pub fn enable_memory_protection() {
         );
         let mut cr0: u64;
         core::arch::asm!("mov {}, cr0", out(reg) cr0, options(nomem, nostack));
-        cr0 |= 1 << 16;
+        // MP=1 и EM=0 разрешают x87/SSE, WP защищает read-only kernel pages.
+        cr0 = (cr0 | (1 << 1) | (1 << 16)) & !(1 << 2);
         core::arch::asm!("mov cr0, {}", in(reg) cr0, options(nostack));
+        let mut cr4: u64;
+        core::arch::asm!("mov {}, cr4", out(reg) cr4, options(nomem, nostack));
+        // OSFXSR включает FXSAVE/FXRSTOR и XMM, OSXMMEXCPT — корректную
+        // доставку SIMD floating-point exceptions через IDT.
+        cr4 |= (1 << 9) | (1 << 10);
+        core::arch::asm!("mov cr4, {}", in(reg) cr4, options(nostack));
     }
 }
 

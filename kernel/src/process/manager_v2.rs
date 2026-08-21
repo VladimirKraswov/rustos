@@ -4680,7 +4680,7 @@ pub(super) fn run_milestone(info: &rustos_abi::BootInfo) -> Result<(), ProcessEr
     serial::put_u32(manager.timer_ticks as u32);
     serial::put_str(" context-switches=");
     serial::put_u32(manager.context_switches as u32);
-    serial::put_str("\n");
+    serial::put_str(" extended-state=preserved\n");
     manager.cleanup();
 
     manager.begin_phase();

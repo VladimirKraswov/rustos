@@ -157,7 +157,7 @@ for pattern in "${patterns[@]}"; do
     fi
 done
 
-preempt_line="$(grep -E '\[preempt\] timer ticks=[0-9]+ context-switches=[0-9]+' "$LOG" | tail -n 1)"
+preempt_line="$(grep -E '\[preempt\] timer ticks=[0-9]+ context-switches=[0-9]+ extended-state=preserved' "$LOG" | tail -n 1)"
 timer_ticks="$(printf '%s\n' "$preempt_line" | sed -E 's/.*ticks=([0-9]+).*/\1/')"
 context_switches="$(printf '%s\n' "$preempt_line" | sed -E 's/.*context-switches=([0-9]+).*/\1/')"
 if [[ "$timer_ticks" =~ ^[0-9]+$ && "$context_switches" =~ ^[0-9]+$ ]] \

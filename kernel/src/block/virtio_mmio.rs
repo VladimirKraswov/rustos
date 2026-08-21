@@ -317,6 +317,7 @@ impl Device {
                 .cast::<u16>()
                 .write_volatile(index.wrapping_add(1));
         }
+        fence(Ordering::SeqCst);
         write32(self.base, REG_QUEUE_NOTIFY, 0);
 
         let wanted = self.last_used.wrapping_add(1);
@@ -333,6 +334,7 @@ impl Device {
         if !completed {
             return Err(BlockError::Timeout);
         }
+        fence(Ordering::Acquire);
         self.last_used = wanted;
         let interrupt = read32(self.base, REG_INTERRUPT_STATUS);
         if interrupt != 0 {
