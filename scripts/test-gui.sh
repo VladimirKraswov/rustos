@@ -71,6 +71,14 @@ move_mouse() {
     local dx="$1"
     local dy="$2"
     local steps="${3:-4}"
+    local abs_x=${dx#-}
+    local abs_y=${dy#-}
+    local required_x=$(((abs_x + 95) / 96))
+    local required_y=$(((abs_y + 95) / 96))
+    # Один PS/2 packet кодирует signed delta. Не полагаемся на то, что QEMU
+    # сам одинаково раздробит скачок >127 во всех версиях/режимах мыши.
+    ((steps < required_x)) && steps=$required_x
+    ((steps < required_y)) && steps=$required_y
     local step_x=$((dx / steps))
     local step_y=$((dy / steps))
     local sent_x=0
@@ -117,6 +125,19 @@ wait_for_serial() {
         sleep 0.1
     done
     echo "[gui-test] serial marker timeout: $pattern" >&2
+    return 1
+}
+
+wait_for_serial_count() {
+    local pattern="$1"
+    local expected="$2"
+    local count _
+    for _ in $(seq 1 300); do
+        count=$(grep -Fc "$pattern" "$RUN_DIR/serial.log" || true)
+        ((count >= expected)) && return 0
+        sleep 0.1
+    done
+    echo "[gui-test] serial marker count timeout: $pattern expected=$expected" >&2
     return 1
 }
 
@@ -386,18 +407,23 @@ wait_for_serial '[app] exit id=0x04 kind=UI GALLERY released-frames='
 send_command 'explorer'
 wait_for_serial '[app] spawn id=0x05 kind=EXPLORER'
 wait_for_serial '[explorer] operation=READY path=/'
-# id=5: rect≈(232,104,1040,640), центр «Новая папка»≈(719,165).
-move_mouse_to 719 165
-# Первый переход hover после полного кадра обязан пройти application-local
-# damage path. При 1280×800 полный кадр равен 1024 kpx; лимит 299 kpx ловит
-# возврат регрессии «один control → present всего framebuffer».
-wait_for_serial '[compositor] repaint=incremental scope=application'
-grep -Eq '\[compositor\] repaint=incremental scope=application rects=[1-9][0-9]* present-kpx=([0-9]{1,2}|[12][0-9]{2}) full-screen=no' \
-    "$RUN_DIR/serial.log"
+# id=5: rect≈(232,104,1040,640). После отдельного menu bar и address bar
+# центр component-кнопки «Новая папка» находится в toolbar около (639,198).
+move_mouse_to 639 198
+# Сохраняем и первый кадр: при ошибке hit-test он остаётся полезным visual
+# artifact, а при успехе ниже будет заменён состоянием после создания папки.
+printf 'screendump %s/explorer.ppm\n' "$RUN_DIR" | hmp
 printf 'mouse_button 1\n' | hmp
 sleep 0.08
 printf 'mouse_button 0\n' | hmp
 wait_for_serial '[explorer] operation=MKDIR path=/Новая папка'
+# Down/Up и command должны пройти application-local damage path. При
+# 1280×800 полный кадр равен 1024 kpx; лимит 299 kpx ловит возврат регрессии
+# «один control → present всего framebuffer» без зависимости от того, успел
+# ли TCG объединить промежуточные hover packets.
+wait_for_serial '[compositor] repaint=incremental scope=application'
+grep -Eq '\[compositor\] repaint=incremental scope=application rects=[1-9][0-9]* present-kpx=([0-9]{1,2}|[12][0-9]{2}) full-screen=no' \
+    "$RUN_DIR/serial.log"
 sleep 0.25
 printf 'screendump %s/explorer.ppm\n' "$RUN_DIR" | hmp
 [[ -s "$RUN_DIR/explorer.ppm" ]] || {
@@ -446,6 +472,7 @@ printf 'screendump %s/terminal.ppm\n' "$RUN_DIR" | hmp
 move_mouse 56 0 1
 printf 'mouse_button 1\n' | hmp
 wait_for_serial '[wm] drag started id=0x03'
+drag_finished_before=$(grep -Fc '[wm] drag finished id=0x03' "$RUN_DIR/serial.log" || true)
 # Не один большой скачок, а серия движений: это regression для preview path.
 # Пауза не даёт искусственному HMP producer переполнить одно-byte 8042 быстрее,
 # чем это вообще способна сделать физическая PS/2-мышь.
@@ -456,7 +483,7 @@ done
 printf '%b' "$drag_commands" | hmp 30
 sleep 0.2
 printf 'mouse_button 0\n' | hmp
-wait_for_serial '[wm] drag finished id=0x03'
+wait_for_serial_count '[wm] drag finished id=0x03' "$((drag_finished_before + 1))"
 grep -Eq '\[wm\] drag finished id=0x03 frames=[1-9][0-9]* packets=[1-9][0-9]* present-kpx=[1-9][0-9]* compositor=layer-cache' \
     "$RUN_DIR/serial.log"
 sleep 0.25

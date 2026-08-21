@@ -425,7 +425,14 @@ impl RenderBackend for SettingsBackend<'_> {
         if rect.intersection(clip).is_empty() {
             return;
         }
-        draw_system_ui_text(self.framebuffer, rect, text_resource(resource), color, spec);
+        draw_system_ui_text(
+            self.framebuffer,
+            rect,
+            text_resource(resource),
+            color,
+            spec,
+            clip,
+        );
     }
 
     fn image(&mut self, rect: Rect, resource: ResourceId, _: Color, clip: Rect) {

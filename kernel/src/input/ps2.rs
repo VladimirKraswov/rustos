@@ -17,14 +17,16 @@ const DATA: u16 = 0x60;
 const STATUS_COMMAND: u16 = 0x64;
 
 /// State-машина PS/2 контроллера: декодирует scancodes клавиатуры и
-/// 3-байтные пакеты мыши из общего потока байтов. Работает только в
+/// 3- или 4-байтные пакеты мыши из общего потока байтов. Работает только в
 /// polling-режиме (см. модуль).
 pub struct Ps2Input {
     shift: bool,
     caps_lock: bool,
     extended: bool,
-    mouse_packet: [u8; 3],
+    mouse_packet: [u8; 4],
     mouse_index: usize,
+    mouse_packet_size: usize,
+    mouse_device_id: u8,
     pending: Option<Event>,
     reported_mouse_buttons: u8,
     settings: MouseSettings,
@@ -43,8 +45,10 @@ impl Ps2Input {
             shift: false,
             caps_lock: false,
             extended: false,
-            mouse_packet: [0; 3],
+            mouse_packet: [0; 4],
             mouse_index: 0,
+            mouse_packet_size: 3,
+            mouse_device_id: 0,
             pending: None,
             reported_mouse_buttons: 0,
             settings: MouseSettings::DEFAULT,
@@ -66,8 +70,8 @@ impl Ps2Input {
         MouseCapabilities {
             configurable_sample_rate: 1,
             configurable_resolution: 1,
-            wheel: 0,
-            extra_buttons: 0,
+            wheel: if self.mouse_packet_size == 4 { 1 } else { 0 },
+            extra_buttons: if self.mouse_device_id == 4 { 1 } else { 0 },
             minimum_rate_hz: 10,
             maximum_rate_hz: 200,
             resolution_levels: 4,
@@ -129,6 +133,8 @@ impl Ps2Input {
                         }
                         accumulated.dx = accumulated.dx.saturating_add(next.dx);
                         accumulated.dy = accumulated.dy.saturating_add(next.dy);
+                        accumulated.wheel_x = accumulated.wheel_x.saturating_add(next.wheel_x);
+                        accumulated.wheel_y = accumulated.wheel_y.saturating_add(next.wheel_y);
                         accumulated.packets = accumulated.packets.saturating_add(next.packets);
                     } else {
                         mouse = Some(next);
@@ -164,10 +170,29 @@ impl Ps2Input {
         }
         unsafe { arch::outb(STATUS_COMMAND, 0xA8) }; // enable auxiliary device
 
-        // Defaults, затем желаемые rate/resolution и reporting. ACK читаем
-        // синхронно, пока GUI ещё не начал принимать пользовательский ввод.
+        // IntelliMouse-compatible устройства включают колёсико только после
+        // стандартной последовательности частот 200/100/80. Затем F2
+        // возвращает ID 3 (wheel) либо 4 (wheel + дополнительные кнопки).
+        // Обычная трёхбайтовая мышь остаётся рабочим безопасным fallback.
         let _ = self.mouse_command(0xF6);
+        self.detect_extended_mouse();
         let _ = self.program_mouse_settings();
+    }
+
+    fn detect_extended_mouse(&mut self) {
+        let magic = self.mouse_command_with_data(0xF3, 200)
+            && self.mouse_command_with_data(0xF3, 100)
+            && self.mouse_command_with_data(0xF3, 80);
+        if !magic || !self.mouse_command(0xF2) {
+            return;
+        }
+        let Some(id) = self.wait_mouse_reply() else {
+            return;
+        };
+        self.mouse_device_id = id;
+        if matches!(id, 3 | 4) {
+            self.mouse_packet_size = 4;
+        }
     }
 
     fn program_mouse_settings(&mut self) -> bool {
@@ -245,6 +270,8 @@ impl Ps2Input {
         }
         let released = scancode & 0x80 != 0;
         let code = scancode & 0x7f;
+        let extended = self.extended;
+        self.extended = false;
         if matches!(code, 0x2A | 0x36) {
             self.shift = !released;
             return None;
@@ -256,9 +283,18 @@ impl Ps2Input {
             self.caps_lock = !self.caps_lock;
             return None;
         }
-        if self.extended {
-            self.extended = false;
-            return None;
+        if extended {
+            return match code {
+                0x47 => Some(Key::Home),
+                0x48 => Some(Key::Up),
+                0x49 => Some(Key::PageUp),
+                0x4B => Some(Key::Left),
+                0x4D => Some(Key::Right),
+                0x4F => Some(Key::End),
+                0x50 => Some(Key::Down),
+                0x51 => Some(Key::PageDown),
+                _ => None,
+            };
         }
         match code {
             0x01 => Some(Key::Escape),
@@ -277,7 +313,7 @@ impl Ps2Input {
         }
         self.mouse_packet[self.mouse_index] = byte;
         self.mouse_index += 1;
-        if self.mouse_index != 3 {
+        if self.mouse_index != self.mouse_packet_size {
             return None;
         }
         self.mouse_index = 0;
@@ -289,10 +325,19 @@ impl Ps2Input {
         // PS/2: положительный Y направлен вверх; GUI — вниз.
         let raw_y = -(self.mouse_packet[2] as i8 as i16);
         let (dx, dy) = self.scale_motion(raw_x, raw_y);
+        let wheel_y = if self.mouse_packet_size == 4 {
+            // Z — signed 4-bit two's-complement. У PS/2 положительный Z
+            // означает wheel-up, а общий UI-контракт использует плюс вниз.
+            -sign_extend_nibble(self.mouse_packet[3])
+        } else {
+            0
+        };
         Some(Event::Mouse(MouseEvent {
             dx,
             // PS/2: положительный Y направлен вверх; GUI — вниз.
             dy,
+            wheel_x: 0,
+            wheel_y,
             left: flags & 1 != 0,
             right: flags & 2 != 0,
             middle: flags & 4 != 0,
@@ -329,6 +374,10 @@ impl Ps2Input {
             self.reported_mouse_buttons = mouse_buttons(mouse);
         }
     }
+}
+
+const fn sign_extend_nibble(byte: u8) -> i16 {
+    ((byte << 4) as i8 >> 4) as i16
 }
 
 fn mouse_buttons(event: MouseEvent) -> u8 {

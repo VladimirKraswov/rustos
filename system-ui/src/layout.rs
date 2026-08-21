@@ -168,7 +168,12 @@ where
     };
 
     match kind {
-        ComponentKind::Row => linear(tree, parent, content, true, parent_node.layout.gap, damaged),
+        ComponentKind::Row
+        | ComponentKind::Toolbar
+        | ComponentKind::StatusBar
+        | ComponentKind::SplitView => {
+            linear(tree, parent, content, true, parent_node.layout.gap, damaged)
+        }
         ComponentKind::Column | ComponentKind::Panel => linear(
             tree,
             parent,
@@ -177,10 +182,13 @@ where
             parent_node.layout.gap,
             damaged,
         ),
-        ComponentKind::ScrollView | ComponentKind::ListView => {
-            scroll_container(tree, parent, content, parent_node, damaged)
+        ComponentKind::ScrollView
+        | ComponentKind::ListView
+        | ComponentKind::TreeView
+        | ComponentKind::TableView => scroll_container(tree, parent, content, parent_node, damaged),
+        ComponentKind::Grid | ComponentKind::GridView => {
+            grid(tree, parent, content, parent_node.layout, damaged)
         }
-        ComponentKind::Grid => grid(tree, parent, content, parent_node.layout, damaged),
         _ => stack(tree, parent, content, damaged),
     }
 }
@@ -204,10 +212,14 @@ fn scroll_container<const N: usize, F>(
             == crate::ScrollBarPolicy::Always
             || parent_node.scroll.horizontal.can_scroll();
         if reserve_vertical {
-            viewport.width = viewport.width.saturating_sub(12);
+            viewport.width = viewport
+                .width
+                .saturating_sub(crate::DEFAULT_SCROLLBAR_INSET);
         }
         if reserve_horizontal {
-            viewport.height = viewport.height.saturating_sub(12);
+            viewport.height = viewport
+                .height
+                .saturating_sub(crate::DEFAULT_SCROLLBAR_INSET);
         }
     }
 

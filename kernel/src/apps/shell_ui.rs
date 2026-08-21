@@ -815,6 +815,7 @@ impl RenderBackend for ShellBackend<'_, '_, '_> {
             self.resources.text(resource),
             color,
             spec,
+            clip,
         );
     }
 

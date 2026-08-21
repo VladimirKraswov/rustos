@@ -36,9 +36,15 @@
   taskbar clock/date и keyboard focus без ручного hit-test пунктов.
 - desktop context menu и отдельное Settings-приложение с selected controls,
   wallpaper preview и общесистемным font scale 100–150%.
-- системный Проводник: toolbar/sidebar, Grid/ListView, read-only path field,
-  status pagination, inline rename и вложенные component popup без отдельного
-  ручного hit-test.
+- системный Проводник: menu/toolbar/address, read-only path field, inline
+  rename и вложенные component popup без отдельного ручного hit-test;
+- переиспользуемый `FileBrowser`: `SplitView`, прокручиваемый `TreeView`,
+  `GridView`/`ListView`/`TableView`, `Toolbar`, `StatusBar`, отдельные колонки,
+  inline rename и всегда видимые inset-scrollbar; Проводник больше не режет
+  каталог на искусственные страницы;
+- полный x86 input adapter для scrolling: IntelliMouse negotiation, 4-байтные
+  PS/2 wheel-пакеты и клавиши Up/Down/PageUp/PageDown/Home/End доходят до того
+  же component dispatcher, что pointer и Tab.
 
 Это фундамент, а не заявление, что весь каталог controls готов. Shaping,
 bidirectional layout, popup/portal, variable-height virtualization, persisted
@@ -265,6 +271,32 @@ keyboard больше не обрабатываются отдельным ко�
 extent реализация уже ограничивает live visuals величиной viewport + overscan.
 Variable extents требуют отдельного measurement index и остаются следующим
 collection milestone.
+
+## TreeView, TableView и FileBrowser
+
+`TreeView`, `TableView` и `GridView` — общие collection primitives, а не код
+Проводника. Они имеют отдельные accessibility-роли, используют единый layout,
+theme, focus и scroll controller. `Toolbar`, `StatusBar` и `SplitView` так же
+являются семантическими компонентами, поэтому файловое приложение не рисует
+панели и не вычисляет их hit-test вручную.
+
+`build_file_browser` — составной typed builder над этими primitives. На входе
+он принимает bounded slices `FileBrowserTreeItem` и `FileBrowserItem`, где
+есть только `ResourceId`, `CommandId` и состояния. Он ничего не знает о VFS,
+правах, диске или строках пути. Поэтому тот же composite подходит для file
+picker, project tree редактора, package manager и просмотра устройств.
+
+Три представления используют одну модель:
+
+- `Grid` — scrollable viewport и измеренная сетка крупных tiles;
+- `List` — компактные строки с иконкой и именем;
+- `Details` — настоящие колонки имени, типа и размера, а не форматирование
+  пробелами внутри одной строки.
+
+Прокрутка не требует focus: wheel получает область под указателем. После
+keyboard focus клавиши Up/Down двигают на строку, PageUp/PageDown — на viewport,
+Home/End — к границе документа. Inset scrollbar имеет 14 logical pixels и
+резервирует собственное место, поэтому thumb не закрывает имена файлов.
 
 `CommandId` связывает кнопку, menu item, toolbar, shortcut и command palette.
 Control не содержит application callback: runtime возвращает command event,

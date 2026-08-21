@@ -668,7 +668,7 @@ fn hit_scrollbar<const N: usize>(
                 node.rect,
                 model,
                 axis,
-                10,
+                crate::DEFAULT_SCROLLBAR_THICKNESS,
                 24,
                 model.can_scroll() || policy == ScrollBarPolicy::Always,
             );
@@ -685,7 +685,7 @@ fn scrollbar_geometry(
     model: crate::ScrollModel,
     axis: ScrollAxis,
 ) -> ScrollbarGeometry {
-    ScrollbarGeometry::overlay(rect, model, axis, 10, 24)
+    ScrollbarGeometry::overlay(rect, model, axis, crate::DEFAULT_SCROLLBAR_THICKNESS, 24)
 }
 
 fn damage_bound_scrollbars<const N: usize, F>(tree: &Tree<N>, target: NodeId, damage: &mut F)
@@ -718,7 +718,7 @@ where
 {
     let mut current = hit;
     while let Some(snapshot) = tree.get(current).copied() {
-        if snapshot.kind == ComponentKind::ListView && snapshot.list.is_configured() {
+        if collection_kind(snapshot.kind) && snapshot.list.is_configured() {
             let local_y = event.y.saturating_sub(snapshot.rect.y).max(0) as u32;
             let shift = event.modifiers & modifiers::SHIFT != 0;
             let control = event.modifiers & modifiers::CONTROL != 0;
@@ -770,7 +770,7 @@ where
             let Some(node) = tree.get_mut_internal(focused) else {
                 return DispatchResult::NONE;
             };
-            if node.kind == ComponentKind::ListView && node.list.is_configured() {
+            if collection_kind(node.kind) && node.list.is_configured() {
                 let changed =
                     node.list
                         .navigate(event.key, shift, control, &mut node.scroll.vertical);
@@ -788,6 +788,18 @@ where
             if let Some(node) = tree.get(focused) {
                 damage(node.rect);
             }
+            return DispatchResult {
+                target: focused,
+                command: CommandId(0),
+                changed: true,
+                consumed: true,
+            };
+        }
+        if matches!(
+            event.key,
+            Key::Up | Key::Down | Key::PageUp | Key::PageDown | Key::Home | Key::End
+        ) && scroll_key_ancestor(tree, focused, event.key, damage)
+        {
             return DispatchResult {
                 target: focused,
                 command: CommandId(0),
@@ -815,6 +827,75 @@ where
         target: state.focused,
         ..DispatchResult::NONE
     }
+}
+
+fn scroll_key_ancestor<const N: usize, F>(
+    tree: &mut Tree<N>,
+    start: NodeId,
+    key: Key,
+    damage: &mut F,
+) -> bool
+where
+    F: FnMut(crate::Rect),
+{
+    let mut current = start;
+    while let Some(snapshot) = tree.get(current).copied() {
+        if snapshot.scroll.config.vertical != ScrollBarPolicy::Hidden
+            && snapshot.scroll.vertical.can_scroll()
+        {
+            let changed = {
+                let node = tree
+                    .get_mut_internal(current)
+                    .expect("snapshot came from the same tree");
+                let model = &mut node.scroll.vertical;
+                let before = model.offset();
+                match key {
+                    Key::Home => {
+                        let _ = model.scroll_to(model.minimum());
+                    }
+                    Key::End => {
+                        let _ = model.scroll_to(model.maximum());
+                    }
+                    Key::Up => {
+                        let _ = model.scroll_by(-i64::from(node.scroll.config.line_extent));
+                    }
+                    Key::Down => {
+                        let _ = model.scroll_by(i64::from(node.scroll.config.line_extent));
+                    }
+                    Key::PageUp => {
+                        let _ = model.scroll_by(-i64::from(model.page_size().max(1)));
+                    }
+                    Key::PageDown => {
+                        let _ = model.scroll_by(i64::from(model.page_size().max(1)));
+                    }
+                    _ => {}
+                }
+                let changed = model.offset() != before;
+                if changed {
+                    node.dirty.insert(crate::DirtyFlags::LAYOUT);
+                    node.dirty.insert(crate::DirtyFlags::PAINT);
+                }
+                changed
+            };
+            if changed {
+                damage(snapshot.rect);
+                damage_bound_scrollbars(tree, current, damage);
+            }
+            return changed;
+        }
+        current = snapshot.parent;
+    }
+    false
+}
+
+const fn collection_kind(kind: ComponentKind) -> bool {
+    matches!(
+        kind,
+        ComponentKind::ListView
+            | ComponentKind::TreeView
+            | ComponentKind::TableView
+            | ComponentKind::GridView
+    )
 }
 
 fn hit_test<const N: usize>(tree: &Tree<N>, x: i32, y: i32) -> NodeId {

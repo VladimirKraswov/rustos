@@ -68,6 +68,33 @@ impl<'a, const N: usize> UiBuilder<'a, N> {
         self.simple(parent, ComponentKind::Grid, layout)
     }
 
+    /// Горизонтальный SplitView. Ширины дочерних панелей задаются обычными
+    /// `Length`, поэтому composite не знает о конкретном приложении.
+    pub fn split_view(&mut self, parent: NodeId, layout: LayoutSpec) -> Result<NodeId, TreeError> {
+        let mut spec = NodeSpec::new(ComponentKind::SplitView);
+        spec.layout = layout;
+        spec.role = SemanticRole::Group;
+        self.component(parent, spec)
+    }
+
+    /// Toolbar — семантическая строка связанных команд.
+    pub fn toolbar(&mut self, parent: NodeId, layout: LayoutSpec) -> Result<NodeId, TreeError> {
+        let mut spec = NodeSpec::new(ComponentKind::Toolbar);
+        spec.layout = layout;
+        spec.role = SemanticRole::Toolbar;
+        spec.tab_index = -1;
+        self.component(parent, spec)
+    }
+
+    /// StatusBar — нижняя строка краткого состояния документа/представления.
+    pub fn status_bar(&mut self, parent: NodeId, layout: LayoutSpec) -> Result<NodeId, TreeError> {
+        let mut spec = NodeSpec::new(ComponentKind::StatusBar);
+        spec.layout = layout;
+        spec.role = SemanticRole::Status;
+        spec.tab_index = -1;
+        self.component(parent, spec)
+    }
+
     /// Text/Label.
     pub fn text(
         &mut self,
@@ -93,6 +120,25 @@ impl<'a, const N: usize> UiBuilder<'a, N> {
         layout: LayoutSpec,
     ) -> Result<NodeId, TreeError> {
         let mut spec = NodeSpec::new(ComponentKind::Image);
+        spec.layout = layout;
+        spec.content = Content::Resource(resource);
+        spec.accessible_name = accessible_name;
+        if accessible_name != ResourceId(0) {
+            spec.role = SemanticRole::Image;
+        }
+        self.component(parent, spec)
+    }
+
+    /// Icon из системного или прикладного resource pack. В отличие от Image,
+    /// renderer может перекрашивать монохромную пиктограмму цветом темы.
+    pub fn icon(
+        &mut self,
+        parent: NodeId,
+        resource: ResourceId,
+        accessible_name: ResourceId,
+        layout: LayoutSpec,
+    ) -> Result<NodeId, TreeError> {
+        let mut spec = NodeSpec::new(ComponentKind::Icon);
         spec.layout = layout;
         spec.content = Content::Resource(resource);
         spec.accessible_name = accessible_name;
@@ -171,6 +217,25 @@ impl<'a, const N: usize> UiBuilder<'a, N> {
         )
     }
 
+    /// RadioButton. Объединение взаимоисключающих вариантов остаётся
+    /// политикой приложения и выражается общей командой/моделью выбора.
+    pub fn radio_button(
+        &mut self,
+        parent: NodeId,
+        label: ResourceId,
+        command: CommandId,
+        layout: LayoutSpec,
+    ) -> Result<NodeId, TreeError> {
+        self.control(
+            parent,
+            ComponentKind::RadioButton,
+            SemanticRole::RadioButton,
+            label,
+            command,
+            layout,
+        )
+    }
+
     /// Switch.
     pub fn switch(
         &mut self,
@@ -205,6 +270,56 @@ impl<'a, const N: usize> UiBuilder<'a, N> {
         self.component(parent, spec)
     }
 
+    /// Многострочный TextArea. Текст хранится в resource adapter приложения,
+    /// поэтому большой документ не копируется внутрь component tree.
+    pub fn text_area(
+        &mut self,
+        parent: NodeId,
+        value: ResourceId,
+        accessible_name: ResourceId,
+        layout: LayoutSpec,
+    ) -> Result<NodeId, TreeError> {
+        let mut spec = NodeSpec::new(ComponentKind::TextArea);
+        spec.layout = layout;
+        spec.content = Content::Text(value);
+        spec.role = SemanticRole::TextArea;
+        spec.accessible_name = accessible_name;
+        self.component(parent, spec)
+    }
+
+    /// Slider со значением 0..=1000.
+    pub fn slider(
+        &mut self,
+        parent: NodeId,
+        value: u16,
+        accessible_name: ResourceId,
+        layout: LayoutSpec,
+    ) -> Result<NodeId, TreeError> {
+        let mut spec = NodeSpec::new(ComponentKind::Slider);
+        spec.layout = layout;
+        spec.content = Content::Value(value.min(1000));
+        spec.role = SemanticRole::Slider;
+        spec.accessible_name = accessible_name;
+        self.component(parent, spec)
+    }
+
+    /// Select/ComboBox. `value` адресует текущую отображаемую строку;
+    /// варианты предоставляет bounded model приложения.
+    pub fn select(
+        &mut self,
+        parent: NodeId,
+        value: ResourceId,
+        accessible_name: ResourceId,
+        layout: LayoutSpec,
+    ) -> Result<NodeId, TreeError> {
+        let mut spec = NodeSpec::new(ComponentKind::Select);
+        spec.layout = layout;
+        spec.content = Content::Text(value);
+        spec.role = SemanticRole::ComboBox;
+        spec.accessible_name = accessible_name;
+        self.component(parent, spec)
+    }
+
     /// Универсальный ScrollView. Конфигурация принадлежит viewport и не
     /// зависит от наличия визуальной полосы прокрутки.
     pub fn scroll_view(
@@ -235,6 +350,113 @@ impl<'a, const N: usize> UiBuilder<'a, N> {
         let mut spec = NodeSpec::new(ComponentKind::ListView);
         spec.layout = layout;
         spec.role = SemanticRole::List;
+        self.component(parent, spec)
+    }
+
+    /// TreeView с общей scroll-моделью и accessibility-ролью дерева.
+    pub fn tree_view(
+        &mut self,
+        parent: NodeId,
+        config: crate::ScrollConfig,
+        layout: LayoutSpec,
+    ) -> Result<NodeId, TreeError> {
+        let mut spec = NodeSpec::new(ComponentKind::TreeView);
+        spec.layout = layout;
+        spec.scroll = config;
+        spec.role = SemanticRole::Tree;
+        self.component(parent, spec)
+    }
+
+    /// Один интерактивный узел TreeView. `depth` преобразуется в indentation;
+    /// файловые пути и expand-policy остаются у model приложения.
+    pub fn tree_item(
+        &mut self,
+        parent: NodeId,
+        label: ResourceId,
+        command: CommandId,
+        depth: u8,
+        selected: bool,
+        mut layout: LayoutSpec,
+    ) -> Result<NodeId, TreeError> {
+        layout.padding.left = layout
+            .padding
+            .left
+            .saturating_add(u16::from(depth).saturating_mul(18));
+        let mut spec = NodeSpec::new(ComponentKind::Button);
+        spec.layout = layout;
+        spec.content = Content::Text(label);
+        spec.command = command;
+        spec.role = SemanticRole::TreeItem;
+        spec.accessible_name = label;
+        if selected {
+            spec.state.insert(crate::NodeState::SELECTED);
+        }
+        self.component(parent, spec)
+    }
+
+    /// TableView с фиксированными строками. Колонки являются Row-дочерними
+    /// компонентами и используют обычные Fill weights.
+    pub fn table_view(
+        &mut self,
+        parent: NodeId,
+        config: crate::ScrollConfig,
+        layout: LayoutSpec,
+    ) -> Result<NodeId, TreeError> {
+        let mut spec = NodeSpec::new(ComponentKind::TableView);
+        spec.layout = layout;
+        spec.scroll = config;
+        spec.role = SemanticRole::Table;
+        self.component(parent, spec)
+    }
+
+    /// GridView layout. Для больших наборов composite помещает его внутрь
+    /// ScrollView и задаёт измеренную высоту строк.
+    pub fn grid_view(&mut self, parent: NodeId, layout: LayoutSpec) -> Result<NodeId, TreeError> {
+        let mut spec = NodeSpec::new(ComponentKind::GridView);
+        spec.layout = layout;
+        spec.role = SemanticRole::Grid;
+        self.component(parent, spec)
+    }
+
+    /// Визуальный разделитель групп.
+    pub fn divider(&mut self, parent: NodeId, layout: LayoutSpec) -> Result<NodeId, TreeError> {
+        self.simple(parent, ComponentKind::Divider, layout)
+    }
+
+    /// Отдельная вкладка. Связанная страница управляется приложением по
+    /// `CommandId`, а выбранное состояние живёт в общем `NodeState`.
+    pub fn tab(
+        &mut self,
+        parent: NodeId,
+        label: ResourceId,
+        command: CommandId,
+        selected: bool,
+        layout: LayoutSpec,
+    ) -> Result<NodeId, TreeError> {
+        let mut spec = NodeSpec::new(ComponentKind::TabView);
+        spec.layout = layout;
+        spec.content = Content::Text(label);
+        spec.command = command;
+        spec.role = SemanticRole::Tab;
+        spec.accessible_name = label;
+        if selected {
+            spec.state.insert(crate::NodeState::SELECTED);
+        }
+        self.component(parent, spec)
+    }
+
+    /// Dialog surface с отдельной accessibility-границей.
+    pub fn dialog(
+        &mut self,
+        parent: NodeId,
+        accessible_name: ResourceId,
+        layout: LayoutSpec,
+    ) -> Result<NodeId, TreeError> {
+        let mut spec = NodeSpec::new(ComponentKind::Dialog);
+        spec.layout = layout;
+        spec.role = SemanticRole::Dialog;
+        spec.accessible_name = accessible_name;
+        spec.tab_index = -1;
         self.component(parent, spec)
     }
 
@@ -305,5 +527,37 @@ mod tests {
         assert_eq!(image.content, Content::Resource(ResourceId(41)));
         assert_eq!(image.accessible_name, ResourceId(42));
         assert_eq!(image.role, SemanticRole::Image);
+    }
+
+    #[test]
+    fn rich_controls_keep_kind_value_and_semantic_role() {
+        let mut tree = Tree::<16>::new();
+        let root = tree.root();
+        let mut ui = UiBuilder::new(&mut tree);
+        let radio = ui
+            .radio_button(root, ResourceId(1), CommandId(2), LayoutSpec::fill())
+            .unwrap();
+        let area = ui
+            .text_area(root, ResourceId(3), ResourceId(4), LayoutSpec::fill())
+            .unwrap();
+        let slider = ui
+            .slider(root, 2_000, ResourceId(5), LayoutSpec::fill())
+            .unwrap();
+        let select = ui
+            .select(root, ResourceId(6), ResourceId(7), LayoutSpec::fill())
+            .unwrap();
+        let tab = ui
+            .tab(root, ResourceId(8), CommandId(9), true, LayoutSpec::fill())
+            .unwrap();
+
+        assert_eq!(tree.get(radio).unwrap().role, SemanticRole::RadioButton);
+        assert_eq!(tree.get(area).unwrap().role, SemanticRole::TextArea);
+        assert_eq!(tree.get(slider).unwrap().content, Content::Value(1000));
+        assert_eq!(tree.get(select).unwrap().role, SemanticRole::ComboBox);
+        assert!(tree
+            .get(tab)
+            .unwrap()
+            .state
+            .contains(crate::NodeState::SELECTED));
     }
 }

@@ -19,6 +19,7 @@ mod collections;
 mod controls;
 mod display_list;
 mod event;
+mod file_browser;
 mod ir;
 mod layout;
 mod metrics;
@@ -41,6 +42,10 @@ pub use event::{
     modifiers, route, DispatchResult, EventPhase, EventRoute, InputEvent, Key, KeyEvent,
     PointerEvent, PointerKind, RoutedEvent,
 };
+pub use file_browser::{
+    build_file_browser, FileBrowserItem, FileBrowserNodes, FileBrowserSpec, FileBrowserTreeItem,
+    FileBrowserView,
+};
 pub use ir::{load_ir, validate_ir, IrError, UiIrHeader, UiIrNode, UI_IR_MAGIC};
 pub use layout::{Align, Edges, LayoutSpec, Length};
 pub use metrics::{WindowMetrics, SCALE_MILLI_ONE};
@@ -49,6 +54,7 @@ pub use rustos_video::{Color, Rect};
 pub use scroll::{
     OverscrollPolicy, ScrollAxis, ScrollBarLayout, ScrollBarPolicy, ScrollBehavior, ScrollConfig,
     ScrollController, ScrollDelta, ScrollModel, ScrollState, ScrollUnit, ScrollbarGeometry,
+    DEFAULT_SCROLLBAR_INSET, DEFAULT_SCROLLBAR_THICKNESS,
 };
 pub use selection::{SelectionError, SelectionMode, SelectionModel, SelectionRange};
 pub use semantics::{SemanticAction, SemanticNode, SemanticRole, SemanticsTree};

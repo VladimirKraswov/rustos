@@ -26,7 +26,7 @@ use u8g2_fonts::{
     FontRenderer,
 };
 
-use crate::graphics::{Color, Framebuffer};
+use crate::graphics::{Color, Framebuffer, Rect};
 
 /// Outline растеризуется host-макросом в 24 px/4-bit coverage. Это даёт
 /// достаточно subpixel-информации для качественного уменьшения до обычных
@@ -215,14 +215,29 @@ pub fn measure_text(text: &str, style: FontStyle) -> TextMetrics {
 /// Рисует UTF-8 строку и возвращает X сразу после последнего символа.
 pub fn draw_text(
     fb: &mut Framebuffer,
-    mut x: i32,
+    x: i32,
     y: i32,
     text: &str,
     color: Color,
     style: FontStyle,
 ) -> i32 {
+    let clip = Rect::new(0, 0, fb.width(), fb.height());
+    draw_text_clipped(fb, x, y, text, color, style, clip)
+}
+
+/// Рисует UTF-8 строку строго внутри clip. Это обязательный путь для retained
+/// UI: ушедшая за ScrollView строка не должна протекать в toolbar или footer.
+pub fn draw_text_clipped(
+    fb: &mut Framebuffer,
+    mut x: i32,
+    y: i32,
+    text: &str,
+    color: Color,
+    style: FontStyle,
+    clip: Rect,
+) -> i32 {
     for character in text.chars() {
-        x = x.saturating_add(draw_char(fb, x, y, character, color, style));
+        x = x.saturating_add(draw_char_clipped(fb, x, y, character, color, style, clip));
     }
     x
 }
@@ -236,8 +251,21 @@ pub fn draw_char(
     color: Color,
     style: FontStyle,
 ) -> i32 {
+    let clip = Rect::new(0, 0, fb.width(), fb.height());
+    draw_char_clipped(fb, x, y, character, color, style, clip)
+}
+
+fn draw_char_clipped(
+    fb: &mut Framebuffer,
+    x: i32,
+    y: i32,
+    character: char,
+    color: Color,
+    style: FontStyle,
+    clip: Rect,
+) -> i32 {
     if is_cyrillic(character) {
-        return draw_cyrillic(fb, x, y, character, color, style);
+        return draw_cyrillic(fb, x, y, character, color, style, clip);
     }
     let font = system_font(style);
     let mut encoded = [0u8; 4];
@@ -293,7 +321,7 @@ pub fn draw_char(
                 target_x as usize,
                 target_y as usize,
             );
-            if coverage != 0 {
+            if coverage != 0 && clip.contains(origin_x + target_x + shear, screen_y) {
                 fb.blend_pixel(origin_x + target_x + shear, screen_y, color, coverage);
             }
         }
@@ -360,6 +388,7 @@ fn draw_cyrillic(
     character: char,
     color: Color,
     style: FontStyle,
+    clip: Rect,
 ) -> i32 {
     let (renderer, source_size) = cyrillic_font(style);
     let Ok(metrics) =
@@ -418,7 +447,7 @@ fn draw_cyrillic(
                 target_x,
                 target_y,
             );
-            if coverage != 0 {
+            if coverage != 0 && clip.contains(origin_x + target_x as i32 + shear, screen_y) {
                 framebuffer.blend_pixel(
                     origin_x + target_x as i32 + shear,
                     screen_y,

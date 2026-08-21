@@ -253,7 +253,16 @@ impl Terminal {
                 }
                 return self.input_redraw(previous_row);
             }
-            Key::Escape | Key::Character(_) => {}
+            Key::Escape
+            | Key::Left
+            | Key::Right
+            | Key::Up
+            | Key::Down
+            | Key::PageUp
+            | Key::PageDown
+            | Key::Home
+            | Key::End
+            | Key::Character(_) => {}
         }
         TerminalAction::None
     }

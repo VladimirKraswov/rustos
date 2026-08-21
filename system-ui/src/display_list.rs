@@ -168,6 +168,26 @@ impl<const C: usize> DisplayList<C> {
         }
     }
 
+    /// Заполняет command storage на месте без временного `[Command; C]`.
+    ///
+    /// # Safety
+    /// `destination` указывает на валидное неинициализированное хранилище
+    /// `DisplayList<C>`.
+    pub(crate) unsafe fn initialize_in_place(destination: *mut Self) {
+        // SAFETY: контракт метода гарантирует storage всего объекта.
+        let commands =
+            unsafe { core::ptr::addr_of_mut!((*destination).commands).cast::<DisplayCommand>() };
+        for index in 0..C {
+            // SAFETY: каждый элемент массива инициализируется ровно один раз.
+            unsafe { commands.add(index).write(DisplayCommand::EMPTY) };
+        }
+        // SAFETY: оставшиеся scalar fields принадлежат тому же storage.
+        unsafe {
+            core::ptr::addr_of_mut!((*destination).len).write(0);
+            core::ptr::addr_of_mut!((*destination).overflowed).write(false);
+        }
+    }
+
     /// Удалить команды предыдущего кадра, сохранив storage.
     pub fn clear(&mut self) {
         self.len = 0;
@@ -523,7 +543,7 @@ impl<const C: usize> DisplayList<C> {
                 node.rect,
                 model,
                 axis,
-                10,
+                crate::DEFAULT_SCROLLBAR_THICKNESS,
                 24,
                 model.can_scroll() || policy == crate::ScrollBarPolicy::Always,
             );

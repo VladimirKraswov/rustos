@@ -22,6 +22,7 @@ pub(crate) fn draw_system_ui_text(
     text: &str,
     color: Color,
     spec: FontSpec,
+    clip: Rect,
 ) {
     let mut style = if spec.monospace {
         font::FontStyle::console(spec.size.clamp(10, 48))
@@ -50,5 +51,5 @@ pub(crate) fn draw_system_ui_text(
     } else {
         rect.y
     };
-    font::draw_text(framebuffer, x, y, text, color, style);
+    font::draw_text_clipped(framebuffer, x, y, text, color, style, clip);
 }

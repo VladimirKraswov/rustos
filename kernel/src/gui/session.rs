@@ -196,56 +196,87 @@ impl ApplicationKind {
     }
 }
 
-// ApplicationMemory сразу переносит enum в кадры frame allocator'а. Большой
-// retained tree Проводника поэтому не раздувает registry окон и не требует
-// глобального heap/Box; размер enum здесь является явным бюджетом app object.
-#[allow(clippy::large_enum_variant)]
-enum Application {
-    Terminal(Terminal),
-    FileExplorer(FileExplorer),
-    UiShowcase(UiShowcase),
-    DesktopSettings(DesktopSettings),
-}
-
-impl Application {
-    const fn kind(&self) -> ApplicationKind {
-        match self {
-            Self::Terminal(_) => ApplicationKind::Terminal,
-            Self::FileExplorer(_) => ApplicationKind::FileExplorer,
-            Self::UiShowcase(_) => ApplicationKind::UiShowcase,
-            Self::DesktopSettings(_) => ApplicationKind::DesktopSettings,
-        }
-    }
+/// Временное типизированное представление объекта, уже лежащего в его
+/// собственных физических кадрах. Сам enum содержит только ссылку и поэтому
+/// не копирует большой retained tree приложения на kernel stack.
+enum Application<'a> {
+    Terminal(&'a mut Terminal),
+    FileExplorer(&'a mut FileExplorer),
+    UiShowcase(&'a mut UiShowcase),
+    DesktopSettings(&'a mut DesktopSettings),
 }
 
 /// Heap ядру не нужен: объект приложения размещается в непрерывных физических
 /// кадрах и уничтожается через Drop. Именно этот владелец превращает `close`
 /// из визуального флага в настоящий lifecycle transition с освобождением RAM.
 struct ApplicationMemory {
-    pointer: *mut Application,
+    pointer: *mut u8,
     block: FrameBlock,
+    kind: ApplicationKind,
 }
 
 impl ApplicationMemory {
-    fn new(application: Application) -> Option<Self> {
-        let bytes = u64::try_from(size_of::<Application>()).ok()?;
+    /// Создаёт конкретный тип сразу в выделенном диапазоне. `factory`
+    /// принципиально вызывается внутри `ptr::write`: large-return ABI может
+    /// построить FileExplorer непосредственно в destination и не требует
+    /// временного 200-KiB enum на ограниченном стеке ядра.
+    fn new<T>(kind: ApplicationKind, factory: impl FnOnce() -> T) -> Option<Self> {
+        let result = Self::allocate_for::<T>(kind)?;
+        // SAFETY: allocate_for предоставил уникальный storage нужного типа.
+        unsafe { result.pointer.cast::<T>().write(factory()) };
+        Some(result)
+    }
+
+    fn new_file_explorer(
+        kind: ApplicationKind,
+        content: Rect,
+        initramfs: BootInitramfs,
+        ui_scale_milli: u16,
+    ) -> Option<Self> {
+        let result = Self::allocate_for::<FileExplorer>(kind)?;
+        // SAFETY: storage ещё не опубликован и имеет размер FileExplorer.
+        unsafe {
+            FileExplorer::initialize_in_place(
+                result.pointer.cast::<FileExplorer>(),
+                content,
+                initramfs,
+                ui_scale_milli,
+            )
+        };
+        Some(result)
+    }
+
+    fn allocate_for<T>(kind: ApplicationKind) -> Option<Self> {
+        let bytes = u64::try_from(size_of::<T>()).ok()?;
         let frames = bytes.checked_add(PAGE_SIZE - 1)? / PAGE_SIZE;
         let block = memory::allocate(frames.max(1), 1).ok()?;
-        let pointer = block.phys as *mut Application;
-        // SAFETY: frame allocator вернул уникальный identity-mapped диапазон,
-        // выровненный минимум на 4 KiB и достаточный для Application.
-        unsafe { pointer.write(application) };
-        Some(Self { pointer, block })
+        let pointer = block.phys as *mut u8;
+        Some(Self {
+            pointer,
+            block,
+            kind,
+        })
     }
 
-    fn get(&self) -> &Application {
-        // SAFETY: pointer инициализирован в new и живёт до Drop владельца.
-        unsafe { &*self.pointer }
-    }
-
-    fn get_mut(&mut self) -> &mut Application {
-        // SAFETY: &mut self гарантирует единственный mutable access.
-        unsafe { &mut *self.pointer }
+    fn get_mut(&mut self) -> Application<'_> {
+        // SAFETY: kind записан вместе с объектом, pointer живёт до Drop, а
+        // `&mut self` гарантирует единственный mutable access.
+        unsafe {
+            match self.kind {
+                ApplicationKind::Terminal => {
+                    Application::Terminal(&mut *self.pointer.cast::<Terminal>())
+                }
+                ApplicationKind::FileExplorer => {
+                    Application::FileExplorer(&mut *self.pointer.cast::<FileExplorer>())
+                }
+                ApplicationKind::UiShowcase => {
+                    Application::UiShowcase(&mut *self.pointer.cast::<UiShowcase>())
+                }
+                ApplicationKind::DesktopSettings => {
+                    Application::DesktopSettings(&mut *self.pointer.cast::<DesktopSettings>())
+                }
+            }
+        }
     }
 
     const fn frames(&self) -> u64 {
@@ -258,8 +289,21 @@ impl Drop for ApplicationMemory {
         if self.pointer.is_null() || self.block.frames == 0 {
             return;
         }
-        // SAFETY: значение было записано ровно один раз и ещё не уничтожено.
-        unsafe { ptr::drop_in_place(self.pointer) };
+        // SAFETY: kind соответствует конкретному типу, записанному в new.
+        unsafe {
+            match self.kind {
+                ApplicationKind::Terminal => ptr::drop_in_place(self.pointer.cast::<Terminal>()),
+                ApplicationKind::FileExplorer => {
+                    ptr::drop_in_place(self.pointer.cast::<FileExplorer>())
+                }
+                ApplicationKind::UiShowcase => {
+                    ptr::drop_in_place(self.pointer.cast::<UiShowcase>())
+                }
+                ApplicationKind::DesktopSettings => {
+                    ptr::drop_in_place(self.pointer.cast::<DesktopSettings>())
+                }
+            }
+        }
         let _ = memory::free(self.block);
         self.pointer = ptr::null_mut();
         self.block = FrameBlock { phys: 0, frames: 0 };
@@ -272,8 +316,8 @@ struct WindowSlot {
 }
 
 impl WindowSlot {
-    fn kind(&self) -> ApplicationKind {
-        self.application.get().kind()
+    const fn kind(&self) -> ApplicationKind {
+        self.application.kind
     }
 }
 
@@ -629,6 +673,14 @@ impl DesktopSession {
             let ui_key = match key {
                 Key::Tab => Some(UiKey::Tab),
                 Key::Enter => Some(UiKey::Enter),
+                Key::Left => Some(UiKey::Left),
+                Key::Right => Some(UiKey::Right),
+                Key::Up => Some(UiKey::Up),
+                Key::Down => Some(UiKey::Down),
+                Key::PageUp => Some(UiKey::PageUp),
+                Key::PageDown => Some(UiKey::PageDown),
+                Key::Home => Some(UiKey::Home),
+                Key::End => Some(UiKey::End),
                 Key::Character(b' ') => Some(UiKey::Space),
                 Key::Character(byte) if byte.is_ascii() => Some(UiKey::Character(char::from(byte))),
                 Key::Escape | Key::Backspace | Key::Character(_) => None,
@@ -662,6 +714,14 @@ impl DesktopSession {
                     Key::Tab => UiKey::Tab,
                     Key::Enter => UiKey::Enter,
                     Key::Escape => UiKey::Escape,
+                    Key::Left => UiKey::Left,
+                    Key::Right => UiKey::Right,
+                    Key::Up => UiKey::Up,
+                    Key::Down => UiKey::Down,
+                    Key::PageUp => UiKey::PageUp,
+                    Key::PageDown => UiKey::PageDown,
+                    Key::Home => UiKey::Home,
+                    Key::End => UiKey::End,
                     Key::Character(b' ') => UiKey::Space,
                     Key::Character(byte) if byte.is_ascii() => UiKey::Character(char::from(byte)),
                     Key::Backspace | Key::Character(_) => return Redraw::None,
@@ -681,6 +741,14 @@ impl DesktopSession {
                     Key::Tab => UiKey::Tab,
                     Key::Enter => UiKey::Enter,
                     Key::Escape => UiKey::Escape,
+                    Key::Left => UiKey::Left,
+                    Key::Right => UiKey::Right,
+                    Key::Up => UiKey::Up,
+                    Key::Down => UiKey::Down,
+                    Key::PageUp => UiKey::PageUp,
+                    Key::PageDown => UiKey::PageDown,
+                    Key::Home => UiKey::Home,
+                    Key::End => UiKey::End,
                     Key::Character(b' ') => UiKey::Space,
                     Key::Character(byte) if byte.is_ascii() => UiKey::Character(char::from(byte)),
                     Key::Backspace | Key::Character(_) => return Redraw::None,
@@ -1103,6 +1171,39 @@ impl DesktopSession {
         }
     }
 
+    fn handle_wheel(&mut self, wheel_x: i16, wheel_y: i16) -> Redraw {
+        let x = self.mouse_x;
+        let y = self.mouse_y;
+        let Some(id) = self.top_window_at(x, y) else {
+            return Redraw::None;
+        };
+        if !self
+            .window_content_rect(id)
+            .is_some_and(|rect| rect.contains(x, y))
+        {
+            return Redraw::None;
+        }
+        let changed = match self.application_mut(id) {
+            Some(Application::UiShowcase(showcase)) => {
+                showcase.pointer(UiPointerKind::Scroll, x, y, wheel_y)
+            }
+            Some(Application::FileExplorer(explorer)) => explorer.scroll(x, y, wheel_x, wheel_y),
+            Some(Application::Terminal(_)) | Some(Application::DesktopSettings(_)) | None => false,
+        };
+        if changed {
+            serial::put_str("[pointer] wheel window=0x");
+            serial::put_hex(id.0);
+            serial::put_str(" dx=");
+            put_serial_i16(wheel_x);
+            serial::put_str(" dy=");
+            put_serial_i16(wheel_y);
+            serial::put_str("\n");
+            Redraw::Ui(id)
+        } else {
+            Redraw::None
+        }
+    }
+
     fn handle_mouse(&mut self, event: MouseEvent) -> Redraw {
         let right_pressed = event.right && !self.previous_right;
         self.previous_right = event.right;
@@ -1179,6 +1280,19 @@ impl DesktopSession {
                 };
             }
             WindowInteraction::None => {}
+        }
+
+        // Wheel маршрутизируется окну под указателем, а не focused-окну. Это
+        // позволяет прокручивать соседнюю галерею без лишнего click-to-focus.
+        // Button transitions обрабатываются обычным путём ниже и не теряются.
+        if (event.wheel_x != 0 || event.wheel_y != 0)
+            && event.left == self.previous_left
+            && !right_pressed
+        {
+            let redraw = self.handle_wheel(event.wheel_x, event.wheel_y);
+            if !matches!(redraw, Redraw::None) {
+                return redraw;
+            }
         }
 
         if right_pressed {
@@ -1541,26 +1655,25 @@ impl DesktopSession {
         )
         .ok()?;
         let content = content_rect_for(&model);
-        let application = match kind {
+        let memory = match kind {
             ApplicationKind::Terminal => {
-                Application::Terminal(Terminal::new(self.usable_ram_mib, self.initramfs))
+                ApplicationMemory::new(kind, || Terminal::new(self.usable_ram_mib, self.initramfs))
             }
-            ApplicationKind::FileExplorer => Application::FileExplorer(FileExplorer::new(
+            ApplicationKind::FileExplorer => ApplicationMemory::new_file_explorer(
+                kind,
                 content,
                 self.initramfs,
                 self.ui_scale_milli,
-            )),
-            ApplicationKind::UiShowcase => {
+            ),
+            ApplicationKind::UiShowcase => ApplicationMemory::new(kind, || {
                 let mut showcase = UiShowcase::new(content);
                 showcase.set_scale(self.ui_scale_milli);
-                Application::UiShowcase(showcase)
-            }
-            ApplicationKind::DesktopSettings => Application::DesktopSettings(DesktopSettings::new(
-                content,
-                self.desktop_settings_snapshot(),
-            )),
-        };
-        let memory = ApplicationMemory::new(application)?;
+                showcase
+            }),
+            ApplicationKind::DesktopSettings => ApplicationMemory::new(kind, || {
+                DesktopSettings::new(content, self.desktop_settings_snapshot())
+            }),
+        }?;
         let frames = memory.frames();
         self.windows[slot_index] = Some(WindowSlot {
             model,
@@ -1755,7 +1868,7 @@ impl DesktopSession {
         self.windows.get_mut(index)?.as_mut()
     }
 
-    fn application_mut(&mut self, id: WindowId) -> Option<&mut Application> {
+    fn application_mut(&mut self, id: WindowId) -> Option<Application<'_>> {
         Some(self.window_slot_mut(id)?.application.get_mut())
     }
 
@@ -1947,6 +2060,9 @@ impl DesktopSession {
         let Some(slot) = windows[index].as_mut() else {
             return damage;
         };
+        let window_rect = video_rect(slot.model.rect());
+        let resizable =
+            slot.model.style().contains(WindowStyle::RESIZABLE) && !slot.model.is_maximized();
         match slot.application.get_mut() {
             Application::Terminal(terminal) => {
                 terminal.draw(framebuffer, content);
@@ -1967,6 +2083,10 @@ impl DesktopSession {
                 settings.resize(content);
                 append_frame_damage(&mut damage, settings.draw(framebuffer, false));
             }
+        }
+        if resizable {
+            draw_resize_grip(framebuffer, window_rect, true);
+            damage.add(resize_grip_rect(window_rect));
         }
         damage
     }
@@ -2367,18 +2487,6 @@ impl DesktopSession {
                 );
             }
         }
-        if style.contains(WindowStyle::BORDER)
-            && style.contains(WindowStyle::RESIZABLE)
-            && !maximized
-        {
-            let x = rect.right().saturating_sub(13);
-            let y = rect.bottom().saturating_sub(6);
-            for offset in [0, 4, 8] {
-                self.framebuffer
-                    .fill_rect(Rect::new(x + offset, y - offset, 5, 1), Theme::TEXT_MUTED);
-            }
-        }
-
         let content = content_rect_from(rect, style);
         let Some(index) = self.window_slot_index(id) else {
             return;
@@ -2402,6 +2510,12 @@ impl DesktopSession {
                 settings.resize(content);
                 let _ = settings.draw(framebuffer, true);
             }
+        }
+        if style.contains(WindowStyle::BORDER)
+            && style.contains(WindowStyle::RESIZABLE)
+            && !maximized
+        {
+            draw_resize_grip(framebuffer, rect, focused);
         }
     }
 
@@ -2578,6 +2692,36 @@ fn append_frame_damage<const D: usize>(
     }
 }
 
+fn resize_grip_rect(window: Rect) -> Rect {
+    Rect::new(
+        window.right().saturating_sub(21),
+        window.bottom().saturating_sub(21),
+        18,
+        18,
+    )
+}
+
+/// Resize grip рисуется оконным сервером последним: приложение не может
+/// случайно стереть системную drag-цель своим footer. Несколько диагоналей
+/// сохраняют узнаваемость и на светлой, и на тёмной поверхности.
+fn draw_resize_grip(framebuffer: &mut Framebuffer, window: Rect, focused: bool) {
+    let grip = resize_grip_rect(window);
+    let color = if focused {
+        Theme::ACCENT
+    } else {
+        Theme::TEXT_MUTED
+    };
+    for length in [4i32, 9, 14] {
+        for step in 0..length {
+            let x = grip.right().saturating_sub(length).saturating_add(step);
+            let y = grip.bottom().saturating_sub(2 + step);
+            if grip.contains(x, y) {
+                framebuffer.blend_pixel(x, y, color, 210);
+            }
+        }
+    }
+}
+
 fn log_incremental_damage(scope: &str, damage: &DamageRegion<INCREMENTAL_DAMAGE_CAPACITY>) {
     serial::put_str("[compositor] repaint=incremental scope=");
     serial::put_str(scope);
@@ -2586,6 +2730,13 @@ fn log_incremental_damage(scope: &str, damage: &DamageRegion<INCREMENTAL_DAMAGE_
     serial::put_str(" present-kpx=");
     serial::put_u32((damage.covered_pixels() / 1_000) as u32);
     serial::put_str(" full-screen=no\n");
+}
+
+fn put_serial_i16(value: i16) {
+    if value < 0 {
+        serial::put_str("-");
+    }
+    serial::put_u32(u32::from(value.unsigned_abs()));
 }
 
 fn remove_id(order: &mut [WindowId; MAX_WINDOWS], count: &mut usize, id: WindowId) {

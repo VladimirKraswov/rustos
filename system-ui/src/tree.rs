@@ -97,6 +97,18 @@ pub enum ComponentKind {
     Dialog = 23,
     /// Самостоятельная полоса прокрутки, связанная с внешней моделью.
     ScrollBar = 24,
+    /// Иерархическое дерево с вертикальной прокруткой.
+    TreeView = 25,
+    /// Таблица с фиксированными строками и вертикальной прокруткой.
+    TableView = 26,
+    /// Сетка элементов. Для прокрутки помещается внутрь ScrollView.
+    GridView = 27,
+    /// Панель команд приложения.
+    Toolbar = 28,
+    /// Нижняя строка состояния.
+    StatusBar = 29,
+    /// Две изменяемые панели в одной строке.
+    SplitView = 30,
 }
 
 impl ComponentKind {
@@ -116,6 +128,9 @@ impl ComponentKind {
                 | Self::ListView
                 | Self::TabView
                 | Self::Menu
+                | Self::TreeView
+                | Self::TableView
+                | Self::GridView
         )
     }
 }
@@ -251,7 +266,13 @@ impl NodeSpec {
             role: SemanticRole::None,
             accessible_name: ResourceId(0),
             tab_index: if kind.focusable() { 0 } else { -1 },
-            scroll: if matches!(kind, ComponentKind::ScrollView | ComponentKind::ListView) {
+            scroll: if matches!(
+                kind,
+                ComponentKind::ScrollView
+                    | ComponentKind::ListView
+                    | ComponentKind::TreeView
+                    | ComponentKind::TableView
+            ) {
                 ScrollConfig::VERTICAL
             } else {
                 ScrollConfig::NONE
@@ -388,6 +409,44 @@ impl<const N: usize> Tree<N> {
             len: 1,
             root,
         }
+    }
+
+    /// Инициализирует большое дерево прямо по адресу владельца.
+    ///
+    /// # Safety
+    /// `destination` должен быть выровнен, доступен для записи и указывать на
+    /// неинициализированное хранилище размером `Tree<N>`.
+    pub(crate) unsafe fn initialize_in_place(destination: *mut Self) {
+        assert!(N > 0 && N <= u16::MAX as usize);
+        // SAFETY: вызывающий предоставил storage всего Tree; массив nodes
+        // занимает его первый именованный field и заполняется поэлементно.
+        let nodes = unsafe { core::ptr::addr_of_mut!((*destination).nodes).cast::<Node>() };
+        for index in 0..N {
+            // SAFETY: index ограничен ёмкостью массива, каждый slot пишется
+            // ровно один раз до публикации объекта.
+            unsafe { nodes.add(index).write(Node::EMPTY) };
+        }
+        // SAFETY: первый slot существует, потому что N > 0.
+        unsafe {
+            nodes.write(Node::from_spec(1, NodeSpec::new(ComponentKind::Root)));
+            core::ptr::addr_of_mut!((*destination).len).write(1);
+            core::ptr::addr_of_mut!((*destination).root).write(NodeId::from_parts(0, 1));
+        }
+    }
+
+    /// Очищает дерево на месте, сохраняя storage и поколения NodeId.
+    /// Нужен большим runtime-ам: пересоздание всего `[Node; N]` временным
+    /// значением способно необоснованно занять сотни KiB kernel stack.
+    pub(crate) fn reset(&mut self) {
+        for node in &mut self.nodes {
+            let generation = node.generation;
+            *node = Node::EMPTY;
+            node.generation = generation;
+        }
+        let generation = self.nodes[0].generation.wrapping_add(1).max(1);
+        self.nodes[0] = Node::from_spec(generation, NodeSpec::new(ComponentKind::Root));
+        self.len = 1;
+        self.root = NodeId::from_parts(0, generation);
     }
 
     /// Корень дерева.

@@ -14,6 +14,14 @@ pub enum Key {
     Backspace,
     Tab,
     Escape,
+    Left,
+    Right,
+    Up,
+    Down,
+    PageUp,
+    PageDown,
+    Home,
+    End,
 }
 
 #[cfg_attr(target_arch = "aarch64", allow(dead_code))]
@@ -21,6 +29,12 @@ pub enum Key {
 pub struct MouseEvent {
     pub dx: i16,
     pub dy: i16,
+    /// Горизонтальная прокрутка в аппаратных шагах. Положительное значение
+    /// означает движение содержимого вправо.
+    pub wheel_x: i16,
+    /// Вертикальная прокрутка в аппаратных шагах. Положительное значение
+    /// означает движение содержимого вниз.
+    pub wheel_y: i16,
     pub left: bool,
     pub right: bool,
     pub middle: bool,

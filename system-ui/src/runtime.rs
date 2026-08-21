@@ -116,6 +116,49 @@ impl<const N: usize, const C: usize, const D: usize> Runtime<N, C, D> {
         }
     }
 
+    /// Инициализирует runtime непосредственно в storage владельца. Это путь
+    /// для kernel/server объектов с большими compile-time budgets: массивы
+    /// tree/display-list не появляются временно на небольшом kernel stack.
+    ///
+    /// # Safety
+    /// `destination` должен быть выровнен, доступен для записи и указывать на
+    /// неинициализированное хранилище размером `Runtime<N, C, D>`.
+    pub unsafe fn initialize_in_place(destination: *mut Self, viewport: Rect, theme: Theme) {
+        assert!(C > 0 && D > 0);
+        // SAFETY: все поля destination инициализируются ровно один раз до
+        // публикации Runtime; вложенные методы получают свои field storage.
+        unsafe {
+            Tree::initialize_in_place(core::ptr::addr_of_mut!((*destination).tree));
+            DisplayList::initialize_in_place(core::ptr::addr_of_mut!((*destination).display_list));
+            SemanticsTree::initialize_in_place(core::ptr::addr_of_mut!((*destination).semantics));
+            let mut damage = DamageRegion::new(viewport);
+            damage.add(viewport);
+            core::ptr::addr_of_mut!((*destination).damage).write(damage);
+            core::ptr::addr_of_mut!((*destination).input).write(event::InputState::new());
+            core::ptr::addr_of_mut!((*destination).viewport).write(viewport);
+            core::ptr::addr_of_mut!((*destination).theme).write(theme);
+            core::ptr::addr_of_mut!((*destination).display_valid).write(false);
+            core::ptr::addr_of_mut!((*destination).counters).write(PerformanceCounters::default());
+        }
+    }
+
+    /// Начинает новую component-сессию в уже выделенном storage.
+    /// В отличие от `*runtime = Runtime::new(...)`, метод не создаёт большой
+    /// временный объект на стеке и потому пригоден для GUI микроядра.
+    pub fn rebuild(&mut self, viewport: Rect, theme: Theme) {
+        assert!(C > 0 && D > 0);
+        self.tree.reset();
+        self.display_list.clear();
+        self.semantics.clear();
+        self.damage = DamageRegion::new(viewport);
+        self.damage.add(viewport);
+        self.input = event::InputState::new();
+        self.viewport = viewport;
+        self.theme = theme;
+        self.display_valid = false;
+        self.counters = PerformanceCounters::default();
+    }
+
     /// Read-only component tree для inspector/tests.
     pub const fn tree(&self) -> &Tree<N> {
         &self.tree
@@ -787,6 +830,42 @@ mod tests {
     }
 
     #[test]
+    fn page_down_scrolls_focused_controls_scroll_view_ancestor() {
+        let mut runtime = Runtime::<8, 64, 8>::new(Rect::new(0, 0, 260, 160), Theme::light());
+        let scroll = {
+            let root = runtime.tree().root();
+            let mut ui = runtime.builder();
+            let scroll = ui
+                .scroll_view(root, ScrollConfig::VERTICAL, LayoutSpec::fill())
+                .unwrap();
+            let mut button = NodeSpec::new(ComponentKind::Button);
+            button.layout.height = Length::Px(40);
+            ui.component(scroll, button).unwrap();
+            let mut content = NodeSpec::new(ComponentKind::Panel);
+            content.layout.height = Length::Px(600);
+            ui.component(scroll, content).unwrap();
+            scroll
+        };
+        runtime.render(&mut Headless::default()).unwrap();
+        runtime.dispatch(InputEvent::Pointer(PointerEvent::at(
+            PointerKind::Down,
+            10,
+            10,
+        )));
+        let result = runtime.dispatch(InputEvent::Key(crate::KeyEvent {
+            key: crate::Key::PageDown,
+            pressed: true,
+            modifiers: 0,
+            shift: false,
+        }));
+        assert!(result.changed && result.consumed);
+        assert_eq!(
+            runtime.tree().get(scroll).unwrap().scroll.vertical.offset(),
+            160
+        );
+    }
+
+    #[test]
     fn focus_ring_is_visible_for_keyboard_but_not_pointer_focus() {
         let mut runtime = Runtime::<4, 32, 8>::new(Rect::new(0, 0, 160, 80), Theme::light());
         let button = {
@@ -879,5 +958,32 @@ mod tests {
             geometry.thumb.y + 60,
         )));
         assert!(runtime.tree().get(scroll).unwrap().scroll.vertical.offset() > 0);
+    }
+
+    #[test]
+    fn rebuild_reuses_storage_without_aliasing_old_node_ids() {
+        let mut runtime = Runtime::<8, 64, 8>::new(Rect::new(0, 0, 240, 180), Theme::light());
+        let old_button = {
+            let root = runtime.tree().root();
+            runtime
+                .builder()
+                .button(root, ResourceId(1), CommandId(1), LayoutSpec::fill())
+                .unwrap()
+        };
+        runtime.render(&mut Headless::default()).unwrap();
+
+        runtime.rebuild(Rect::new(20, 30, 320, 220), Theme::dark());
+        assert_eq!(runtime.tree().len(), 1);
+        assert!(runtime.tree().get(old_button).is_none());
+        assert_eq!(runtime.counters(), PerformanceCounters::default());
+
+        let new_button = {
+            let root = runtime.tree().root();
+            runtime
+                .builder()
+                .button(root, ResourceId(2), CommandId(2), LayoutSpec::fill())
+                .unwrap()
+        };
+        assert_ne!(old_button, new_button);
     }
 }

@@ -153,10 +153,16 @@ impl Theme {
         let compact_choice = matches!(kind, ComponentKind::CheckBox | ComponentKind::RadioButton);
         let mut background = match kind {
             ComponentKind::Root => Some(self.palette.window),
-            ComponentKind::Panel | ComponentKind::Menu | ComponentKind::Dialog => {
-                Some(self.palette.surface)
-            }
-            ComponentKind::ScrollView | ComponentKind::ListView => Some(self.palette.raised),
+            ComponentKind::Panel
+            | ComponentKind::Menu
+            | ComponentKind::Dialog
+            | ComponentKind::Toolbar
+            | ComponentKind::StatusBar => Some(self.palette.surface),
+            ComponentKind::ScrollView
+            | ComponentKind::ListView
+            | ComponentKind::TreeView
+            | ComponentKind::TableView
+            | ComponentKind::GridView => Some(self.palette.raised),
             ComponentKind::Button
             | ComponentKind::TextField
             | ComponentKind::TextArea

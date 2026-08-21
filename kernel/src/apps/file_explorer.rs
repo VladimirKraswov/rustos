@@ -19,7 +19,8 @@ use crate::{
 use rustos_abi::{bootinfo::BootInitramfs, input::MouseSettings};
 use rustos_system_assets::{icon_for_path, IconKind, IconPack};
 use rustos_system_ui::{
-    style_class, Align, CommandId, ComponentKind, Content, Edges, FontSpec, FrameResult,
+    build_file_browser, style_class, Align, CommandId, ComponentKind, Content, Edges,
+    FileBrowserItem, FileBrowserSpec, FileBrowserTreeItem, FileBrowserView, FontSpec, FrameResult,
     InputEvent, LayoutSpec, Length, NodeId, NodeSpec, NodeState, PointerEvent, PointerKind,
     RenderBackend, ResourceId, Runtime, SemanticRole, Theme,
 };
@@ -40,13 +41,13 @@ const COMMAND_DELETE: CommandId = CommandId(8);
 const COMMAND_VIEW_GRID: CommandId = CommandId(9);
 const COMMAND_VIEW_LIST: CommandId = CommandId(10);
 const COMMAND_VIEW_DETAILS: CommandId = CommandId(11);
-const COMMAND_PAGE_PREVIOUS: CommandId = CommandId(12);
-const COMMAND_PAGE_NEXT: CommandId = CommandId(13);
 const COMMAND_HOME: CommandId = CommandId(20);
 const COMMAND_ROOT: CommandId = CommandId(21);
 const COMMAND_BOOT: CommandId = CommandId(22);
 const COMMAND_SYSTEM: CommandId = CommandId(23);
 const COMMAND_SOURCE: CommandId = CommandId(24);
+const COMMAND_SYSTEM_BIN: CommandId = CommandId(25);
+const COMMAND_SYSTEM_LIB: CommandId = CommandId(26);
 const COMMAND_ENTRY_BASE: u32 = 1_000;
 
 const COMMAND_POPUP_CREATE: CommandId = CommandId(100);
@@ -77,15 +78,24 @@ const TEXT_SYSTEM: ResourceId = ResourceId(16);
 const TEXT_SOURCE: ResourceId = ResourceId(17);
 const TEXT_NAME_HEADER: ResourceId = ResourceId(18);
 const TEXT_STATUS: ResourceId = ResourceId(19);
-const TEXT_PREVIOUS: ResourceId = ResourceId(20);
-const TEXT_NEXT: ResourceId = ResourceId(21);
 const TEXT_EMPTY: ResourceId = ResourceId(22);
 const TEXT_POPUP_CREATE: ResourceId = ResourceId(23);
 const TEXT_CREATE_FOLDER: ResourceId = ResourceId(24);
 const TEXT_CREATE_TEXT: ResourceId = ResourceId(25);
-const TEXT_RENAME_VALUE: ResourceId = ResourceId(26);
 const TEXT_LOCATION: ResourceId = ResourceId(27);
 const TEXT_QUICK_ACCESS: ResourceId = ResourceId(28);
+const TEXT_MENU_FILE: ResourceId = ResourceId(29);
+const TEXT_MENU_EDIT: ResourceId = ResourceId(30);
+const TEXT_MENU_VIEW: ResourceId = ResourceId(31);
+const TEXT_MENU_FAVORITES: ResourceId = ResourceId(32);
+const TEXT_MENU_HELP: ResourceId = ResourceId(33);
+const TEXT_SEARCH: ResourceId = ResourceId(34);
+const TEXT_ADDRESS: ResourceId = ResourceId(35);
+const TEXT_KIND_HEADER: ResourceId = ResourceId(37);
+const TEXT_SIZE_HEADER: ResourceId = ResourceId(38);
+const TEXT_FS_STATUS: ResourceId = ResourceId(39);
+const TEXT_SYSTEM_BIN: ResourceId = ResourceId(40);
+const TEXT_SYSTEM_LIB: ResourceId = ResourceId(41);
 
 const IMAGE_HOME: ResourceId = ResourceId(50);
 const IMAGE_ROOT: ResourceId = ResourceId(51);
@@ -98,10 +108,13 @@ const IMAGE_TRASH: ResourceId = ResourceId(57);
 const IMAGE_GRID: ResourceId = ResourceId(58);
 const IMAGE_BACK: ResourceId = ResourceId(59);
 const IMAGE_FORWARD: ResourceId = ResourceId(60);
+const IMAGE_SEARCH: ResourceId = ResourceId(61);
 const TEXT_ENTRY_BASE: u32 = 200;
 const IMAGE_ENTRY_BASE: u32 = 300;
+const TEXT_ENTRY_KIND_BASE: u32 = 400;
+const TEXT_ENTRY_SIZE_BASE: u32 = 500;
 
-type ExplorerRuntime = Runtime<128, 512, 24>;
+type ExplorerRuntime = Runtime<320, 1_024, 24>;
 type PopupRuntime = Runtime<20, 72, 8>;
 /// Основное дерево и два popup вместе могут вернуть не более 40 независимых
 /// dirty-прямоугольников. Этот бюджет передаётся compositor'у без heap.
@@ -245,8 +258,8 @@ impl ExplorerPath {
 struct ExplorerEntry {
     name: FixedText<NAME_CAPACITY>,
     grid_label: FixedText<NAME_CAPACITY>,
-    list_label: FixedText<STATUS_CAPACITY>,
-    details: FixedText<STATUS_CAPACITY>,
+    kind_label: FixedText<NAME_CAPACITY>,
+    size_label: FixedText<NAME_CAPACITY>,
     kind: FileKind,
     size: usize,
     read_only: bool,
@@ -256,8 +269,8 @@ impl ExplorerEntry {
     const EMPTY: Self = Self {
         name: FixedText::EMPTY,
         grid_label: FixedText::EMPTY,
-        list_label: FixedText::EMPTY,
-        details: FixedText::EMPTY,
+        kind_label: FixedText::EMPTY,
+        size_label: FixedText::EMPTY,
         kind: FileKind::File,
         size: 0,
         read_only: false,
@@ -297,7 +310,6 @@ pub struct FileExplorer {
     entry_len: usize,
     selected: Option<usize>,
     view: ExplorerView,
-    page: usize,
     status: FixedText<STATUS_CAPACITY>,
     rename: FixedText<NAME_CAPACITY>,
     renaming: Option<usize>,
@@ -312,38 +324,65 @@ pub struct FileExplorer {
 }
 
 impl FileExplorer {
-    pub fn new(viewport: Rect, initramfs: BootInitramfs, ui_scale_milli: u16) -> Self {
+    /// Создаёт крупную UI-сессию непосредственно в кадрах приложения.
+    ///
+    /// # Safety
+    /// `destination` должен быть выровнен, доступен для записи и указывать на
+    /// неинициализированное хранилище размером `FileExplorer`.
+    pub unsafe fn initialize_in_place(
+        destination: *mut Self,
+        viewport: Rect,
+        initramfs: BootInitramfs,
+        ui_scale_milli: u16,
+    ) {
         let theme = explorer_theme(ui_scale_milli);
-        let mut result = Self {
-            runtime: ExplorerRuntime::new(viewport, theme),
-            popup: PopupRuntime::new(Rect::EMPTY, theme),
-            create_popup: PopupRuntime::new(Rect::EMPTY, theme),
-            fs: BootstrapFs::new(initramfs),
-            viewport,
-            current: ExplorerPath::new("/").expect("root path is valid"),
-            back: ExplorerPath::new("/").expect("root path is valid"),
-            has_back: false,
-            entries: [ExplorerEntry::EMPTY; MAX_ENTRIES],
-            entry_nodes: [NodeId::NONE; MAX_ENTRIES],
-            entry_len: 0,
-            selected: None,
-            view: ExplorerView::Grid,
-            page: 0,
-            status: FixedText::EMPTY,
-            rename: FixedText::EMPTY,
-            renaming: None,
-            clipboard: Clipboard::empty(),
-            popup_open: false,
-            create_popup_open: false,
-            popup_rect: Rect::EMPTY,
-            create_popup_rect: Rect::EMPTY,
-            last_clicked: None,
-            last_click_ms: 0,
-            ui_scale_milli,
-        };
+        // SAFETY: контракт метода предоставляет storage всего FileExplorer;
+        // каждый field инициализируется ровно один раз до получения &mut Self.
+        unsafe {
+            ExplorerRuntime::initialize_in_place(
+                core::ptr::addr_of_mut!((*destination).runtime),
+                viewport,
+                theme,
+            );
+            PopupRuntime::initialize_in_place(
+                core::ptr::addr_of_mut!((*destination).popup),
+                Rect::EMPTY,
+                theme,
+            );
+            PopupRuntime::initialize_in_place(
+                core::ptr::addr_of_mut!((*destination).create_popup),
+                Rect::EMPTY,
+                theme,
+            );
+            core::ptr::addr_of_mut!((*destination).fs).write(BootstrapFs::new(initramfs));
+            core::ptr::addr_of_mut!((*destination).viewport).write(viewport);
+            core::ptr::addr_of_mut!((*destination).current)
+                .write(ExplorerPath::new("/").expect("root path is valid"));
+            core::ptr::addr_of_mut!((*destination).back)
+                .write(ExplorerPath::new("/").expect("root path is valid"));
+            core::ptr::addr_of_mut!((*destination).has_back).write(false);
+            core::ptr::addr_of_mut!((*destination).entries)
+                .write([ExplorerEntry::EMPTY; MAX_ENTRIES]);
+            core::ptr::addr_of_mut!((*destination).entry_nodes).write([NodeId::NONE; MAX_ENTRIES]);
+            core::ptr::addr_of_mut!((*destination).entry_len).write(0);
+            core::ptr::addr_of_mut!((*destination).selected).write(None);
+            core::ptr::addr_of_mut!((*destination).view).write(ExplorerView::Grid);
+            core::ptr::addr_of_mut!((*destination).status).write(FixedText::EMPTY);
+            core::ptr::addr_of_mut!((*destination).rename).write(FixedText::EMPTY);
+            core::ptr::addr_of_mut!((*destination).renaming).write(None);
+            core::ptr::addr_of_mut!((*destination).clipboard).write(Clipboard::empty());
+            core::ptr::addr_of_mut!((*destination).popup_open).write(false);
+            core::ptr::addr_of_mut!((*destination).create_popup_open).write(false);
+            core::ptr::addr_of_mut!((*destination).popup_rect).write(Rect::EMPTY);
+            core::ptr::addr_of_mut!((*destination).create_popup_rect).write(Rect::EMPTY);
+            core::ptr::addr_of_mut!((*destination).last_clicked).write(None);
+            core::ptr::addr_of_mut!((*destination).last_click_ms).write(0);
+            core::ptr::addr_of_mut!((*destination).ui_scale_milli).write(ui_scale_milli);
+        }
+        // SAFETY: все поля полностью инициализированы выше.
+        let result = unsafe { &mut *destination };
         result.refresh();
         log_operation("READY", result.current.as_str());
-        result
     }
 
     pub fn resize(&mut self, viewport: Rect) {
@@ -469,7 +508,16 @@ impl FileExplorer {
                     }
                     true
                 }
-                InputKey::Tab | InputKey::Character(_) => true,
+                InputKey::Tab
+                | InputKey::Left
+                | InputKey::Right
+                | InputKey::Up
+                | InputKey::Down
+                | InputKey::PageUp
+                | InputKey::PageDown
+                | InputKey::Home
+                | InputKey::End
+                | InputKey::Character(_) => true,
             };
         }
         if (self.popup_open || self.create_popup_open) && matches!(key, InputKey::Escape) {
@@ -481,6 +529,14 @@ impl FileExplorer {
             InputKey::Tab => rustos_system_ui::Key::Tab,
             InputKey::Enter => rustos_system_ui::Key::Enter,
             InputKey::Escape => rustos_system_ui::Key::Escape,
+            InputKey::Left => rustos_system_ui::Key::Left,
+            InputKey::Right => rustos_system_ui::Key::Right,
+            InputKey::Up => rustos_system_ui::Key::Up,
+            InputKey::Down => rustos_system_ui::Key::Down,
+            InputKey::PageUp => rustos_system_ui::Key::PageUp,
+            InputKey::PageDown => rustos_system_ui::Key::PageDown,
+            InputKey::Home => rustos_system_ui::Key::Home,
+            InputKey::End => rustos_system_ui::Key::End,
             InputKey::Character(b' ') => rustos_system_ui::Key::Space,
             InputKey::Character(byte) if byte.is_ascii() => {
                 rustos_system_ui::Key::Character(char::from(byte))
@@ -507,6 +563,16 @@ impl FileExplorer {
             self.execute(result.command, now_ms, 0, 0);
         }
         result.changed || result.command != CommandId(0)
+    }
+
+    /// Wheel не меняет focus окна: событие получает scrollable-компонент под
+    /// указателем, как в обычных desktop-системах.
+    pub fn scroll(&mut self, x: i32, y: i32, wheel_x: i16, wheel_y: i16) -> bool {
+        let mut pointer = PointerEvent::at(PointerKind::Scroll, x, y);
+        pointer.scroll_x = wheel_x;
+        pointer.scroll_y = wheel_y;
+        pointer.scroll_unit = rustos_system_ui::ScrollUnit::Line;
+        self.runtime.dispatch(InputEvent::Pointer(pointer)).changed
     }
 
     pub fn draw(
@@ -568,7 +634,6 @@ impl FileExplorer {
             COMMAND_BACK if self.has_back => {
                 core::mem::swap(&mut self.back, &mut self.current);
                 self.selected = None;
-                self.page = 0;
                 self.refresh();
             }
             COMMAND_UP => self.navigate(self.current.parent()),
@@ -577,6 +642,8 @@ impl FileExplorer {
             COMMAND_BOOT => self.navigate_path("/boot"),
             COMMAND_SYSTEM => self.navigate_path("/system"),
             COMMAND_SOURCE => self.navigate_path("/src"),
+            COMMAND_SYSTEM_BIN => self.navigate_path("/system/bin"),
+            COMMAND_SYSTEM_LIB => self.navigate_path("/system/lib"),
             COMMAND_NEW_FOLDER | COMMAND_CREATE_FOLDER => self.create_folder(),
             COMMAND_CREATE_TEXT => self.create_text_file(),
             COMMAND_COPY | COMMAND_POPUP_COPY => self.copy_selection(false),
@@ -587,16 +654,6 @@ impl FileExplorer {
             COMMAND_VIEW_GRID => self.set_view(ExplorerView::Grid),
             COMMAND_VIEW_LIST => self.set_view(ExplorerView::List),
             COMMAND_VIEW_DETAILS => self.set_view(ExplorerView::Details),
-            COMMAND_PAGE_PREVIOUS => {
-                self.page = self.page.saturating_sub(1);
-                self.rebuild_main();
-            }
-            COMMAND_PAGE_NEXT => {
-                if (self.page + 1) * self.page_capacity() < self.entry_len {
-                    self.page += 1;
-                    self.rebuild_main();
-                }
-            }
             COMMAND_POPUP_CREATE => {
                 self.create_popup_open = true;
                 self.create_popup_rect = popup_rect(
@@ -672,7 +729,6 @@ impl FileExplorer {
                 self.current = path;
                 self.selected = None;
                 self.renaming = None;
-                self.page = 0;
                 self.refresh();
                 log_operation("OPEN", self.current.as_str());
             }
@@ -683,7 +739,6 @@ impl FileExplorer {
 
     fn set_view(&mut self, view: ExplorerView) {
         self.view = view;
-        self.page = 0;
         self.rebuild_main();
     }
 
@@ -906,17 +961,21 @@ impl FileExplorer {
                     if let Ok(path) = self.current.join(source.name()) {
                         entry.size = self.fs.stat(path.as_str()).map_or(0, |stat| stat.size);
                     }
-                    entry.details = detail_text(&entry);
+                    entry.kind_label.set(if entry.kind == FileKind::Directory {
+                        "Папка"
+                    } else {
+                        "Файл"
+                    });
+                    if entry.kind == FileKind::Directory {
+                        entry.size_label.set("—");
+                    } else {
+                        let _ = write!(entry.size_label, "{} Б", entry.size);
+                    }
                     entry.grid_label = compact_label(entry.name.as_str(), 17);
-                    let _ = write!(entry.list_label, "      {}", entry.name.as_str());
                     self.entries[self.entry_len] = entry;
                     self.entry_len += 1;
                 }
                 self.sort_entries();
-                let capacity = self.page_capacity();
-                if self.page.saturating_mul(capacity) >= self.entry_len {
-                    self.page = 0;
-                }
                 self.set_default_status();
             }
             Err(error) => self.set_error("Не удалось прочитать каталог", error),
@@ -973,19 +1032,6 @@ impl FileExplorer {
         self.rebuild_main();
     }
 
-    fn page_capacity(&self) -> usize {
-        match self.view {
-            ExplorerView::Grid => {
-                let columns = grid_columns(self.viewport.width);
-                let rows = self.viewport.height.saturating_sub(150).max(100) / 104;
-                (columns * rows.max(1) as usize).clamp(4, 24)
-            }
-            ExplorerView::List | ExplorerView::Details => {
-                (self.viewport.height.saturating_sub(150) / 42).clamp(5, 18) as usize
-            }
-        }
-    }
-
     fn close_popups(&mut self) {
         self.popup_open = false;
         self.create_popup_open = false;
@@ -993,14 +1039,12 @@ impl FileExplorer {
 
     fn rebuild_main(&mut self) {
         let theme = explorer_theme(self.ui_scale_milli);
-        self.runtime = ExplorerRuntime::new(self.viewport, theme);
+        self.runtime.rebuild(self.viewport, theme);
         self.entry_nodes.fill(NodeId::NONE);
-        let page_capacity = self.page_capacity();
+        let path = self.current.as_str();
         let state = MainTreeState {
             viewport_width: self.viewport.width,
             view: self.view,
-            page: self.page,
-            page_capacity,
             entry_len: self.entry_len,
             selected: self.selected,
             renaming: self.renaming,
@@ -1008,12 +1052,30 @@ impl FileExplorer {
             can_up: self.current.as_str() != "/",
             read_only: self.current.as_str().starts_with("/boot"),
             can_paste: self.clipboard.valid,
+            selected_location: if path == "/home/user" {
+                COMMAND_HOME
+            } else if path == "/" {
+                COMMAND_ROOT
+            } else if path.starts_with("/boot") {
+                COMMAND_BOOT
+            } else if path.starts_with("/system/bin") {
+                COMMAND_SYSTEM_BIN
+            } else if path.starts_with("/system/lib") {
+                COMMAND_SYSTEM_LIB
+            } else if path.starts_with("/system") {
+                COMMAND_SYSTEM
+            } else if path.starts_with("/src") {
+                COMMAND_SOURCE
+            } else {
+                CommandId(0)
+            },
         };
         build_main_tree(&mut self.runtime, state, &mut self.entry_nodes);
     }
 
     fn rebuild_popup(&mut self) {
-        self.popup = PopupRuntime::new(self.popup_rect, explorer_theme(self.ui_scale_milli));
+        self.popup
+            .rebuild(self.popup_rect, explorer_theme(self.ui_scale_milli));
         build_popup_tree(
             &mut self.popup,
             self.selected.is_some(),
@@ -1025,8 +1087,8 @@ impl FileExplorer {
     }
 
     fn rebuild_create_popup(&mut self) {
-        self.create_popup =
-            PopupRuntime::new(self.create_popup_rect, explorer_theme(self.ui_scale_milli));
+        self.create_popup
+            .rebuild(self.create_popup_rect, explorer_theme(self.ui_scale_milli));
         build_create_popup_tree(&mut self.create_popup);
     }
 }
@@ -1035,8 +1097,6 @@ impl FileExplorer {
 struct MainTreeState {
     viewport_width: u32,
     view: ExplorerView,
-    page: usize,
-    page_capacity: usize,
     entry_len: usize,
     selected: Option<usize>,
     renaming: Option<usize>,
@@ -1044,6 +1104,7 @@ struct MainTreeState {
     can_up: bool,
     read_only: bool,
     can_paste: bool,
+    selected_location: CommandId,
 }
 
 fn build_main_tree(
@@ -1054,8 +1115,6 @@ fn build_main_tree(
     let MainTreeState {
         viewport_width,
         view,
-        page,
-        page_capacity,
         entry_len,
         selected,
         renaming,
@@ -1063,78 +1122,124 @@ fn build_main_tree(
         can_up,
         read_only,
         can_paste,
+        selected_location,
     } = state;
     let root = runtime.tree().root();
     let mut ui = runtime.builder();
-    let mut page_spec = NodeSpec::new(ComponentKind::Column);
-    page_spec.layout = LayoutSpec {
-        width: Length::Fill(1),
-        height: Length::Fill(1),
-        gap: 1,
-        ..LayoutSpec::default()
-    };
-    let Ok(page_node) = ui.component(root, page_spec) else {
-        return;
+    let page_node = match ui.column(
+        root,
+        LayoutSpec {
+            width: Length::Fill(1),
+            height: Length::Fill(1),
+            gap: 1,
+            ..LayoutSpec::default()
+        },
+    ) {
+        Ok(node) => node,
+        Err(_) => return,
     };
 
-    let mut toolbar_spec = NodeSpec::new(ComponentKind::Row);
-    toolbar_spec.layout = LayoutSpec {
-        width: Length::Fill(1),
-        height: Length::Px(58),
-        padding: Edges::symmetric(10, 8),
-        gap: 6,
-        align: Align::Center,
-        ..LayoutSpec::default()
+    // Верхнее меню остаётся обычным Toolbar: когда появятся popup-пункты,
+    // приложение добавит команды, не меняя layout и hit-test.
+    let menu = match ui.toolbar(
+        page_node,
+        LayoutSpec {
+            width: Length::Fill(1),
+            height: Length::Px(30),
+            padding: Edges::symmetric(8, 3),
+            gap: 2,
+            align: Align::Center,
+            ..LayoutSpec::default()
+        },
+    ) {
+        Ok(node) => node,
+        Err(_) => return,
     };
-    toolbar_spec.style = style_class::CARD;
-    let Ok(toolbar) = ui.component(page_node, toolbar_spec) else {
-        return;
+    for (label, width) in [
+        (TEXT_MENU_FILE, 82),
+        (TEXT_MENU_EDIT, 96),
+        (TEXT_MENU_VIEW, 82),
+        (TEXT_MENU_FAVORITES, 132),
+        (TEXT_MENU_HELP, 92),
+    ] {
+        add_menu_label(&mut ui, menu, label, width);
+    }
+
+    let toolbar = match ui.toolbar(
+        page_node,
+        LayoutSpec {
+            width: Length::Fill(1),
+            height: Length::Px(56),
+            padding: Edges::symmetric(10, 7),
+            gap: 7,
+            align: Align::Center,
+            ..LayoutSpec::default()
+        },
+    ) {
+        Ok(node) => node,
+        Err(_) => return,
     };
-    add_toolbar_button(&mut ui, toolbar, TEXT_BACK, COMMAND_BACK, 42, !has_back);
-    add_toolbar_button(&mut ui, toolbar, TEXT_UP, COMMAND_UP, 42, !can_up);
-    let mut path = NodeSpec::new(ComponentKind::TextField);
-    path.layout = LayoutSpec {
-        width: Length::Fill(1),
-        height: Length::Px(38),
-        min_width: 180,
-        ..LayoutSpec::default()
-    };
-    path.content = Content::Text(TEXT_PATH);
-    path.accessible_name = TEXT_LOCATION;
-    path.role = SemanticRole::TextField;
-    path.state = NodeState::READ_ONLY;
-    path.tab_index = -1;
-    let _ = ui.component(toolbar, path);
-    add_toolbar_button(
+    add_command_button(
+        &mut ui,
+        toolbar,
+        TEXT_BACK,
+        IMAGE_BACK,
+        COMMAND_BACK,
+        100,
+        !has_back,
+    );
+    add_command_button(
+        &mut ui,
+        toolbar,
+        TEXT_UP,
+        IMAGE_FOLDER,
+        COMMAND_UP,
+        96,
+        !can_up,
+    );
+    add_command_button(
+        &mut ui,
+        toolbar,
+        TEXT_SEARCH,
+        IMAGE_SEARCH,
+        CommandId(0),
+        96,
+        false,
+    );
+    add_command_button(
         &mut ui,
         toolbar,
         TEXT_NEW_FOLDER,
+        IMAGE_FOLDER,
         COMMAND_NEW_FOLDER,
-        132,
+        160,
         read_only,
     );
-    add_toolbar_button(
+    add_command_button(
         &mut ui,
         toolbar,
         TEXT_COPY,
+        IMAGE_TEXT,
         COMMAND_COPY,
-        108,
+        126,
         selected.is_none(),
     );
-    add_toolbar_button(
+    add_command_button(
         &mut ui,
         toolbar,
         TEXT_PASTE,
+        IMAGE_TEXT,
         COMMAND_PASTE,
-        100,
+        118,
         !can_paste || read_only,
     );
-    add_toolbar_button(
+    add_command_button(
         &mut ui,
         toolbar,
         TEXT_DELETE,
+        IMAGE_TRASH,
         COMMAND_DELETE,
-        100,
+        110,
         selected.is_none() || read_only,
     );
     for (label, command, active) in [
@@ -1146,135 +1251,144 @@ fn build_main_tree(
             view == ExplorerView::Details,
         ),
     ] {
-        let mut spec = NodeSpec::new(ComponentKind::Button);
-        spec.layout = LayoutSpec {
-            width: Length::Px(44),
-            height: Length::Px(38),
-            ..LayoutSpec::default()
-        };
-        spec.content = Content::Text(label);
-        spec.accessible_name = label;
-        spec.command = command;
-        spec.role = SemanticRole::Button;
-        if active {
-            spec.state.insert(NodeState::SELECTED);
-        }
-        let _ = ui.component(toolbar, spec);
+        add_view_button(&mut ui, toolbar, label, command, active);
     }
 
-    let mut body_spec = NodeSpec::new(ComponentKind::Row);
-    body_spec.layout = LayoutSpec {
-        width: Length::Fill(1),
-        height: Length::Fill(1),
-        gap: 1,
-        ..LayoutSpec::default()
-    };
-    let Ok(body) = ui.component(page_node, body_spec) else {
-        return;
-    };
-    let mut sidebar_spec = NodeSpec::new(ComponentKind::Column);
-    sidebar_spec.layout = LayoutSpec {
-        width: Length::Px(240),
-        height: Length::Fill(1),
-        padding: Edges::all(12),
-        gap: 6,
-        ..LayoutSpec::default()
-    };
-    sidebar_spec.style = style_class::CARD;
-    let Ok(sidebar) = ui.component(body, sidebar_spec) else {
-        return;
-    };
-    add_heading(&mut ui, sidebar, TEXT_QUICK_ACCESS, 30);
-    for (label, image, command) in [
-        (TEXT_HOME, IMAGE_HOME, COMMAND_HOME),
-        (TEXT_ROOT, IMAGE_ROOT, COMMAND_ROOT),
-        (TEXT_BOOT, IMAGE_BOOT, COMMAND_BOOT),
-        (TEXT_SYSTEM, IMAGE_SYSTEM, COMMAND_SYSTEM),
-        (TEXT_SOURCE, IMAGE_SOURCE, COMMAND_SOURCE),
-    ] {
-        add_sidebar_item(&mut ui, sidebar, label, image, command);
-    }
-
-    let mut content_spec = NodeSpec::new(ComponentKind::Column);
-    content_spec.layout = LayoutSpec {
-        width: Length::Fill(1),
-        height: Length::Fill(1),
-        padding: Edges::all(12),
-        gap: 8,
-        ..LayoutSpec::default()
-    };
-    content_spec.style = style_class::CARD;
-    let Ok(content) = ui.component(body, content_spec) else {
-        return;
-    };
-    if view == ExplorerView::Details {
-        let mut header = NodeSpec::new(ComponentKind::Text);
-        header.layout = LayoutSpec {
+    let address = match ui.row(
+        page_node,
+        LayoutSpec {
             width: Length::Fill(1),
-            height: Length::Px(30),
-            ..LayoutSpec::default()
-        };
-        header.content = Content::Text(TEXT_NAME_HEADER);
-        header.style = style_class::CAPTION;
-        let _ = ui.component(content, header);
-    }
-
-    let start = page.saturating_mul(page_capacity).min(entry_len);
-    let end = start.saturating_add(page_capacity).min(entry_len);
-    if start == end {
-        let mut empty = NodeSpec::new(ComponentKind::Text);
-        empty.layout = LayoutSpec {
-            width: Length::Fill(1),
-            height: Length::Px(80),
+            height: Length::Px(44),
+            padding: Edges::symmetric(10, 5),
+            gap: 8,
             align: Align::Center,
             ..LayoutSpec::default()
-        };
-        empty.content = Content::Text(TEXT_EMPTY);
-        empty.style = style_class::CAPTION;
-        let _ = ui.component(content, empty);
-    } else {
-        let kind = if view == ExplorerView::Grid {
-            ComponentKind::Grid
-        } else {
-            ComponentKind::ListView
-        };
-        let mut collection = NodeSpec::new(kind);
-        collection.layout = LayoutSpec {
-            width: Length::Fill(1),
+        },
+    ) {
+        Ok(node) => node,
+        Err(_) => return,
+    };
+    let _ = ui.text(
+        address,
+        TEXT_ADDRESS,
+        LayoutSpec {
+            width: Length::Px(54),
             height: Length::Fill(1),
-            gap: if view == ExplorerView::Grid { 10 } else { 5 },
-            padding: Edges::all(3),
-            grid_columns: grid_columns(viewport_width) as u8,
             ..LayoutSpec::default()
-        };
-        collection.role = SemanticRole::List;
-        collection.tab_index = -1;
-        let Ok(collection) = ui.component(content, collection) else {
-            return;
-        };
-        for (index, node) in entry_nodes.iter_mut().enumerate().take(end).skip(start) {
-            *node = add_entry(
-                &mut ui,
-                collection,
-                index,
-                view,
-                selected == Some(index),
-                renaming == Some(index),
-            );
-        }
-    }
-
-    let mut status_spec = NodeSpec::new(ComponentKind::Row);
-    status_spec.layout = LayoutSpec {
+        },
+    );
+    let mut path = NodeSpec::new(ComponentKind::TextField);
+    path.layout = LayoutSpec {
         width: Length::Fill(1),
-        height: Length::Px(36),
-        padding: Edges::symmetric(8, 3),
-        gap: 6,
-        align: Align::Center,
+        height: Length::Px(34),
+        min_width: 180,
         ..LayoutSpec::default()
     };
-    status_spec.style = style_class::SUBTLE;
-    if let Ok(status) = ui.component(page_node, status_spec) {
+    path.content = Content::Text(TEXT_PATH);
+    path.accessible_name = TEXT_LOCATION;
+    path.role = SemanticRole::TextField;
+    path.state = NodeState::READ_ONLY;
+    path.tab_index = -1;
+    let _ = ui.component(address, path);
+
+    let tree_items = [
+        tree_item(TEXT_HOME, IMAGE_HOME, COMMAND_HOME, 0, selected_location),
+        tree_item(TEXT_ROOT, IMAGE_ROOT, COMMAND_ROOT, 0, selected_location),
+        tree_item(TEXT_BOOT, IMAGE_BOOT, COMMAND_BOOT, 1, selected_location),
+        tree_item(
+            TEXT_SYSTEM,
+            IMAGE_SYSTEM,
+            COMMAND_SYSTEM,
+            1,
+            selected_location,
+        ),
+        tree_item(
+            TEXT_SYSTEM_BIN,
+            IMAGE_FOLDER,
+            COMMAND_SYSTEM_BIN,
+            2,
+            selected_location,
+        ),
+        tree_item(
+            TEXT_SYSTEM_LIB,
+            IMAGE_FOLDER,
+            COMMAND_SYSTEM_LIB,
+            2,
+            selected_location,
+        ),
+        tree_item(
+            TEXT_SOURCE,
+            IMAGE_SOURCE,
+            COMMAND_SOURCE,
+            1,
+            selected_location,
+        ),
+    ];
+    let empty_item = FileBrowserItem {
+        label: ResourceId(0),
+        kind_label: ResourceId(0),
+        size_label: ResourceId(0),
+        icon: ResourceId(0),
+        command: CommandId(0),
+        selected: false,
+        editing: false,
+    };
+    let mut items = [empty_item; MAX_ENTRIES];
+    for (index, item) in items.iter_mut().enumerate().take(entry_len) {
+        *item = FileBrowserItem {
+            label: ResourceId(TEXT_ENTRY_BASE + index as u32),
+            kind_label: ResourceId(TEXT_ENTRY_KIND_BASE + index as u32),
+            size_label: ResourceId(TEXT_ENTRY_SIZE_BASE + index as u32),
+            icon: ResourceId(IMAGE_ENTRY_BASE + index as u32),
+            command: CommandId(COMMAND_ENTRY_BASE + index as u32),
+            selected: selected == Some(index),
+            editing: renaming == Some(index),
+        };
+    }
+    let browser_view = match view {
+        ExplorerView::Grid => FileBrowserView::Grid,
+        ExplorerView::List => FileBrowserView::List,
+        ExplorerView::Details => FileBrowserView::Details,
+    };
+    if build_file_browser(
+        &mut ui,
+        page_node,
+        FileBrowserSpec {
+            layout: LayoutSpec {
+                width: Length::Fill(1),
+                height: Length::Fill(1),
+                gap: 1,
+                ..LayoutSpec::default()
+            },
+            navigation_width: 228,
+            navigation_heading: TEXT_QUICK_ACCESS,
+            empty_text: TEXT_EMPTY,
+            name_heading: TEXT_NAME_HEADER,
+            kind_heading: TEXT_KIND_HEADER,
+            size_heading: TEXT_SIZE_HEADER,
+            view: browser_view,
+            grid_columns: grid_columns(viewport_width) as u8,
+        },
+        &tree_items,
+        &items[..entry_len],
+        entry_nodes,
+    )
+    .is_err()
+    {
+        return;
+    }
+
+    if let Ok(status) = ui.status_bar(
+        page_node,
+        LayoutSpec {
+            width: Length::Fill(1),
+            height: Length::Px(34),
+            padding: Edges::symmetric(10, 4),
+            gap: 8,
+            align: Align::Center,
+            ..LayoutSpec::default()
+        },
+    ) {
         let _ = ui.text(
             status,
             TEXT_STATUS,
@@ -1284,175 +1398,134 @@ fn build_main_tree(
                 ..LayoutSpec::default()
             },
         );
-        add_toolbar_button(
-            &mut ui,
+        let _ = ui.text(
             status,
-            TEXT_PREVIOUS,
-            COMMAND_PAGE_PREVIOUS,
-            86,
-            page == 0,
-        );
-        add_toolbar_button(
-            &mut ui,
-            status,
-            TEXT_NEXT,
-            COMMAND_PAGE_NEXT,
-            86,
-            end >= entry_len,
+            TEXT_FS_STATUS,
+            LayoutSpec {
+                width: Length::Px(220),
+                height: Length::Fill(1),
+                align: Align::End,
+                ..LayoutSpec::default()
+            },
         );
     }
 }
 
-fn add_toolbar_button<const N: usize>(
-    ui: &mut rustos_system_ui::UiBuilder<'_, N>,
-    parent: NodeId,
+fn tree_item(
     label: ResourceId,
+    icon: ResourceId,
     command: CommandId,
-    width: u16,
-    disabled: bool,
-) {
-    let mut spec = NodeSpec::new(ComponentKind::Button);
-    spec.layout = LayoutSpec {
-        width: Length::Px(width),
-        height: Length::Px(38),
-        ..LayoutSpec::default()
-    };
-    spec.content = Content::Text(label);
-    spec.accessible_name = label;
-    spec.command = command;
-    spec.role = SemanticRole::Button;
-    if disabled {
-        spec.state.insert(NodeState::DISABLED);
+    depth: u8,
+    selected: CommandId,
+) -> FileBrowserTreeItem {
+    FileBrowserTreeItem {
+        label,
+        icon,
+        command,
+        depth,
+        selected: command == selected,
+        disabled: false,
     }
-    let _ = ui.component(parent, spec);
 }
 
-fn add_heading<const N: usize>(
+fn add_menu_label<const N: usize>(
     ui: &mut rustos_system_ui::UiBuilder<'_, N>,
     parent: NodeId,
     label: ResourceId,
-    height: u16,
+    width: u16,
 ) {
-    let mut spec = NodeSpec::new(ComponentKind::Text);
-    spec.layout = LayoutSpec {
-        width: Length::Fill(1),
-        height: Length::Px(height),
+    let mut button = NodeSpec::new(ComponentKind::Button);
+    button.layout = LayoutSpec {
+        width: Length::Px(width),
+        height: Length::Px(24),
         ..LayoutSpec::default()
     };
-    spec.content = Content::Text(label);
-    spec.style = style_class::HEADING;
-    let _ = ui.component(parent, spec);
+    button.content = Content::Text(label);
+    button.accessible_name = label;
+    button.role = SemanticRole::Button;
+    button.style = style_class::GHOST;
+    let _ = ui.component(parent, button);
 }
 
-fn add_sidebar_item<const N: usize>(
+fn add_command_button<const N: usize>(
     ui: &mut rustos_system_ui::UiBuilder<'_, N>,
     parent: NodeId,
     label: ResourceId,
     image: ResourceId,
     command: CommandId,
+    width: u16,
+    disabled: bool,
 ) {
-    let button = ui
-        .button(
-            parent,
-            label,
-            command,
-            LayoutSpec {
-                width: Length::Fill(1),
-                height: Length::Px(44),
-                ..LayoutSpec::default()
-            },
-        )
-        .unwrap_or(NodeId::NONE);
-    if !button.is_none() {
-        let _ = ui.image(
-            button,
-            image,
-            label,
-            LayoutSpec {
-                width: Length::Px(26),
-                height: Length::Px(26),
-                align: Align::Start,
-                ..LayoutSpec::default()
-            },
-        );
-    }
-}
-
-fn add_entry<const N: usize>(
-    ui: &mut rustos_system_ui::UiBuilder<'_, N>,
-    parent: NodeId,
-    index: usize,
-    view: ExplorerView,
-    selected: bool,
-    renaming: bool,
-) -> NodeId {
     let mut button = NodeSpec::new(ComponentKind::Button);
     button.layout = LayoutSpec {
-        width: Length::Fill(1),
-        height: Length::Px(if view == ExplorerView::Grid { 96 } else { 38 }),
+        width: Length::Px(width),
+        height: Length::Px(40),
         ..LayoutSpec::default()
     };
-    button.command = CommandId(COMMAND_ENTRY_BASE + index as u32);
-    button.role = SemanticRole::ListItem;
-    button.accessible_name = ResourceId(TEXT_ENTRY_BASE + index as u32);
-    if selected {
-        button.state.insert(NodeState::SELECTED);
+    button.command = command;
+    button.accessible_name = label;
+    button.role = SemanticRole::Button;
+    if disabled {
+        button.state.insert(NodeState::DISABLED);
     }
-    let Ok(node) = ui.component(parent, button) else {
-        return NodeId::NONE;
+    let Ok(button) = ui.component(parent, button) else {
+        return;
     };
-    let image_size = if view == ExplorerView::Grid { 42 } else { 26 };
-    let _ = ui.image(
-        node,
-        ResourceId(IMAGE_ENTRY_BASE + index as u32),
-        ResourceId(TEXT_ENTRY_BASE + index as u32),
+    let Ok(row) = ui.row(
+        button,
         LayoutSpec {
-            width: Length::Px(image_size),
-            height: Length::Px(image_size),
-            align: if view == ExplorerView::Grid {
-                Align::Center
-            } else {
-                Align::Start
-            },
+            width: Length::Fill(1),
+            height: Length::Fill(1),
+            padding: Edges::symmetric(8, 6),
+            gap: 6,
+            align: Align::Center,
+            ..LayoutSpec::default()
+        },
+    ) else {
+        return;
+    };
+    let _ = ui.image(
+        row,
+        image,
+        ResourceId(0),
+        LayoutSpec {
+            width: Length::Px(25),
+            height: Length::Px(25),
             ..LayoutSpec::default()
         },
     );
-    let label_resource = if renaming {
-        TEXT_RENAME_VALUE
-    } else {
-        ResourceId(TEXT_ENTRY_BASE + index as u32)
-    };
-    let mut text = NodeSpec::new(if renaming {
-        ComponentKind::TextField
-    } else {
-        ComponentKind::Text
-    });
-    text.layout = LayoutSpec {
-        width: Length::Fill(1),
-        height: Length::Px(if view == ExplorerView::Grid { 28 } else { 34 }),
-        align: Align::End,
+    let _ = ui.text(
+        row,
+        label,
+        LayoutSpec {
+            width: Length::Fill(1),
+            height: Length::Fill(1),
+            ..LayoutSpec::default()
+        },
+    );
+}
+
+fn add_view_button<const N: usize>(
+    ui: &mut rustos_system_ui::UiBuilder<'_, N>,
+    parent: NodeId,
+    label: ResourceId,
+    command: CommandId,
+    active: bool,
+) {
+    let mut button = NodeSpec::new(ComponentKind::Button);
+    button.layout = LayoutSpec {
+        width: Length::Px(40),
+        height: Length::Px(40),
         ..LayoutSpec::default()
     };
-    text.content = Content::Text(label_resource);
-    text.accessible_name = label_resource;
-    text.role = if renaming {
-        SemanticRole::TextField
-    } else {
-        SemanticRole::Text
-    };
-    text.style = if view == ExplorerView::Grid {
-        style_class::CAPTION
-    } else {
-        style_class::DEFAULT
-    };
-    if selected {
-        text.state.insert(NodeState::SELECTED);
+    button.content = Content::Text(label);
+    button.accessible_name = label;
+    button.command = command;
+    button.role = SemanticRole::Button;
+    if active {
+        button.state.insert(NodeState::SELECTED);
     }
-    if renaming {
-        text.state.insert(NodeState::FOCUSED);
-    }
-    let _ = ui.component(node, text);
-    node
+    let _ = ui.component(parent, button);
 }
 
 fn build_popup_tree(
@@ -1579,22 +1652,27 @@ impl ExplorerResources<'_> {
             let index = (resource.0 - TEXT_ENTRY_BASE) as usize;
             return if self.renaming == Some(index) {
                 self.rename.as_str()
-            } else if self.view == ExplorerView::Details {
-                self.entries[index].details.as_str()
-            } else if self.view == ExplorerView::List {
-                self.entries[index].list_label.as_str()
             } else if self.view == ExplorerView::Grid {
                 self.entries[index].grid_label.as_str()
             } else {
                 self.entries[index].name.as_str()
             };
         }
+        if (TEXT_ENTRY_KIND_BASE..TEXT_ENTRY_KIND_BASE + MAX_ENTRIES as u32).contains(&resource.0) {
+            return self.entries[(resource.0 - TEXT_ENTRY_KIND_BASE) as usize]
+                .kind_label
+                .as_str();
+        }
+        if (TEXT_ENTRY_SIZE_BASE..TEXT_ENTRY_SIZE_BASE + MAX_ENTRIES as u32).contains(&resource.0) {
+            return self.entries[(resource.0 - TEXT_ENTRY_SIZE_BASE) as usize]
+                .size_label
+                .as_str();
+        }
         match resource {
             TEXT_PATH => self.current.as_str(),
             TEXT_STATUS => self.status.as_str(),
-            TEXT_RENAME_VALUE => self.rename.as_str(),
-            TEXT_BACK => "<",
-            TEXT_UP => "^",
+            TEXT_BACK => "Назад",
+            TEXT_UP => "Вверх",
             TEXT_NEW_FOLDER => "Новая папка",
             TEXT_COPY => "Копировать",
             TEXT_CUT => "Вырезать",
@@ -1604,22 +1682,30 @@ impl ExplorerResources<'_> {
             TEXT_GRID => "С",
             TEXT_LIST => "Л",
             TEXT_DETAILS => "Т",
-            TEXT_HOME => "      Домой",
-            TEXT_ROOT => "      Этот компьютер",
-            TEXT_BOOT => "      Загрузка",
-            TEXT_SYSTEM => "      Система",
-            TEXT_SOURCE => "      Исходники",
-            TEXT_NAME_HEADER => {
-                "      Имя                                      Тип          Размер"
-            }
-            TEXT_PREVIOUS => "Назад",
-            TEXT_NEXT => "Далее",
+            TEXT_HOME => "Домой",
+            TEXT_ROOT => "Этот компьютер",
+            TEXT_BOOT => "Загрузка",
+            TEXT_SYSTEM => "Система",
+            TEXT_SOURCE => "Исходники",
+            TEXT_NAME_HEADER => "Имя",
             TEXT_EMPTY => "В этой папке пока ничего нет",
             TEXT_POPUP_CREATE => "Создать                         >",
             TEXT_CREATE_FOLDER => "      Папку",
             TEXT_CREATE_TEXT => "      Текстовый файл",
             TEXT_LOCATION => "Текущий путь",
-            TEXT_QUICK_ACCESS => "Быстрый доступ",
+            TEXT_QUICK_ACCESS => "Папки",
+            TEXT_MENU_FILE => "Файл",
+            TEXT_MENU_EDIT => "Правка",
+            TEXT_MENU_VIEW => "Вид",
+            TEXT_MENU_FAVORITES => "Избранное",
+            TEXT_MENU_HELP => "Справка",
+            TEXT_SEARCH => "Поиск",
+            TEXT_ADDRESS => "Адрес",
+            TEXT_KIND_HEADER => "Тип",
+            TEXT_SIZE_HEADER => "Размер",
+            TEXT_FS_STATUS => "VaraniaFS · подключено",
+            TEXT_SYSTEM_BIN => "Программы",
+            TEXT_SYSTEM_LIB => "Библиотеки",
             _ => "",
         }
     }
@@ -1642,6 +1728,7 @@ impl ExplorerResources<'_> {
             IMAGE_GRID => Some(IconKind::Grid),
             IMAGE_BACK => Some(IconKind::ChevronLeft),
             IMAGE_FORWARD => Some(IconKind::ChevronRight),
+            IMAGE_SEARCH => Some(IconKind::Search),
             _ => None,
         }
     }
@@ -1685,6 +1772,7 @@ impl RenderBackend for ExplorerBackend<'_, '_> {
                 self.resources.text(resource),
                 color,
                 spec,
+                clip,
             );
         }
     }
@@ -1722,32 +1810,6 @@ fn grid_columns(viewport_width: u32) -> usize {
         .checked_div(150)
         .unwrap_or(1)
         .clamp(2, 6) as usize
-}
-
-fn detail_text(entry: &ExplorerEntry) -> FixedText<STATUS_CAPACITY> {
-    let mut result = FixedText::EMPTY;
-    let kind = if entry.kind == FileKind::Directory {
-        "Папка"
-    } else {
-        "Файл"
-    };
-    if entry.kind == FileKind::Directory {
-        let _ = write!(
-            result,
-            "      {}                    {}",
-            entry.name.as_str(),
-            kind
-        );
-    } else {
-        let _ = write!(
-            result,
-            "      {}                    {} · {} Б",
-            entry.name.as_str(),
-            kind,
-            entry.size
-        );
-    }
-    result
 }
 
 fn compact_label(value: &str, max_characters: usize) -> FixedText<NAME_CAPACITY> {

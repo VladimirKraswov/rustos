@@ -565,7 +565,14 @@ impl RenderBackend for FramebufferBackend<'_> {
 
     fn text(&mut self, rect: Rect, resource: ResourceId, color: Color, spec: FontSpec, clip: Rect) {
         if !rect.intersection(clip).is_empty() {
-            draw_system_ui_text(self.framebuffer, rect, text_resource(resource), color, spec);
+            draw_system_ui_text(
+                self.framebuffer,
+                rect,
+                text_resource(resource),
+                color,
+                spec,
+                clip,
+            );
         }
     }
 

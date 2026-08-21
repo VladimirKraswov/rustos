@@ -43,6 +43,30 @@ pub enum SemanticRole {
     Image = 15,
     /// Полоса прокрутки.
     ScrollBar = 16,
+    /// Многострочный редактор текста.
+    TextArea = 17,
+    /// Ползунок числового значения.
+    Slider = 18,
+    /// Select/ComboBox.
+    ComboBox = 19,
+    /// Вкладка набора страниц.
+    Tab = 20,
+    /// Иерархическое дерево.
+    Tree = 21,
+    /// Узел дерева.
+    TreeItem = 22,
+    /// Таблица.
+    Table = 23,
+    /// Строка таблицы.
+    Row = 24,
+    /// Сетка.
+    Grid = 25,
+    /// Ячейка/элемент сетки.
+    GridCell = 26,
+    /// Панель команд.
+    Toolbar = 27,
+    /// Строка состояния.
+    Status = 28,
 }
 
 /// Доступные assistive-действия.
@@ -112,6 +136,26 @@ impl<const N: usize> SemanticsTree<N> {
         }
     }
 
+    /// Инициализирует semantic storage на месте.
+    ///
+    /// # Safety
+    /// `destination` указывает на валидное неинициализированное хранилище
+    /// `SemanticsTree<N>`.
+    pub(crate) unsafe fn initialize_in_place(destination: *mut Self) {
+        // SAFETY: вызывающий предоставил storage всего объекта.
+        let nodes = unsafe { core::ptr::addr_of_mut!((*destination).nodes).cast::<SemanticNode>() };
+        for index in 0..N {
+            // SAFETY: каждый slot массива пишется ровно один раз.
+            unsafe { nodes.add(index).write(SemanticNode::EMPTY) };
+        }
+        // SAFETY: scalar field принадлежит тому же storage.
+        unsafe { core::ptr::addr_of_mut!((*destination).len).write(0) };
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.len = 0;
+    }
+
     /// Перестраивает только компактные semantic records.
     pub fn rebuild(&mut self, tree: &Tree<N>) {
         self.len = 0;
@@ -168,8 +212,16 @@ fn actions_for(role: SemanticRole, state: NodeState) -> SemanticAction {
         SemanticRole::CheckBox | SemanticRole::RadioButton | SemanticRole::Switch => {
             actions.0 |= SemanticAction::TOGGLE.0
         }
-        SemanticRole::TextField => actions.0 |= SemanticAction::SET_VALUE.0,
-        SemanticRole::List | SemanticRole::ScrollBar => {
+        SemanticRole::TextField
+        | SemanticRole::TextArea
+        | SemanticRole::Slider
+        | SemanticRole::ComboBox => actions.0 |= SemanticAction::SET_VALUE.0,
+        SemanticRole::Tab => actions.0 |= SemanticAction::ACTIVATE.0,
+        SemanticRole::List
+        | SemanticRole::Tree
+        | SemanticRole::Table
+        | SemanticRole::Grid
+        | SemanticRole::ScrollBar => {
             actions.0 |= SemanticAction::SCROLL_FORWARD.0 | SemanticAction::SCROLL_BACKWARD.0
         }
         _ => {}

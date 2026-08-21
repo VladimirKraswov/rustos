@@ -6,6 +6,12 @@
 
 use rustos_video::Rect;
 
+/// Стандартная толщина интерактивной полосы. 14 logical px остаются удобными
+/// для мыши при 1× и масштабируются до крупной физической цели на HiDPI.
+pub const DEFAULT_SCROLLBAR_THICKNESS: u32 = 14;
+/// Место, резервируемое inset-полосой вместе с двухпиксельным отступом.
+pub const DEFAULT_SCROLLBAR_INSET: u32 = DEFAULT_SCROLLBAR_THICKNESS + 2;
+
 /// Ось прокрутки.
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
