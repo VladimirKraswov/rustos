@@ -23,6 +23,13 @@ pub extern "C" fn _start(server: u64, reply: u64, abi_version: u64) -> ! {
     let _ = client.unlink("/tmp/vfsd-test/vfsd-stream-renamed.bin");
     let _ = client.unlink("/tmp/vfsd-test/vfsd-stream.bin");
     let _ = client.unlink("/tmp/vfsd-test");
+    // Чистый volume содержит только корень и установленные system paths.
+    // `/tmp` — часть runtime namespace, поэтому bootstrap создаёт его
+    // идемпотентно, а не полагается на состояние предыдущей загрузки.
+    match client.make_dir("/tmp") {
+        Ok(()) | Err(rustos_abi::vfs::status::ALREADY_EXISTS) => {}
+        Err(error) => process_exit(500 + error.saturating_abs()),
+    }
     if let Err(error) = client.make_dir("/tmp/vfsd-test") {
         process_exit(600 + error.saturating_abs());
     }

@@ -80,6 +80,10 @@ pub mod status {
     pub const LIMIT_REACHED: i32 = -110;
     /// Нарушена версия или структура RPC.
     pub const PROTOCOL: i32 = -111;
+    /// Ядро отвергло отправку VFS RPC до его доставки сервису.
+    pub const TRANSPORT_SEND: i32 = -112;
+    /// Ядро не смогло доставить ответ VFS RPC клиенту.
+    pub const TRANSPORT_RECEIVE: i32 = -113;
 }
 
 /// Значения типа объекта в ответах и directory records.

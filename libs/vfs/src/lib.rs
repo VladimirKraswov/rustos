@@ -264,12 +264,12 @@ impl VfsClient {
         }
         let result = ipc_send(self.server, &message);
         if result != syscall::status::OK {
-            return Err(result as i32);
+            return Err(vfs::status::TRANSPORT_SEND);
         }
         let mut response = Message::EMPTY;
         let result = ipc_receive(self.reply, &mut response);
         if result != syscall::status::OK {
-            return Err(result as i32);
+            return Err(vfs::status::TRANSPORT_RECEIVE);
         }
         if response.header.abi_version != rustos_abi::ipc::IPC_ABI_VERSION
             || response.header.flags & ipc_flags::REPLY == 0
