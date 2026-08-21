@@ -50,7 +50,10 @@ Xvfb -displayfd 1 -screen 0 1600x1000x24 -fbdir "$RUN_DIR" \
     -nolisten tcp -noreset >"$DISPLAY_NUMBER_FILE" \
     2>"$RUN_DIR/xvfb-stderr.log" &
 XVFB_PID=$!
-for _ in {1..50}; do
+# На загруженном GitHub runner компиляция XKB keymap иногда занимает заметно
+# больше пяти секунд. `displayfd` публикуется только после полной готовности
+# X-сервера, поэтому ждём bounded 30 секунд вместо ложного падения теста.
+for _ in {1..300}; do
     [[ -s "$DISPLAY_NUMBER_FILE" ]] && break
     kill -0 "$XVFB_PID" 2>/dev/null || break
     sleep 0.1
