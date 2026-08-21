@@ -94,7 +94,10 @@ impl Framebuffer {
         };
         let gpu = match VirtioGpu::initialize(fallback) {
             Ok(gpu) => {
+                #[cfg(target_arch = "x86_64")]
                 serial::put_str("[video] virtio-gpu modern PCI controlq ready\n");
+                #[cfg(target_arch = "aarch64")]
+                serial::put_str("[video] virtio-gpu modern MMIO controlq ready\n");
                 Some(gpu)
             }
             Err(_) => {

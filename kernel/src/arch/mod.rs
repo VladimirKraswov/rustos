@@ -10,10 +10,7 @@
 //! ISA пока запускаются и безопасно паркуются; распределение user threads по
 //! нескольким CPU остаётся отдельным per-CPU scheduler milestone.
 
-#![allow(dead_code)]
-
 use core::sync::atomic::{AtomicU64, Ordering};
-use rustos_abi::BootInfo;
 
 // Эти C builtins не зависят от ISA и нужны freestanding `core` на каждом
 // kernel target. Держим их один раз, вне backend'ов.
@@ -70,7 +67,6 @@ pub struct SmpInfo {
 /// Ошибка аппаратного backend'а, пригодная для общего boot path.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ArchError {
-    Unsupported,
     InterruptController,
     FirmwareDescription,
     SecondaryCpuStartup,
@@ -101,6 +97,3 @@ pub fn counter_frequency() -> u64 {
 pub fn set_counter_frequency(hz: u64) {
     COUNTER_HZ.store(hz.max(1), Ordering::Release);
 }
-
-/// Единая сигнатура запуска CPU backend'а.
-pub type EarlyInitializer = fn(&BootInfo) -> Result<EarlyInit, ArchError>;

@@ -9,7 +9,7 @@ RustOS — учебная 64-битная микроядерная операц�
 Текущий рабочий вертикальный срез:
 
 - GRUB/Multiboot2 boot на AMD64 и UEFI loader на Rust для AArch64;
-- ELF64 PIE kernel и initramfs;
+- ELF64 kernel для выбранной ISA и проверяемый RIFS initramfs;
 - собственные GDT/TSS/IDT, NX/WP и отдельный ring-0 trap stack;
 - 64-битная карта памяти без ограничения 4 ГиБ;
 - реальное резервирование kernel pages через UEFI `AllocatePages`;
@@ -25,7 +25,7 @@ RustOS — учебная 64-битная микроядерная операц�
 - ACPI MADT discovery и INIT–SIPI–SIPI запуск AP-ядер через 16/32/64-битный
   trampoline; AP пока безопасно parked до per-CPU TSS/IDT;
 - dynamic create/exit/reap с generation-safe PID/TID и полным reclaim;
-- capability ABI v2: ring-3 `spawn/wait/kill`, несколько потоков с
+- process/capability ABI v4: ring-3 `spawn/wait/kill`, несколько потоков с
   `create/join`, argv/environment, FS-base/TPIDR TLS и monotonic clock;
 - anonymous `map/unmap/protect` с W^X и shared-memory objects с раздельным
   учётом capability/mapping references;
@@ -33,8 +33,9 @@ RustOS — учебная 64-битная микроядерная операц�
   передача только ослабленных capabilities;
 - host-tested scheduler core: CPU affinity, приоритетные классы и bounded
   driver priority;
-- GOP 1280×800×32, CPU rendering и RAM back buffer без мерцания сцены;
-- PS/2 keyboard и mouse;
+- wide-screen GOP/virtio-gpu scanout поверх PCI (AMD64) и MMIO (AArch64),
+  выбор режима и CPU back buffer с damage;
+- PS/2 input на PC и virtio-input keyboard/mouse на ARM VM;
 - desktop, taskbar, Start menu и icons;
 - window manager: drag, minimize, maximize, restore и close;
 - цветной terminal с командами `help`, `clear`, `about`, `mem`, `gui`,
@@ -54,19 +55,16 @@ RustOS — учебная 64-битная микроядерная операц�
 macOS Apple Silicon:
 
 ```sh
-brew install qemu
-make bootstrap
-make build
-make run
+brew install qemu shellcheck
+make run       # автоматически AArch64 + HVF + CPU host
 ```
 
 Debian/Ubuntu:
 
 ```sh
-sudo apt install qemu-system-x86 qemu-system-arm ovmf
+sudo apt install qemu-system-x86 qemu-system-arm ovmf shellcheck
 make bootstrap
-make build
-make run
+make run       # AMD64; на native AArch64 Linux можно явно make run-arm
 ```
 
 ARM (AArch64, QEMU `virt` + UEFI):
@@ -75,12 +73,18 @@ ARM (AArch64, QEMU `virt` + UEFI):
 make build-arm      # kernel/RUNE/initramfs/VaraniaFS/AAVMF/ESP
 make run-arm        # интерактивный QEMU virt; serial в терминале
 make test-arm-boot  # headless EL0/EL1/GICv3/PSCI integration test
+make test-arm-gui   # virtio GPU + keyboard + mouse + SystemUI
 ```
 
 Firmware для ARM (AAVMF) уже закоммичен в `firmware/aarch64/`; сетевая
 загрузка не требуется. Полный ESP находится в `build/arm/esp-arm.img`,
 канонический загрузчик — `EFI/BOOT/BOOTAA64.EFI`, persistent диск —
 `build/arm-system.vfs`.
+
+На Apple Silicon `make build`/`make run` выбирают ARM-профиль: QEMU `virt`,
+HVF, CPU `host`, 4 vCPU, 1 ГиБ RAM, virtio-gpu и virtio-input. Это аппаратная
+виртуализация AArch64 без медленной эмуляции x86. Явный AMD64-профиль сохранён
+как `make build-x86`/`make run-x86`. На других хостах default остаётся AMD64.
 
 `make run` открывает графическое окно QEMU. Клавиатура сразу направлена в
 terminal. Мышью можно перемещать окно и использовать кнопки заголовка.
@@ -94,14 +98,17 @@ make test-arch
 make test
 ```
 
-`make test` выполняет пять разных сценариев:
+`make test` выполняет шесть разных сценариев:
 
-1. Host unit tests проверяют ABI, scheduler, video и инструменты образов.
+1. Host unit tests проверяют ABI, scheduler, SystemUI/assets, video,
+   RUNE/loaders, filesystem и инструменты образов.
 2. Cross-build создаёт AMD64 и AArch64 ELF ядра, runtime и приложений.
 3. AMD64 boot-test завершается настоящим `isa-debug-exit`.
 4. AArch64 boot-test проходит AAVMF, GICv3 preemption, PSCI SMP, EL0 fault
    containment и завершается через `PSCI SYSTEM_OFF`.
-5. GUI-тест через настоящий PS/2 выполняет запись/чтение файлов и работу с
+5. ARM GUI smoke выполняет ввод `help`, клик Start и screendump через настоящие
+   virtio GPU/keyboard/mouse event queues.
+6. AMD64 GUI-тест через настоящий PS/2 выполняет запись/чтение файлов и работу с
    каталогами, перетаскивает и сворачивает terminal, получает QEMU
    screendump и проверяет геометрию и пиксели.
 
@@ -111,8 +118,9 @@ make test
 
 Обязательный первый рубеж микроядра пройден: QEMU действительно выполняет
 `system/bin/init.rune` в CPL3/EL0. Процесс получает только read-only handle корня
-bootstrap VFS, выполняет syscall, завершается, а второй тестовый ELF вызывает
-`UD2`; ядро перехватывает fault, освобождает address space и продолжает boot.
+bootstrap VFS, выполняет syscall, завершается, а второй тестовый RUNE вызывает
+illegal instruction (`UD2` на AMD64, `BRK` на AArch64); ядро локализует fault,
+освобождает address space и продолжает boot.
 
 GUI пока остаётся bootstrap-сеансом CPU0 внутри kernel image. До его запуска
 process manager выполняет настоящую preemptive-сессию: timer IRQ сохраняет
@@ -126,6 +134,6 @@ runtime, interrupt routing, TLB shootdown и work stealing. Затем display/i
 Подробнее: [архитектуры CPU](docs/ARCHITECTURES.md), [архитектура системы](docs/ARCHITECTURE.md),
 [графическая подсистема](docs/GUI.md), [видеосистема](docs/VIDEO.md), [VFS](docs/VFS.md),
 [микроядро](docs/MICROKERNEL.md), [DLL](docs/DYNAMIC_LIBRARIES.md),
-[IPC](docs/IPC.md), [процессы и память ABI v2](docs/PROCESS_MEMORY_ABI.md),
+[IPC](docs/IPC.md), [процессы и память ABI v4](docs/PROCESS_MEMORY_ABI.md),
 [self-hosting Rust](docs/SELF_HOSTING.md),
 [сборка](docs/BUILDING.md).

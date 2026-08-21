@@ -1,6 +1,6 @@
 [package]
 name = "rustos-bootstrap-apps"
-description = "Первые изолированные ELF64 процессы RustOS"
+description = "Bootstrap ring-3 процессы и сервисы, устанавливаемые как RUNE"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

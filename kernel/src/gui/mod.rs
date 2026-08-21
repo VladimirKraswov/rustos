@@ -1,7 +1,11 @@
 //! GUI-подсистема раннего ядра (см. docs/GUI.md):
-//! * [`components`] — theme и базовые widgets (SDK-слой, без unsafe);
+//! * [`chrome`] — маленький renderer-adapter оформления системных окон;
 //! * [`session`] — compositor, desktop, taskbar и window manager
 //!   (единственный владелец framebuffer'а и input).
-pub mod components;
+//!
+//! Общая библиотека компонентов находится в crate `rustos-system-ui`.
+//! Здесь намеренно нет второй модели Checkbox/ListView/TextEdit: иначе
+//! приложения начали бы зависеть от framebuffer и дублировать SystemUI.
+mod chrome;
 mod cursor;
 pub mod session;

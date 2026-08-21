@@ -11,7 +11,11 @@ bash scripts/bootstrap-ovmf.sh >/dev/null
 cp -f build/ovmf/OVMF_VARS.fd build/ovmf/OVMF_VARS_RUNTIME.fd
 
 ACCEL=tcg
-[[ -w /dev/kvm ]] && ACCEL=kvm
+case "$(uname -m)" in
+    x86_64|amd64)
+        [[ -w /dev/kvm ]] && ACCEL=kvm
+        ;;
+esac
 
 PLATFORM="$(uname -s)"
 DEFAULT_POLICY=actual

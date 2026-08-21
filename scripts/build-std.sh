@@ -10,12 +10,14 @@ bash scripts/prepare-rustos-std.sh
 REAL_RUSTC="$(rustup which rustc)"
 COMMIT_HASH="$($REAL_RUSTC -Vv | awk '/^commit-hash:/ { print $2 }')"
 export RUSTOS_REAL_RUSTC="$REAL_RUSTC"
-export RUSTOS_REAL_SYSROOT="$($REAL_RUSTC --print sysroot)"
+RUSTOS_REAL_SYSROOT="$($REAL_RUSTC --print sysroot)"
+export RUSTOS_REAL_SYSROOT
 export RUSTOS_STD_SYSROOT="$ROOT/build/rustos-std-sysroot/$COMMIT_HASH/sysroot"
 export RUSTC="$ROOT/scripts/rustc-rustos-std.sh"
 # Content-addressed target dir — часть корректности порта, а не оптимизация.
 # Изменённый PAL никогда не линкуется со старым libstd из Cargo cache.
-export CARGO_TARGET_DIR="$(bash scripts/rustos-std-target-dir.sh)"
+CARGO_TARGET_DIR="$(bash scripts/rustos-std-target-dir.sh)"
+export CARGO_TARGET_DIR
 # RustOS не использует Unix crt1.o. `_start` находится в rustos-crt rlib;
 # `-u` гарантирует извлечение startup object даже без явного вызова из main.
 export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }-C link-arg=-u_start"

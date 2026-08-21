@@ -38,7 +38,7 @@ send_command() {
         case "$character" in
             ' ') key=spc ;;
             '/') key=slash ;;
-            '.') key=dot ;;
+            '.') key='dot' ;;
             '-') key=minus ;;
             [A-Z])
                 # HMP использует имена физических клавиш: заглавная буква

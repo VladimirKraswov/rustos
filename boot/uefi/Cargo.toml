@@ -7,7 +7,8 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 
-# Загрузчик — EFI-приложение (PE/COFF), собирается под x86_64-unknown-uefi.
+# Загрузчик — EFI-приложение (PE/COFF), собирается под UEFI target выбранной
+# архитектуры: `x86_64-unknown-uefi` либо `aarch64-unknown-uefi`.
 # Ядро и initramfs встраиваются через include_bytes! из payload/ (файлы
 # создаёт Makefile перед сборкой; см. docs/BOOT.md и ADR-0002).
 [[bin]]

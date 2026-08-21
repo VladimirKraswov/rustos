@@ -4,27 +4,31 @@
 
 - Rust nightly `2026-08-18` с `rust-src`, `rustfmt`, `clippy`;
 - QEMU x86-64 (и `qemu-system-aarch64` для ARM-варианта);
-- стандартные POSIX shell tools.
+- стандартные POSIX shell tools;
+- ShellCheck (требуется для `make lint`, но не для обычной сборки).
 
 OVMF загружается `scripts/bootstrap-ovmf.sh` из зафиксированного Debian package
 и проверяется SHA-256. AAVMF для ARM уже лежит в репозитории
 (`firmware/aarch64/`, SHA-256 в `SHA256SUMS`), сетевая загрузка не требуется.
-На macOS используется QEMU TCG, на Linux при наличии `/dev/kvm` автоматически
-выбирается KVM.
+На Apple Silicon интерактивный ARM-профиль использует HVF и CPU `host`; на
+native AArch64 Linux при наличии `/dev/kvm` — KVM. Cross-ISA интеграционные
+тесты сохраняют TCG там, где нужна воспроизводимая эмуляция.
 
 ## Цели Makefile
 
 ```text
 make bootstrap   подготовить OVMF
-make build       собрать интерактивный GUI-образ (x86_64)
-make run         запустить графическую VM (x86_64)
+make build/run   ARM+HVF на Apple Silicon, AMD64 на остальных хостах
+make build-x86   явно собрать AMD64 GUI-образ
+make run-x86     явно запустить AMD64 VM
 make build-arm   собрать полный ARM-образ (kernel/RUNE/VaraniaFS/AAVMF/ESP)
 make run-arm     запустить ARM-вариант (QEMU virt + UEFI)
-make lint        fmt + Clippy -D warnings
-make test-host   ABI, scheduler/lifecycle и host-tool unit tests
+make lint        fmt + ShellCheck + Clippy -D warnings для host/обеих ISA/UEFI
+make test-host   ABI, SystemUI/assets, scheduler, loader/format/fs/tool tests
 make test-arch   собрать kernel/runtime/apps для AMD64 и AArch64
 make test-boot   GRUB/Multiboot2 + CPL3 RUNE/VFS/fault/reclaim test
 make test-arm-boot AAVMF + EL0/EL1/GICv3/PSCI/VFS test
+make test-arm-gui AAVMF + virtio GPU/input + SystemUI smoke test
 make test-gui    keyboard/mouse/window framebuffer test
 make test        полный test suite
 make clean       удалить генерируемые артефакты
@@ -53,12 +57,16 @@ SHA-256 check, zeroed 64 MiB NVRAM template).
 - `build/arm-firmware/edk2-aarch64-{code,vars-template}.fd`.
 
 `make run-arm` (`scripts/run-arm.sh`) запускает QEMU `virt` с двумя pflash
-(code + runtime NVRAM), modern virtio-mmio VaraniaFS и ESP; serial остаётся в
-терминале. `acpi=off` обязателен: AAVMF публикует FDT, из которого kernel
-получает CPU/PSCI. Текущая AAVMF-конфигурация не даёт GOP, поэтому ARM boot
-работает serial-only.
-Переопределяемые параметры: `ARM_SMP` (2), `ARM_MEMORY_MB` (512),
-`ARM_CPU_MODEL` (cortex-a72), `RUSTOS_FULLSCREEN` (1 на macOS).
+(code + runtime NVRAM), modern virtio-mmio VaraniaFS, GPU, keyboard/mouse и
+ESP; serial остаётся в терминале. `acpi=off` обязателен: AAVMF публикует FDT,
+из которого kernel получает CPU/PSCI. GOP у этой конфигурации `BltOnly`,
+поэтому после handoff собственный modern virtio-mmio GPU driver создаёт
+scanout и обеспечивает runtime mode-set.
+
+На macOS ARM default — `hvf + host`; на AArch64 Linux — `kvm + host`; fallback
+— `tcg + cortex-a72`. Переопределяемые параметры: `ARM_SMP` (4),
+`ARM_MEMORY_MB` (1024), `ARM_CPU_MODEL`, `ARM_ACCEL`, `RUSTOS_FULLSCREEN`
+(1 на macOS).
 
 `make test-arm-boot` пересобирает kernel с `boot-test`, запускает headless
 QEMU и требует: Device Tree, GICv3/Generic Timer, минимум два timer tick и
@@ -70,6 +78,9 @@ context switch, `discovered=2 online=2` после настоящего PSCI `CP
 
 GUI-тест общается с QEMU monitor через workspace tool `rustos-hmp`, поэтому
 не зависит от несовместимых вариантов `nc` на macOS и Linux.
+`make test-arm-gui` дополнительно требует настоящие keyboard/mouse events,
+команду terminal, открытие Start и валидный PPM screendump; артефакты лежат в
+`build/test-results/arm-gui/`.
 
 `scripts/build.sh` сначала собирает freestanding user ELF из
 `userspace/bootstrap`, помещает их в generated RIFS initramfs, затем собирает

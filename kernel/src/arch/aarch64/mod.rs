@@ -340,6 +340,39 @@ pub fn debug_exit(_code: u8) {
     }
 }
 
+/// Публикует записанный kernel'ом диапазон для последующего исполнения.
+///
+/// AArch64 не обещает автоматическую когерентность D-cache и I-cache. Сначала
+/// очищаем каждую data line до point of unification, затем инвалидируем
+/// соответствующие instruction lines. Размеры линий берутся из CTR_EL0, а не
+/// зашиваются под QEMU/Apple Silicon.
+pub fn synchronize_executable_memory(address: u64, length: usize) {
+    if length == 0 {
+        return;
+    }
+    let mut ctr: u64;
+    unsafe {
+        asm!("mrs {ctr}, ctr_el0", ctr = out(reg) ctr, options(nomem, nostack));
+    }
+    let data_line = 4u64 << ((ctr >> 16) & 0xf);
+    let instruction_line = 4u64 << (ctr & 0xf);
+    let end = address.saturating_add(length as u64);
+    let mut cursor = address & !(data_line - 1);
+    while cursor < end {
+        unsafe { asm!("dc cvau, {line}", line = in(reg) cursor, options(nostack)) };
+        cursor = cursor.saturating_add(data_line);
+    }
+    unsafe { asm!("dsb ish", options(nostack)) };
+    cursor = address & !(instruction_line - 1);
+    while cursor < end {
+        unsafe { asm!("ic ivau, {line}", line = in(reg) cursor, options(nostack)) };
+        cursor = cursor.saturating_add(instruction_line);
+    }
+    unsafe {
+        asm!("dsb ish", "isb", options(nostack));
+    }
+}
+
 pub fn power_off() -> ! {
     debug_exit(0);
     loop {

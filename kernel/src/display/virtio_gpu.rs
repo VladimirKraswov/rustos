@@ -15,11 +15,11 @@ use rustos_video::{
 
 use crate::memory::{self, FrameBlock};
 
-use super::{
-    edid,
-    pci::discover_virtio_gpu,
-    virtqueue::{ModernTransport, TransportError},
-};
+#[cfg(target_arch = "aarch64")]
+use super::virtqueue_mmio::ModernMmioTransport as GpuTransport;
+use super::{edid, TransportError};
+#[cfg(target_arch = "x86_64")]
+use super::{pci::discover_virtio_gpu, virtqueue::ModernTransport as GpuTransport};
 
 const MAX_SCANOUTS: usize = 16;
 // Preferred + до 16 EDID timings + полный набор стандартных режимов. Лимит
@@ -187,7 +187,7 @@ struct Resource {
 }
 
 pub struct VirtioGpu {
-    transport: ModernTransport,
+    transport: GpuTransport,
     scanout: u32,
     resource: Resource,
     next_resource: u32,
@@ -201,8 +201,13 @@ pub struct VirtioGpu {
 
 impl VirtioGpu {
     pub fn initialize(fallback: DisplayMode) -> Result<Self, ModeSetError> {
-        let regions = discover_virtio_gpu().ok_or(ModeSetError::DeviceLost)?;
-        let transport = ModernTransport::initialize(regions).map_err(map_transport)?;
+        #[cfg(target_arch = "x86_64")]
+        let transport = {
+            let regions = discover_virtio_gpu().ok_or(ModeSetError::DeviceLost)?;
+            GpuTransport::initialize(regions).map_err(map_transport)?
+        };
+        #[cfg(target_arch = "aarch64")]
+        let transport = GpuTransport::initialize().map_err(map_transport)?;
         let placeholder = Resource {
             id: 0,
             backing: FrameBlock { phys: 0, frames: 0 },

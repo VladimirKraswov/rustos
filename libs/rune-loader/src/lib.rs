@@ -684,19 +684,7 @@ impl<'a, S: ModuleSource> DynamicLoader<'a, S> {
                             )
                             .or_else(|| {
                                 (import.flags & rustos_rune_format::import_flags::WEAK != 0)
-                                    .then_some(Definition {
-                                        address: 0,
-                                        module: module_index,
-                                        export: Export {
-                                            interface: import.interface,
-                                            symbol: import.symbol,
-                                            virtual_address: 0,
-                                            abi_version: 0,
-                                            flags: 0,
-                                            name_offset: 0,
-                                            name_length: 0,
-                                        },
-                                    })
+                                    .then_some(Definition { address: 0 })
                             })
                             .ok_or(LoadError::MissingImport)?;
                         if relocation.kind == relocation_kind::IMPORT64 {
@@ -738,7 +726,7 @@ impl<'a, S: ModuleSource> DynamicLoader<'a, S> {
         maximum_abi: u16,
         import_flags: u32,
     ) -> Option<Definition> {
-        for (module_index, module) in self.modules.iter().take(self.module_count).enumerate() {
+        for module in self.modules.iter().take(self.module_count) {
             let module = module.as_ref()?;
             for export in exports(module.container).ok()? {
                 if export.interface == interface
@@ -749,8 +737,6 @@ impl<'a, S: ModuleSource> DynamicLoader<'a, S> {
                 {
                     return Some(Definition {
                         address: module.base.checked_add(export.virtual_address)?,
-                        module: module_index,
-                        export,
                     });
                 }
             }
@@ -805,10 +791,6 @@ impl<'a, S: ModuleSource> DynamicLoader<'a, S> {
 #[derive(Clone, Copy)]
 struct Definition {
     address: u64,
-    #[allow(dead_code)]
-    module: usize,
-    #[allow(dead_code)]
-    export: Export,
 }
 
 fn regions<'a>(container: Container<'a>) -> impl Iterator<Item = TocEntry> + 'a {

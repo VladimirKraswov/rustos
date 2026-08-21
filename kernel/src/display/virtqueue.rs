@@ -12,7 +12,7 @@ use core::{
 
 use crate::memory::{self, FrameBlock};
 
-use super::pci::VirtioPciRegions;
+use super::{pci::VirtioPciRegions, TransportError};
 
 const STATUS_ACKNOWLEDGE: u8 = 1;
 const STATUS_DRIVER: u8 = 2;
@@ -26,15 +26,6 @@ const DESC_WRITE: u16 = 2;
 const CONTROL_QUEUE: u16 = 0;
 const MAX_QUEUE_SIZE: u16 = 64;
 const POLL_LIMIT: usize = 50_000_000;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum TransportError {
-    Unsupported,
-    InvalidConfiguration,
-    OutOfMemory,
-    RejectedFeatures,
-    Timeout,
-}
 
 #[repr(C)]
 #[derive(Clone, Copy)]

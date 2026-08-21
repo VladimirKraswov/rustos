@@ -1,9 +1,9 @@
 # RustOS — учебная 64-битная микроядерная операционная система.
 #
 # Workspace делится на четыре «мира»:
-#   * no_std ми́ры (target x86_64-unknown-rustos): ядро, runtime, сервисы,
-#     драйверы, приложения;
-#   * UEFI-мир (target x86_64-unknown-uefi): загрузчик;
+#   * no_std миры (`targets/*-unknown-rustos.json`): ядро, runtime, сервисы,
+#     драйверы и приложения для AMD64/AArch64;
+#   * UEFI-мир (`x86_64-unknown-uefi`, `aarch64-unknown-uefi`): загрузчик;
 #   * host-мир (native target): инструменты mkfs/image и хост-тесты.
 #
 # Все версии зависимостей зафиксированы жёстко (оператор `=`) — см. Cargo.lock.

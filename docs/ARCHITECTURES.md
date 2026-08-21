@@ -30,8 +30,9 @@ address space и абстрактный scheduler timer. Он не знает и
 слое. AMD64 Multiboot entry изолирован в `arch/x86_64/multiboot2.rs`.
 
 PS/2 находится в `kernel/src/input/ps2.rs`, потому что это устройство PC, а
-не часть x86. На ARM input backend пока пустой; конкретная плата позднее
-выберет USB HID, virtio-input или SoC controller из Device Tree/ACPI.
+не часть x86. QEMU ARM использует независимый modern virtio-mmio backend для
+keyboard/mouse; физическая плата позднее выберет USB HID либо SoC controller
+из Device Tree.
 
 ## Общий ABI
 
@@ -68,7 +69,8 @@ toolchain output. User stack соблюдает SysV AMD64 и AAPCS64.
 | interrupt controller / timer | xAPIC/x2APIC + TSC deadline | GICv3 + Generic Timer PPI 30 |
 | SMP startup | ACPI + INIT-SIPI | Device Tree + PSCI `CPU_ON` |
 | persistent block | virtio-blk PCI | virtio-blk modern MMIO |
-| input | PS/2 bootstrap | нужен virtio-input/USB HID |
+| display | virtio-gpu modern PCI | virtio-gpu modern MMIO |
+| input | PS/2 bootstrap | virtio-input modern MMIO |
 
 `make test-arch` **собирает**, а не только парсит, kernel, runtime и все
 bootstrap applications для обоих JSON targets. `make test-arm-boot`
@@ -80,7 +82,9 @@ RUNE/std/VFS/loader и маркер `RING3_MILESTONE_OK`. CI выполняет 
 
 ## Эталонная ARM-платформа
 
-Эталонная платформа — QEMU `virt`, CPU `cortex-a72`, AAVMF и Device Tree.
+Эталонная VM-платформа — QEMU `virt`, AAVMF и Device Tree. На Apple Silicon
+интерактивный профиль использует `hvf + host`, а переносимый TCG-профиль —
+`cortex-a72`.
 Рабочая цепочка уже включает:
 
 1. `aarch64-unknown-uefi` loader, который принимает вход AAVMF из EL1 либо
@@ -92,12 +96,17 @@ RUNE/std/VFS/loader и маркер `RING3_MILESTONE_OK`. CI выполняет 
 4. bounded FDT parser и PSCI HVC/SMC conduit; до 64 CPU получают отдельные
    стеки, подтверждают online и пока безопасно parked;
 5. modern virtio-mmio block transport, persistent VaraniaFS, RUNE и
-   портированный Rust `std` в ring 3.
+   портированный Rust `std` в ring 3;
+6. modern virtio-mmio GPU control queue и virtio-input keyboard/mouse,
+   проверяемые отдельным ARM GUI integration test.
 
 Следующая граница честно уже не «запустить ARM»: нужны per-CPU scheduler/GICR,
-TLB shootdown и распределение runnable threads, затем virtio-input и
-virtio-gpu/display service. Текущий ARM запуск serial-only, поскольку AAVMF в
-этой конфигурации не предоставляет GOP.
+TLB shootdown и распределение runnable threads, затем перенос уже работающих
+virtio display/input transport'ов из bootstrap kernel в изолированные сервисы.
+
+Первая физическая ARM-цель — Raspberry Pi 4 (BCM2711, VideoCore VI / V3D
+4.2). Она не подменяет QEMU `virt`: для неё добавляются firmware/DT, VC4 KMS,
+USB и V3D backends, а микроядро, RUNE, SystemUI и applications остаются общими.
 
 После QEMU `virt` Raspberry Pi добавляет только platform backend (firmware
 boot, BCM interrupt/display/USB либо UEFI), не форк микроядра. Телефоны требуют

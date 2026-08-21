@@ -363,6 +363,14 @@ impl AddressSpace {
                     count,
                 );
             }
+            // На AMD64 I/D cache coherent. На AArch64 без явного clean D-cache
+            // + invalidate I-cache только что загруженная RX-страница иногда
+            // исполняет старые нули (особенно заметно под HVF при повторном
+            // использовании кадра). Backend сам выбирает нужную операцию.
+            crate::arch::synchronize_executable_memory(
+                page.physical_address + offset as u64,
+                count,
+            );
             copied += count;
         }
         Ok(())

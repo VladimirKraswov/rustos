@@ -138,7 +138,6 @@ impl FontStyle {
 
 pub const TERMINAL_DEFAULT: FontStyle = FontStyle::console(18);
 pub const UI_SMALL: FontStyle = FontStyle::sans(13);
-pub const UI_NORMAL: FontStyle = FontStyle::sans(15);
 pub const UI_TITLE: FontStyle = FontStyle::sans(15).bold();
 
 type SystemFont = BitmapFont<'static, Gray4, 1>;

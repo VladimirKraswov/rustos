@@ -1,6 +1,6 @@
 //! Поиск зависимостей, отображение сегментов и динамическая линковка.
 
-use core::{ptr, slice, str};
+use core::{ptr, str};
 
 use rustos_abi::{memory::MEMORY_ABI_VERSION, syscall, Handle, VmFlags, PAGE_SIZE};
 use rustos_runtime::{
@@ -978,8 +978,3 @@ fn add_signed(base: u64, addend: i64) -> Result<u64, LoadError> {
 // Гарантируем, что публичный caller может передавать таблицу shared regions
 // через ABI без зависимости от Rust layout внутренних структур.
 const _: () = assert!(core::mem::size_of::<SharedRegion>() == 32);
-
-#[allow(dead_code)]
-fn bytes_of<T>(value: &T) -> &[u8] {
-    unsafe { slice::from_raw_parts((value as *const T).cast::<u8>(), core::mem::size_of::<T>()) }
-}

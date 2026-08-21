@@ -82,7 +82,7 @@ client facade — четыре последовательные задачи, а
 | kernel/ring 3 compile | x86-64 target build | `make test-arch` |
 | desktop/terminal input/render | соответствующий host unit test | `make test-gui` |
 | process/VM/IPC/loader/VFS | узкий crate test | `make test-boot` либо полный `make test` |
-| RUNE/VaraniaFS format | crate unit + invalid fixtures | `make test-host` и совместимый image verify |
+| RUNE/RIFS/VaraniaFS format | crate unit + invalid fixtures | `make test-host` и совместимый image verify |
 | SDK example | `bash scripts/build-std.sh build -p rustos-sdk-hello --target targets/x86_64-unknown-rustos.json` | запуск RUNE в boot-test |
 
 Для проверки только компиляции kernel используй тот же freestanding target,

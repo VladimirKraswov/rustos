@@ -5,10 +5,6 @@
 //! привилегиями, и каждый доступ к порту/регистру осознан.
 //! Инициализация не нужна (порты x86 работают «из коробки» в long mode).
 
-// Часть функций (например, `outw` под ACPI PM) пока не используется —
-// модуль расширяется по мере появления драйверов, поэтому allow на уровень модуля.
-#![allow(dead_code)]
-
 mod apic;
 mod multiboot2;
 mod segmentation;
@@ -313,6 +309,12 @@ pub fn debug_exit(code: u8) {
             options(nomem, nostack)
         );
     }
+}
+
+/// x86 гарантирует когерентность instruction/data cache для обычной WB RAM.
+/// Compiler fence не даёт Rust переставить загрузку user image через границу.
+pub fn synchronize_executable_memory(_address: u64, _length: usize) {
+    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
 }
 
 /// Чтение 8-битного значения из IO-порта (для serial и ранней диагностики).

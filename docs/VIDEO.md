@@ -10,7 +10,8 @@
 3. **compositor** собирает произвольное число окон и overlays только в damage.
 
 Сейчас основной scanout — собственный драйвер **virtio-gpu 2D** поверх
-modern virtio-pci. Он получает EDID, перечисляет широкоформатные
+modern virtio-pci на AMD64 и modern virtio-mmio на AArch64. Он получает EDID,
+перечисляет широкоформатные
 режимы, создаёт 32-bit BGRX resource и меняет scanout без
 перезапуска. Закрытые GPU API, VirGL и host OpenGL не нужны:
 вся отрисовка по-прежнему выполняется CPU.
@@ -40,6 +41,8 @@ Policy `actual` сохраняет строгое окно 1:1 для pixel-leve
   обслуживает bounded split control queue. На bootstrap-этапе в очереди
   не больше одной команды, completion ожидается polling'ом с
   timeout;
+- `display/virtqueue_mmio.rs` предоставляет тому же GPU protocol modern MMIO
+  transport QEMU ARM `virt`; scanout/mode-set код не дублируется;
 - `display/edid.rs` проверяет signature/checksum EDID 1.x и извлекает
   preferred/standard timings и физический размер монитора;
 - `display/virtio_gpu.rs` реализует `GET_DISPLAY_INFO`, `GET_EDID`,
@@ -143,6 +146,32 @@ SwapBuffers станет surface commit: compositor заберёт послед�
 damage и fence, а сами пиксели остаются в shared memory.
 
 ## Следующие аппаратные этапы
+
+### Физическая ARM-цель: Raspberry Pi 4
+
+Первой поддерживаемой реальной платой выбрана Raspberry Pi 4 / BCM2711:
+четыре Cortex-A72 и VideoCore VI (V3D 4.2). Важно не называть это одним
+«видеодрайвером»: display controller и render GPU — разные устройства.
+
+Порт строится четырьмя независимо проверяемыми слоями:
+
+1. board support читает DT и выдаёт capabilities только на разрешённые MMIO,
+   IRQ, clocks/resets и DMA ranges;
+2. `vc4-displayd` управляет HVS/pixel valves/HDMI, EDID, modeset, planes и
+   page flip; compositor не получает прямого MMIO;
+3. `v3d-renderd` владеет V3D MMU, buffer objects, command queues, interrupts,
+   fences, hang reset и проверкой submission;
+4. user-space Mesa V3D/V3DV порт использует стабильный RustOS render ABI;
+   OpenGL/EGL не встраиваются в kernel и падение renderer не валит desktop.
+
+Начинать с абстрактной «Mali» хуже: Utgard, Midgard/Bifrost и Valhall требуют
+разных Lima/Panfrost/Panthor стеков и конкретной SoC display pipeline. Pi 4
+даёт одну воспроизводимую плату и зрелый открытый upstream VC4/V3D stack.
+
+Ссылки для реализации: [официальные характеристики BCM2711](https://www.raspberrypi.com/documentation/computers/processors.html),
+[Linux V3D driver](https://docs.kernel.org/gpu/v3d.html),
+[Mesa V3D/V3DV](https://docs.mesa3d.org/drivers/v3d.html) и
+[Linux VC4 display driver](https://docs.kernel.org/gpu/vc4.html).
 
 - frame pacing и monotonic presentation clock;
 - front/back/triple-buffer protocol с generation и fences;

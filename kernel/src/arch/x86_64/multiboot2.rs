@@ -55,7 +55,6 @@ static mut PAGE_TABLE_POOL: PageTablePool = PageTablePool([0; GRUB_PAGE_TABLE_BU
 unsafe extern "C" {
     static __kernel_start: u8;
     static __kernel_end: u8;
-    static rustos_multiboot2_stack_bottom: u8;
     static rustos_multiboot2_stack_top: u8;
 }
 
@@ -66,8 +65,6 @@ struct Interval {
 }
 
 impl Interval {
-    const EMPTY: Self = Self { start: 0, end: 0 };
-
     fn normalized(start: u64, end: u64) -> Option<Self> {
         let start = align_down(start, PAGE_SIZE);
         let end = align_up(end, PAGE_SIZE)?;
@@ -666,8 +663,6 @@ rustos_multiboot2_initial_pd3:
 
 .pushsection .bss.rustos_multiboot2_stack,"aw",@nobits
 .balign 16
-.global rustos_multiboot2_stack_bottom
-rustos_multiboot2_stack_bottom:
     .skip {kernel_stack_size}
 .global rustos_multiboot2_stack_top
 rustos_multiboot2_stack_top:

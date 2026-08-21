@@ -7,7 +7,6 @@
 
 // Конкретный транспорт выбирается на границе платформы: legacy PCI на
 // эталонном x86 QEMU и modern virtio-mmio на QEMU `virt` AArch64.
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug)]
 pub enum BlockError {
     Unsupported,

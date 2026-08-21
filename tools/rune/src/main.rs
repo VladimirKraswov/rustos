@@ -873,7 +873,7 @@ fn extract_relocations(
     let mut rela_entry_size = RELOCATION_SIZE as u64;
     let mut plt_rela_address = 0u64;
     let mut plt_rela_size = 0u64;
-    for entry in dynamic_bytes.chunks_exact(16) {
+    for entry in dynamic_entries(dynamic_bytes)? {
         let tag = read_i64(entry, 0)?;
         let value = read_u64(entry, 8)?;
         match tag {
@@ -895,18 +895,29 @@ fn extract_relocations(
     {
         return Err("only ELF64 RELA entries are supported".into());
     }
-    let count = (rela_size + plt_rela_size) / rela_entry_size;
-    let mut output = Vec::with_capacity(count as usize * RELOCATION_SIZE);
+    let count = rela_size
+        .checked_add(plt_rela_size)
+        .ok_or("combined RELA size overflow")?
+        / rela_entry_size;
+    let capacity = usize::try_from(count)
+        .ok()
+        .and_then(|count| count.checked_mul(RELOCATION_SIZE))
+        .ok_or("RELA output is too large")?;
+    let mut output = Vec::with_capacity(capacity);
     for (address, size) in [(rela_address, rela_size), (plt_rela_address, plt_rela_size)] {
         if size == 0 {
             continue;
         }
         let file_offset = virtual_to_file_offset(segments, address)?;
         for index in 0..size / rela_entry_size {
-            let offset = file_offset
-                .checked_add(index * rela_entry_size)
-                .ok_or("RELA offset overflow")? as usize;
-            let rela = elf.get(offset..offset + 24).ok_or("truncated RELA table")?;
+            let offset = usize::try_from(
+                file_offset
+                    .checked_add(index * rela_entry_size)
+                    .ok_or("RELA offset overflow")?,
+            )
+            .map_err(|_| "RELA offset does not fit host usize")?;
+            let end = offset.checked_add(24).ok_or("RELA range overflow")?;
+            let rela = elf.get(offset..end).ok_or("truncated RELA table")?;
             let target = read_u64(rela, 0)?
                 .checked_sub(min_page)
                 .ok_or("relocation target below image")?;
@@ -1111,15 +1122,26 @@ fn validate_load_segment(elf: &[u8], segment: ElfSegment) -> Result<(), String> 
 }
 
 fn virtual_to_file_offset(segments: &[ElfSegment], address: u64) -> Result<u64, String> {
-    segments
+    let segment = segments
         .iter()
         .find(|segment| {
             segment.kind == PT_LOAD
                 && address >= segment.virtual_address
                 && address < segment.virtual_address.saturating_add(segment.file_size)
         })
-        .map(|segment| segment.offset + address - segment.virtual_address)
-        .ok_or_else(|| "dynamic address is not backed by a load region".into())
+        .ok_or_else(|| "dynamic address is not backed by a load region".to_string())?;
+    segment
+        .offset
+        .checked_add(address - segment.virtual_address)
+        .ok_or_else(|| "dynamic file offset overflow".into())
+}
+
+fn dynamic_entries(bytes: &[u8]) -> Result<&[[u8; 16]], String> {
+    let (entries, remainder) = bytes.as_chunks::<16>();
+    if !remainder.is_empty() {
+        return Err("PT_DYNAMIC size is not a multiple of Elf64_Dyn".into());
+    }
+    Ok(entries)
 }
 
 fn add_string(table: &mut Vec<u8>, value: &str) -> Result<(u32, u16), String> {
@@ -1141,43 +1163,28 @@ fn align_up(value: u64, alignment: u64) -> Result<u64, String> {
 }
 
 fn read_u16(bytes: &[u8], offset: usize) -> Result<u16, String> {
-    Ok(u16::from_le_bytes(
-        bytes
-            .get(offset..offset + 2)
-            .ok_or("truncated u16")?
-            .try_into()
-            .unwrap(),
-    ))
+    Ok(u16::from_le_bytes(read_array(bytes, offset)?))
 }
 
 fn read_u32(bytes: &[u8], offset: usize) -> Result<u32, String> {
-    Ok(u32::from_le_bytes(
-        bytes
-            .get(offset..offset + 4)
-            .ok_or("truncated u32")?
-            .try_into()
-            .unwrap(),
-    ))
+    Ok(u32::from_le_bytes(read_array(bytes, offset)?))
 }
 
 fn read_u64(bytes: &[u8], offset: usize) -> Result<u64, String> {
-    Ok(u64::from_le_bytes(
-        bytes
-            .get(offset..offset + 8)
-            .ok_or("truncated u64")?
-            .try_into()
-            .unwrap(),
-    ))
+    Ok(u64::from_le_bytes(read_array(bytes, offset)?))
 }
 
 fn read_i64(bytes: &[u8], offset: usize) -> Result<i64, String> {
-    Ok(i64::from_le_bytes(
-        bytes
-            .get(offset..offset + 8)
-            .ok_or("truncated i64")?
-            .try_into()
-            .unwrap(),
-    ))
+    Ok(i64::from_le_bytes(read_array(bytes, offset)?))
+}
+
+fn read_array<const N: usize>(bytes: &[u8], offset: usize) -> Result<[u8; N], String> {
+    let end = offset.checked_add(N).ok_or("ELF field offset overflow")?;
+    bytes
+        .get(offset..end)
+        .ok_or_else(|| format!("truncated {N}-byte ELF field"))?
+        .try_into()
+        .map_err(|_| "internal ELF field length mismatch".into())
 }
 
 fn put_u16(bytes: &mut [u8], offset: usize, value: u16) {
@@ -1190,4 +1197,22 @@ fn put_u32(bytes: &mut [u8], offset: usize, value: u32) {
 
 fn put_u64(bytes: &mut [u8], offset: usize, value: u64) {
     bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dynamic_table_requires_complete_elf64_records() {
+        assert_eq!(dynamic_entries(&[0; 32]).unwrap().len(), 2);
+        assert!(dynamic_entries(&[0; 17]).is_err());
+    }
+
+    #[test]
+    fn integer_reader_rejects_truncation_and_offset_overflow() {
+        assert_eq!(read_u64(&8u64.to_le_bytes(), 0).unwrap(), 8);
+        assert!(read_u64(&[0; 7], 0).is_err());
+        assert!(read_u32(&[0; 8], usize::MAX).is_err());
+    }
 }

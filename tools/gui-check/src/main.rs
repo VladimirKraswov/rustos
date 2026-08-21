@@ -1,7 +1,15 @@
-//! Проверка PPM screendump до, во время и после действий window manager.
+//! CI-проверка GUI по трём PPM-скриншотам QEMU:
+//! `<terminal.ppm>` (окно открыто) `<dragged.ppm>` (окно перетащено)
+//! `<minimized.ppm>` (окно свёрнуто в taskbar).
+//!
+//! Проверяются именно изменения геометрии: старый левый край окна стал
+//! обоями, новый правый — тёмным terminal, центр при минимизации — синий
+//! desktop, taskbar не пустой, и общее число изменившихся пикселей
+//! достаточно велико (защита от «счастливой» пустой VM).
 
 use std::{env, fs, path::Path};
 
+/// Разобранный binary PPM (P6) — RGB, 8 бит на канал.
 struct Image {
     width: usize,
     height: usize,
@@ -9,6 +17,7 @@ struct Image {
 }
 
 impl Image {
+    /// Читает и валидирует PPM-файл (max=255, размер не меньше 800×600).
     fn read(path: &Path) -> Result<Self, String> {
         let data = fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
         let mut cursor = 0;
@@ -59,6 +68,7 @@ impl Image {
     }
 }
 
+/// Следующий whitespace-токен заголовка PPM, с пропуском `#`-комментариев.
 fn token<'a>(data: &'a [u8], cursor: &mut usize) -> Result<&'a [u8], String> {
     loop {
         while data.get(*cursor).is_some_and(u8::is_ascii_whitespace) {

@@ -145,10 +145,6 @@ fn main() -> Status {
 
 /// Раскладка блока резерва (смещения от начала блока).
 ///
-/// Поля `scratch`/`stack` не читаются в текущем срезе (вершина стека =
-/// `base + size`) — они существуют, чтобы документировать раскладку блока,
-/// поэтому `allow(dead_code)`.
-#[allow(dead_code)]
 struct Layout {
     /// Общий размер блока, выровненный вверх до 64 KiB.
     size: u64,
@@ -161,9 +157,8 @@ struct Layout {
     /// Копия BootInfo.
     bootinfo: u64,
     /// Вспомогательная область.
+    #[cfg(target_arch = "aarch64")]
     scratch: u64,
-    /// Boot-стек (заканчивает блок; верх = начало + size).
-    stack: u64,
 }
 
 impl Layout {
@@ -187,8 +182,8 @@ impl Layout {
             initramfs: kernel_end,
             page_tables: kernel_end + initramfs_end,
             bootinfo: kernel_end + initramfs_end + PAGE_TABLE_BUDGET,
+            #[cfg(target_arch = "aarch64")]
             scratch: kernel_end + initramfs_end + PAGE_TABLE_BUDGET + bootinfo_end,
-            stack: size - KERNEL_STACK_SIZE,
         }
     }
 }

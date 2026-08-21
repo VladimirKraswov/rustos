@@ -6,13 +6,17 @@
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-cd "$ROOT"
+cd "$ROOT" || exit 1
 
 [[ -f build/esp.img ]] || { echo "нет build/esp.img — сначала: make build" >&2; exit 1; }
 bash scripts/bootstrap-ovmf.sh >/dev/null
 
 ACCEL=tcg
-[[ -w /dev/kvm ]] && ACCEL=kvm
+case "$(uname -m)" in
+    x86_64|amd64)
+        [[ -w /dev/kvm ]] && ACCEL=kvm
+        ;;
+esac
 if [[ "$ACCEL" == "kvm" ]]; then
     DEFAULT_TIMEOUT=120
 else
@@ -43,6 +47,8 @@ cp -f build/ovmf/OVMF_VARS.fd "$VARS"
 
 QPID=""
 WATCHDOG=""
+# Функция вызывается косвенно через `trap`; ShellCheck не строит такой edge.
+# shellcheck disable=SC2329
 cleanup() {
     trap - EXIT INT TERM HUP
     if [[ -n "$WATCHDOG" ]]; then

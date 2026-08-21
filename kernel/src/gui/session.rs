@@ -21,7 +21,7 @@ use crate::{
     arch, font,
     graphics::{Color, Framebuffer, Rect},
     gui::{
-        components::{Button, Label, Panel, Theme, Widget},
+        chrome::{Button, Label, Panel, Theme, Widget},
         cursor::Cursor,
     },
     input::{self, Event, Key, MouseEvent, PlatformInput},

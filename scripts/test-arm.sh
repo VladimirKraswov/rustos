@@ -7,7 +7,7 @@
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-cd "$ROOT"
+cd "$ROOT" || exit 1
 
 [[ -f build/arm/esp-arm.img ]] || {
     echo "нет build/arm/esp-arm.img — сначала: RUSTOS_BOOT_TEST=1 make build-arm" >&2
@@ -58,6 +58,8 @@ cp -f build/arm-system.vfs "$SYSTEM_DISK"
 
 QPID=""
 WATCHDOG=""
+# Функция вызывается косвенно через `trap`; ShellCheck не строит такой edge.
+# shellcheck disable=SC2329
 cleanup() {
     trap - EXIT INT TERM HUP
     if [[ -n "$WATCHDOG" ]]; then

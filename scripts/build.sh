@@ -83,6 +83,14 @@ else
         --target targets/x86_64-unknown-rustos.json
 fi
 
+# Cargo кладёт варианты с разными feature в один человекочитаемый путь
+# `target/.../rustos-kernel`. Последующие `cargo run` для host-инструментов не
+# должны иметь возможности незаметно подменить выбранный boot-test/GUI-вариант.
+# Поэтому, как и в ARM-сборке, фиксируем ядро сразу после компиляции и дальше
+# работаем только с этой неизменяемой копией.
+mkdir -p build/x86
+cp -f target/x86_64-unknown-rustos/debug/rustos-kernel build/x86/kernel.elf
+
 echo "[build] 3/9 staging: kernel + initramfs root"
 STAGE="$ROOT/build/initramfs-root"
 rm -rf "$STAGE"
@@ -112,7 +120,7 @@ cargo run -q -p rustos-vfs-image -- --verify build/system.vfs
 
 echo "[build] 6/9 GRUB 2 standalone EFI (Multiboot2)"
 bash scripts/build-grub.sh \
-    target/x86_64-unknown-rustos/debug/rustos-kernel \
+    build/x86/kernel.elf \
     build/initramfs.img \
     build/grub/BOOTX64.EFI
 

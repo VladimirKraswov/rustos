@@ -18,5 +18,5 @@ fn main() {
 
 #[cfg(not(target_os = "rustos"))]
 fn main() {
-    eprintln!("Этот пример предназначен для target x86_64-unknown-rustos");
+    eprintln!("Этот пример предназначен для одного из RustOS target specs");
 }

@@ -23,9 +23,9 @@
 //! DOS-дата 1980/1/1 (fatfs без фичи `chrono`). Один и тот же загрузчик даёт
 //! байт-в-байт идентичный образ.
 
-use std::fs;
+use std::fs::{self, File, OpenOptions};
 use std::io::{Cursor, Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use fatfs::{format_volume, FatType, FileSystem, FormatVolumeOptions, FsOptions};
@@ -36,6 +36,9 @@ const DEFAULT_SIZE_MB: u64 = 256;
 const DEFAULT_EFI_NAME: &str = "BOOTX64.EFI";
 const NUM_ENTRIES: u32 = 128;
 const ENTRY_SIZE: u32 = 128;
+const GPT_HEADER_SIZE: usize = 92;
+const ENTRY_ARRAY_BYTES: usize = NUM_ENTRIES as usize * ENTRY_SIZE as usize;
+const ENTRY_ARRAY_SECTORS: u64 = ENTRY_ARRAY_BYTES.div_ceil(SECTOR) as u64;
 /// Первая usable LBA (после protective MBR + GPT header + 128 записей).
 const FIRST_USABLE_LBA: u64 = 34;
 /// Запас с конца диска под backup GPT (записи + заголовок).
@@ -93,6 +96,7 @@ fn run() -> Result<(), String> {
                     "usage: rustos-image --verify <img> [expected_efi] [--efi-name NAME]".into(),
                 );
             }
+            validate_efi_name(&efi_name)?;
             return verify_image(
                 positionals.first().copied(),
                 positionals.get(1).copied(),
@@ -140,8 +144,12 @@ fn run() -> Result<(), String> {
     }
 
     let efi_bytes = fs::read(efi_path).map_err(|e| format!("{}: {e}", efi_path.display()))?;
+    validate_efi_name(&efi_name)?;
 
-    let total_bytes = (size_mb * 1024 * 1024) as usize;
+    let total_bytes = size_mb
+        .checked_mul(1024 * 1024)
+        .and_then(|bytes| usize::try_from(bytes).ok())
+        .ok_or("--size-mb: размер не помещается в адресное пространство host")?;
     let total_lbas = (total_bytes / SECTOR) as u64;
 
     // 1. Нулевой диск.
@@ -154,12 +162,12 @@ fn run() -> Result<(), String> {
     //    (BOOTX64.EFI по умолчанию; BOOTAA64.EFI для AArch64).
     let part_first = FIRST_USABLE_LBA;
     let part_last = total_lbas - TAIL_RESERVED_LBA;
-    let part_start = (part_first * SECTOR as u64) as usize;
-    let part_end = ((part_last + 1) * SECTOR as u64) as usize;
-    write_esp(&mut disk[part_start..part_end], &efi_bytes, &efi_name)?;
+    let partition = lba_range(part_first, part_last, disk.len())?;
+    write_esp(&mut disk[partition], &efi_bytes, &efi_name)?;
 
-    // 4. Запись образа.
-    fs::write(out_path, &disk).map_err(|e| format!("{}: {e}", out_path.display()))?;
+    // 4. До публикации образ обязан пройти тот же parser, что `--verify`.
+    verify_disk(&mut disk, Some(&efi_bytes), &efi_name)?;
+    atomic_write(out_path, &disk)?;
 
     println!(
         "rustos-image: OK — {} ({} МБ, {} LBA, ESP {}..{} LBA, FAT32, EFI/BOOT/{} {} Б)",
@@ -186,87 +194,185 @@ fn verify_image(
     let img_path =
         img.ok_or("usage: rustos-image --verify <img> [expected_efi] [--efi-name NAME]")?;
     let mut disk = fs::read(img_path).map_err(|e| format!("{}: {e}", img_path))?;
-    let total_lbas = (disk.len() / SECTOR) as u64;
-
-    // 1. GPT: primary header (LBA 1).
-    let hdr = &disk[SECTOR..2 * SECTOR];
-    if &hdr[0..8] != b"EFI PART" {
-        return Err("GPT: primary header signature не найдена".into());
+    let expected = expected_efi
+        .map(|path| fs::read(path).map_err(|error| format!("{path}: {error}")))
+        .transpose()?;
+    let verified = verify_disk(&mut disk, expected.as_deref(), efi_name)?;
+    println!(
+        "verify: GPT OK — {} LBA, ESP {}..{} LBA (EF00)",
+        verified.total_lbas, verified.partition_first, verified.partition_last
+    );
+    println!("verify: FAT OK — {efi_name} = {} Б", verified.efi_size);
+    if let Some(reference) = expected_efi {
+        println!("verify: {efi_name} совпадает с эталоном ({reference})");
     }
-    let header_size = u32::from_le_bytes(hdr[12..16].try_into().unwrap()) as usize;
-    let stored_hdr_crc = u32::from_le_bytes(hdr[16..20].try_into().unwrap());
-    let mut hdr_check = hdr[..header_size].to_vec();
-    hdr_check[16..20].copy_from_slice(&0u32.to_le_bytes());
-    let calc_hdr_crc = crc32(&hdr_check);
-    if calc_hdr_crc != stored_hdr_crc {
-        return Err(format!(
-            "GPT: CRC primary header не сходится (stored {stored_hdr_crc:#010x}, calc {calc_hdr_crc:#010x})"
-        ));
-    }
-    let entries_lba = u64::from_le_bytes(hdr[72..80].try_into().unwrap());
-    let num_entries = u32::from_le_bytes(hdr[80..84].try_into().unwrap()) as usize;
-    let entry_size = u32::from_le_bytes(hdr[84..88].try_into().unwrap()) as usize;
-    let stored_ent_crc = u32::from_le_bytes(hdr[88..92].try_into().unwrap());
+    println!("rustos-image: verify OK");
+    Ok(())
+}
 
-    let ent_start = (entries_lba as usize) * SECTOR;
-    let ent_bytes = num_entries * entry_size;
-    let entries = &disk[ent_start..ent_start + ent_bytes];
-    let calc_ent_crc = crc32(entries);
-    if calc_ent_crc != stored_ent_crc {
-        return Err(format!(
-            "GPT: CRC partition entries не сходится (stored {stored_ent_crc:#010x}, calc {calc_ent_crc:#010x})"
-        ));
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct VerifiedImage {
+    total_lbas: u64,
+    partition_first: u64,
+    partition_last: u64,
+    efi_size: usize,
+}
+
+#[derive(Clone, Copy)]
+struct GptHeader {
+    my_lba: u64,
+    alternate_lba: u64,
+    first_usable: u64,
+    last_usable: u64,
+    entries_lba: u64,
+    entries_crc: u32,
+}
+
+fn verify_disk(
+    disk: &mut [u8],
+    expected_efi: Option<&[u8]>,
+    efi_name: &str,
+) -> Result<VerifiedImage, String> {
+    validate_efi_name(efi_name)?;
+    if disk.len() < 4 * SECTOR || !disk.len().is_multiple_of(SECTOR) {
+        return Err("GPT: размер диска мал или не кратен сектору".into());
+    }
+    if disk.get(510..512) != Some(&[0x55, 0xaa])
+        || disk.get(450) != Some(&0xee)
+        || read_u32(disk, 454)? != 1
+    {
+        return Err("GPT: protective MBR повреждён".into());
     }
 
-    // Ищем ESP (EF00).
-    let mut esp: Option<(u64, u64)> = None;
-    for i in 0..num_entries {
-        let e = &entries[i * entry_size..(i + 1) * entry_size];
-        if e[0..16] == ESP_TYPE_GUID {
-            let first = u64::from_le_bytes(e[32..40].try_into().unwrap());
-            let last = u64::from_le_bytes(e[40..48].try_into().unwrap());
-            esp = Some((first, last));
+    let total_lbas = u64::try_from(disk.len() / SECTOR).map_err(|_| "GPT: диск слишком велик")?;
+    let primary = parse_gpt_header(disk, 1)?;
+    let backup_lba = total_lbas.checked_sub(1).ok_or("GPT: нет backup LBA")?;
+    let backup = parse_gpt_header(disk, backup_lba)?;
+    let expected_backup_entries = backup_lba
+        .checked_sub(ENTRY_ARRAY_SECTORS)
+        .ok_or("GPT: backup entries underflow")?;
+    if primary.my_lba != 1
+        || primary.alternate_lba != backup_lba
+        || primary.entries_lba != 2
+        || backup.my_lba != backup_lba
+        || backup.alternate_lba != 1
+        || backup.entries_lba != expected_backup_entries
+        || primary.first_usable != backup.first_usable
+        || primary.last_usable != backup.last_usable
+        || primary.entries_crc != backup.entries_crc
+    {
+        return Err("GPT: primary и backup headers не согласованы".into());
+    }
+
+    let primary_entries = partition_entries(disk, primary)?;
+    let backup_entries = partition_entries(disk, backup)?;
+    if primary_entries != backup_entries {
+        return Err("GPT: primary и backup partition arrays различаются".into());
+    }
+
+    let mut esp = None;
+    let (entries, remainder) = primary_entries.as_chunks::<{ ENTRY_SIZE as usize }>();
+    if !remainder.is_empty() {
+        return Err("GPT: partition array не кратен размеру записи".into());
+    }
+    for entry in entries {
+        let kind = entry.get(..16).ok_or("GPT: обрезан GUID записи")?;
+        if kind.iter().all(|&byte| byte == 0) {
+            continue;
         }
+        if kind != ESP_TYPE_GUID {
+            return Err("GPT: образ RustOS содержит неизвестный раздел".into());
+        }
+        if esp.is_some() {
+            return Err("GPT: образ RustOS содержит несколько ESP".into());
+        }
+        let first = read_u64(entry, 32)?;
+        let last = read_u64(entry, 40)?;
+        if first < primary.first_usable || last > primary.last_usable || first > last {
+            return Err("GPT: ESP выходит за usable LBA".into());
+        }
+        esp = Some((first, last));
     }
-    let (part_first, part_last) = esp.ok_or("GPT: ESP-раздел (EF00) не найден")?;
-    println!("verify: GPT OK — {total_lbas} LBA, ESP {part_first}..{part_last} LBA (EF00)");
+    let (partition_first, partition_last) = esp.ok_or("GPT: ESP-раздел не найден")?;
+    let partition = lba_range(partition_first, partition_last, disk.len())?;
 
-    // 2. FAT: read-back EFI/BOOT/<efi_name>.
-    let part_start = (part_first * SECTOR as u64) as usize;
-    let part_end = ((part_last + 1) * SECTOR as u64) as usize;
     let mut efi_on_disk = Vec::new();
     {
-        let volume = FileSystem::new(
-            Cursor::new(&mut disk[part_start..part_end]),
-            FsOptions::new(),
-        )
-        .map_err(|e| format!("FAT: FileSystem::new: {e}"))?;
+        let volume = FileSystem::new(Cursor::new(&mut disk[partition]), FsOptions::new())
+            .map_err(|error| format!("FAT: FileSystem::new: {error}"))?;
         let root = volume.root_dir();
         let efi_dir = root
             .open_dir("EFI")
-            .map_err(|e| format!("FAT: каталог EFI: {e}"))?;
+            .map_err(|error| format!("FAT: каталог EFI: {error}"))?;
         let boot_dir = efi_dir
             .open_dir("BOOT")
-            .map_err(|e| format!("FAT: каталог EFI/BOOT: {e}"))?;
+            .map_err(|error| format!("FAT: каталог EFI/BOOT: {error}"))?;
         let mut file = boot_dir
             .open_file(efi_name)
-            .map_err(|e| format!("FAT: EFI/BOOT/{efi_name}: {e}"))?;
-        Read::read_to_end(&mut file, &mut efi_on_disk)
-            .map_err(|e| format!("FAT: read {efi_name}: {e}"))?;
+            .map_err(|error| format!("FAT: EFI/BOOT/{efi_name}: {error}"))?;
+        file.read_to_end(&mut efi_on_disk)
+            .map_err(|error| format!("FAT: read {efi_name}: {error}"))?;
     }
-    println!("verify: FAT OK — {efi_name} = {} Б", efi_on_disk.len());
-
-    // 3. Опциональное байт-в-байт сравнение с эталоном.
-    if let Some(ref_e) = expected_efi {
-        let ref_bytes = fs::read(ref_e).map_err(|e| format!("{}: {e}", ref_e))?;
-        if ref_bytes != efi_on_disk {
-            return Err(format!("{efi_name} на образе НЕ совпадает с эталоном"));
-        }
-        println!("verify: {efi_name} совпадает с эталоном ({ref_e})");
+    if expected_efi.is_some_and(|expected| expected != efi_on_disk) {
+        return Err(format!("{efi_name} на образе не совпадает с эталоном"));
     }
+    Ok(VerifiedImage {
+        total_lbas,
+        partition_first,
+        partition_last,
+        efi_size: efi_on_disk.len(),
+    })
+}
 
-    println!("rustos-image: verify OK");
-    Ok(())
+fn parse_gpt_header(disk: &[u8], lba: u64) -> Result<GptHeader, String> {
+    let sector = lba_count_range(lba, 1, disk.len())?;
+    let header = disk.get(sector).ok_or("GPT: header вне диска")?;
+    if header.get(..8) != Some(b"EFI PART") {
+        return Err(format!("GPT: signature не найдена в LBA {lba}"));
+    }
+    if read_u32(header, 8)? != 0x0001_0000 || read_u32(header, 20)? != 0 {
+        return Err("GPT: revision/reserved заголовка не поддерживаются".into());
+    }
+    let header_size =
+        usize::try_from(read_u32(header, 12)?).map_err(|_| "GPT: header_size overflow")?;
+    if !(GPT_HEADER_SIZE..=SECTOR).contains(&header_size) {
+        return Err("GPT: неверный header_size".into());
+    }
+    let stored_crc = read_u32(header, 16)?;
+    let mut checked = header
+        .get(..header_size)
+        .ok_or("GPT: обрезанный заголовок")?
+        .to_vec();
+    checked[16..20].copy_from_slice(&0u32.to_le_bytes());
+    if crc32(&checked) != stored_crc {
+        return Err(format!("GPT: CRC заголовка LBA {lba} не сходится"));
+    }
+    if read_u32(header, 80)? != NUM_ENTRIES || read_u32(header, 84)? != ENTRY_SIZE {
+        return Err("GPT: RustOS ожидает 128 записей по 128 байт".into());
+    }
+    let result = GptHeader {
+        my_lba: read_u64(header, 24)?,
+        alternate_lba: read_u64(header, 32)?,
+        first_usable: read_u64(header, 40)?,
+        last_usable: read_u64(header, 48)?,
+        entries_lba: read_u64(header, 72)?,
+        entries_crc: read_u32(header, 88)?,
+    };
+    if result.my_lba != lba || result.first_usable > result.last_usable {
+        return Err("GPT: неверные self/usable LBA".into());
+    }
+    Ok(result)
+}
+
+fn partition_entries(disk: &[u8], header: GptHeader) -> Result<&[u8], String> {
+    let range = lba_count_range(header.entries_lba, ENTRY_ARRAY_SECTORS, disk.len())?;
+    let entries = disk
+        .get(range.start..range.start + ENTRY_ARRAY_BYTES)
+        .ok_or("GPT: partition array обрезан")?;
+    if crc32(entries) != header.entries_crc {
+        return Err("GPT: CRC partition entries не сходится".into());
+    }
+    Ok(entries)
 }
 
 /// Записывает GPT (protective MBR + primary/backup header + partition entries).
@@ -274,7 +380,7 @@ fn write_gpt(disk: &mut [u8], total_lbas: u64) -> Result<(), String> {
     let primary_hdr_lba: u64 = 1;
     let backup_hdr_lba: u64 = total_lbas - 1;
     let primary_entries_lba: u64 = 2;
-    let backup_entries_lba: u64 = total_lbas - 1 - (NUM_ENTRIES as u64);
+    let backup_entries_lba: u64 = total_lbas - 1 - ENTRY_ARRAY_SECTORS;
     let first_usable: u64 = FIRST_USABLE_LBA;
     let last_usable: u64 = total_lbas - TAIL_RESERVED_LBA;
     let part_first: u64 = FIRST_USABLE_LBA;
@@ -322,8 +428,6 @@ fn write_gpt(disk: &mut [u8], total_lbas: u64) -> Result<(), String> {
 /// Protective MBR: один псевдо-раздел 0xEE, покрывающий весь диск.
 fn build_protective_mbr(total_lbas: u64) -> [u8; SECTOR] {
     let mut m = [0u8; SECTOR];
-    m[444] = 0x55;
-    m[445] = 0xaa;
     // Partition entry #1 (offset 446..462).
     m[446] = 0x00; // status
     m[447] = 0x00; // CHS start: head
@@ -340,6 +444,8 @@ fn build_protective_mbr(total_lbas: u64) -> [u8; SECTOR] {
         (total_lbas - 1) as u32
     };
     m[458..462].copy_from_slice(&lba_count.to_le_bytes());
+    m[510] = 0x55;
+    m[511] = 0xaa;
     m
 }
 
@@ -427,6 +533,113 @@ fn write_esp(part: &mut [u8], efi: &[u8], efi_name: &str) -> Result<(), String> 
     Ok(())
 }
 
+fn validate_efi_name(name: &str) -> Result<(), String> {
+    if name.is_empty()
+        || name.len() > 12
+        || name.bytes().any(|byte| {
+            !byte.is_ascii_alphanumeric() && byte != b'.' && byte != b'_' && byte != b'-'
+        })
+        || name.matches('.').count() > 1
+    {
+        return Err("--efi-name: ожидается одно безопасное ASCII 8.3 имя".into());
+    }
+    Ok(())
+}
+
+fn lba_range(first: u64, last: u64, disk_len: usize) -> Result<core::ops::Range<usize>, String> {
+    if first > last {
+        return Err("GPT: диапазон LBA инвертирован".into());
+    }
+    lba_count_range(
+        first,
+        last.checked_sub(first)
+            .and_then(|count| count.checked_add(1))
+            .ok_or("GPT: число LBA переполнено")?,
+        disk_len,
+    )
+}
+
+fn lba_count_range(
+    first: u64,
+    count: u64,
+    disk_len: usize,
+) -> Result<core::ops::Range<usize>, String> {
+    let start = first
+        .checked_mul(SECTOR as u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .ok_or("GPT: byte offset переполнен")?;
+    let length = count
+        .checked_mul(SECTOR as u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .ok_or("GPT: byte length переполнен")?;
+    let end = start
+        .checked_add(length)
+        .ok_or("GPT: byte range переполнен")?;
+    if end > disk_len {
+        return Err("GPT: LBA range выходит за диск".into());
+    }
+    Ok(start..end)
+}
+
+fn read_u32(bytes: &[u8], offset: usize) -> Result<u32, String> {
+    Ok(u32::from_le_bytes(read_array(bytes, offset)?))
+}
+
+fn read_u64(bytes: &[u8], offset: usize) -> Result<u64, String> {
+    Ok(u64::from_le_bytes(read_array(bytes, offset)?))
+}
+
+fn read_array<const N: usize>(bytes: &[u8], offset: usize) -> Result<[u8; N], String> {
+    let end = offset.checked_add(N).ok_or("GPT: field offset overflow")?;
+    bytes
+        .get(offset..end)
+        .ok_or("GPT: обрезанное поле")?
+        .try_into()
+        .map_err(|_| "GPT: внутренняя ошибка размера поля".into())
+}
+
+fn atomic_write(output: &Path, bytes: &[u8]) -> Result<(), String> {
+    let parent = output
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let file_name = output
+        .file_name()
+        .ok_or_else(|| format!("нет имени выходного файла: {}", output.display()))?
+        .to_string_lossy();
+    let (temporary, mut file) = create_temporary(parent, &file_name)?;
+    let result = (|| {
+        file.write_all(bytes)
+            .map_err(|error| format!("{}: {error}", temporary.display()))?;
+        file.sync_all()
+            .map_err(|error| format!("{}: {error}", temporary.display()))?;
+        drop(file);
+        fs::rename(&temporary, output).map_err(|error| {
+            format!(
+                "rename {} -> {}: {error}",
+                temporary.display(),
+                output.display()
+            )
+        })
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
+fn create_temporary(parent: &Path, file_name: &str) -> Result<(PathBuf, File), String> {
+    for nonce in 0..100u32 {
+        let path = parent.join(format!(".{file_name}.{}.{}.tmp", std::process::id(), nonce));
+        match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(file) => return Ok((path, file)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(format!("{}: {error}", path.display())),
+        }
+    }
+    Err("не удалось выбрать имя временного файла".into())
+}
+
 /// Стандартный CRC32 (IEEE 802.3, polynomial 0xEDB88320, reflected,
 /// init/xorout 0xFFFFFFFF) — тот же, что используется в GPT.
 fn crc32(data: &[u8]) -> u32 {
@@ -447,4 +660,52 @@ fn crc32(data: &[u8]) -> u32 {
         crc = table[((crc ^ b as u32) & 0xFF) as usize] ^ (crc >> 8);
     }
     crc ^ 0xFFFF_FFFF
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const TEST_BYTES: usize = 32 * 1024 * 1024;
+
+    fn gpt_fixture() -> Vec<u8> {
+        let mut disk = vec![0; TEST_BYTES];
+        write_gpt(&mut disk, (TEST_BYTES / SECTOR) as u64).unwrap();
+        disk
+    }
+
+    #[test]
+    fn gpt_has_standard_protective_mbr_and_matching_backup() {
+        let disk = gpt_fixture();
+        assert_eq!(&disk[510..512], &[0x55, 0xaa]);
+        assert_eq!(disk[450], 0xee);
+
+        let total_lbas = (disk.len() / SECTOR) as u64;
+        let primary = parse_gpt_header(&disk, 1).unwrap();
+        let backup = parse_gpt_header(&disk, total_lbas - 1).unwrap();
+        assert_eq!(primary.alternate_lba, backup.my_lba);
+        assert_eq!(backup.entries_lba, total_lbas - 1 - ENTRY_ARRAY_SECTORS);
+        assert_eq!(
+            partition_entries(&disk, primary).unwrap(),
+            partition_entries(&disk, backup).unwrap()
+        );
+    }
+
+    #[test]
+    fn malformed_gpt_is_rejected_without_unchecked_slices() {
+        assert!(parse_gpt_header(&[0; SECTOR], 1).is_err());
+        assert!(lba_count_range(u64::MAX, 2, usize::MAX).is_err());
+
+        let mut disk = gpt_fixture();
+        disk[SECTOR + 12..SECTOR + 16].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(parse_gpt_header(&disk, 1).is_err());
+    }
+
+    #[test]
+    fn efi_name_is_one_bounded_path_component() {
+        assert!(validate_efi_name("BOOTX64.EFI").is_ok());
+        assert!(validate_efi_name("BOOTAA64.EFI").is_ok());
+        assert!(validate_efi_name("../BOOT.EFI").is_err());
+        assert!(validate_efi_name("EFI/BOOTX64.EFI").is_err());
+    }
 }
