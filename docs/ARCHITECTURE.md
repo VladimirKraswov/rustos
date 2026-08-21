@@ -52,6 +52,13 @@ EL0/EL1 `TrapFrame`, TTBR0 и `eret`: GICv3/Generic Timer вытесняют п�
 настоящие QEMU boot integration tests. Полный контракт описан в
 [ARCHITECTURES.md](ARCHITECTURES.md).
 
+Основной user stack начинает с 64 КиБ и растёт вниз страницами по translation
+fault до 8 МиБ. Ядро заполняет только короткий непрерывный промежуток (не более
+64 КиБ) до уже отображённой части стека — этого достаточно для stack probing
+AMD64/AArch64. Дальний произвольный fault, protection fault или выход за лимит
+по-прежнему завершает только виновный процесс. Поэтому крупные scratch frames
+сервисов не требуют заранее закреплять мегабайты RAM за каждым процессом.
+
 Platform-independent `rustos-video` задаёт безопасные pixel surfaces,
 RGB/BGR/ARGB/RGB565/grayscale formats, span fill, blit, alpha composition,
 bounded damage и
@@ -81,8 +88,8 @@ MADT перечисляет CPU, BSP последовательно выполн
 7. **готово:** изолированный `vfsd`, persistent VaraniaFS и native RUNE
    resolver (interface ABI, imports, TLS, RELRO, shared RX);
 8. **готов runtime S1:** upstream target `std`, CRT, threads/futex,
-   process/pipes/stdio и запуск RUNE с VFS; дальше scalable VaraniaFS v2,
-   постоянный supervisor, native Rust toolchain и package/build services;
+   process/pipes/stdio, запуск RUNE с VFS и масштабируемая COW VaraniaFS;
+   дальше постоянный supervisor, native Rust toolchain и package/build services;
 9. **переходно:** persistent ring-3 `vfsd` и GUI `RUN` bridge готовы;
    дальше `inputd`, `displayd`, compositor и terminal как отдельные процессы;
 10. supervisor применяет restart policy к реальным service manifests.

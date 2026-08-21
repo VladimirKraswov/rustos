@@ -1,9 +1,8 @@
-//! Изолированный ring-3 VFS server.
+//! Изолированный ring-3 VFS server для VaraniaFS.
 //!
-//! Только этот процесс получает raw block capability. Ошибка parser'а,
-//! pathname logic или filesystem metadata завершит `vfsd`, но не kernel и не
-//! остальные процессы. Control plane идёт через capability IPC, данные —
-//! через переданное shared-memory окно.
+//! `vfsd` единолично владеет raw block capability. Ядро видит только IPC и
+//! shared-memory transfer windows; ошибка filesystem parser завершает этот
+//! процесс, но не микроядро и не другие приложения.
 
 #![no_std]
 #![no_main]
@@ -23,14 +22,16 @@ use rustos_runtime::{
     process_exit, shared_memory_map, syscall, vm_unmap, Handle, Message, SharedMemoryMap, VmFlags,
 };
 use varaniafs::{
-    crc32, kind, metadata_slot_start, FileExtent, FreeExtent, Inode, Metadata, Superblock,
-    BLOCK_SIZE, MAX_EXTENTS_PER_INODE, MAX_FREE_EXTENTS, MAX_INODES, MAX_PATH_BYTES,
-    METADATA_BLOCKS,
+    file,
+    format::{self, Block, Error as StorageError, InodeKind, Superblock},
+    namespace::{self, NamespaceError},
+    tree::{BlockDevice, Transaction, TransactionWorkspace},
+    BLOCK_SIZE,
 };
 
 const SHARED_BYTES: usize = 16 * BLOCK_SIZE;
 const MAX_OPEN_FILES: usize = 32;
-const ROOT_INODE: u16 = u16::MAX;
+const MAX_PATH_BYTES: usize = 192;
 const ALL_OPEN_FLAGS: u32 = vfs::open_flags::READ
     | vfs::open_flags::WRITE
     | vfs::open_flags::CREATE
@@ -44,10 +45,10 @@ struct OpenFile {
     used: bool,
     generation: u32,
     owner: u64,
-    inode: u16,
-    inode_generation: u64,
+    object_id: u64,
     offset: u64,
     flags: u32,
+    path: [u8; MAX_PATH_BYTES],
 }
 
 impl OpenFile {
@@ -55,21 +56,65 @@ impl OpenFile {
         used: false,
         generation: 1,
         owner: 0,
-        inode: ROOT_INODE,
-        inode_generation: 0,
+        object_id: 0,
         offset: 0,
         flags: 0,
+        path: [0; MAX_PATH_BYTES],
     };
+}
+
+struct Device {
+    handle: Handle,
+}
+
+impl Device {
+    fn call(&mut self, write: bool, block: u64, buffer: *mut u8) -> Result<(), StorageError> {
+        let request = BlockIoRequest {
+            version: BLOCK_ABI_VERSION,
+            flags: 0,
+            block,
+            buffer_address: buffer as u64,
+            block_count: 1,
+            reserved: 0,
+        };
+        let result = if write {
+            block_write(self.handle, &request)
+        } else {
+            block_read(self.handle, &request)
+        };
+        if result == syscall::status::OK {
+            Ok(())
+        } else {
+            Err(StorageError::Io)
+        }
+    }
+}
+
+impl BlockDevice for Device {
+    fn read(&mut self, block: u64, output: &mut Block) -> Result<(), StorageError> {
+        self.call(false, block, output.as_mut_ptr())
+    }
+
+    fn write(&mut self, block: u64, input: &Block) -> Result<(), StorageError> {
+        self.call(true, block, input.as_ptr() as *mut u8)
+    }
+
+    fn flush(&mut self) -> Result<(), StorageError> {
+        if block_flush(self.handle) == syscall::status::OK {
+            Ok(())
+        } else {
+            Err(StorageError::Io)
+        }
+    }
 }
 
 struct Server {
     device: Handle,
     endpoint: Handle,
     volume_blocks: u64,
-    active_slot: u32,
-    metadata: Metadata,
+    mounted: Option<Superblock>,
     opens: [OpenFile; MAX_OPEN_FILES],
-    block_buffer: [u8; BLOCK_SIZE],
+    transaction_workspace: TransactionWorkspace,
 }
 
 impl Server {
@@ -78,10 +123,9 @@ impl Server {
             device: Handle::INVALID,
             endpoint: Handle::INVALID,
             volume_blocks: 0,
-            active_slot: 0,
-            metadata: Metadata::empty(),
+            mounted: None,
             opens: [OpenFile::EMPTY; MAX_OPEN_FILES],
-            block_buffer: [0; BLOCK_SIZE],
+            transaction_workspace: TransactionWorkspace::new(),
         }
     }
 
@@ -93,26 +137,13 @@ impl Server {
             return Err(vfs::status::IO);
         }
         self.volume_blocks = blocks as u64;
-
-        let first = self.read_superblock(0).ok();
-        let second = self.read_superblock(1).ok();
-        let order = match (first, second) {
-            (Some(a), Some(b)) if b.sequence > a.sequence => [Some(b), Some(a)],
-            (Some(a), Some(b)) => [Some(a), Some(b)],
-            (Some(a), None) => [Some(a), None],
-            (None, Some(b)) => [Some(b), None],
-            (None, None) => return Err(vfs::status::IO),
-        };
-        for candidate in order.into_iter().flatten() {
-            if self.load_metadata(candidate.active_slot).is_ok()
-                && self.metadata.sequence == candidate.sequence
-                && crc32(self.metadata.bytes()) == candidate.metadata_crc32
-            {
-                self.active_slot = candidate.active_slot;
-                return Ok(());
-            }
-        }
-        Err(vfs::status::IO)
+        let mut block_device = Device { handle: device };
+        let recovered = format::recover_latest(self.volume_blocks, |number, output| {
+            block_device.read(number, output).is_ok()
+        })
+        .map_err(storage_status)?;
+        self.mounted = Some(recovered.superblock);
+        Ok(())
     }
 
     fn serve(&mut self) -> ! {
@@ -147,8 +178,6 @@ impl Server {
             if let Some(address) = shared {
                 let _ = vm_unmap(address as u64, SHARED_BYTES as u64);
             }
-            // Даже если map отклонён, полученный capability необходимо
-            // закрыть: malformed client не должен исчерпать таблицу vfsd.
             if request.header.handle_count >= 2 {
                 let _ = handle_close(request.handles[1].handle);
             }
@@ -168,48 +197,44 @@ impl Server {
         let result = match message.header.opcode {
             vfs::opcode::OPEN => self
                 .payload::<OpenRequest>(message)
-                .and_then(|request| self.open(sender, request, shared)),
+                .and_then(|r| self.open(sender, r, shared)),
             vfs::opcode::CLOSE => self
                 .payload::<VfsObject>(message)
-                .and_then(|object| self.close(sender, object)),
+                .and_then(|r| self.close(sender, r)),
             vfs::opcode::READ => self
                 .payload::<IoRequest>(message)
-                .and_then(|request| self.read(sender, request, shared)),
+                .and_then(|r| self.read(sender, r, shared)),
             vfs::opcode::WRITE => self
                 .payload::<IoRequest>(message)
-                .and_then(|request| self.write(sender, request, shared)),
+                .and_then(|r| self.write(sender, r, shared)),
             vfs::opcode::SEEK => self
                 .payload::<SeekRequest>(message)
-                .and_then(|request| self.seek(sender, request)),
+                .and_then(|r| self.seek(sender, r)),
             vfs::opcode::RESIZE => self
                 .payload::<ResizeRequest>(message)
-                .and_then(|request| self.resize(sender, request)),
+                .and_then(|r| self.resize(sender, r)),
             vfs::opcode::READ_DIR => self
                 .payload::<IoRequest>(message)
-                .and_then(|request| self.read_dir(sender, request, shared)),
+                .and_then(|r| self.read_dir(sender, r, shared)),
             vfs::opcode::STAT => self
                 .payload::<PathRequest>(message)
-                .and_then(|request| self.stat(sender, request, shared)),
+                .and_then(|r| self.stat(sender, r, shared)),
             vfs::opcode::MAKE_DIR => self
                 .payload::<PathRequest>(message)
-                .and_then(|request| self.make_dir(sender, request, shared)),
+                .and_then(|r| self.make_dir(sender, r, shared)),
             vfs::opcode::UNLINK => self
                 .payload::<PathRequest>(message)
-                .and_then(|request| self.unlink(sender, request, shared)),
+                .and_then(|r| self.unlink(sender, r, shared)),
             vfs::opcode::RENAME => self
                 .payload::<RenameRequest>(message)
-                .and_then(|request| self.rename(sender, request, shared)),
-            vfs::opcode::SYNC => self
-                .sync()
-                .map(|_| ok_reply(vfs::object_kind::NONE, VfsObject::INVALID, 0, 0)),
-            vfs::opcode::SHUTDOWN => self
+                .and_then(|r| self.rename(sender, r, shared)),
+            vfs::opcode::SYNC | vfs::opcode::SHUTDOWN => self
                 .sync()
                 .map(|_| ok_reply(vfs::object_kind::NONE, VfsObject::INVALID, 0, 0)),
             _ => Err(vfs::status::PROTOCOL),
         };
         let reply = result.unwrap_or_else(error_reply);
-        let shutdown = message.header.opcode == vfs::opcode::SHUTDOWN;
-        (reply, shutdown)
+        (reply, message.header.opcode == vfs::opcode::SHUTDOWN)
     }
 
     fn open(
@@ -228,52 +253,60 @@ impl Server {
             request.path_length,
             shared,
         )?;
-        let mut inode_index = self.find_inode(&path);
-        if let Some(index) = inode_index {
-            if request.open_flags & vfs::open_flags::CREATE != 0
-                && request.open_flags & vfs::open_flags::EXCLUSIVE != 0
-            {
-                return Err(vfs::status::ALREADY_EXISTS);
-            }
-            let inode = &self.metadata.inodes[index];
-            if request.open_flags & vfs::open_flags::DIRECTORY != 0 && inode.kind != kind::DIRECTORY
-            {
-                return Err(vfs::status::NOT_DIRECTORY);
-            }
-            if request.open_flags & vfs::open_flags::TRUNCATE != 0 {
-                if request.open_flags & vfs::open_flags::WRITE == 0 {
-                    return Err(vfs::status::READ_ONLY);
+        let path_bytes = path_slice(&path);
+        let mut device = Device {
+            handle: self.device,
+        };
+        let mounted = self.superblock()?;
+        let mut transaction =
+            Transaction::begin(&mut device, mounted, &mut self.transaction_workspace)
+                .map_err(storage_status)?;
+        let mut changed = false;
+        let object_id = match namespace::resolve(&mut transaction, path_bytes) {
+            Ok(object) => {
+                if request.open_flags & vfs::open_flags::CREATE != 0
+                    && request.open_flags & vfs::open_flags::EXCLUSIVE != 0
+                {
+                    return Err(vfs::status::ALREADY_EXISTS);
                 }
-                if inode.kind == kind::DIRECTORY {
-                    return Err(vfs::status::IS_DIRECTORY);
-                }
-                self.truncate_inode(index)?;
-                self.commit()?;
+                object
             }
-        } else {
-            if request.open_flags & vfs::open_flags::CREATE == 0 {
-                return Err(vfs::status::NOT_FOUND);
+            Err(NamespaceError::NotFound)
+                if request.open_flags & vfs::open_flags::CREATE != 0
+                    && request.open_flags & vfs::open_flags::DIRECTORY == 0 =>
+            {
+                changed = true;
+                namespace::create(&mut transaction, path_bytes, InodeKind::File, 0)
+                    .map_err(namespace_status)?
             }
-            if request.open_flags & vfs::open_flags::DIRECTORY != 0 {
-                return Err(vfs::status::INVALID_ARGUMENT);
-            }
-            self.require_parent_directory(&path)?;
-            inode_index = Some(self.create_inode(&path, kind::FILE)?);
-            self.commit()?;
+            Err(error) => return Err(namespace_status(error)),
+        };
+        let mut inode = namespace::inode(&mut transaction, object_id).map_err(namespace_status)?;
+        if request.open_flags & vfs::open_flags::DIRECTORY != 0
+            && inode.kind != InodeKind::Directory
+        {
+            return Err(vfs::status::NOT_DIRECTORY);
         }
-        let index = inode_index.ok_or(vfs::status::NOT_FOUND)?;
-        let object = self.allocate_open(owner, index as u16, request.open_flags)?;
-        let inode = &self.metadata.inodes[index];
-        Ok(ok_reply(
-            if inode.kind == kind::DIRECTORY {
-                vfs::object_kind::DIRECTORY
-            } else {
-                vfs::object_kind::FILE
-            },
-            object,
-            inode.size,
-            0,
-        ))
+        if request.open_flags & vfs::open_flags::TRUNCATE != 0 {
+            if request.open_flags & vfs::open_flags::WRITE == 0 {
+                return Err(vfs::status::READ_ONLY);
+            }
+            if inode.kind == InodeKind::Directory {
+                return Err(vfs::status::IS_DIRECTORY);
+            }
+            file::resize(&mut transaction, object_id, 0, 0).map_err(storage_status)?;
+            inode.size = 0;
+            changed = true;
+        }
+        if changed {
+            self.mounted = Some(transaction.commit().map_err(storage_status)?);
+        } else {
+            // Освобождаем mutable borrow переиспользуемого transaction
+            // workspace до изменения таблицы открытых объектов.
+            drop(transaction);
+        }
+        let object = self.allocate_open(owner, object_id, request.open_flags, path)?;
+        Ok(ok_reply(object_kind(inode.kind), object, inode.size, 0))
     }
 
     fn close(&mut self, owner: u64, object: VfsObject) -> Result<Reply, i32> {
@@ -290,54 +323,42 @@ impl Server {
         shared: Option<*mut u8>,
     ) -> Result<Reply, i32> {
         let buffer = checked_shared(shared, request.buffer_offset, request.length)?;
-        let open_index = self.open_index(owner, request.file)?;
-        let open = self.opens[open_index];
+        let index = self.open_index(owner, request.file)?;
+        let open = self.opens[index];
         if open.flags & vfs::open_flags::READ == 0 {
             return Err(vfs::status::READ_ONLY);
-        }
-        let inode_index = usize::from(open.inode);
-        let inode = *self
-            .metadata
-            .inodes
-            .get(inode_index)
-            .ok_or(vfs::status::BAD_OBJECT)?;
-        if inode.kind == kind::DIRECTORY {
-            return Err(vfs::status::IS_DIRECTORY);
         }
         let start = if request.file_offset == u64::MAX {
             open.offset
         } else {
             request.file_offset
         };
-        let total = request.length.min(inode.size.saturating_sub(start));
-        let mut done = 0u64;
-        while done < total {
-            let position = start + done;
-            let logical = position / BLOCK_SIZE as u64;
-            let within = (position % BLOCK_SIZE as u64) as usize;
-            let count = ((total - done) as usize).min(BLOCK_SIZE - within);
-            if let Some(physical) = inode_block(&inode, logical) {
-                self.read_disk_block(physical)?;
-            } else {
-                self.block_buffer.fill(0);
-            }
-            unsafe {
-                ptr::copy_nonoverlapping(
-                    self.block_buffer[within..].as_ptr(),
-                    buffer.add(done as usize),
-                    count,
-                )
-            };
-            done += count as u64;
+        let output = unsafe { slice::from_raw_parts_mut(buffer, request.length as usize) };
+        let mut device = Device {
+            handle: self.device,
+        };
+        let mounted = self.superblock()?;
+        let mut transaction =
+            Transaction::begin(&mut device, mounted, &mut self.transaction_workspace)
+                .map_err(storage_status)?;
+        if namespace::inode(&mut transaction, open.object_id)
+            .map_err(namespace_status)?
+            .kind
+            == InodeKind::Directory
+        {
+            return Err(vfs::status::IS_DIRECTORY);
         }
+        let done = file::read_at(&mut transaction, open.object_id, start, output)
+            .map_err(storage_status)?;
+        let end = start + done as u64;
         if request.file_offset == u64::MAX {
-            self.opens[open_index].offset = start + done;
+            self.opens[index].offset = end;
         }
         Ok(ok_reply(
             vfs::object_kind::FILE,
             request.file,
-            done,
-            start + done,
+            done as u64,
+            end,
         ))
     }
 
@@ -348,74 +369,61 @@ impl Server {
         shared: Option<*mut u8>,
     ) -> Result<Reply, i32> {
         let buffer = checked_shared(shared, request.buffer_offset, request.length)?;
-        let open_index = self.open_index(owner, request.file)?;
-        let open = self.opens[open_index];
+        let index = self.open_index(owner, request.file)?;
+        let open = self.opens[index];
         if open.flags & vfs::open_flags::WRITE == 0 {
             return Err(vfs::status::READ_ONLY);
         }
-        let inode_index = usize::from(open.inode);
-        if self.metadata.inodes[inode_index].kind == kind::DIRECTORY {
+        let input = unsafe { slice::from_raw_parts(buffer, request.length as usize) };
+        let mut device = Device {
+            handle: self.device,
+        };
+        let mounted = self.superblock()?;
+        let mut transaction =
+            Transaction::begin(&mut device, mounted, &mut self.transaction_workspace)
+                .map_err(storage_status)?;
+        let inode = namespace::inode(&mut transaction, open.object_id).map_err(namespace_status)?;
+        if inode.kind == InodeKind::Directory {
             return Err(vfs::status::IS_DIRECTORY);
         }
         let start = if open.flags & vfs::open_flags::APPEND != 0 {
-            self.metadata.inodes[inode_index].size
+            inode.size
         } else if request.file_offset == u64::MAX {
             open.offset
         } else {
             request.file_offset
         };
-        let end = start
-            .checked_add(request.length)
-            .ok_or(vfs::status::NO_SPACE)?;
-        let mut done = 0u64;
-        while done < request.length {
-            let position = start + done;
-            let logical = position / BLOCK_SIZE as u64;
-            let within = (position % BLOCK_SIZE as u64) as usize;
-            let count = ((request.length - done) as usize).min(BLOCK_SIZE - within);
-            let physical = match inode_block(&self.metadata.inodes[inode_index], logical) {
-                Some(block) => {
-                    if within != 0 || count != BLOCK_SIZE {
-                        self.read_disk_block(block)?;
-                    }
-                    block
-                }
-                None => {
-                    self.block_buffer.fill(0);
-                    let block = self.allocate_data_block()?;
-                    add_inode_block(&mut self.metadata.inodes[inode_index], logical, block)?;
-                    block
-                }
-            };
-            unsafe {
-                ptr::copy_nonoverlapping(
-                    buffer.add(done as usize),
-                    self.block_buffer[within..].as_mut_ptr(),
-                    count,
-                )
-            };
-            self.write_disk_block(physical)?;
-            done += count as u64;
-        }
-        self.metadata.inodes[inode_index].size = self.metadata.inodes[inode_index].size.max(end);
+        let done = file::write_at(&mut transaction, open.object_id, start, input, 0)
+            .map_err(storage_status)?;
+        self.mounted = Some(transaction.commit().map_err(storage_status)?);
+        let end = start + done as u64;
         if request.file_offset == u64::MAX || open.flags & vfs::open_flags::APPEND != 0 {
-            self.opens[open_index].offset = end;
+            self.opens[index].offset = end;
         }
-        self.commit()?;
-        Ok(ok_reply(vfs::object_kind::FILE, request.file, done, end))
+        Ok(ok_reply(
+            vfs::object_kind::FILE,
+            request.file,
+            done as u64,
+            end,
+        ))
     }
 
     fn seek(&mut self, owner: u64, request: SeekRequest) -> Result<Reply, i32> {
         if request.reserved != 0 {
             return Err(vfs::status::INVALID_ARGUMENT);
         }
-        let open_index = self.open_index(owner, request.file)?;
-        let open = self.opens[open_index];
-        let size = if open.inode == ROOT_INODE {
-            0
-        } else {
-            self.metadata.inodes[open.inode as usize].size
+        let index = self.open_index(owner, request.file)?;
+        let open = self.opens[index];
+        let mut device = Device {
+            handle: self.device,
         };
+        let mounted = self.superblock()?;
+        let mut transaction =
+            Transaction::begin(&mut device, mounted, &mut self.transaction_workspace)
+                .map_err(storage_status)?;
+        let size = namespace::inode(&mut transaction, open.object_id)
+            .map_err(namespace_status)?
+            .size;
         let base = match request.whence {
             vfs::seek_from::START => 0i128,
             vfs::seek_from::CURRENT => i128::from(open.offset),
@@ -426,7 +434,7 @@ impl Server {
         if position < 0 || position > i128::from(u64::MAX) {
             return Err(vfs::status::INVALID_ARGUMENT);
         }
-        self.opens[open_index].offset = position as u64;
+        self.opens[index].offset = position as u64;
         Ok(ok_reply(
             vfs::object_kind::NONE,
             request.file,
@@ -439,26 +447,21 @@ impl Server {
         if request.reserved != 0 {
             return Err(vfs::status::INVALID_ARGUMENT);
         }
-        let open_index = self.open_index(owner, request.file)?;
-        let open = self.opens[open_index];
+        let index = self.open_index(owner, request.file)?;
+        let open = self.opens[index];
         if open.flags & vfs::open_flags::WRITE == 0 {
             return Err(vfs::status::READ_ONLY);
         }
-        let inode_index = usize::from(open.inode);
-        if self.metadata.inodes[inode_index].kind == kind::DIRECTORY {
-            return Err(vfs::status::IS_DIRECTORY);
-        }
-
-        let old_size = self.metadata.inodes[inode_index].size;
-        if request.length < old_size {
-            self.shrink_inode(inode_index, request.length)?;
-        } else {
-            // VaraniaFS является sparse-aware: для увеличения длины не нужно
-            // записывать гигабайты нулей. Неотображённые logical blocks уже
-            // возвращаются read() как нули и займут место при первой записи.
-            self.metadata.inodes[inode_index].size = request.length;
-        }
-        self.commit()?;
+        let mut device = Device {
+            handle: self.device,
+        };
+        let mounted = self.superblock()?;
+        let mut transaction =
+            Transaction::begin(&mut device, mounted, &mut self.transaction_workspace)
+                .map_err(storage_status)?;
+        file::resize(&mut transaction, open.object_id, request.length, 0)
+            .map_err(storage_status)?;
+        self.mounted = Some(transaction.commit().map_err(storage_status)?);
         Ok(ok_reply(
             vfs::object_kind::FILE,
             request.file,
@@ -481,62 +484,50 @@ impl Server {
             request.buffer_offset,
             size_of::<DirectoryEntry>() as u64,
         )?;
-        let open_index = self.open_index(owner, request.file)?;
-        let open = self.opens[open_index];
-        let parent = if open.inode == ROOT_INODE {
-            b"/".as_slice()
+        let index = self.open_index(owner, request.file)?;
+        let open = self.opens[index];
+        let cursor = if request.file_offset == u64::MAX {
+            open.offset
         } else {
-            let inode = &self.metadata.inodes[open.inode as usize];
-            if inode.kind != kind::DIRECTORY {
-                return Err(vfs::status::NOT_DIRECTORY);
-            }
-            inode.path()
+            request.file_offset
         };
-        let mut cursor = if request.file_offset == u64::MAX {
-            open.offset as usize
-        } else {
-            request.file_offset as usize
+        let mut device = Device {
+            handle: self.device,
         };
-        while cursor < MAX_INODES {
-            let inode = &self.metadata.inodes[cursor];
-            cursor += 1;
-            if inode.used == 0 {
-                continue;
-            }
-            let Some(name) = immediate_child(parent, inode.path()) else {
-                continue;
-            };
-            let mut entry = DirectoryEntry::EMPTY;
-            entry.object = VfsObject((inode.generation << 16) | (cursor - 1) as u64);
-            entry.size = inode.size;
-            entry.kind = if inode.kind == kind::DIRECTORY {
-                vfs::object_kind::DIRECTORY
-            } else {
-                vfs::object_kind::FILE
-            };
-            entry.name_length = name.len() as u16;
-            entry.name[..name.len()].copy_from_slice(name);
-            unsafe { ptr::write_unaligned(buffer.cast::<DirectoryEntry>(), entry) };
-            if request.file_offset == u64::MAX {
-                self.opens[open_index].offset = cursor as u64;
-            }
+        let mounted = self.superblock()?;
+        let mut transaction =
+            Transaction::begin(&mut device, mounted, &mut self.transaction_workspace)
+                .map_err(storage_status)?;
+        let Some(source) = namespace::read_dir_at(&mut transaction, open.object_id, cursor)
+            .map_err(namespace_status)?
+        else {
             return Ok(ok_reply(
                 vfs::object_kind::DIRECTORY,
                 request.file,
-                1,
-                cursor as u64,
+                0,
+                cursor,
             ));
+        };
+        let mut entry = DirectoryEntry::EMPTY;
+        entry.object = VfsObject(source.object_id);
+        entry.size = source.inode.size;
+        entry.kind = object_kind(source.inode.kind);
+        entry.name_length = source.name_len;
+        entry.name[..source.name().len()].copy_from_slice(source.name());
+        unsafe { ptr::write_unaligned(buffer.cast::<DirectoryEntry>(), entry) };
+        if request.file_offset == u64::MAX {
+            self.opens[index].offset = cursor + 1;
         }
         Ok(ok_reply(
             vfs::object_kind::DIRECTORY,
             request.file,
-            0,
-            cursor as u64,
+            1,
+            cursor + 1,
         ))
     }
 
     fn stat(
-        &self,
+        &mut self,
         owner: u64,
         request: PathRequest,
         shared: Option<*mut u8>,
@@ -548,17 +539,18 @@ impl Server {
             request.path_length,
             shared,
         )?;
-        if path_slice(&path) == b"/" {
-            return Ok(ok_reply(vfs::object_kind::DIRECTORY, VfsObject::ROOT, 0, 0));
-        }
-        let index = self.find_inode(&path).ok_or(vfs::status::NOT_FOUND)?;
-        let inode = &self.metadata.inodes[index];
+        let mut device = Device {
+            handle: self.device,
+        };
+        let mounted = self.superblock()?;
+        let mut transaction =
+            Transaction::begin(&mut device, mounted, &mut self.transaction_workspace)
+                .map_err(storage_status)?;
+        let object =
+            namespace::resolve(&mut transaction, path_slice(&path)).map_err(namespace_status)?;
+        let inode = namespace::inode(&mut transaction, object).map_err(namespace_status)?;
         Ok(ok_reply(
-            if inode.kind == kind::DIRECTORY {
-                vfs::object_kind::DIRECTORY
-            } else {
-                vfs::object_kind::FILE
-            },
+            object_kind(inode.kind),
             VfsObject::INVALID,
             inode.size,
             inode.generation,
@@ -578,12 +570,16 @@ impl Server {
             request.path_length,
             shared,
         )?;
-        if self.find_inode(&path).is_some() || path_slice(&path) == b"/" {
-            return Err(vfs::status::ALREADY_EXISTS);
-        }
-        self.require_parent_directory(&path)?;
-        self.create_inode(&path, kind::DIRECTORY)?;
-        self.commit()?;
+        let mut device = Device {
+            handle: self.device,
+        };
+        let mounted = self.superblock()?;
+        let mut transaction =
+            Transaction::begin(&mut device, mounted, &mut self.transaction_workspace)
+                .map_err(storage_status)?;
+        namespace::create(&mut transaction, path_slice(&path), InodeKind::Directory, 0)
+            .map_err(namespace_status)?;
+        self.mounted = Some(transaction.commit().map_err(storage_status)?);
         Ok(ok_reply(
             vfs::object_kind::DIRECTORY,
             VfsObject::INVALID,
@@ -605,26 +601,30 @@ impl Server {
             request.path_length,
             shared,
         )?;
-        let index = self.find_inode(&path).ok_or(vfs::status::NOT_FOUND)?;
-        if self.metadata.inodes[index].kind == kind::DIRECTORY
-            && self
-                .metadata
-                .inodes
-                .iter()
-                .any(|inode| inode.used != 0 && is_descendant(path_slice(&path), inode.path()))
+        let bytes = path_slice(&path);
+        let mut device = Device {
+            handle: self.device,
+        };
+        let mounted = self.superblock()?;
+        let mut transaction =
+            Transaction::begin(&mut device, mounted, &mut self.transaction_workspace)
+                .map_err(storage_status)?;
+        let object = namespace::resolve(&mut transaction, bytes).map_err(namespace_status)?;
+        if namespace::inode(&mut transaction, object)
+            .map_err(namespace_status)?
+            .kind
+            == InodeKind::File
         {
-            return Err(vfs::status::NOT_EMPTY);
+            file::resize(&mut transaction, object, 0, 0).map_err(storage_status)?;
         }
-        self.truncate_inode(index)?;
-        self.metadata.inodes[index] = Inode::EMPTY;
-        self.metadata.inode_count = self.metadata.inode_count.saturating_sub(1);
+        namespace::unlink(&mut transaction, bytes).map_err(namespace_status)?;
+        self.mounted = Some(transaction.commit().map_err(storage_status)?);
         for open in &mut self.opens {
-            if open.used && open.inode as usize == index {
+            if open.used && open.object_id == object {
                 open.used = false;
                 open.generation = open.generation.wrapping_add(1).max(1);
             }
         }
-        self.commit()?;
         Ok(ok_reply(vfs::object_kind::NONE, VfsObject::INVALID, 0, 0))
     }
 
@@ -651,44 +651,17 @@ impl Server {
             request.new_length,
             shared,
         )?;
-        let old_path = path_slice(&old);
-        let new_path = path_slice(&new);
-        let source = self.find_inode(&old).ok_or(vfs::status::NOT_FOUND)?;
-        if self.find_inode(&new).is_some() {
-            return Err(vfs::status::ALREADY_EXISTS);
-        }
-        self.require_parent_directory(&new)?;
-        if self.metadata.inodes[source].kind == kind::DIRECTORY && is_descendant(old_path, new_path)
-        {
-            return Err(vfs::status::INVALID_ARGUMENT);
-        }
-        for inode in &self.metadata.inodes {
-            if inode.used == 0
-                || (!same_path(inode.path(), old_path) && !is_descendant(old_path, inode.path()))
-            {
-                continue;
-            }
-            let suffix = &inode.path()[old_path.len()..];
-            if new_path.len() + suffix.len() > MAX_PATH_BYTES {
-                return Err(vfs::status::INVALID_ARGUMENT);
-            }
-        }
-        for inode in &mut self.metadata.inodes {
-            if inode.used == 0
-                || (!same_path(inode.path(), old_path) && !is_descendant(old_path, inode.path()))
-            {
-                continue;
-            }
-            let mut path = [0u8; MAX_PATH_BYTES];
-            let suffix_start = old_path.len();
-            let suffix_len = inode.path_len as usize - suffix_start;
-            path[..new_path.len()].copy_from_slice(new_path);
-            path[new_path.len()..new_path.len() + suffix_len]
-                .copy_from_slice(&inode.path[suffix_start..suffix_start + suffix_len]);
-            inode.path = path;
-            inode.path_len = (new_path.len() + suffix_len) as u16;
-        }
-        self.commit()?;
+        let mut device = Device {
+            handle: self.device,
+        };
+        let mounted = self.superblock()?;
+        let mut transaction =
+            Transaction::begin(&mut device, mounted, &mut self.transaction_workspace)
+                .map_err(storage_status)?;
+        namespace::rename(&mut transaction, path_slice(&old), path_slice(&new))
+            .map_err(namespace_status)?;
+        self.mounted = Some(transaction.commit().map_err(storage_status)?);
+        self.update_open_paths(path_slice(&old), path_slice(&new));
         Ok(ok_reply(vfs::object_kind::NONE, VfsObject::INVALID, 0, 0))
     }
 
@@ -708,41 +681,32 @@ impl Server {
         let base = if directory == VfsObject::ROOT {
             b"/".as_slice()
         } else {
-            let index = self.open_index(owner, directory)?;
-            let open = self.opens[index];
-            if open.inode == ROOT_INODE {
-                b"/".as_slice()
-            } else {
-                let inode = &self.metadata.inodes[open.inode as usize];
-                if inode.kind != kind::DIRECTORY {
-                    return Err(vfs::status::NOT_DIRECTORY);
-                }
-                inode.path()
-            }
+            path_slice(&self.opens[self.open_index(owner, directory)?].path)
         };
         normalize_path(base, raw)
     }
 
-    fn allocate_open(&mut self, owner: u64, inode: u16, flags: u32) -> Result<VfsObject, i32> {
+    fn allocate_open(
+        &mut self,
+        owner: u64,
+        object_id: u64,
+        flags: u32,
+        path: [u8; MAX_PATH_BYTES],
+    ) -> Result<VfsObject, i32> {
         let index = self
             .opens
             .iter()
             .position(|entry| !entry.used)
             .ok_or(vfs::status::LIMIT_REACHED)?;
         let generation = self.opens[index].generation.max(1);
-        let inode_generation = if inode == ROOT_INODE {
-            0
-        } else {
-            self.metadata.inodes[inode as usize].generation
-        };
         self.opens[index] = OpenFile {
             used: true,
             generation,
             owner,
-            inode,
-            inode_generation,
+            object_id,
             offset: 0,
             flags,
+            path,
         };
         Ok(VfsObject(
             (u64::from(generation) << 32) | (index as u64 + 1),
@@ -758,243 +722,35 @@ impl Server {
         if !open.used || open.owner != owner || open.generation != generation {
             return Err(vfs::status::BAD_OBJECT);
         }
-        if open.inode != ROOT_INODE {
-            let inode = &self.metadata.inodes[open.inode as usize];
-            if inode.used == 0 || inode.generation != open.inode_generation {
-                return Err(vfs::status::BAD_OBJECT);
-            }
-        }
         Ok(slot)
     }
 
-    fn find_inode(&self, path: &[u8; MAX_PATH_BYTES]) -> Option<usize> {
-        let path = path_slice(path);
-        self.metadata
-            .inodes
-            .iter()
-            .position(|inode| inode.used != 0 && same_path(inode.path(), path))
-    }
-
-    fn require_parent_directory(&self, path: &[u8; MAX_PATH_BYTES]) -> Result<(), i32> {
-        let path = path_slice(path);
-        let split = path
-            .iter()
-            .rposition(|byte| *byte == b'/')
-            .ok_or(vfs::status::INVALID_ARGUMENT)?;
-        if split == 0 {
-            return Ok(());
-        }
-        let mut parent = [0u8; MAX_PATH_BYTES];
-        parent[..split].copy_from_slice(&path[..split]);
-        let index = self.find_inode(&parent).ok_or(vfs::status::NOT_FOUND)?;
-        if self.metadata.inodes[index].kind != kind::DIRECTORY {
-            Err(vfs::status::NOT_DIRECTORY)
-        } else {
-            Ok(())
-        }
-    }
-
-    fn create_inode(&mut self, path: &[u8; MAX_PATH_BYTES], inode_kind: u8) -> Result<usize, i32> {
-        let index = self
-            .metadata
-            .inodes
-            .iter()
-            .position(|inode| inode.used == 0)
-            .ok_or(vfs::status::NO_SPACE)?;
-        let bytes = path_slice(path);
-        let mut inode = Inode::EMPTY;
-        inode.used = 1;
-        inode.kind = inode_kind;
-        inode.generation = self.metadata.next_inode_generation;
-        self.metadata.next_inode_generation =
-            self.metadata.next_inode_generation.wrapping_add(1).max(1);
-        inode.path_len = bytes.len() as u16;
-        inode.path[..bytes.len()].copy_from_slice(bytes);
-        self.metadata.inodes[index] = inode;
-        self.metadata.inode_count += 1;
-        Ok(index)
-    }
-
-    fn truncate_inode(&mut self, index: usize) -> Result<(), i32> {
-        let inode = self.metadata.inodes[index];
-        for extent in inode.extents.iter().take(inode.extent_count as usize) {
-            self.release_extent(extent.physical, extent.blocks)?;
-        }
-        self.metadata.inodes[index].size = 0;
-        self.metadata.inodes[index].extent_count = 0;
-        self.metadata.inodes[index].extents = [FileExtent::EMPTY; MAX_EXTENTS_PER_INODE];
-        Ok(())
-    }
-
-    fn shrink_inode(&mut self, index: usize, new_size: u64) -> Result<(), i32> {
-        let keep_blocks = new_size.div_ceil(BLOCK_SIZE as u64);
-        let inode = self.metadata.inodes[index];
-        let mut kept = [FileExtent::EMPTY; MAX_EXTENTS_PER_INODE];
-        let mut kept_count = 0usize;
-
-        // POSIX/Rust гарантируют нули после последовательности shrink→grow.
-        // Поэтому остаток последнего сохранённого блока нельзя оставлять со
-        // старыми данными: иначе другой процесс увидит содержимое за EOF.
-        let tail = (new_size % BLOCK_SIZE as u64) as usize;
-        if tail != 0 {
-            let logical = new_size / BLOCK_SIZE as u64;
-            if let Some(physical) = inode_block(&inode, logical) {
-                self.read_disk_block(physical)?;
-                self.block_buffer[tail..].fill(0);
-                self.write_disk_block(physical)?;
-            }
-        }
-
-        for extent in inode.extents.iter().take(inode.extent_count as usize) {
-            if extent.logical >= keep_blocks {
-                self.release_extent(extent.physical, extent.blocks)?;
+    fn update_open_paths(&mut self, old: &[u8], new: &[u8]) {
+        for open in &mut self.opens {
+            let current = path_slice(&open.path);
+            if !open.used || (current != old && !is_descendant(old, current)) {
                 continue;
             }
-            let keep = extent.blocks.min(keep_blocks - extent.logical);
-            kept[kept_count] = FileExtent {
-                blocks: keep,
-                ..*extent
-            };
-            kept_count += 1;
-            if keep < extent.blocks {
-                self.release_extent(extent.physical + keep, extent.blocks - keep)?;
-            }
-        }
-        self.metadata.inodes[index].size = new_size;
-        self.metadata.inodes[index].extent_count = kept_count as u16;
-        self.metadata.inodes[index].extents = kept;
-        Ok(())
-    }
-
-    fn allocate_data_block(&mut self) -> Result<u64, i32> {
-        for index in 0..self.metadata.free_extent_count as usize {
-            let extent = self.metadata.free_extents[index];
-            if extent.blocks == 0 {
+            let suffix = &current[old.len()..];
+            if new.len() + suffix.len() > MAX_PATH_BYTES {
                 continue;
             }
-            let result = extent.start;
-            self.metadata.free_extents[index].start += 1;
-            self.metadata.free_extents[index].blocks -= 1;
-            if self.metadata.free_extents[index].blocks == 0 {
-                let count = self.metadata.free_extent_count as usize;
-                for cursor in index..count - 1 {
-                    self.metadata.free_extents[cursor] = self.metadata.free_extents[cursor + 1];
-                }
-                self.metadata.free_extents[count - 1] = FreeExtent::EMPTY;
-                self.metadata.free_extent_count -= 1;
-            }
-            return Ok(result);
-        }
-        if self.metadata.next_data_block >= self.volume_blocks {
-            return Err(vfs::status::NO_SPACE);
-        }
-        let result = self.metadata.next_data_block;
-        self.metadata.next_data_block += 1;
-        Ok(result)
-    }
-
-    fn release_extent(&mut self, start: u64, blocks: u64) -> Result<(), i32> {
-        if blocks == 0 {
-            return Ok(());
-        }
-        let count = self.metadata.free_extent_count as usize;
-        if count == MAX_FREE_EXTENTS {
-            return Err(vfs::status::LIMIT_REACHED);
-        }
-        self.metadata.free_extents[count] = FreeExtent { start, blocks };
-        self.metadata.free_extent_count += 1;
-        Ok(())
-    }
-
-    fn read_superblock(&mut self, block: u64) -> Result<Superblock, i32> {
-        self.read_disk_block(block)?;
-        let superblock =
-            unsafe { ptr::read_unaligned(self.block_buffer.as_ptr().cast::<Superblock>()) };
-        if superblock.validate(self.volume_blocks) {
-            Ok(superblock)
-        } else {
-            Err(vfs::status::IO)
+            let mut path = [0; MAX_PATH_BYTES];
+            path[..new.len()].copy_from_slice(new);
+            path[new.len()..new.len() + suffix.len()].copy_from_slice(suffix);
+            open.path = path;
         }
     }
 
-    fn load_metadata(&mut self, slot: u32) -> Result<(), i32> {
-        let start = metadata_slot_start(slot);
-        for block in 0..METADATA_BLOCKS as usize {
-            let target = self.metadata.bytes_mut()[block * BLOCK_SIZE..][..BLOCK_SIZE].as_mut_ptr();
-            Self::block_call(self.device, false, start + block as u64, target)?;
-        }
-        Ok(())
+    fn superblock(&self) -> Result<Superblock, i32> {
+        self.mounted.ok_or(vfs::status::IO)
     }
-
-    fn commit(&mut self) -> Result<(), i32> {
-        if block_flush(self.device) != syscall::status::OK {
-            return Err(vfs::status::IO);
-        }
-        self.metadata.sequence = self.metadata.sequence.wrapping_add(1).max(1);
-        let inactive = 1 - self.active_slot;
-        let start = metadata_slot_start(inactive);
-        for block in 0..METADATA_BLOCKS as usize {
-            let source =
-                self.metadata.bytes()[block * BLOCK_SIZE..][..BLOCK_SIZE].as_ptr() as *mut u8;
-            Self::block_call(self.device, true, start + block as u64, source)?;
-        }
-        if block_flush(self.device) != syscall::status::OK {
-            return Err(vfs::status::IO);
-        }
-        let superblock = Superblock::new(
-            self.volume_blocks,
-            self.metadata.sequence,
-            inactive,
-            crc32(self.metadata.bytes()),
-        );
-        Self::block_call(
-            self.device,
-            true,
-            self.metadata.sequence & 1,
-            superblock.bytes().as_ptr() as *mut u8,
-        )?;
-        if block_flush(self.device) != syscall::status::OK {
-            return Err(vfs::status::IO);
-        }
-        self.active_slot = inactive;
-        Ok(())
-    }
-
     fn sync(&self) -> Result<(), i32> {
-        if block_flush(self.device) == syscall::status::OK {
-            Ok(())
-        } else {
-            Err(vfs::status::IO)
+        Device {
+            handle: self.device,
         }
-    }
-
-    fn read_disk_block(&mut self, block: u64) -> Result<(), i32> {
-        Self::block_call(self.device, false, block, self.block_buffer.as_mut_ptr())
-    }
-
-    fn write_disk_block(&mut self, block: u64) -> Result<(), i32> {
-        Self::block_call(self.device, true, block, self.block_buffer.as_mut_ptr())
-    }
-
-    fn block_call(device: Handle, write: bool, block: u64, buffer: *mut u8) -> Result<(), i32> {
-        let request = BlockIoRequest {
-            version: BLOCK_ABI_VERSION,
-            flags: 0,
-            block,
-            buffer_address: buffer as u64,
-            block_count: 1,
-            reserved: 0,
-        };
-        let result = if write {
-            block_write(device, &request)
-        } else {
-            block_read(device, &request)
-        };
-        if result == syscall::status::OK {
-            Ok(())
-        } else {
-            Err(vfs::status::IO)
-        }
+        .flush()
+        .map_err(storage_status)
     }
 
     fn map_shared(&self, handle: Handle) -> Result<*mut u8, i32> {
@@ -1141,65 +897,38 @@ fn path_slice(path: &[u8; MAX_PATH_BYTES]) -> &[u8] {
     &path[..length]
 }
 
-fn same_path(left: &[u8], right: &[u8]) -> bool {
-    left == right
-}
-
 fn is_descendant(parent: &[u8], candidate: &[u8]) -> bool {
     candidate.len() > parent.len()
         && candidate.starts_with(parent)
         && (parent == b"/" || candidate.get(parent.len()) == Some(&b'/'))
 }
 
-fn immediate_child<'a>(parent: &[u8], candidate: &'a [u8]) -> Option<&'a [u8]> {
-    let remainder = if parent == b"/" {
-        candidate.strip_prefix(b"/")?
+fn object_kind(kind: InodeKind) -> u32 {
+    if kind == InodeKind::Directory {
+        vfs::object_kind::DIRECTORY
     } else {
-        let rest = candidate.strip_prefix(parent)?;
-        rest.strip_prefix(b"/")?
-    };
-    if remainder.is_empty() || remainder.contains(&b'/') {
-        None
-    } else {
-        Some(remainder)
+        vfs::object_kind::FILE
     }
 }
 
-fn inode_block(inode: &Inode, logical: u64) -> Option<u64> {
-    inode
-        .extents
-        .iter()
-        .take(inode.extent_count as usize)
-        .find_map(|extent| {
-            (logical >= extent.logical && logical < extent.logical + extent.blocks)
-                .then_some(extent.physical + logical - extent.logical)
-        })
+fn namespace_status(error: NamespaceError) -> i32 {
+    match error {
+        NamespaceError::Storage(error) => storage_status(error),
+        NamespaceError::InvalidPath => vfs::status::INVALID_ARGUMENT,
+        NamespaceError::NotFound => vfs::status::NOT_FOUND,
+        NamespaceError::AlreadyExists => vfs::status::ALREADY_EXISTS,
+        NamespaceError::NotDirectory => vfs::status::NOT_DIRECTORY,
+        NamespaceError::IsDirectory => vfs::status::IS_DIRECTORY,
+        NamespaceError::DirectoryNotEmpty => vfs::status::NOT_EMPTY,
+    }
 }
 
-fn add_inode_block(inode: &mut Inode, logical: u64, physical: u64) -> Result<(), i32> {
-    if let Some(last) = inode
-        .extents
-        .get_mut(inode.extent_count.saturating_sub(1) as usize)
-    {
-        if inode.extent_count != 0
-            && last.logical + last.blocks == logical
-            && last.physical + last.blocks == physical
-        {
-            last.blocks += 1;
-            return Ok(());
-        }
+fn storage_status(error: StorageError) -> i32 {
+    match error {
+        StorageError::Capacity => vfs::status::NO_SPACE,
+        StorageError::InvalidArgument | StorageError::InvalidItem => vfs::status::INVALID_ARGUMENT,
+        _ => vfs::status::IO,
     }
-    let index = inode.extent_count as usize;
-    if index == MAX_EXTENTS_PER_INODE {
-        return Err(vfs::status::NO_SPACE);
-    }
-    inode.extents[index] = FileExtent {
-        logical,
-        physical,
-        blocks: 1,
-    };
-    inode.extent_count += 1;
-    Ok(())
 }
 
 fn ok_reply(kind: u32, object: VfsObject, value: u64, auxiliary: u64) -> Reply {
@@ -1211,14 +940,12 @@ fn ok_reply(kind: u32, object: VfsObject, value: u64, auxiliary: u64) -> Reply {
         auxiliary,
     }
 }
-
 fn error_reply(status: i32) -> Reply {
     Reply {
         status,
         ..Reply::EMPTY
     }
 }
-
 fn bytes_of<T>(value: &T) -> &[u8] {
     unsafe { slice::from_raw_parts((value as *const T).cast::<u8>(), size_of::<T>()) }
 }

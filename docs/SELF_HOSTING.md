@@ -26,8 +26,8 @@ sealed shared RX. `std::process::Command` прозрачно запускает 
 Это всё ещё не нативный compiler, и документация намеренно не называет этап
 self-hosted. Четыре оставшихся архитектурных барьера:
 
-1. VaraniaFS v2 со scalable inode/directory/extent trees: лимит v1 в 64 inode
-   не позволяет развернуть Rust/Cargo source и vendor store;
+1. развернуть Rust/Cargo source и vendor store в масштабируемой VaraniaFS и
+   добавить воспроизводимый package cache;
 2. user-space `init`/supervisor и console service. После boot milestones уже
    остаётся persistent `vfsd`, а GUI-команда `RUN` запускает ring-3 RUNE и
    захватывает pipe; однако orchestration/terminal всё ещё живут в kernel;

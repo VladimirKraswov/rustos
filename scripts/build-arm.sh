@@ -7,7 +7,7 @@
 #   2) проверяемые native RUNE-контейнеры AArch64;
 #   3) статически размещённое kernel под тот же target;
 #   4) staging в build/arm/ + boot/uefi/payload/ (include_bytes! загрузчика);
-#   5) initramfs (RIFS v1) и persistent VaraniaFS;
+#   5) initramfs RIFS и persistent VaraniaFS;
 #   6) AAVMF UEFI-файрмварь (build/arm-firmware/);
 #   7) UEFI-загрузчик под aarch64-unknown-uefi;
 #   8) GPT/ESP с каноническим `EFI/BOOT/BOOTAA64.EFI`.

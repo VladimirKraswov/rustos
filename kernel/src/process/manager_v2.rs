@@ -57,6 +57,13 @@ const MAX_ARGUMENT_BYTES: usize = 2048;
 const MAX_ENVIRONMENT_BYTES: usize = 2048;
 const MAX_PIPES: usize = 8;
 const PIPE_BUFFER_BYTES: usize = 4096;
+const INITIAL_USER_STACK_TOP: u64 = 0x0000_7fff_ffff_f000;
+/// Initial thread получает страницы по требованию, но не может бесконечно
+/// поглощать address space из-за runaway recursion.
+const MAX_GROWING_STACK_BYTES: u64 = 8 * 1024 * 1024;
+/// LLVM stack probing на разных ISA может обратиться не к строго соседней
+/// странице. Разрешаем только короткий gap до непрерывной mapped части.
+const MAX_STACK_FAULT_GAP_PAGES: u64 = 16;
 
 const NO_EXIT: ExitReason = ExitReason {
     status: 0,
@@ -929,24 +936,95 @@ impl ProcessManager {
         let TrapKind::Exception {
             number,
             code,
+            instruction_pointer,
             fault_address,
-            ..
         } = kind
         else {
             crate::boot::exit_kernel(0x7c);
         };
+        let pid = self.threads[thread_index]
+            .as_ref()
+            .expect("current thread")
+            .pid;
+        if self.try_grow_initial_stack(pid, number, code, fault_address) {
+            return 0;
+        }
         let reason = ExitReason {
             status: status::FAULT as i32,
             exception: number,
             flags: code,
             fault_address,
         };
-        let pid = self.threads[thread_index]
-            .as_ref()
-            .expect("current thread")
-            .pid;
+        serial::put_str("[process-manager] fault pid=0x");
+        serial::put_hex(pid.0);
+        serial::put_str(" exception=");
+        serial::put_u32(u32::from(number));
+        serial::put_str(" code=0x");
+        serial::put_hex(u64::from(code));
+        serial::put_str(" ip=0x");
+        serial::put_hex(instruction_pointer);
+        serial::put_str(" address=0x");
+        serial::put_hex(fault_address);
+        serial::put_str("\n");
         self.finish_process(pid, reason);
         self.schedule_next(frame)
+    }
+
+    /// Обрабатывает только translation fault в коротком непрерывном диапазоне
+    /// под уже отображённой частью основного стека. Такое правило учитывает
+    /// ISA-specific stack probing, но не позволяет ошибочному указателю
+    /// превратить произвольный дальний адрес в новую mapping.
+    fn try_grow_initial_stack(
+        &mut self,
+        pid: ProcessId,
+        exception: u16,
+        code: u16,
+        fault_address: u64,
+    ) -> bool {
+        if !is_stack_translation_fault(exception, code) {
+            return false;
+        }
+        let page = fault_address & !(PAGE_SIZE - 1);
+        let lower_limit = INITIAL_USER_STACK_TOP - MAX_GROWING_STACK_BYTES;
+        if page < lower_limit || page >= INITIAL_USER_STACK_TOP {
+            return false;
+        }
+        let Some(process_index) = self.process_index(pid) else {
+            return false;
+        };
+        let process = self.processes[process_index].as_mut().expect("process");
+        if process.address_space.is_writable(page) {
+            return false;
+        }
+        let mut mapped_boundary = page.saturating_add(PAGE_SIZE);
+        let mut gap_pages = 1u64;
+        while mapped_boundary < INITIAL_USER_STACK_TOP
+            && !process.address_space.is_writable(mapped_boundary)
+            && gap_pages < MAX_STACK_FAULT_GAP_PAGES
+        {
+            mapped_boundary = mapped_boundary.saturating_add(PAGE_SIZE);
+            gap_pages += 1;
+        }
+        if mapped_boundary >= INITIAL_USER_STACK_TOP
+            || !process.address_space.is_writable(mapped_boundary)
+        {
+            return false;
+        }
+        let mut candidate = page;
+        while candidate < mapped_boundary {
+            if process
+                .address_space
+                .map_page(candidate, UserPageFlags::READ_WRITE)
+                .is_err()
+            {
+                return false;
+            }
+            candidate += PAGE_SIZE;
+        }
+        // Новый PTE относится к активному address space. Перезагрузка того же
+        // root выполняет обязательную TLB-инвалидацию на обеих архитектурах.
+        unsafe { arch::switch_address_space(process.address_space.root()) };
+        true
     }
 
     fn handle_syscall(&mut self, thread_index: usize, frame: &mut TrapFrame) -> u64 {
@@ -3853,6 +3931,19 @@ fn checked_page_count(length: u64) -> Result<u64, i64> {
         return Err(status::LIMIT_REACHED);
     }
     Ok(pages)
+}
+
+#[cfg(target_arch = "aarch64")]
+fn is_stack_translation_fault(exception: u16, code: u16) -> bool {
+    // EC=0x24: Data Abort from lower EL. DFSC 0b0001xx — translation fault
+    // уровней 0..3; permission/alignment faults стек не расширяют.
+    exception == 0x24 && matches!(code & 0x3f, 0x04..=0x07)
+}
+
+#[cfg(target_arch = "x86_64")]
+fn is_stack_translation_fault(exception: u16, code: u16) -> bool {
+    // #PF, P=0. Protection faults остаются обычными изолированными ошибками.
+    exception == 14 && code & 1 == 0
 }
 
 fn normalize_boot_path(path: &str) -> &str {

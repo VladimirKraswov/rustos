@@ -11,7 +11,7 @@
 | CLI ring 3 | `std`, CRT, RUNE runner, capability startup и VFS работают | что native `rustc` уже работает |
 | GUI | component runtime и CPU backend работают; desktop-приложения пока bootstrap-объекты kernel | что GUI-приложения уже изолированы в ring 3 |
 | DLL | RUNE library resolver, imports/exports, TLS и RELRO работают | что Rust ABI стабилен или DLL равна service |
-| VFS | изолированный `vfsd`, shared-memory streaming и persistent VaraniaFS v1 | что формат v1 уже масштабируется как production FS |
+| VFS | изолированный `vfsd`, shared-memory streaming, COW B+tree, checksums, snapshots, scrub/fsck | что исчерпывающее fault-injection тестирование равно production-аудиту |
 | SMP | AP startup и вытеснение CPU0 проверены, AP пока безопасно parked | что scheduler распределяет процессы по всем CPU |
 | Display | framebuffer/virtio scanout и инкрементальный CPU compositor | что есть аппаратный 3D/GPU command path |
 

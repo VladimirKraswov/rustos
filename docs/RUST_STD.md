@@ -94,7 +94,7 @@ Process/thread/memory/VFS/RUNE prerequisites для первого seed compiler
 2. dynamic loading proc-macro server и codegen backend через RUNE DLL;
 3. native `rust-lld`, затем cross-built RustOS-host `rustc_driver`;
 4. offline Cargo vendor/index и запуск build scripts/proc macros;
-5. масштабируемая VaraniaFS v2: v1 с 64 inode не вмещает исходники toolchain;
+5. развёртывание Rust/Cargo source и vendor store в уже масштабируемой VaraniaFS;
 6. user-space supervisor и console IPC: GUI `RUN` уже создаёт настоящий
    ring-3 процесс и захватывает pipe, но terminal orchestration пока остаётся
    bootstrap-кодом ядра.

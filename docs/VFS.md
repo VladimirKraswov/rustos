@@ -141,12 +141,9 @@ server process.
 - Legacy virtio-blk transport временно находится в kernel. После появления
   PCI, DMA и IRQ capabilities он переедет в изолированный `virtioblkd`, не
   меняя VFS ABI.
-- VaraniaFS v1 имеет 64-битные номера блоков, но bounded таблицы v1 рассчитаны
-  на 64 inode, 32 extent'а на inode и 64 свободных extent'а. Масштабируемые
-  B-деревья/extent trees относятся к формату v2.
-- Две checksummed копии метаданных защищают commit. Данные файла сейчас
-  пишутся in-place и не имеют checksum/COW, поэтому torn sector в data block
-  пока может испортить содержимое при сохранённых метаданных.
+- VaraniaFS использует 64-битные COW B+tree без фиксированного лимита в десятки
+  inode/extents; metadata mirrored, данные checksummed, `fsync` использует
+  intent log, а host предоставляет scrub и offline fsck.
 - `std::process::Command` прозрачно направляет небутовый executable path через
   `rune-runner`; runner и native resolver читают target/DLL из VaraniaFS без
   parser'а диска в kernel.

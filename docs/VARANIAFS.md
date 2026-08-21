@@ -1,96 +1,119 @@
-# VaraniaFS v1: формат и восстановление
+# VaraniaFS
 
-Это описание стабильного legacy-формата. Архитектура масштабируемого и более
-надёжного преемника находится в [VARANIAFS_V2.md](VARANIAFS_V2.md). V1 остаётся
-доступен до завершения migration/power-loss gates и не будет молча прочитан как
-v2.
+VaraniaFS — единственная поддерживаемая постоянная файловая система RustOS.
+Она рассчитана на SSD и флеш-накопители, но сохраняет последовательный I/O и
+крупные extents, полезные для HDD. Все адреса и размеры 64-битные; формат не
+накладывает практического ограничения в несколько TiB.
 
-VaraniaFS — собственный постоянный формат RustOS. Его структуры вынесены в
-отдельный `no_std` crate [`varaniafs`](../varaniafs/src/lib.rs): один и тот же
-код использует ring-3 `vfsd` и host-утилита `rustos-vfs-image` на macOS/Linux.
-Kernel формат не разбирает.
+## Гарантии
 
-## Разметка тома
+- metadata хранится в checksummed copy-on-write B+tree;
+- каждый metadata-узел имеет физическую зеркальную копию;
+- пользовательские данные проверяются detached CRC32C checksums;
+- два superblock сохраняют последнюю и предыдущую recovery point;
+- короткий mirrored intent log делает `fsync` durable до фонового checkpoint;
+- torn write не публикует частично готовое поколение;
+- `scrub` восстанавливает одну повреждённую metadata-копию из второй;
+- offline `fsck` ничего не записывает и проверяет деревья, ссылки и данные;
+- snapshots фиксируют набор immutable корней без копирования data blocks;
+- sparse-файлы читаются нулями и занимают блоки только после записи.
 
-Логический блок равен 4096 байтам, все номера блоков и размеры тома имеют тип
-`u64`.
+Filesystem намеренно не содержит Unix permissions. Доступ выдаёт capability
+слой микроядра и `vfsd`; отсутствие uid/mode не означает отсутствие изоляции.
 
-| Блоки | Назначение |
-|---|---|
-| `0..2` | две копии superblock |
-| `2..18` | metadata slot A, 16 блоков |
-| `18..34` | metadata slot B, 16 блоков |
-| `34..` | данные файлов и свободные extent'ы |
+## Дисковая схема
 
-Superblock содержит magic `VARNFS1`, версию, размер блока, полный размер
-тома, номер активного metadata slot, sequence и CRC32 snapshot. Metadata
-содержит inode, пути, extent maps и allocator state. Все структуры имеют
-compile-time проверки размера.
+Логический блок равен 4096 байтам. В начале тома находятся:
 
-## Commit без повреждения старой версии
+1. две копии superblock;
+2. 16 mirrored слотов intent log;
+3. шесть COW-деревьев: inode, directory, extent, free-space/reverse-map,
+   checksum и snapshot;
+4. metadata/data allocation area.
 
-Изменение метаданных фиксируется в строгом порядке:
+Metadata allocator выдаёт чётные пары `(primary, mirror)`. Копия содержит тот
+же logical `self_block`, поэтому parent pointer стабилен и recovery может
+переключиться на зеркало без переписывания дерева.
 
-1. записать изменённые data blocks;
-2. выполнить device flush;
-3. сериализовать полный snapshot в неактивный metadata slot;
-4. выполнить device flush;
-5. записать новый superblock с увеличенным sequence и CRC snapshot;
-6. выполнить device flush.
+Ключи числовых объектов кодируются big-endian, поля значений — little-endian.
+Parser не делает pointer cast дисковых байтов в Rust-структуры и строго
+проверяет длины, ordering, ranges, reserved bits, UUID и CRC32C.
 
-Mount проверяет обе копии superblock и CRC соответствующего metadata slot,
-после чего выбирает валидную пару с наибольшим sequence. Если последний
-commit оборван, предыдущая пара остаётся доступной. Это обеспечивает
-атомарность метаданных без журнала и хорошо видно в учебном коде.
+## Порядок транзакции
 
-## Allocator и операции
+```text
+новые data blocks
+flush (если были data)
+новые primary+mirror metadata nodes
+flush
+primary+mirror intent record
+flush                 <- fsync уже можно подтвердить
+новый superblock
+flush                 <- checkpoint завершён
+```
 
-Файлы представлены extent'ами `(logical, physical, blocks)`. Последовательная
-потоковая запись обычно добавляет один большой extent и хорошо подходит SSD и
-современным HDD. Удаление возвращает диапазоны в bounded free-extent table;
-новая запись сначала повторно использует их, затем растит линейный cursor.
-`File::set_len` уже использует sparse layout: grow меняет только logical size,
-а чтение hole возвращает нули. Shrink освобождает целые хвостовые extent'ы и
-зануляет неиспользованный хвост последнего блока, поэтому shrink→grow не
-раскрывает старые данные.
+До последнего шага предыдущий superblock остаётся валидным. Mount выбирает
+самую новую полностью проверяемую точку среди superblock и intent log. Запись
+журнала с отсутствующим, torn или повреждённым корнем отбрасывается целиком.
 
-Путь inode нормализован и абсолютен. Для учебного v1 это делает lookup и
-проверку rename очень прозрачными. Переименование каталога обновляет пути всех
-потомков в одном metadata snapshot.
+## B+tree и allocator
 
-## Ограничения v1
+`varaniafs::tree::Transaction` реализует exact lookup, ordered traversal,
+insert/upsert/remove, split, cascade merge и collapse корня. Узлы immutable;
+изменение строится снизу вверх и публикуется одной сменой RootSet.
+Большой bounded набор ещё не опубликованных блоков вынесен в переиспользуемый
+`TransactionWorkspace`: `vfsd` хранит его в BSS, а не на ring-3 stack, и не
+делает heap allocation на каждый запрос.
 
-64-битная адресация не означает, что текущая metadata table уже эффективна
-на терабайтном рабочем томе. Версия 1 намеренно ограничена:
+`varaniafs::allocator::BlockAllocator` хранит bounded cache свободных extents,
+объединяет соседей, выбирает best-fit с alignment и не теряет alignment gaps.
+Полная карта пространства хранится в space tree. Старые COW-блоки нельзя
+переиспользовать, пока superblock нового поколения не стал durable и пока на
+них ссылается snapshot.
 
-- 64 inode;
-- 32 extent'а на inode;
-- 64 записи свободных extent'ов;
-- 192 байта на полный путь;
-- один writer (`vfsd`) и синхронные block requests;
-- CRC защищает метаданные, но не содержимое data blocks.
+## Файлы и каталоги
 
-Формат v2 заменит линейные bounded таблицы checksummed copy-on-write B-деревьями
-для directory index, inode table, extent map и free space. Данные получат
-optional checksums; allocator — SSD-aware discard и HDD-friendly placement.
-Номер версии на диске запрещает молча интерпретировать v2 как v1.
+Inode не хранит абсолютный путь. Directory tree связывает `(parent, name)` с
+object id, поэтому rename каталога меняет одну запись, а не всех потомков.
+Имена — произвольные bytes без NUL и `/`; UI и стандартная библиотека используют
+UTF-8. Это упрощает портирование Unix-программ без привязки формата к locale.
 
-## Host-инструмент
+`varaniafs::file` выполняет потоковые partial/multi-block read/write. Partial
+write сначала собирает полный новый блок, затем меняет extent и checksum COW.
+После shrink хвост последнего блока обнуляется, поэтому shrink→grow не раскрывает
+старые данные.
 
-Создать том или проверить существующий:
+## Host-команды
 
 ```bash
 cargo run -p rustos-vfs-image -- build/system.vfs 1024
-cargo run -p rustos-vfs-image -- --grow build/system.vfs 1024
+cargo run -p rustos-vfs-image -- --grow build/system.vfs 2048
+cargo run -p rustos-vfs-image -- --put build/system.vfs ./app.rune /system/bin/app.rune
 cargo run -p rustos-vfs-image -- --verify build/system.vfs
-cargo run -p rustos-vfs-image -- --put build/system.vfs ./app.rune /system/lib/app.rune
-cargo run -p rustos-vfs-image -- --force build/system.vfs 1024
+cargo run -p rustos-vfs-image -- --fsck build/system.vfs
+cargo run -p rustos-vfs-image -- --scrub build/system.vfs
 ```
 
-`--grow` сохраняет содержимое и публикует новый размер тем же COW commit.
-Расширенный файл остаётся sparse на macOS/Linux. Последняя команда уничтожает
-содержимое указанного образа и предназначена
-только для воспроизводимых тестов. `--put` выполняет copy-on-write замену:
-старые extent'ы освобождаются в новой metadata snapshot только после записи
-новых data blocks. `ls/get/fsck` будут следующим расширением этой же утилиты;
-mounted образ нельзя менять с host одновременно с запущенной VM.
+Создание использует temporary file, `sync_all`, проверку нового образа, atomic
+rename и sync parent directory. Существующий экспериментальный developer-образ
+автоматически импортируется с сохранением recoverable backup; новые компоненты
+не монтируют экспериментальный layout.
+
+## Изоляция
+
+Только ring-3 `vfsd` получает block capability. Клиенты вызывают `vfs.dll`,
+передавая control plane через capability IPC, а данные — через shared memory.
+Падение или отказ parser завершает/перезапускает сервис, но не микроядро.
+
+## Проверки
+
+```bash
+cargo test -p varaniafs -p rustos-vfs-image
+cargo clippy -p varaniafs -p rustos-vfs-image --all-targets -- -D warnings
+cargo run -p rustos-vfs-image -- --fsck build/system.vfs
+```
+
+Unit-набор покрывает split/merge после сотен ключей, зеркальное восстановление,
+intent recovery до checkpoint, sparse streaming, checksum corruption, snapshots,
+namespace rename/unlink и allocator coalescing. Stress-набор дополнительно
+перебирает точки потери питания и массовые случайные повреждения копий.

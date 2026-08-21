@@ -1,6 +1,6 @@
-//! Масштабируемые on-disk структуры VaraniaFS v2.
+//! Масштабируемые on-disk структуры VaraniaFS.
 //!
-//! V2 не хранит полный bounded metadata snapshot. Шесть copy-on-write деревьев
+//! Формат не хранит полный bounded metadata snapshot. Шесть copy-on-write деревьев
 //! индексируют inode, каталоги, extents, checksums, пространство и snapshots. Commit
 //! сначала записывает новые immutable nodes, выполняет device flush и только
 //! затем публикует один checksummed superblock. Предыдущая копия superblock и
@@ -15,13 +15,17 @@ use core::{cmp::Ordering, ops::Range};
 
 use crate::{BLOCK_SIZE, MIN_VOLUME_BLOCKS};
 
-/// Один физический блок формата v2.
+/// Один физический блок VaraniaFS.
 pub type Block = [u8; BLOCK_SIZE];
 
-pub const MAGIC: [u8; 8] = *b"VARNFS2\0";
-pub const VERSION: u32 = 2;
+pub const MAGIC: [u8; 8] = *b"VARANIA\0";
+/// Первая рабочая спецификация формата. Номер остаётся внутренним полем
+/// совместимости и не является частью пользовательского имени filesystem.
+pub const VERSION: u32 = 1;
 pub const SUPERBLOCK_COPIES: u64 = 2;
-pub const FIRST_ALLOCATABLE_BLOCK: u64 = SUPERBLOCK_COPIES;
+pub const INTENT_LOG_START: u64 = SUPERBLOCK_COPIES;
+pub const INTENT_LOG_BLOCKS: u64 = 32;
+pub const FIRST_ALLOCATABLE_BLOCK: u64 = INTENT_LOG_START + INTENT_LOG_BLOCKS;
 pub const ROOT_COUNT: usize = 6;
 pub const SUPERBLOCK_HEADER_SIZE: usize = 256;
 pub const NODE_HEADER_SIZE: usize = 80;
@@ -34,7 +38,7 @@ pub const ROOT_OBJECT_ID: u64 = 1;
 const SUPERBLOCK_CHECKSUM_OFFSET: usize = 240;
 const NODE_CHECKSUM_OFFSET: usize = 72;
 const NODE_MAGIC: [u8; 4] = *b"VNOD";
-const NODE_VERSION: u16 = 2;
+const NODE_VERSION: u16 = 1;
 const CHECKSUM_CRC32C: u16 = 1;
 const INCOMPAT_COW_BTREE: u64 = 1;
 const KNOWN_INCOMPAT_FEATURES: u64 = INCOMPAT_COW_BTREE;
@@ -83,7 +87,7 @@ impl TreeKind {
         }
     }
 
-    const fn index(self) -> usize {
+    pub const fn index(self) -> usize {
         self as usize - 1
     }
 }
@@ -134,6 +138,12 @@ impl RootSet {
 
     pub fn iter(&self) -> impl Iterator<Item = RootPointer> + '_ {
         self.roots.iter().copied()
+    }
+
+    /// Возвращает новый набор корней, не изменяя опубликованное поколение.
+    pub const fn with(mut self, kind: TreeKind, root: RootPointer) -> Self {
+        self.roots[kind.index()] = root;
+        self
     }
 
     fn validate(&self, volume_blocks: u64, sequence: u64) -> bool {
@@ -296,7 +306,7 @@ impl Superblock {
             && self.volume_blocks <= actual_blocks
             && self.next_object_id > ROOT_OBJECT_ID
             && self.uuid.iter().any(|byte| *byte != 0)
-            && self.allocated_blocks >= SUPERBLOCK_COPIES + ROOT_COUNT as u64
+            && self.allocated_blocks >= FIRST_ALLOCATABLE_BLOCK + ROOT_COUNT as u64 * 2
             && self.allocated_blocks <= self.volume_blocks
             && self.incompatible_features & INCOMPAT_COW_BTREE != 0
             && self.incompatible_features & !KNOWN_INCOMPAT_FEATURES == 0
@@ -614,6 +624,28 @@ impl InodeValue {
         bytes[52] = self.kind as u8;
         Ok(bytes)
     }
+
+    pub fn decode(bytes: &[u8], volume_blocks: u64) -> Result<Self, Error> {
+        if !inode_value_is_valid(bytes, volume_blocks) {
+            return Err(Error::InvalidItem);
+        }
+        let kind = match bytes[52] {
+            1 => InodeKind::File,
+            2 => InodeKind::Directory,
+            3 => InodeKind::SymbolicLink,
+            _ => return Err(Error::InvalidItem),
+        };
+        Ok(Self {
+            generation: get_u64(bytes, 0),
+            size: get_u64(bytes, 8),
+            allocated_blocks: get_u64(bytes, 16),
+            created_ns: get_u64(bytes, 24),
+            modified_ns: get_u64(bytes, 32),
+            content_generation: get_u64(bytes, 40),
+            flags: get_u32(bytes, 48),
+            kind,
+        })
+    }
 }
 
 /// Значение directory tree. Ключ состоит из parent object id и имени.
@@ -634,6 +666,16 @@ impl DirectoryValue {
         put_u64(&mut bytes, 0, self.object_id);
         put_u64(&mut bytes, 8, self.generation);
         Ok(bytes)
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, Error> {
+        if bytes.len() != Self::ENCODED_SIZE || get_u64(bytes, 0) == 0 || get_u64(bytes, 8) == 0 {
+            return Err(Error::InvalidItem);
+        }
+        Ok(Self {
+            object_id: get_u64(bytes, 0),
+            generation: get_u64(bytes, 8),
+        })
     }
 }
 
@@ -691,6 +733,25 @@ impl ExtentValue {
         bytes[28] = self.reliability as u8;
         Ok(bytes)
     }
+
+    pub fn decode(bytes: &[u8], volume_blocks: u64) -> Result<Self, Error> {
+        if !extent_value_is_valid(bytes, volume_blocks) {
+            return Err(Error::InvalidItem);
+        }
+        let reliability = match bytes[28] {
+            1 => ReliabilityClass::Checksummed,
+            2 => ReliabilityClass::Replicated,
+            3 => ReliabilityClass::Ephemeral,
+            _ => return Err(Error::InvalidItem),
+        };
+        Ok(Self {
+            physical: get_u64(bytes, 0),
+            mirror_physical: get_u64(bytes, 8),
+            blocks: get_u64(bytes, 16),
+            flags: get_u32(bytes, 24),
+            reliability,
+        })
+    }
 }
 
 /// Значение free-space tree. Ключ — physical start block.
@@ -743,6 +804,25 @@ impl DataChecksumValue {
         bytes[8..40].copy_from_slice(&self.digest);
         Ok(bytes)
     }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, Error> {
+        if !checksum_value_is_valid(bytes) {
+            return Err(Error::InvalidItem);
+        }
+        let algorithm = match get_u16(bytes, 2) {
+            1 => ChecksumAlgorithm::Crc32c,
+            2 => ChecksumAlgorithm::Blake3,
+            _ => return Err(Error::InvalidItem),
+        };
+        let mut digest = [0; 32];
+        digest.copy_from_slice(&bytes[8..40]);
+        Ok(Self {
+            blocks: get_u16(bytes, 0),
+            algorithm,
+            digest_len: get_u16(bytes, 4),
+            digest,
+        })
+    }
 }
 
 /// Reverse mapping позволяет scrub/fsck независимо сверить physical extent с
@@ -753,6 +833,78 @@ pub struct ReverseMapValue {
     pub logical_block: u64,
     pub blocks: u64,
     pub generation: u64,
+}
+
+/// Snapshot фиксирует все корни до вставки собственной manifest-записи.
+/// Поэтому снимок не образует рекурсивную ссылку на самого себя.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SnapshotValue {
+    pub sequence: u64,
+    pub created_ns: u64,
+    pub next_object_id: u64,
+    pub roots: RootSet,
+}
+
+impl SnapshotValue {
+    pub const ENCODED_SIZE: usize = 176;
+
+    pub fn encode(self, volume_blocks: u64) -> Result<[u8; Self::ENCODED_SIZE], Error> {
+        if self.sequence == 0
+            || self.next_object_id <= ROOT_OBJECT_ID
+            || !self.roots.validate(volume_blocks, self.sequence)
+        {
+            return Err(Error::InvalidArgument);
+        }
+        let mut bytes = [0; Self::ENCODED_SIZE];
+        put_u64(&mut bytes, 0, self.sequence);
+        put_u64(&mut bytes, 8, self.created_ns);
+        put_u64(&mut bytes, 16, self.next_object_id);
+        put_u16(&mut bytes, 24, ROOT_COUNT as u16);
+        for (index, root) in self.roots.iter().enumerate() {
+            let offset = 32 + index * 24;
+            put_u64(&mut bytes, offset, root.block);
+            put_u64(&mut bytes, offset + 8, root.generation);
+            put_u16(&mut bytes, offset + 16, root.level);
+            put_u16(&mut bytes, offset + 18, root.kind as u16);
+        }
+        Ok(bytes)
+    }
+
+    pub fn decode(bytes: &[u8], volume_blocks: u64) -> Result<Self, Error> {
+        if bytes.len() != Self::ENCODED_SIZE
+            || get_u16(bytes, 24) as usize != ROOT_COUNT
+            || bytes[26..32].iter().any(|byte| *byte != 0)
+        {
+            return Err(Error::InvalidItem);
+        }
+        let sequence = get_u64(bytes, 0);
+        let mut roots = [RootPointer::new(0, 0, 0, TreeKind::Inode); ROOT_COUNT];
+        for (index, root) in roots.iter_mut().enumerate() {
+            let offset = 32 + index * 24;
+            if get_u32(bytes, offset + 20) != 0 {
+                return Err(Error::InvalidItem);
+            }
+            *root = RootPointer::new(
+                get_u64(bytes, offset),
+                get_u64(bytes, offset + 8),
+                get_u16(bytes, offset + 16),
+                TreeKind::from_disk(get_u16(bytes, offset + 18))?,
+            );
+        }
+        let value = Self {
+            sequence,
+            created_ns: get_u64(bytes, 8),
+            next_object_id: get_u64(bytes, 16),
+            roots: RootSet { roots },
+        };
+        if value.sequence == 0
+            || value.next_object_id <= ROOT_OBJECT_ID
+            || !value.roots.validate(volume_blocks, value.sequence)
+        {
+            return Err(Error::InvalidItem);
+        }
+        Ok(value)
+    }
 }
 
 impl ReverseMapValue {
@@ -803,6 +955,16 @@ impl FreeSpaceValue {
         put_u64(&mut bytes, 8, self.hints);
         Ok(bytes)
     }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, Error> {
+        if bytes.len() != Self::ENCODED_SIZE || get_u64(bytes, 0) == 0 {
+            return Err(Error::InvalidItem);
+        }
+        Ok(Self {
+            blocks: get_u64(bytes, 0),
+            hints: get_u64(bytes, 8),
+        })
+    }
 }
 
 /// Numeric keys используют big endian, чтобы byte ordering node совпадал с
@@ -850,6 +1012,19 @@ pub struct Mount {
     pub copy: u8,
 }
 
+/// Откуда mount получил самое новое durable поколение.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RecoverySource {
+    Superblock(u8),
+    IntentLog(u8),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Recovery {
+    pub superblock: Superblock,
+    pub source: RecoverySource,
+}
+
 /// Выбирает последнюю полностью публикуемую пару superblock/root nodes.
 ///
 /// `read_block` не возвращает borrowed storage: caller может читать с диска,
@@ -884,6 +1059,47 @@ where
         }
     }
     Err(Error::InvalidRoot)
+}
+
+/// Выбирает самое новое поколение среди superblock и mirrored intent log.
+/// Повреждённая или ссылающаяся на недописанный root запись журнала полностью
+/// игнорируется, а не применяется частично.
+pub fn recover_latest<F>(actual_blocks: u64, mut read_block: F) -> Result<Recovery, Error>
+where
+    F: FnMut(u64, &mut Block) -> bool,
+{
+    let mount = recover(actual_blocks, |number, output| read_block(number, output))?;
+    let mut best = Recovery {
+        superblock: mount.superblock,
+        source: RecoverySource::Superblock(mount.copy),
+    };
+    for slot in 0..crate::intent::INTENT_LOG_SLOTS {
+        let primary = INTENT_LOG_START + slot * 2;
+        let mut selected = None;
+        for (copy, number) in [primary, primary + 1].into_iter().enumerate() {
+            let mut block = [0; BLOCK_SIZE];
+            if !read_block(number, &mut block) {
+                continue;
+            }
+            let Ok(intent) = crate::intent::IntentRecord::decode(&block, actual_blocks) else {
+                continue;
+            };
+            selected = Some((copy as u8, intent.superblock));
+            break;
+        }
+        let Some((copy, candidate)) = selected else {
+            continue;
+        };
+        if sequence_is_newer(candidate.sequence, best.superblock.sequence)
+            && roots_are_valid(candidate, &mut read_block)
+        {
+            best = Recovery {
+                superblock: candidate,
+                source: RecoverySource::IntentLog(copy),
+            };
+        }
+    }
+    Ok(best)
 }
 
 /// Commit чередует superblock copies. Nodes всегда записываются COW и поэтому
@@ -1039,13 +1255,13 @@ pub fn format_empty(volume_blocks: u64, uuid: [u8; 16]) -> Result<EmptyVolume, E
     let first_root = FIRST_ALLOCATABLE_BLOCK;
     let roots = RootSet::new(
         RootPointer::new(first_root, sequence, 0, TreeKind::Inode),
-        RootPointer::new(first_root + 1, sequence, 0, TreeKind::Directory),
-        RootPointer::new(first_root + 2, sequence, 0, TreeKind::Extent),
-        RootPointer::new(first_root + 3, sequence, 0, TreeKind::Space),
-        RootPointer::new(first_root + 4, sequence, 0, TreeKind::Checksum),
-        RootPointer::new(first_root + 5, sequence, 0, TreeKind::Snapshot),
+        RootPointer::new(first_root + 2, sequence, 0, TreeKind::Directory),
+        RootPointer::new(first_root + 4, sequence, 0, TreeKind::Extent),
+        RootPointer::new(first_root + 6, sequence, 0, TreeKind::Space),
+        RootPointer::new(first_root + 8, sequence, 0, TreeKind::Checksum),
+        RootPointer::new(first_root + 10, sequence, 0, TreeKind::Snapshot),
     );
-    let first_free = first_root + ROOT_COUNT as u64;
+    let first_free = first_root + ROOT_COUNT as u64 * 2;
     let superblock = Superblock::new(
         volume_blocks,
         sequence,
@@ -1081,7 +1297,7 @@ pub fn format_empty(volume_blocks: u64, uuid: [u8; 16]) -> Result<EmptyVolume, E
         TreeKind::Directory,
         0,
         sequence,
-        first_root + 1,
+        first_root + 2,
         uuid,
         volume_blocks,
     )?;
@@ -1089,33 +1305,26 @@ pub fn format_empty(volume_blocks: u64, uuid: [u8; 16]) -> Result<EmptyVolume, E
         TreeKind::Extent,
         0,
         sequence,
-        first_root + 2,
+        first_root + 4,
         uuid,
         volume_blocks,
     )?;
-    let mut space = NodeBuilder::new(
+    let space = NodeBuilder::new(
         TreeKind::Space,
         0,
         sequence,
-        first_root + 3,
+        first_root + 6,
         uuid,
         volume_blocks,
     )?;
-    let free_value = FreeSpaceValue {
-        blocks: volume_blocks - first_free,
-        hints: 0,
-    }
-    .encode()?;
-    space.push(
-        &space_key(SPACE_KEY_FREE, first_free),
-        &free_value,
-        volume_blocks,
-    )?;
+    // Неосвоенный хвост тома задаётся high-water mark superblock, а не
+    // дублирующей free-записью. Space tree содержит только действительно
+    // освобождённые extents, иначе первый allocation пересёкся бы с «free».
     let checksum = NodeBuilder::new(
         TreeKind::Checksum,
         0,
         sequence,
-        first_root + 4,
+        first_root + 8,
         uuid,
         volume_blocks,
     )?;
@@ -1123,7 +1332,7 @@ pub fn format_empty(volume_blocks: u64, uuid: [u8; 16]) -> Result<EmptyVolume, E
         TreeKind::Snapshot,
         0,
         sequence,
-        first_root + 5,
+        first_root + 10,
         uuid,
         volume_blocks,
     )?;
@@ -1146,16 +1355,53 @@ where
     F: FnMut(u64, &mut Block) -> bool,
 {
     for root in superblock.roots.iter() {
-        let mut block = [0u8; BLOCK_SIZE];
-        if !read_block(root.block, &mut block) {
+        if !tree_is_valid(superblock, root, read_block) {
             return false;
         }
-        // Файл-контейнер может быть больше опубликованного volume после grow.
-        // Ни один child/extent из старого поколения не получает право ссылаться
-        // в этот хвост до атомарной публикации нового размера в superblock.
+    }
+    true
+}
+
+#[derive(Clone, Copy)]
+struct ValidationFrame {
+    block: u64,
+    level: u16,
+    next_child: u16,
+    entered: bool,
+    expected: [u8; 8 + MAX_NAME_BYTES],
+    expected_len: u16,
+}
+
+impl ValidationFrame {
+    const EMPTY: Self = Self {
+        block: 0,
+        level: 0,
+        next_child: 0,
+        entered: false,
+        expected: [0; 8 + MAX_NAME_BYTES],
+        expected_len: 0,
+    };
+}
+
+fn tree_is_valid<F>(superblock: Superblock, root: RootPointer, read_block: &mut F) -> bool
+where
+    F: FnMut(u64, &mut Block) -> bool,
+{
+    let mut stack = [ValidationFrame::EMPTY; MAX_TREE_HEIGHT as usize + 1];
+    stack[0].block = root.block;
+    stack[0].level = root.level;
+    let mut depth = 1usize;
+    let mut visited = 0u64;
+    while depth != 0 {
+        let index = depth - 1;
+        let frame = stack[index];
+        let mut block = [0; BLOCK_SIZE];
+        if !read_valid_metadata_copy(superblock, frame.block, read_block, &mut block) {
+            return false;
+        }
         let Ok(node) = NodeView::parse(
             &block,
-            root.block,
+            frame.block,
             superblock.uuid,
             superblock.volume_blocks,
         ) else {
@@ -1163,13 +1409,85 @@ where
         };
         let header = node.header();
         if header.kind != root.kind
-            || header.level != root.level
-            || header.generation != root.generation
+            || header.level != frame.level
+            || header.generation > superblock.sequence
+            || (depth == 1 && header.generation != root.generation)
         {
             return false;
         }
+        if !frame.entered {
+            stack[index].entered = true;
+            visited += 1;
+            if visited > superblock.allocated_blocks {
+                return false;
+            }
+            if frame.expected_len != 0
+                && node.item(0).is_none_or(|item| {
+                    item.key != &frame.expected[..usize::from(frame.expected_len)]
+                })
+            {
+                return false;
+            }
+            if header.level == 0 {
+                depth -= 1;
+                continue;
+            }
+            if header.item_count == 0 {
+                return false;
+            }
+        }
+        let child_index = usize::from(stack[index].next_child);
+        if child_index == usize::from(header.item_count) {
+            depth -= 1;
+            continue;
+        }
+        let Some(item) = node.item(child_index) else {
+            return false;
+        };
+        let Ok(raw_child) = <[u8; 8]>::try_from(item.value) else {
+            return false;
+        };
+        let child = u64::from_le_bytes(raw_child);
+        if child < FIRST_ALLOCATABLE_BLOCK
+            || child + 1 >= superblock.volume_blocks
+            || child & 1 != 0
+            || item.key.len() > 8 + MAX_NAME_BYTES
+            || depth == stack.len()
+        {
+            return false;
+        }
+        stack[index].next_child += 1;
+        let mut expected = [0; 8 + MAX_NAME_BYTES];
+        expected[..item.key.len()].copy_from_slice(item.key);
+        stack[depth] = ValidationFrame {
+            block: child,
+            level: header.level - 1,
+            next_child: 0,
+            entered: false,
+            expected,
+            expected_len: item.key.len() as u16,
+        };
+        depth += 1;
     }
     true
+}
+
+fn read_valid_metadata_copy<F>(
+    superblock: Superblock,
+    primary: u64,
+    read_block: &mut F,
+    output: &mut Block,
+) -> bool
+where
+    F: FnMut(u64, &mut Block) -> bool,
+{
+    if read_block(primary, output)
+        && NodeView::parse(output, primary, superblock.uuid, superblock.volume_blocks).is_ok()
+    {
+        return true;
+    }
+    read_block(primary + 1, output)
+        && NodeView::parse(output, primary, superblock.uuid, superblock.volume_blocks).is_ok()
 }
 
 fn candidate_sequence(candidate: Option<(u8, Superblock)>) -> u64 {
@@ -1242,12 +1560,7 @@ fn leaf_shape_is_valid(header: NodeHeader, item: NodeItem<'_>, volume_blocks: u6
                     .checked_add(u64::from(get_u16(item.value, 0)))
                     .is_some_and(|end| end <= volume_blocks)
         }
-        TreeKind::Snapshot => {
-            // Snapshot manifest codec появится вместе с retention service.
-            // До этого этапа разрешён только пустой root, чтобы нельзя было
-            // опубликовать opaque запись без строгой проверки.
-            false
-        }
+        TreeKind::Snapshot => SnapshotValue::decode(item.value, volume_blocks).is_ok(),
     }
 }
 
@@ -1446,16 +1759,16 @@ mod tests {
     use std::vec;
 
     const VOLUME_BLOCKS: u64 = MIN_VOLUME_BLOCKS;
-    const TEST_UUID: [u8; 16] = *b"VaraniaFS-v2test";
+    const TEST_UUID: [u8; 16] = *b"VaraniaFSTestVol";
 
     fn roots(generation: u64, first_block: u64) -> RootSet {
         RootSet::new(
             RootPointer::new(first_block, generation, 0, TreeKind::Inode),
-            RootPointer::new(first_block + 1, generation, 0, TreeKind::Directory),
-            RootPointer::new(first_block + 2, generation, 0, TreeKind::Extent),
-            RootPointer::new(first_block + 3, generation, 0, TreeKind::Space),
-            RootPointer::new(first_block + 4, generation, 0, TreeKind::Checksum),
-            RootPointer::new(first_block + 5, generation, 0, TreeKind::Snapshot),
+            RootPointer::new(first_block + 2, generation, 0, TreeKind::Directory),
+            RootPointer::new(first_block + 4, generation, 0, TreeKind::Extent),
+            RootPointer::new(first_block + 6, generation, 0, TreeKind::Space),
+            RootPointer::new(first_block + 8, generation, 0, TreeKind::Checksum),
+            RootPointer::new(first_block + 10, generation, 0, TreeKind::Snapshot),
         )
     }
 
@@ -1496,7 +1809,7 @@ mod tests {
             TreeKind::Directory,
             0,
             generation,
-            first_block + 1,
+            first_block + 2,
             TEST_UUID,
             VOLUME_BLOCKS,
         )
@@ -1505,29 +1818,17 @@ mod tests {
             TreeKind::Extent,
             0,
             generation,
-            first_block + 2,
+            first_block + 4,
             TEST_UUID,
             VOLUME_BLOCKS,
         )
         .unwrap();
-        let mut free = NodeBuilder::new(
+        let free = NodeBuilder::new(
             TreeKind::Space,
             0,
             generation,
-            first_block + 3,
+            first_block + 6,
             TEST_UUID,
-            VOLUME_BLOCKS,
-        )
-        .unwrap();
-        let free_start = first_block + ROOT_COUNT as u64;
-        free.push(
-            &space_key(SPACE_KEY_FREE, free_start),
-            &FreeSpaceValue {
-                blocks: VOLUME_BLOCKS - free_start,
-                hints: 0,
-            }
-            .encode()
-            .unwrap(),
             VOLUME_BLOCKS,
         )
         .unwrap();
@@ -1535,7 +1836,7 @@ mod tests {
             TreeKind::Checksum,
             0,
             generation,
-            first_block + 4,
+            first_block + 8,
             TEST_UUID,
             VOLUME_BLOCKS,
         )
@@ -1544,7 +1845,7 @@ mod tests {
             TreeKind::Snapshot,
             0,
             generation,
-            first_block + 5,
+            first_block + 10,
             TEST_UUID,
             VOLUME_BLOCKS,
         )
@@ -1564,7 +1865,7 @@ mod tests {
             VOLUME_BLOCKS,
             generation,
             ROOT_OBJECT_ID + 1,
-            SUPERBLOCK_COPIES + ROOT_COUNT as u64,
+            first_block + ROOT_COUNT as u64 * 2,
             TEST_UUID,
             roots(generation, first_block),
         )
@@ -1572,7 +1873,7 @@ mod tests {
 
     #[test]
     fn superblock_roundtrip_rejects_corruption_and_unknown_features() {
-        let source = superblock(7, 2);
+        let source = superblock(7, 100);
         let encoded = source.encode().unwrap();
         assert_eq!(Superblock::decode(&encoded, VOLUME_BLOCKS), Ok(source));
 
@@ -1603,7 +1904,7 @@ mod tests {
     #[test]
     fn node_builder_preserves_sorted_keys_and_validates_grapheme_agnostic_names() {
         let mut builder =
-            NodeBuilder::new(TreeKind::Directory, 0, 3, 10, TEST_UUID, VOLUME_BLOCKS).unwrap();
+            NodeBuilder::new(TreeKind::Directory, 0, 3, 100, TEST_UUID, VOLUME_BLOCKS).unwrap();
         let mut first_key = [0u8; 8 + MAX_NAME_BYTES];
         let mut second_key = [0u8; 8 + MAX_NAME_BYTES];
         let first = directory_key(ROOT_OBJECT_ID, "Документы".as_bytes(), &mut first_key).unwrap();
@@ -1623,7 +1924,7 @@ mod tests {
         builder.push(first, &first_value, VOLUME_BLOCKS).unwrap();
         builder.push(second, &second_value, VOLUME_BLOCKS).unwrap();
         let block = builder.finish().unwrap();
-        let node = NodeView::parse(&block, 10, TEST_UUID, VOLUME_BLOCKS).unwrap();
+        let node = NodeView::parse(&block, 100, TEST_UUID, VOLUME_BLOCKS).unwrap();
         assert_eq!(node.header().item_count, 2);
         assert_eq!(node.item(0).unwrap().key, first);
         assert_eq!(node.item(1).unwrap().key, second);
@@ -1638,7 +1939,7 @@ mod tests {
     #[test]
     fn node_rejects_checksum_overlap_and_unsorted_items() {
         let mut builder =
-            NodeBuilder::new(TreeKind::Inode, 0, 1, 2, TEST_UUID, VOLUME_BLOCKS).unwrap();
+            NodeBuilder::new(TreeKind::Inode, 0, 1, 100, TEST_UUID, VOLUME_BLOCKS).unwrap();
         builder
             .push(&object_key(2), &inode_value(1), VOLUME_BLOCKS)
             .unwrap();
@@ -1648,16 +1949,16 @@ mod tests {
         );
         let mut block = builder.finish().unwrap();
         assert_eq!(
-            NodeView::parse(&block, 3, TEST_UUID, VOLUME_BLOCKS).err(),
+            NodeView::parse(&block, 102, TEST_UUID, VOLUME_BLOCKS).err(),
             Some(Error::InvalidNode)
         );
         assert_eq!(
-            NodeView::parse(&block, 2, *b"another-volume!!", VOLUME_BLOCKS).err(),
+            NodeView::parse(&block, 100, *b"another-volume!!", VOLUME_BLOCKS).err(),
             Some(Error::InvalidNode)
         );
         block[BLOCK_SIZE - 1] ^= 1;
         assert!(matches!(
-            NodeView::parse(&block, 2, TEST_UUID, VOLUME_BLOCKS),
+            NodeView::parse(&block, 100, TEST_UUID, VOLUME_BLOCKS),
             Err(Error::InvalidChecksum)
         ));
 
@@ -1667,14 +1968,14 @@ mod tests {
         let checksum = crc32c_with_zeroed_u32(&unknown_gap, NODE_CHECKSUM_OFFSET);
         put_u32(&mut unknown_gap, NODE_CHECKSUM_OFFSET, checksum);
         assert_eq!(
-            NodeView::parse(&unknown_gap, 2, TEST_UUID, VOLUME_BLOCKS).err(),
+            NodeView::parse(&unknown_gap, 100, TEST_UUID, VOLUME_BLOCKS).err(),
             Some(Error::InvalidNode)
         );
     }
 
     fn builder_with_one_inode() -> NodeBuilder {
         let mut builder =
-            NodeBuilder::new(TreeKind::Inode, 0, 1, 2, TEST_UUID, VOLUME_BLOCKS).unwrap();
+            NodeBuilder::new(TreeKind::Inode, 0, 1, 100, TEST_UUID, VOLUME_BLOCKS).unwrap();
         builder
             .push(&object_key(2), &inode_value(1), VOLUME_BLOCKS)
             .unwrap();
@@ -1683,17 +1984,19 @@ mod tests {
 
     #[test]
     fn recovery_rolls_back_torn_superblock_and_missing_new_root() {
-        let old_nodes = make_root_nodes(1, 2);
-        let new_nodes = make_root_nodes(2, 8);
-        let old_superblock = superblock(1, 2).encode().unwrap();
-        let new_superblock = superblock(2, 8).encode().unwrap();
-        let mut disk = vec![[0u8; BLOCK_SIZE]; 14];
+        let old_start = 100u64;
+        let new_start = 200u64;
+        let old_nodes = make_root_nodes(1, old_start);
+        let new_nodes = make_root_nodes(2, new_start);
+        let old_superblock = superblock(1, old_start).encode().unwrap();
+        let new_superblock = superblock(2, new_start).encode().unwrap();
+        let mut disk = vec![[0u8; BLOCK_SIZE]; 212];
         disk[0] = old_superblock;
         for (index, node) in old_nodes.into_iter().enumerate() {
-            disk[2 + index] = node;
+            disk[old_start as usize + index * 2] = node;
         }
         for (index, node) in new_nodes.into_iter().enumerate() {
-            disk[8 + index] = node;
+            disk[new_start as usize + index * 2] = node;
         }
 
         let mounted = recover(VOLUME_BLOCKS, |block, output| {
@@ -1709,7 +2012,7 @@ mod tests {
         // Новый superblock опубликован, но один root torn: mount обязан
         // сохранить последнее полностью валидное поколение.
         disk[1] = new_superblock;
-        disk[10][100] ^= 1;
+        disk[(new_start + 4) as usize][100] ^= 1;
         let mounted = recover(VOLUME_BLOCKS, |block, output| {
             let Some(source) = disk.get(block as usize) else {
                 return false;
@@ -1720,7 +2023,7 @@ mod tests {
         .unwrap();
         assert_eq!(mounted.superblock.sequence, 1);
 
-        disk[10][100] ^= 1;
+        disk[(new_start + 4) as usize][100] ^= 1;
         let mounted = recover(VOLUME_BLOCKS, |block, output| {
             let Some(source) = disk.get(block as usize) else {
                 return false;
@@ -1736,9 +2039,10 @@ mod tests {
     #[test]
     fn recovery_never_uses_container_tail_beyond_published_volume() {
         let actual_blocks = VOLUME_BLOCKS + 8;
-        let mut nodes = make_root_nodes(1, 2);
+        let first = 100u64;
+        let mut nodes = make_root_nodes(1, first);
         let mut extent =
-            NodeBuilder::new(TreeKind::Extent, 0, 1, 4, TEST_UUID, actual_blocks).unwrap();
+            NodeBuilder::new(TreeKind::Extent, 0, 1, first + 4, TEST_UUID, actual_blocks).unwrap();
         let outside_published_volume = ExtentValue {
             physical: VOLUME_BLOCKS,
             mirror_physical: 0,
@@ -1752,7 +2056,7 @@ mod tests {
             .push(&extent_key(2, 0), &outside_published_volume, actual_blocks)
             .unwrap();
         nodes[TreeKind::Extent.index()] = extent.finish().unwrap();
-        let encoded_superblock = superblock(1, 2).encode().unwrap();
+        let encoded_superblock = superblock(1, first).encode().unwrap();
 
         assert_eq!(
             recover(actual_blocks, |block, output| match block {
@@ -1760,8 +2064,12 @@ mod tests {
                     *output = encoded_superblock;
                     true
                 }
-                block if (2..2 + ROOT_COUNT as u64).contains(&block) => {
-                    *output = nodes[(block - 2) as usize];
+                block
+                    if block >= first
+                        && block < first + ROOT_COUNT as u64 * 2
+                        && (block - first).is_multiple_of(2) =>
+                {
+                    *output = nodes[((block - first) / 2) as usize];
                     true
                 }
                 _ => false,
@@ -1772,17 +2080,19 @@ mod tests {
 
     #[test]
     fn every_power_cut_before_all_roots_are_durable_keeps_old_generation() {
-        let old_nodes = make_root_nodes(1, 2);
-        let new_nodes = make_root_nodes(2, 8);
-        let old_superblock = superblock(1, 2).encode().unwrap();
-        let new_superblock = superblock(2, 8).encode().unwrap();
+        let old_start = 100u64;
+        let new_start = 200u64;
+        let old_nodes = make_root_nodes(1, old_start);
+        let new_nodes = make_root_nodes(2, new_start);
+        let old_superblock = superblock(1, old_start).encode().unwrap();
+        let new_superblock = superblock(2, new_start).encode().unwrap();
 
         for durable_new_roots in 0..=ROOT_COUNT {
-            let mut disk = vec![[0u8; BLOCK_SIZE]; 14];
+            let mut disk = vec![[0u8; BLOCK_SIZE]; 212];
             disk[0] = old_superblock;
             disk[1] = new_superblock;
             for (index, node) in old_nodes.iter().copied().enumerate() {
-                disk[2 + index] = node;
+                disk[old_start as usize + index * 2] = node;
             }
             for (index, node) in new_nodes
                 .iter()
@@ -1790,7 +2100,7 @@ mod tests {
                 .take(durable_new_roots)
                 .enumerate()
             {
-                disk[8 + index] = node;
+                disk[new_start as usize + index * 2] = node;
             }
             let mounted = recover(VOLUME_BLOCKS, |block, output| {
                 let Some(source) = disk.get(block as usize) else {
@@ -1821,7 +2131,7 @@ mod tests {
     #[test]
     fn capacity_error_does_not_publish_a_partially_valid_node() {
         let mut builder =
-            NodeBuilder::new(TreeKind::Inode, 0, 1, 2, TEST_UUID, VOLUME_BLOCKS).unwrap();
+            NodeBuilder::new(TreeKind::Inode, 0, 1, 100, TEST_UUID, VOLUME_BLOCKS).unwrap();
         let value = inode_value(1);
         let mut object = 1u64;
         loop {
@@ -1832,27 +2142,20 @@ mod tests {
             }
         }
         let block = builder.finish().unwrap();
-        let node = NodeView::parse(&block, 2, TEST_UUID, VOLUME_BLOCKS).unwrap();
+        let node = NodeView::parse(&block, 100, TEST_UUID, VOLUME_BLOCKS).unwrap();
         assert!(node.header().item_count > 1);
         assert_eq!(node.item(usize::from(node.header().item_count)), None);
     }
 
     #[test]
-    fn crc32c_has_stable_reference_vector_and_differs_from_v1_crc() {
-        let mut block = [0u8; BLOCK_SIZE];
-        block[..9].copy_from_slice(b"123456789");
-        assert_ne!(
-            crc32c_with_zeroed_u32(&block, 100),
-            crate::crc32(b"123456789")
-        );
-        assert_eq!(crate::crc32(b"123456789"), 0xcbf4_3926);
+    fn crc32c_has_stable_reference_vector() {
         assert_eq!(crc32c(b"123456789"), 0xe306_9283);
     }
 
     #[test]
     fn checksum_and_reverse_map_records_have_strict_shapes() {
         let mut checksum =
-            NodeBuilder::new(TreeKind::Checksum, 0, 1, 20, TEST_UUID, VOLUME_BLOCKS).unwrap();
+            NodeBuilder::new(TreeKind::Checksum, 0, 1, 100, TEST_UUID, VOLUME_BLOCKS).unwrap();
         let mut digest = [0u8; 32];
         digest[..4].copy_from_slice(&0xe306_9283u32.to_le_bytes());
         let value = DataChecksumValue {
@@ -1867,10 +2170,10 @@ mod tests {
             .push(&object_key(100), &value, VOLUME_BLOCKS)
             .unwrap();
         let block = checksum.finish().unwrap();
-        assert!(NodeView::parse(&block, 20, TEST_UUID, VOLUME_BLOCKS).is_ok());
+        assert!(NodeView::parse(&block, 100, TEST_UUID, VOLUME_BLOCKS).is_ok());
 
         let mut space =
-            NodeBuilder::new(TreeKind::Space, 0, 1, 21, TEST_UUID, VOLUME_BLOCKS).unwrap();
+            NodeBuilder::new(TreeKind::Space, 0, 1, 102, TEST_UUID, VOLUME_BLOCKS).unwrap();
         let reverse = ReverseMapValue {
             object_id: 7,
             logical_block: 3,
@@ -1883,7 +2186,7 @@ mod tests {
             .push(&space_key(SPACE_KEY_REVERSE, 100), &reverse, VOLUME_BLOCKS)
             .unwrap();
         let block = space.finish().unwrap();
-        assert!(NodeView::parse(&block, 21, TEST_UUID, VOLUME_BLOCKS).is_ok());
+        assert!(NodeView::parse(&block, 102, TEST_UUID, VOLUME_BLOCKS).is_ok());
 
         let replicated = ExtentValue {
             physical: 100,
@@ -1921,8 +2224,12 @@ mod tests {
                 *output = image.superblock;
                 true
             }
-            block if (2..2 + ROOT_COUNT as u64).contains(&block) => {
-                *output = image.roots[(block - 2) as usize];
+            block
+                if block >= FIRST_ALLOCATABLE_BLOCK
+                    && block < FIRST_ALLOCATABLE_BLOCK + ROOT_COUNT as u64 * 2
+                    && (block - FIRST_ALLOCATABLE_BLOCK).is_multiple_of(2) =>
+            {
+                *output = image.roots[((block - FIRST_ALLOCATABLE_BLOCK) / 2) as usize];
                 true
             }
             _ => false,
@@ -1930,7 +2237,10 @@ mod tests {
         .unwrap();
         assert_eq!(mounted.superblock.sequence, 1);
         assert_eq!(mounted.superblock.next_object_id, ROOT_OBJECT_ID + 1);
-        assert_eq!(mounted.superblock.roots.get(TreeKind::Snapshot).block, 7);
+        assert_eq!(
+            mounted.superblock.roots.get(TreeKind::Snapshot).block,
+            FIRST_ALLOCATABLE_BLOCK + 10
+        );
     }
 
     #[test]
