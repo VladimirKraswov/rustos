@@ -14,6 +14,11 @@ RUN_DIR="$(mktemp -d "${TMPDIR:-/tmp}/rustos-arm-gui-test.XXXXXX")"
 RESULT_DIR="$ROOT/build/test-results/arm-gui"
 mkdir -p "$RESULT_DIR"
 cp -f build/arm-firmware/edk2-aarch64-vars-template.fd "$RUN_DIR/VARS.fd"
+# Интерактивный QEMU держит writable VaraniaFS image эксклюзивно. GUI-test
+# использует собственную sparse-копию: тесты можно запускать, не закрывая VM
+# пользователя, а их записи никогда не меняют developer volume.
+SYSTEM_DISK="$RUN_DIR/system.vfs"
+cp -f build/arm-system.vfs "$SYSTEM_DISK"
 
 HOST_SYSTEM="$(uname -s)"
 HOST_MACHINE="$(uname -m)"
@@ -55,6 +60,7 @@ cleanup() {
     for file in serial.log qemu-stderr.log desktop.ppm; do
         [[ -f "$RUN_DIR/$file" ]] && cp -f "$RUN_DIR/$file" "$RESULT_DIR/$file"
     done
+    rm -rf "$RUN_DIR"
 }
 trap cleanup EXIT INT TERM HUP
 
@@ -63,7 +69,7 @@ qemu-system-aarch64 \
     -cpu "$CPU_MODEL" -smp "$CPUS" -m "$MEMORY_MB" -accel "$ACCEL" \
     -drive if=pflash,format=raw,readonly=on,file=build/arm-firmware/edk2-aarch64-code.fd \
     -drive if=pflash,format=raw,file="$RUN_DIR/VARS.fd" \
-    -drive if=none,id=systemdisk,format=raw,file=build/arm-system.vfs \
+    -drive if=none,id=systemdisk,format=raw,file="$SYSTEM_DISK" \
     -device virtio-blk-device,drive=systemdisk \
     -device virtio-gpu-device,xres=1280,yres=720 \
     -device virtio-keyboard-device \
@@ -86,8 +92,13 @@ for _ in $(seq 1 "$TIMEOUT"); do
     sleep 1
 done
 [[ $ready == 1 ]] || {
-    echo "[test-arm-gui] GUI_READY timeout after ${TIMEOUT}s" >&2
+    if kill -0 "$QPID" 2>/dev/null; then
+        echo "[test-arm-gui] GUI_READY timeout after ${TIMEOUT}s" >&2
+    else
+        echo "[test-arm-gui] QEMU exited before GUI_READY" >&2
+    fi
     tail -n 80 "$RUN_DIR/serial.log" 2>/dev/null || true
+    tail -n 40 "$RUN_DIR/qemu-stderr.log" 2>/dev/null || true
     exit 1
 }
 
