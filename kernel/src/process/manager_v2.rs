@@ -1,5 +1,5 @@
-//! CPU0 process manager ABI v4: процессы, несколько потоков, VM, shared
-//! memory, capability IPC и монотонные часы.
+//! CPU0 process manager ABI v6: процессы, несколько потоков, VM, shared
+//! memory, capability IPC, graphics objects и монотонные часы.
 //!
 //! Здесь сознательно используются ограниченные статические таблицы: раннее
 //! микроядро не должно зависеть от собственного heap allocator. Лимиты
@@ -14,6 +14,7 @@ use core::{
 use rustos_abi::{
     block::{BlockIoRequest, BLOCK_ABI_VERSION},
     bootinfo::BootInitramfs,
+    display::{DisplayAtomicPresent, DisplayScanoutInfo, DisplayVblankWait},
     graphics_buffer::{BufferUsage, GraphicsBufferDesc, MemoryDomain},
     ipc::{Message, IPC_MAX_HANDLES},
     memory::{SharedMemoryCreate, SharedMemoryMap, VmFlags, VmMapRequest, MEMORY_ABI_VERSION},
@@ -37,7 +38,9 @@ use rustos_microkernel::{
 
 use crate::{
     arch::{self, TrapFrame, TrapKind, UserContext},
-    block, fs,
+    block,
+    display::scanout::{self, DisplayBrokerError},
+    fs,
     memory::{self, AddressSpace, FrameBlock, UserPageBacking, UserPageFlags},
     serial,
 };
@@ -117,6 +120,13 @@ struct PendingPipe {
 }
 
 #[derive(Clone, Copy)]
+struct PendingVblank {
+    sequence: u64,
+    present_deadline_ns: u64,
+    timeout_deadline_ns: u64,
+}
+
+#[derive(Clone, Copy)]
 struct PendingSyncPoint {
     timeline: TimelineId,
     value: u64,
@@ -159,6 +169,7 @@ enum PendingOperation {
     Futex(PendingFutex),
     Pipe(PendingPipe),
     Sync(u8),
+    DisplayVblank(PendingVblank),
 }
 
 struct ManagedThread {
@@ -603,6 +614,9 @@ struct ProcessManager {
     context_switches: u64,
     blocked_receives: u64,
     transferred_capabilities: u64,
+    display_present_sequence: u64,
+    display_completed_sequence: u64,
+    display_present_deadline_ns: u64,
     deferred_process_reap: Option<ProcessId>,
     deferred_thread_reap: Option<ThreadId>,
 }
@@ -631,6 +645,9 @@ impl ProcessManager {
             context_switches: 0,
             blocked_receives: 0,
             transferred_capabilities: 0,
+            display_present_sequence: 0,
+            display_completed_sequence: 0,
+            display_present_deadline_ns: 0,
             deferred_process_reap: None,
             deferred_thread_reap: None,
         }
@@ -657,6 +674,9 @@ impl ProcessManager {
         self.context_switches = 0;
         self.blocked_receives = 0;
         self.transferred_capabilities = 0;
+        self.display_present_sequence = 0;
+        self.display_completed_sequence = 0;
+        self.display_present_deadline_ns = 0;
         self.deferred_process_reap = None;
         self.deferred_thread_reap = None;
     }
@@ -1013,6 +1033,7 @@ impl ProcessManager {
             arch::rearm_scheduler_timer(self.counter_hz);
             self.wake_expired_futexes();
             self.wake_expired_sync_waiters();
+            self.wake_display_vblank_waiters();
             return self.schedule_next(frame);
         }
         if kind == TrapKind::Syscall {
@@ -1290,6 +1311,30 @@ impl ProcessManager {
                     BlockingResult::Blocked => self.schedule_next(frame),
                 }
             }
+            syscall::number::DISPLAY_GET_INFO => {
+                let result = self.display_get_info(process_index, Handle(arg0 as u32), arg1);
+                frame.set_syscall_result(result);
+                0
+            }
+            syscall::number::DISPLAY_ATOMIC_PRESENT => {
+                let result = self.display_atomic_present(
+                    process_index,
+                    Handle(arg0 as u32),
+                    Handle(arg1 as u32),
+                    arg2,
+                );
+                frame.set_syscall_result(result);
+                0
+            }
+            syscall::number::DISPLAY_WAIT_VBLANK => {
+                match self.display_wait_vblank(thread_index, Handle(arg0 as u32), arg1) {
+                    BlockingResult::Return(result) => {
+                        frame.set_syscall_result(result);
+                        0
+                    }
+                    BlockingResult::Blocked => self.schedule_next(frame),
+                }
+            }
             syscall::number::FUTEX_WAIT => {
                 match self.futex_wait(thread_index, arg0, arg1 as u32, arg2) {
                     BlockingResult::Return(result) => {
@@ -1377,13 +1422,14 @@ impl ProcessManager {
 
     fn schedule_next(&mut self, frame: &mut TrapFrame) -> u64 {
         let previous = self.current;
-        let next = match self.scheduler.schedule(0) {
-            Ok(Some(next)) => next,
-            _ => {
-                arch::stop_scheduler_timer();
-                arch::set_user_run_result(0);
-                return 1;
-            }
+        let mut next = self.scheduler.schedule(0).ok().flatten();
+        if next.is_none() && self.complete_idle_estimated_vblank() {
+            next = self.scheduler.schedule(0).ok().flatten();
+        }
+        let Some(next) = next else {
+            arch::stop_scheduler_timer();
+            arch::set_user_run_result(0);
+            return 1;
         };
         let Some(thread_index) = self.thread_index(next) else {
             arch::set_user_run_result(status::DEADLOCK as u64);
@@ -1415,6 +1461,40 @@ impl ProcessManager {
             self.reap_thread(tid);
         }
         0
+    }
+
+    /// Virtio-gpu 2D не экспортирует vblank IRQ. Когда displayd — последний
+    /// runnable thread, нельзя оставить всю систему blocked в ожидании
+    /// несуществующего interrupt. Завершаем именно estimated wait событием
+    /// fenced FLUSH; ABI feedback явно несёт ESTIMATED_VBLANK. При наличии
+    /// другой runnable работы обычный timer path сохраняет frame pacing.
+    fn complete_idle_estimated_vblank(&mut self) -> bool {
+        let Some(index) = self.threads.iter().position(|slot| {
+            slot.as_ref()
+                .is_some_and(|thread| matches!(thread.pending, PendingOperation::DisplayVblank(_)))
+        }) else {
+            return false;
+        };
+        let PendingOperation::DisplayVblank(wait) =
+            self.threads[index].as_ref().expect("vblank waiter").pending
+        else {
+            return false;
+        };
+        self.display_completed_sequence = self.display_completed_sequence.max(wait.sequence);
+        let thread = self.threads[index].as_mut().expect("vblank waiter");
+        thread.pending = PendingOperation::None;
+        thread.context.set_syscall_result(status::OK);
+        self.scheduler.wake(thread.tid).is_ok()
+    }
+
+    /// Снимает незавершённое estimated-vblank состояние умершего display
+    /// master'а. `display_atomic_present` возвращается только после fenced
+    /// virtio FLUSH, поэтому незавершённой DMA-команды здесь уже нет: остаётся
+    /// лишь scheduler deadline. Sequence не обнуляется, чтобы feedback после
+    /// supervisor restart сохранял глобальную монотонность.
+    fn recover_display_master_after_exit(&mut self) {
+        self.display_completed_sequence = self.display_present_sequence;
+        self.display_present_deadline_ns = 0;
     }
 
     fn finish_thread(&mut self, tid: ThreadId, reason: ExitReason) {
@@ -2707,6 +2787,193 @@ impl ProcessManager {
             .unwrap_or(status::INVALID_ARGUMENT)
     }
 
+    fn display_get_info(&self, process_index: usize, handle: Handle, info_address: u64) -> i64 {
+        if !self.user_writable(process_index, info_address, size_of::<DisplayScanoutInfo>()) {
+            return status::INVALID_ARGUMENT;
+        }
+        if let Err(error) = self.processes[process_index]
+            .as_ref()
+            .expect("process")
+            .resolve(handle, CapabilityKind::DisplayScanout(0), Rights::READ)
+        {
+            return error;
+        }
+        let info = match scanout::info() {
+            Ok(info) => info,
+            Err(error) => return display_status(error),
+        };
+        self.write_struct(process_index, info_address, &info)
+            .map(|_| status::OK)
+            .unwrap_or(status::INVALID_ARGUMENT)
+    }
+
+    fn display_atomic_present(
+        &mut self,
+        process_index: usize,
+        scanout_handle: Handle,
+        buffer_handle: Handle,
+        request_address: u64,
+    ) -> i64 {
+        let request = match self.read_struct::<DisplayAtomicPresent>(process_index, request_address)
+        {
+            Ok(request) => request,
+            Err(error) => return error,
+        };
+        if request.validate().is_err() {
+            return status::INVALID_ARGUMENT;
+        }
+        if let Err(error) = self.processes[process_index]
+            .as_ref()
+            .expect("process")
+            .resolve(
+                scanout_handle,
+                CapabilityKind::DisplayScanout(0),
+                Rights::WRITE,
+            )
+        {
+            return error;
+        }
+        let object = match self.processes[process_index]
+            .as_ref()
+            .expect("process")
+            .capability(buffer_handle, Rights::READ)
+        {
+            Ok(CapabilityEntry {
+                kind: CapabilityKind::GraphicsBuffer(object),
+                ..
+            }) => object,
+            Ok(_) => return status::ACCESS_DENIED,
+            Err(error) => return error,
+        };
+        if self.display_present_sequence != self.display_completed_sequence {
+            return status::BUSY;
+        }
+        let descriptor = match self.graphics.descriptor(object) {
+            Ok(descriptor) => descriptor,
+            Err(error) => return error,
+        };
+        let info = match scanout::info() {
+            Ok(info) => info,
+            Err(error) => return display_status(error),
+        };
+        if request.expected_mode_generation != info.mode_generation
+            || descriptor.width != info.width
+            || descriptor.height != info.height
+            || descriptor.planes[0].stride_bytes < info.stride_bytes
+            || !matches!(
+                descriptor.format,
+                rustos_abi::graphics_buffer::PixelFormatCode::B8G8R8X8_UNORM
+                    | rustos_abi::graphics_buffer::PixelFormatCode::B8G8R8A8_UNORM
+            )
+        {
+            return status::INVALID_ARGUMENT;
+        }
+        let sequence = self.display_present_sequence.wrapping_add(1).max(1);
+        let graphics = &self.graphics;
+        if let Err(error) = scanout::present_graphics(
+            descriptor,
+            |page| graphics.physical_page(object, page).ok(),
+            sequence,
+        ) {
+            return display_status(error);
+        }
+        let now = self.monotonic_nanoseconds().max(0) as u64;
+        let interval = match scanout::refresh_interval_ns() {
+            Ok(interval) => interval,
+            Err(error) => return display_status(error),
+        };
+        self.display_present_sequence = sequence;
+        self.display_present_deadline_ns =
+            next_refresh_deadline(now, request.target_time_ns.max(now), interval);
+        sequence as i64
+    }
+
+    fn display_wait_vblank(
+        &mut self,
+        thread_index: usize,
+        scanout_handle: Handle,
+        request_address: u64,
+    ) -> BlockingResult {
+        let process_index = self
+            .process_index(self.threads[thread_index].as_ref().expect("thread").pid)
+            .expect("process");
+        let request = match self.read_struct::<DisplayVblankWait>(process_index, request_address) {
+            Ok(request) => request,
+            Err(error) => return BlockingResult::Return(error),
+        };
+        if request.validate().is_err() {
+            return BlockingResult::Return(status::INVALID_ARGUMENT);
+        }
+        if let Err(error) = self.processes[process_index]
+            .as_ref()
+            .expect("process")
+            .resolve(
+                scanout_handle,
+                CapabilityKind::DisplayScanout(0),
+                Rights::WAIT,
+            )
+        {
+            return BlockingResult::Return(error);
+        }
+        if request.sequence <= self.display_completed_sequence {
+            return BlockingResult::Return(status::OK);
+        }
+        if request.sequence != self.display_present_sequence {
+            return BlockingResult::Return(status::INVALID_ARGUMENT);
+        }
+        let now = self.monotonic_nanoseconds().max(0) as u64;
+        if now >= self.display_present_deadline_ns {
+            self.display_completed_sequence = request.sequence;
+            return BlockingResult::Return(status::OK);
+        }
+        if request.timeout_ns == 0 {
+            return BlockingResult::Return(status::TIMED_OUT);
+        }
+        let timeout_deadline_ns = if request.timeout_ns == SYNC_TIMEOUT_INFINITE {
+            SYNC_TIMEOUT_INFINITE
+        } else {
+            now.saturating_add(request.timeout_ns)
+        };
+        let tid = self.threads[thread_index].as_ref().expect("thread").tid;
+        if self.scheduler.block(tid).is_err() {
+            return BlockingResult::Return(status::BUSY);
+        }
+        self.threads[thread_index].as_mut().expect("thread").pending =
+            PendingOperation::DisplayVblank(PendingVblank {
+                sequence: request.sequence,
+                present_deadline_ns: self.display_present_deadline_ns,
+                timeout_deadline_ns,
+            });
+        BlockingResult::Blocked
+    }
+
+    fn wake_display_vblank_waiters(&mut self) {
+        let now = self.monotonic_nanoseconds().max(0) as u64;
+        for index in 0..MAX_THREADS {
+            let pending = self.threads[index].as_ref().map(|thread| thread.pending);
+            let Some(PendingOperation::DisplayVblank(wait)) = pending else {
+                continue;
+            };
+            let result = if now >= wait.present_deadline_ns {
+                self.display_completed_sequence =
+                    self.display_completed_sequence.max(wait.sequence);
+                Some(status::OK)
+            } else if wait.timeout_deadline_ns != SYNC_TIMEOUT_INFINITE
+                && now >= wait.timeout_deadline_ns
+            {
+                Some(status::TIMED_OUT)
+            } else {
+                None
+            };
+            if let Some(result) = result {
+                let thread = self.threads[index].as_mut().expect("thread");
+                thread.pending = PendingOperation::None;
+                thread.context.set_syscall_result(result);
+                let _ = self.scheduler.wake(thread.tid);
+            }
+        }
+    }
+
     fn sync_timeline_create(&mut self, process_index: usize, request_address: u64) -> i64 {
         let request = match self.read_struct::<SyncTimelineCreate>(process_index, request_address) {
             Ok(request) => request,
@@ -3835,6 +4102,15 @@ impl ProcessManager {
             .any(|thread| thread.pid == pid && !thread.exited)
     }
 
+    fn has_runnable_threads(&self) -> bool {
+        self.threads.iter().flatten().any(|thread| {
+            !thread.exited
+                && self.scheduler.info(thread.tid).is_ok_and(|info| {
+                    matches!(info.state, ThreadState::Ready | ThreadState::Running)
+                })
+        })
+    }
+
     fn cleanup(&mut self) {
         for slot in 0..MAX_SYNC_WAITS {
             if self.sync_waits[slot].used || self.sync_waits[slot].point_count != 0 {
@@ -3899,6 +4175,8 @@ enum BlockingResult {
 static mut MANAGER: ProcessManager = ProcessManager::empty();
 static mut ACTIVE_MANAGER: *mut ProcessManager = ptr::null_mut();
 static mut INTERACTIVE_SERVICES_READY: bool = false;
+static mut INTERACTIVE_GRAPHICS_SERVICES: Option<GraphicsServices> = None;
+static mut GRAPHICS_RESTARTS: u8 = 0;
 
 pub(super) fn handle_active_trap(frame: &mut TrapFrame) -> Option<u64> {
     let manager = unsafe { ACTIVE_MANAGER.as_mut() }?;
@@ -4029,10 +4307,13 @@ pub(super) fn run_milestone(info: &rustos_abi::BootInfo) -> Result<(), ProcessEr
     serial::put_str("[abi-v4] spawn/wait/kill threads VM shared-memory TLS clock verified\n");
     manager.cleanup();
 
-    run_graphics_service_phase(manager)?;
-    serial::put_str(
-        "[graphics-abi-v5] GraphicsBuffer SyncTimeline ring3 displayd/compositord verified\n",
-    );
+    if run_graphics_service_phase(manager)? {
+        serial::put_str(
+            "[graphics-abi-v6] exclusive scanout atomic-present estimated-vblank supervisor-restart verified\n",
+        );
+    } else {
+        serial::put_str("[graphics] native scanout unavailable; kernel fallback remains active\n");
+    }
 
     run_std_startup_phase(manager)?;
     serial::put_str("[std-startup] ordinary fn main argv and process-local environment verified\n");
@@ -4095,15 +4376,77 @@ pub(super) fn start_interactive_services() -> Result<(), ProcessError> {
         None,
     )?;
     manager.endpoints[SERVER_ENDPOINT as usize].receiver = server;
+    let graphics = if scanout::info().is_ok() {
+        Some(spawn_graphics_services(manager)?)
+    } else {
+        None
+    };
 
-    // Сервер доходит до blocking receive; отсутствие runnable threads
-    // возвращает управление GUI kernel loop, не завершая сам процесс.
+    // Все доступные сервисы доходят до blocking receive; отсутствие runnable
+    // threads возвращает управление bootstrap GUI, не завершая процессы.
     if let Err(error) = manager.run() {
         manager.cleanup();
         return Err(error);
     }
+    if graphics.is_some_and(|services| !graphics_services_blocked(manager, services)) {
+        manager.cleanup();
+        return Err(ProcessError::UnexpectedExit);
+    }
     unsafe { INTERACTIVE_SERVICES_READY = true };
+    unsafe { INTERACTIVE_GRAPHICS_SERVICES = graphics };
+    unsafe { GRAPHICS_RESTARTS = 0 };
     serial::put_str("[services] persistent ring3 vfsd ready for GUI terminal\n");
+    if graphics.is_some() {
+        serial::put_str(
+            "[supervisor] persistent displayd/compositord atomic-present services ready\n",
+        );
+    } else {
+        serial::put_str("[supervisor] display services omitted: firmware scanout fallback\n");
+    }
+    Ok(())
+}
+
+/// Короткий supervisor tick из bootstrap GUI loop. В норме все graphics
+/// threads blocked и функция ничего не планирует. После user fault пара
+/// полностью reaped/restarted; kernel desktop при этом продолжает работать.
+pub(super) fn pump_interactive_services() -> Result<(), ProcessError> {
+    if !unsafe { INTERACTIVE_SERVICES_READY } {
+        return Err(ProcessError::UnexpectedExit);
+    }
+    let manager = unsafe { &mut *ptr::addr_of_mut!(MANAGER) };
+    let Some(services) = (unsafe { INTERACTIVE_GRAPHICS_SERVICES }) else {
+        // Firmware framebuffer не имеет transferable hardware authority.
+        // VFS и kernel recovery desktop продолжают работать без displayd.
+        return Ok(());
+    };
+    if graphics_services_blocked(manager, services) {
+        return Ok(());
+    }
+    if manager.has_runnable_threads() {
+        manager.run()?;
+        if graphics_services_blocked(manager, services) {
+            return Ok(());
+        }
+    }
+    let restarts = unsafe { GRAPHICS_RESTARTS };
+    if restarts >= 3 {
+        return Err(ProcessError::UnexpectedExit);
+    }
+    stop_service(manager, services.display, 81);
+    stop_service(manager, services.compositor, 82);
+    manager.recover_display_master_after_exit();
+    manager.endpoints[0] = Endpoint::EMPTY;
+    manager.endpoints[3] = Endpoint::EMPTY;
+    let restarted = spawn_graphics_services(manager)?;
+    manager.run()?;
+    if !graphics_services_blocked(manager, restarted) {
+        return Err(ProcessError::UnexpectedExit);
+    }
+    unsafe { INTERACTIVE_GRAPHICS_SERVICES = Some(restarted) };
+    unsafe { GRAPHICS_RESTARTS = restarts + 1 };
+    serial::put_str("[supervisor] display stack restarted count=");
+    serial::put_u32(u32::from(restarts + 1));
+    serial::put_str("\n");
     Ok(())
 }
 
@@ -4448,26 +4791,81 @@ fn run_vfs_phase(
     Ok(())
 }
 
-/// Первый end-to-end графический data plane. `displayd` намеренно не получает
-/// framebuffer/MMIO capability, поэтому тест проверяет headless present и
-/// release; hardware scanout станет отдельным driver-capability milestone.
-fn run_graphics_service_phase(manager: &mut ProcessManager) -> Result<(), ProcessError> {
-    const DISPLAY_ENDPOINT: u8 = 0;
-    const DISPLAY_SLOT: usize = 2;
+#[derive(Clone, Copy)]
+struct GraphicsServices {
+    display: ProcessId,
+    compositor: ProcessId,
+}
 
+/// End-to-end графический data plane: exclusive scanout capability получает
+/// только displayd, compositor владеет buffers/timelines и reply endpoint.
+fn run_graphics_service_phase(manager: &mut ProcessManager) -> Result<bool, ProcessError> {
+    if scanout::info().is_err() {
+        return Ok(false);
+    }
     manager.begin_phase();
+    let first = spawn_graphics_services(manager)?;
+    if let Err(error) = manager.run() {
+        manager.cleanup();
+        return Err(error);
+    }
+    if !graphics_services_blocked(manager, first) {
+        manager.cleanup();
+        return Err(ProcessError::UnexpectedExit);
+    }
+
+    // Supervisor fault drill: завершаем оба blocked процесса, полностью
+    // отзываем их handles/mappings и запускаем пару заново. Второй frame
+    // должен пройти тот же atomic present/vblank path без stale capability.
+    manager.finish_process(first.display, normal_exit(71));
+    manager.finish_process(first.compositor, normal_exit(72));
+    manager.reap_process(first.display);
+    manager.reap_process(first.compositor);
+    manager.recover_display_master_after_exit();
+    manager.endpoints[0] = Endpoint::EMPTY;
+    manager.endpoints[3] = Endpoint::EMPTY;
+    let restarted = spawn_graphics_services(manager)?;
+    if let Err(error) = manager.run() {
+        manager.cleanup();
+        return Err(error);
+    }
+    if !graphics_services_blocked(manager, restarted) {
+        manager.cleanup();
+        return Err(ProcessError::UnexpectedExit);
+    }
+    manager.cleanup();
+    Ok(true)
+}
+
+fn spawn_graphics_services(manager: &mut ProcessManager) -> Result<GraphicsServices, ProcessError> {
+    const DISPLAY_ENDPOINT: u8 = 0;
+    const FEEDBACK_ENDPOINT: u8 = 3;
+    const DISPLAY_SLOT: usize = 2;
+    const DEVICE_OR_FEEDBACK_SLOT: usize = 3;
+
     let mut display_caps = [EMPTY_CAPABILITY; MAX_CAPABILITIES];
     display_caps[DISPLAY_SLOT] = CapabilityEntry {
         kind: CapabilityKind::Endpoint(DISPLAY_ENDPOINT),
         rights: Rights::RECEIVE,
     };
-    let display = manager.spawn(
+    display_caps[DEVICE_OR_FEEDBACK_SLOT] = CapabilityEntry {
+        kind: CapabilityKind::DisplayScanout(0),
+        rights: Rights::READ.union(Rights::WRITE).union(Rights::WAIT),
+    };
+    let display = manager.spawn_internal(
         "system/bin/displayd.rune",
-        PriorityClass::System,
-        [DISPLAY_SLOT as u64, syscall::ABI_VERSION, 0],
-        0,
-        0,
+        SpawnOptions {
+            parent: ProcessId::KERNEL,
+            priority: PriorityClass::Driver,
+            boot_arguments: [
+                DISPLAY_SLOT as u64,
+                DEVICE_OR_FEEDBACK_SLOT as u64,
+                syscall::ABI_VERSION,
+            ],
+            expected: None,
+        },
         display_caps,
+        None,
     )?;
     manager.endpoints[DISPLAY_ENDPOINT as usize].receiver = display;
 
@@ -4476,20 +4874,66 @@ fn run_graphics_service_phase(manager: &mut ProcessManager) -> Result<(), Proces
         kind: CapabilityKind::Endpoint(DISPLAY_ENDPOINT),
         rights: Rights::SEND,
     };
-    manager.spawn(
+    compositor_caps[DEVICE_OR_FEEDBACK_SLOT] = CapabilityEntry {
+        kind: CapabilityKind::Endpoint(FEEDBACK_ENDPOINT),
+        rights: Rights::SEND.union(Rights::RECEIVE).union(Rights::TRANSFER),
+    };
+    let compositor = manager.spawn_internal(
         "system/bin/compositord.rune",
-        PriorityClass::Interactive,
-        [DISPLAY_SLOT as u64, syscall::ABI_VERSION, 0],
-        0,
-        0,
+        SpawnOptions {
+            parent: ProcessId::KERNEL,
+            priority: PriorityClass::System,
+            boot_arguments: [
+                DISPLAY_SLOT as u64,
+                DEVICE_OR_FEEDBACK_SLOT as u64,
+                syscall::ABI_VERSION,
+            ],
+            expected: None,
+        },
         compositor_caps,
+        None,
     )?;
-    if let Err(error) = manager.run() {
-        manager.cleanup();
-        return Err(error);
+    manager.endpoints[FEEDBACK_ENDPOINT as usize].receiver = compositor;
+    Ok(GraphicsServices {
+        display,
+        compositor,
+    })
+}
+
+fn graphics_services_blocked(manager: &ProcessManager, services: GraphicsServices) -> bool {
+    service_blocked_on(manager, services.display, 0)
+        && service_blocked_on(manager, services.compositor, 3)
+        && manager.display_present_sequence == manager.display_completed_sequence
+        && manager.display_completed_sequence != 0
+}
+
+fn service_blocked_on(manager: &ProcessManager, pid: ProcessId, endpoint: u8) -> bool {
+    manager
+        .processes
+        .iter()
+        .flatten()
+        .any(|process| process.pid == pid && !process.exited)
+        && manager.threads.iter().flatten().any(|thread| {
+            thread.pid == pid
+                && !thread.exited
+                && matches!(
+                    thread.pending,
+                    PendingOperation::Receive(receive) if receive.endpoint == endpoint
+                )
+        })
+}
+
+fn stop_service(manager: &mut ProcessManager, pid: ProcessId, status_value: i32) {
+    let exited = manager
+        .processes
+        .iter()
+        .flatten()
+        .find(|process| process.pid == pid)
+        .map(|process| process.exited);
+    if let Some(false) = exited {
+        manager.finish_process(pid, normal_exit(status_value as i64 as u64));
     }
-    manager.cleanup();
-    Ok(())
+    manager.reap_process(pid);
 }
 
 fn run_ipc_phase(
@@ -4711,6 +5155,26 @@ fn timeline_status(error: TimelineError) -> i64 {
         TimelineError::InvalidId => status::BAD_HANDLE,
         TimelineError::NonMonotonic => status::INVALID_ARGUMENT,
     }
+}
+
+fn display_status(error: DisplayBrokerError) -> i64 {
+    match error {
+        DisplayBrokerError::Unavailable | DisplayBrokerError::UnsupportedMode => {
+            status::NOT_SUPPORTED
+        }
+        DisplayBrokerError::Busy => status::BUSY,
+        DisplayBrokerError::InvalidSurface => status::INVALID_ARGUMENT,
+        DisplayBrokerError::DeviceLost => status::IO_ERROR,
+        DisplayBrokerError::OutOfMemory => status::OUT_OF_MEMORY,
+    }
+}
+
+fn next_refresh_deadline(now: u64, requested: u64, interval: u64) -> u64 {
+    let base = requested.max(now);
+    base.checked_div(interval)
+        .and_then(|period| period.checked_add(1))
+        .and_then(|period| period.checked_mul(interval))
+        .unwrap_or(u64::MAX)
 }
 
 /// Ошибки pipe редки и почти всегда означают дефект lifecycle/handle table.

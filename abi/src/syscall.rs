@@ -8,7 +8,7 @@
 /// инструкции `svc` равно нулю.
 pub const INTERRUPT_VECTOR: u8 = 0x80;
 /// Версия syscall ABI, передаваемая вторым bootstrap-аргументом.
-pub const ABI_VERSION: u64 = 5;
+pub const ABI_VERSION: u64 = 6;
 
 /// Номера операций (`RAX`).
 pub mod number {
@@ -104,6 +104,15 @@ pub mod number {
     pub const SYNC_TIMELINE_WAIT: u64 = 37;
     /// Блокировать поток до bounded wait-set. `arg0=*const SyncWaitMany`.
     pub const SYNC_TIMELINE_WAIT_MANY: u64 = 38;
+    /// Получить active output/mode. `arg0=scanout, arg1=*mut DisplayScanoutInfo`.
+    pub const DISPLAY_GET_INFO: u64 = 39;
+    /// Атомарно опубликовать graphics buffer.
+    /// `arg0=scanout, arg1=buffer, arg2=*const DisplayAtomicPresent`;
+    /// положительный результат — display sequence.
+    pub const DISPLAY_ATOMIC_PRESENT: u64 = 40;
+    /// Блокироваться до predicted/hardware vblank sequence.
+    /// `arg0=scanout, arg1=*const DisplayVblankWait`.
+    pub const DISPLAY_WAIT_VBLANK: u64 = 41;
 }
 
 /// Отрицательные результаты syscall. Не совпадают с Unix errno намеренно:

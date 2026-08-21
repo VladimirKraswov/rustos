@@ -26,7 +26,7 @@ use crate::{
     },
     input::{self, Event, Key, MouseEvent, PlatformInput},
     memory::{self, FrameBlock},
-    serial,
+    process, serial,
 };
 use rustos_abi::{
     bootinfo::BootInitramfs,
@@ -399,6 +399,7 @@ struct DesktopSession {
     drag_preview_visible: bool,
     incremental_application_logged: bool,
     incremental_shell_logged: bool,
+    display_fallback_logged: bool,
     desktop_icon_selected: bool,
     desktop_icon_pressed: bool,
     desktop_terminal_x: i32,
@@ -468,6 +469,7 @@ impl DesktopSession {
             drag_preview_visible: false,
             incremental_application_logged: false,
             incremental_shell_logged: false,
+            display_fallback_logged: false,
             desktop_icon_selected: false,
             desktop_icon_pressed: false,
             desktop_terminal_x: 28,
@@ -502,6 +504,12 @@ impl DesktopSession {
 
     fn event_loop(&mut self) -> ! {
         loop {
+            if process::pump_interactive_services().is_err() && !self.display_fallback_logged {
+                serial::put_str(
+                    "[supervisor] display stack unavailable; kernel desktop fallback active\n",
+                );
+                self.display_fallback_logged = true;
+            }
             if let Some(event) = self.input.poll() {
                 let old_cursor = self.cursor.rect();
                 self.cursor.restore(&mut self.framebuffer);

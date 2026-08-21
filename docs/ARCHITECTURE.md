@@ -66,9 +66,10 @@ contract. `GraphicsBufferDesc` описывает packed/multi-plane памят�
 usage/domain и modifier; `SyncPoint` и `SurfaceCommit` задают явное владение
 кадром, damage, buffer release и presentation feedback. Kernel objects уже
 предоставляют generation-safe GraphicsBuffer/SyncTimeline handles, mapping
-lifetime и блокирующий wait-many. Два RUNE-процесса `compositord`/`displayd`
-проходят headless present при boot; интерактивный desktop пока использует CPU
-raster/damage bootstrap поверх firmware/virtio scanout. Контракт описан в
+lifetime и блокирующий wait-many. Постоянный RUNE `displayd` эксклюзивно
+владеет непередаваемой scanout capability; `compositord` выполняет atomic
+present, ждёт оценочный vblank и получает feedback. Интерактивный desktop пока
+использует CPU raster/damage bootstrap через тот же broker. Контракт описан в
 [GRAPHICS_ABI.md](GRAPHICS_ABI.md) и
 [ADR-0001](adr/0001-modern-graphics-architecture.md).
 
@@ -96,10 +97,11 @@ MADT перечисляет CPU, BSP последовательно выполн
 8. **готов runtime S1:** upstream target `std`, CRT, threads/futex,
    process/pipes/stdio, запуск RUNE с VFS и масштабируемая COW VaraniaFS;
    дальше постоянный supervisor, native Rust toolchain и package/build services;
-9. **переходно:** persistent ring-3 `vfsd`, GUI `RUN` bridge и изолированный
-   headless present `compositord -> displayd` готовы; дальше scanout capability,
-   постоянные display/input services и terminal как отдельный процесс;
-10. supervisor применяет restart policy к реальным service manifests.
+9. **переходно:** persistent ring-3 `vfsd`, `displayd` и `compositord` готовы;
+   displayd эксклюзивно владеет scanout, atomic present/vblank feedback и
+   bounded supervisor restart проходят boot-test; дальше оконные surface
+   queues, постоянный input service и terminal как отдельный процесс;
+10. supervisor переносит restart policy из bootstrap pair в service manifests.
 
 UI API уже отделён от framebuffer ownership, поэтому widget logic не должна
 переписываться при замене прямых вызовов IPC-сообщениями.

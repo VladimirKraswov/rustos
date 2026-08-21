@@ -1,4 +1,4 @@
-# Процессы, потоки, память и object waits: syscall ABI v5
+# Процессы, потоки, память и object waits: syscall ABI v6
 
 Этот документ описывает первый исполняемый ABI RustOS, достаточный для
 построения `std::process`, `std::thread`, allocator и zero-copy IPC. Общие
@@ -96,12 +96,12 @@ control message остаётся inline, а исходники, object-файл�
 
 ## Графические объекты и timeline waits
 
-ABI v5 аддитивно вводит отдельные `GraphicsBuffer` и `SyncTimeline` object
-kinds. Они не подменяют shared memory или futex: graphics buffer фиксирует
-pixel layout и mapping rights, timeline предоставляет межпроцессное
-монотонное signal/wait. Wait-many копирует bounded массив points до блокировки
-и удерживает object references. Полный контракт находится в
-[GRAPHICS_ABI.md](GRAPHICS_ABI.md).
+ABI v6 содержит отдельные `GraphicsBuffer`, `SyncTimeline` и `DisplayScanout`
+object kinds. Первые два описывают pixel layout и межпроцессную синхронизацию;
+последний выдаётся только `displayd`, не передаётся по IPC и разрешает query,
+atomic present и блокирующее ожидание presentation boundary. Wait-many и
+display wait копируют bounded request до блокировки и не сохраняют user
+pointer. Полный контракт находится в [GRAPHICS_ABI.md](GRAPHICS_ABI.md).
 
 ## Монотонные часы
 
@@ -134,6 +134,6 @@ make test-boot
 
 ```text
 [abi-v4] spawn/wait/kill threads VM shared-memory TLS clock verified
-[graphics-abi-v5] GraphicsBuffer SyncTimeline ring3 displayd/compositord verified
+[graphics-abi-v6] exclusive scanout atomic-present estimated-vblank supervisor-restart verified
 [process-manager] ABI v4 VM/shared-memory frames reclaimed
 ```

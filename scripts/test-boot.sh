@@ -135,7 +135,7 @@ patterns=(
     "\[isolation\] concurrent #UD terminated one process; survivor exited=22"
     "\[ipc\] queued block/wake and attenuated VFS capability verified"
     "\[abi-v4\] spawn/wait/kill threads VM shared-memory TLS clock verified"
-    "\[graphics-abi-v5\] GraphicsBuffer SyncTimeline ring3 displayd/compositord verified"
+    "\[graphics-abi-v6\] exclusive scanout atomic-present estimated-vblank supervisor-restart verified"
     "\[std-startup\] ordinary fn main argv and process-local environment verified"
     "\[std\] allocator fs threads futex process pipes stdio native SDK and VFS executable verified in ring3 RUNE"
     "\[vfsd\] open/read/write/seek/readdir/create/rename over shared memory verified"

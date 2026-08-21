@@ -1,7 +1,11 @@
 //! Ранняя инициализация ядра: banner, разбор BootInfo, self-test.
 
-use crate::{arch, block, gui, memory, process, serial};
-use rustos_abi::{BootInfo, MemRegion, MemRegionKind, BOOT_INFO_MAGIC, BOOT_INFO_VERSION};
+use crate::{arch, block, display, gui, memory, process, serial};
+use rustos_abi::{
+    bootinfo::{FRAMEBUFFER_FORMAT_BGR, FRAMEBUFFER_FORMAT_RGB},
+    BootInfo, MemRegion, MemRegionKind, BOOT_INFO_MAGIC, BOOT_INFO_VERSION,
+};
+use rustos_video::{CpuPixelFormat, DisplayMode};
 
 /// Главная функция ядра: serial → валидация BootInfo → banner → self-test,
 /// после чего графическая сессия GUI (или немедленный exit в режиме
@@ -73,6 +77,35 @@ pub fn kernel_main(info: &BootInfo) -> ! {
             }
         }
         Err(_) => serial::put_str("[block] no persistent system disk; vfsd unavailable\n"),
+    }
+
+    // Scanout broker создаётся до process milestone: только так ring-3
+    // displayd действительно проверяет native driver capability, а не
+    // headless подмену. Framebuffer позднее переиспользует тот же объект.
+    let framebuffer = info.framebuffer;
+    let fallback_format = match framebuffer.format {
+        FRAMEBUFFER_FORMAT_RGB => CpuPixelFormat::Rgb888,
+        FRAMEBUFFER_FORMAT_BGR => CpuPixelFormat::Bgr888,
+        _ => CpuPixelFormat::Bgr888,
+    };
+    let fallback = DisplayMode {
+        width: framebuffer.width.max(1280),
+        height: framebuffer.height.max(720),
+        stride_pixels: (framebuffer.stride / 4).max(framebuffer.width).max(1280),
+        format: fallback_format,
+        refresh_millihertz: 60_000,
+    };
+    match display::scanout::initialize(fallback) {
+        Ok(mode) => {
+            serial::put_str("[display-broker] native virtio scanout=");
+            serial::put_u32(mode.width);
+            serial::put_str("x");
+            serial::put_u32(mode.height);
+            serial::put_str(" capability-ready\n");
+        }
+        Err(_) => {
+            serial::put_str("[display-broker] native scanout unavailable; firmware fallback\n")
+        }
     }
 
     match self_test(info) {

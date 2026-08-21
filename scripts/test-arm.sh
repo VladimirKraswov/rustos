@@ -89,6 +89,7 @@ qemu-system-aarch64 \
     -drive if=pflash,format=raw,file="$VARS" \
     -drive if=none,id=systemdisk,format=raw,file="$SYSTEM_DISK" \
     -device virtio-blk-device,drive=systemdisk \
+    -device virtio-gpu-device \
     -global virtio-mmio.force-legacy=false \
     -drive if=virtio,format=raw,readonly=on,file=build/arm/esp-arm.img \
     -serial file:"$LOG" -monitor none -display none -no-reboot \
@@ -138,7 +139,7 @@ patterns=(
     "\[isolation\] concurrent #UD terminated one process; survivor exited=22"
     "\[ipc\] queued block/wake and attenuated VFS capability verified"
     "\[abi-v4\] spawn/wait/kill threads VM shared-memory TLS clock verified"
-    "\[graphics-abi-v5\] GraphicsBuffer SyncTimeline ring3 displayd/compositord verified"
+    "\[graphics-abi-v6\] exclusive scanout atomic-present estimated-vblank supervisor-restart verified"
     "\[std\] allocator fs threads futex process pipes stdio native SDK and VFS executable verified in ring3 RUNE"
     "\[vfsd\] restart recovered committed VaraniaFS metadata and file data"
     "\[loader\] RUNE interfaces imports ABI TLS RELRO and cross-process shared RX verified"

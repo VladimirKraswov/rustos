@@ -156,9 +156,10 @@ size, fractional scale и target presentation time. ABI проверяет
 `physical = ceil(logical × scale)`, поэтому растягивание уже растрированного
 bitmap нельзя случайно выдать за HiDPI. Kernel objects уже реализуют
 generation-safe lifetime, отдельные capability/mapping references и
-блокирующий wait/wait-many. Boot-test проводит один frame между изолированными
-ring-3 `compositord` и `displayd`; детали и честная граница headless backend
-описаны в [GRAPHICS_ABI.md](GRAPHICS_ABI.md).
+блокирующий wait/wait-many. Постоянный ring-3 `displayd` один получает
+непередаваемую scanout capability, публикует buffer через atomic present и
+возвращает typed feedback постоянному `compositord`. Подробности и граница
+оценочного vblank описаны в [GRAPHICS_ABI.md](GRAPHICS_ABI.md).
 
 ## Много окон и изоляция
 
@@ -167,11 +168,12 @@ slice видимых layers. Bounded только список damage rectangles
 переполнение никогда не теряет картинку — области объединяются в более дорогой
 bounding rectangle.
 
-Следующий шаг изоляции — выдать только `displayd` настоящий scanout capability
-и перевести headless present на atomic modeset/vblank. После этого постоянный
-`compositord` примет независимые surface queues приложений, а bootstrap kernel
-desktop останется аварийным fallback. Падение клиента должно удалять только
-его buffer queue и layers, не останавливая desktop.
+Эксклюзивная scanout capability, atomic full-frame commit, estimated vblank и
+supervisor restart уже работают. Следующий шаг изоляции — подключить к
+постоянному `compositord` независимые surface queues окон и заменить один
+full-frame buffer на bounded multi-buffer queue с damage. Bootstrap kernel
+desktop останется только аварийным fallback. Падение клиента должно удалять
+только его buffer queue и layers, не останавливая desktop.
 
 ## Software OpenGL и видео
 

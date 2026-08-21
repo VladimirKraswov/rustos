@@ -134,13 +134,14 @@ per-CPU GDT/TSS/IDT, ring-0 interrupt stack, run queue и TLB shootdown inbox.
 5. TLB shootdown и PCID optimization;
 6. тест параллельной записи разных user pages двумя CPU с fault/GUI heartbeat.
 
-Process ABI v5 предоставляет spawn/kill/wait, несколько потоков, anonymous
+Process ABI v6 предоставляет spawn/kill/wait, несколько потоков, anonymous
 VM, sealed shared-memory capabilities, args/env, TLS и monotonic clock.
 Streaming VFS IPC, persistent VaraniaFS и user-space RUNE DLL loader уже
 проходят boot-test. `std::process::Command` умеет выполнять RUNE с VFS через
-ring-3 runner. Следующий программный milestone — постоянный supervisor:
-ring-3 `init` запускает filesystem, display/input services и desktop по
-manifests, а не только последовательно проверяет их при boot. Контракт описан в
+ring-3 runner. Постоянные `displayd`/`compositord` уже получают отдельные
+priorities, private endpoints и bounded restart policy. Следующий программный
+milestone — ring-3 `init`, который запускает filesystem, display/input services
+и desktop по manifests вместо bootstrap-таблиц kernel. Контракт описан в
 [PROCESS_MEMORY_ABI.md](PROCESS_MEMORY_ABI.md) и
 [ELF_LOADER.md](ELF_LOADER.md).
 
@@ -177,7 +178,8 @@ PID/TID, изоляцию process fault и supervisor backoff. `make test-boot` 
 [isolation] concurrent #UD terminated one process; survivor exited=22
 [ipc] queued block/wake and attenuated VFS capability verified
 [abi-v4] spawn/wait/kill threads VM shared-memory TLS clock verified
-[graphics-abi-v5] GraphicsBuffer SyncTimeline ring3 displayd/compositord verified
+[graphics-abi-v6] exclusive scanout atomic-present estimated-vblank supervisor-restart verified
+[supervisor] persistent displayd/compositord atomic-present services ready
 [std] allocator fs threads futex process pipes stdio native SDK and VFS executable verified in ring3 RUNE
 [vfsd] restart recovered committed VaraniaFS metadata and file data
 [loader] RUNE interfaces imports ABI TLS RELRO and cross-process shared RX verified

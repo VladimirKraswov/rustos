@@ -103,6 +103,10 @@ done
 }
 
 grep -Fq '[microkernel] RING3_MILESTONE_OK' "$RUN_DIR/serial.log"
+grep -Fq '[graphics-abi-v6] exclusive scanout atomic-present estimated-vblank supervisor-restart verified' \
+    "$RUN_DIR/serial.log"
+grep -Fq '[supervisor] persistent displayd/compositord atomic-present services ready' \
+    "$RUN_DIR/serial.log"
 grep -Fq '[video] virtio-gpu modern MMIO controlq ready' "$RUN_DIR/serial.log"
 grep -Fq 'mouse=virtio-input-mmio' "$RUN_DIR/serial.log"
 

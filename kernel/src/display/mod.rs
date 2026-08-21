@@ -7,6 +7,7 @@
 mod edid;
 #[cfg(target_arch = "x86_64")]
 mod pci;
+pub mod scanout;
 mod virtio_gpu;
 #[cfg(target_arch = "x86_64")]
 mod virtqueue;

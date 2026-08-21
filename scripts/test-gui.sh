@@ -196,6 +196,10 @@ done
     exit 1
 }
 grep -q '\[microkernel\] RING3_MILESTONE_OK' "$RUN_DIR/serial.log"
+grep -Fq '[graphics-abi-v6] exclusive scanout atomic-present estimated-vblank supervisor-restart verified' \
+    "$RUN_DIR/serial.log"
+grep -Fq '[supervisor] persistent displayd/compositord atomic-present services ready' \
+    "$RUN_DIR/serial.log"
 grep -Eq '\[video\] scanout=virtio-gpu mode=1280x800 format=bgr888 present=immediate page-flip=no' \
     "$RUN_DIR/serial.log"
 grep -q '\[display-metrics\] logical=1280x800 physical=1280x800 device-scale-milli=1000 framebuffer=1280x800 compositor-scale-milli=1000' \
@@ -521,7 +525,10 @@ printf 'mouse_button 1\n' | hmp
 sleep 0.08
 printf 'mouse_button 0\n' | hmp
 wait_for_serial '[wm] window minimized id=0x03'
-sleep 0.3
+# Marker пишется при принятии window command. Даём медленному TCG закончить
+# полный wallpaper redraw и доставить virtio-gpu FLUSH в display frontend до
+# HMP screendump; 0.3 s на загруженном Apple Silicon хосте было погранично.
+sleep "${GUI_FULL_REDRAW_SETTLE_SECONDS:-1.0}"
 printf 'screendump %s/minimized.ppm\n' "$RUN_DIR" \
     | hmp
 

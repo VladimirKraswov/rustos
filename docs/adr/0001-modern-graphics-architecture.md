@@ -58,17 +58,17 @@ reset. Оно не реализует Vulkan, OpenGL, оконную полит�
 ## Порядок реализации
 
 1. **Готово:** версионированные `GraphicsBufferDesc`, multi-plane metadata,
-   `SyncPoint`/timeline, kernel objects и surface commit/release/feedback ABI;
-   headless ring-3 `compositord -> displayd` проходит boot-test.
-2. PCI bridges, ECAM, MSI/MSI-X, IRQ capabilities, scatter/gather DMA и IOMMU.
-3. Асинхронный virtio transport, несколько запросов in-flight, fences,
+   `SyncPoint`/timeline, kernel objects и surface commit/release/feedback ABI.
+2. **Готово:** непередаваемая ring-3 scanout capability, atomic full-frame
+   present, estimated vblank feedback и постоянные supervisor-сервисы.
+3. PCI bridges, ECAM, MSI/MSI-X, IRQ capabilities, scatter/gather DMA и IOMMU.
+4. Асинхронный virtio transport, несколько запросов in-flight, fences,
    cursor queue, blob resources и несколько outputs.
-4. Выдать ring-3 `displayd` scanout capability и сделать постоянный
-   `compositord` с client-owned buffer queues.
-5. Mesa platform, `libdrm-rustos`, EGL platform и Vulkan WSI.
-6. VirGL как первый ускоренный end-to-end milestone, затем Venus.
-7. GPU backend SystemUI без изменения API компонентов.
-8. Raspberry Pi VC4/V3D как первая фиксированная физическая ARM-цель.
+5. Подключить client-owned surface queues окон, multi-buffer damage и inputd.
+6. Mesa platform, `libdrm-rustos`, EGL platform и Vulkan WSI.
+7. VirGL как первый ускоренный end-to-end milestone, затем Venus.
+8. GPU backend SystemUI без изменения API компонентов.
+9. Raspberry Pi VC4/V3D как первая фиксированная физическая ARM-цель.
 
 Первый пакет сохраняет рабочее поведение desktop, но не старые имена API. Весь
 workspace сразу переводится с неоднозначных `Surface`/`SurfaceMut` на точные

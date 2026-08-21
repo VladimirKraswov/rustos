@@ -1,4 +1,4 @@
-//! Первый ring-3 `compositord` vertical slice.
+//! Постоянный ring-3 `compositord` bootstrap service.
 //!
 //! Сервис формирует client-owned surface frame, публикует buffer в displayd и
 //! блокируется на release timeline через wait-many. Ни pixel data, ни
@@ -10,7 +10,11 @@
 use core::panic::PanicInfo;
 
 use rustos_abi::{
-    display::{DisplayPresentRequest, DISPLAY_PRESENT_HANDLE_COUNT, DISPLAY_PRESENT_OPCODE},
+    display::{
+        DisplayPresentFeedback, DisplayPresentRequest, DisplayScanoutInfo, DISPLAY_FEEDBACK_OPCODE,
+        DISPLAY_INFO_OPCODE, DISPLAY_PRESENT_HANDLE_COUNT, DISPLAY_PRESENT_OPCODE,
+        DISPLAY_QUERY_HANDLE_COUNT, DISPLAY_QUERY_OPCODE,
+    },
     graphics_buffer::{BufferUsage, GraphicsBufferDesc, MemoryDomain, PixelFormatCode},
     ipc::TransferredHandle,
     memory::MEMORY_ABI_VERSION,
@@ -21,21 +25,22 @@ use rustos_abi::{
     },
 };
 use rustos_runtime::{
-    graphics_buffer_create, graphics_buffer_map, handle_close, ipc_send, process_exit,
+    graphics_buffer_create, graphics_buffer_map, handle_close, ipc_receive, ipc_send, process_exit,
     shared_memory_create, shared_memory_map, sync_timeline_create, sync_timeline_signal,
     sync_timeline_wait_many, syscall, vm_unmap, Handle, Message, Rights, SharedMemoryCreate,
     SharedMemoryMap, VmFlags,
 };
 
-const WIDTH: u32 = 64;
-const HEIGHT: u32 = 48;
 const FRAME_MAGIC: u64 = 0x5255_5354_4f53_4758;
 
 #[no_mangle]
-pub extern "C" fn _start(display_endpoint: u64, abi_version: u64) -> ! {
+pub extern "C" fn _start(display_endpoint: u64, feedback_endpoint: u64, abi_version: u64) -> ! {
     if abi_version != syscall::ABI_VERSION {
         process_exit(181);
     }
+    let display_endpoint = Handle(display_endpoint as u32);
+    let feedback_endpoint = Handle(feedback_endpoint as u32);
+    let info = query_display(display_endpoint, feedback_endpoint);
     let usage = BufferUsage::CPU_READ
         .union(BufferUsage::CPU_WRITE)
         .union(BufferUsage::RENDER_TARGET)
@@ -44,8 +49,8 @@ pub extern "C" fn _start(display_endpoint: u64, abi_version: u64) -> ! {
         .union(MemoryDomain::HOST_VISIBLE)
         .union(MemoryDomain::SHARED);
     let descriptor = match GraphicsBufferDesc::linear(
-        WIDTH,
-        HEIGHT,
+        info.width,
+        info.height,
         PixelFormatCode::B8G8R8A8_UNORM,
         usage,
         domains,
@@ -78,7 +83,8 @@ pub extern "C" fn _start(display_endpoint: u64, abi_version: u64) -> ! {
     }
     unsafe {
         (address as *mut u64).write_volatile(FRAME_MAGIC);
-        ((address as *mut u32).add((WIDTH * HEIGHT - 1) as usize)).write_volatile(0xff_24_80_ff);
+        ((address as *mut u32).add((info.width * info.height - 1) as usize))
+            .write_volatile(0xff_24_80_ff);
     }
     if vm_unmap(address as u64, mapped_length) != syscall::status::OK {
         process_exit(186);
@@ -98,7 +104,7 @@ pub extern "C" fn _start(display_endpoint: u64, abi_version: u64) -> ! {
         process_exit(188);
     }
 
-    let metrics = SurfaceMetrics::new(WIDTH, HEIGHT, WIDTH, HEIGHT, 1000);
+    let metrics = SurfaceMetrics::new(info.width, info.height, info.width, info.height, 1000);
     let surface = SurfaceCreateRequest::new(metrics, 3);
     let mut commit = SurfaceCommit::full_damage(Handle(0x7fff), buffer, metrics, 1);
     commit.acquire = SyncPoint::new(acquire, 1);
@@ -127,7 +133,12 @@ pub extern "C" fn _start(display_endpoint: u64, abi_version: u64) -> ! {
         reserved: 0,
         rights: Rights::WRITE,
     };
-    if ipc_send(Handle(display_endpoint as u32), &message) != syscall::status::OK {
+    message.handles[3] = TransferredHandle {
+        handle: feedback_endpoint,
+        reserved: 0,
+        rights: Rights::SEND,
+    };
+    if ipc_send(display_endpoint, &message) != syscall::status::OK {
         process_exit(190);
     }
 
@@ -174,10 +185,63 @@ pub extern "C" fn _start(display_endpoint: u64, abi_version: u64) -> ! {
     {
         process_exit(193);
     }
-    process_exit(0)
+    let mut feedback_message = Message::EMPTY;
+    if ipc_receive(feedback_endpoint, &mut feedback_message) != syscall::status::OK
+        || feedback_message.header.opcode != DISPLAY_FEEDBACK_OPCODE
+        || feedback_message.header.request_id != commit.frame_id
+        || feedback_message.header.payload_len != 64
+        || feedback_message.header.handle_count != 0
+    {
+        process_exit(194);
+    }
+    let feedback = match DisplayPresentFeedback::decode_inline(&feedback_message.payload) {
+        Ok(feedback) => feedback,
+        Err(_) => process_exit(195),
+    };
+    if feedback.frame_id != commit.frame_id || feedback.output != info.output {
+        process_exit(196);
+    }
+
+    // Bootstrap compositor остаётся живым как supervisor service. Следующие
+    // client surface commits позднее придут на отдельный endpoint; пока
+    // bounded receive доказывает persistent blocked, а не завершённый процесс.
+    loop {
+        let mut idle = Message::EMPTY;
+        if ipc_receive(feedback_endpoint, &mut idle) != syscall::status::OK {
+            process_exit(197);
+        }
+    }
+}
+
+fn query_display(display: Handle, feedback: Handle) -> DisplayScanoutInfo {
+    let mut query = Message::EMPTY;
+    query.header.opcode = DISPLAY_QUERY_OPCODE;
+    query.header.request_id = 1;
+    query.header.handle_count = DISPLAY_QUERY_HANDLE_COUNT;
+    query.handles[0] = TransferredHandle {
+        handle: feedback,
+        reserved: 0,
+        rights: Rights::SEND,
+    };
+    if ipc_send(display, &query) != syscall::status::OK {
+        process_exit(198);
+    }
+    let mut reply = Message::EMPTY;
+    if ipc_receive(feedback, &mut reply) != syscall::status::OK
+        || reply.header.opcode != DISPLAY_INFO_OPCODE
+        || reply.header.request_id != 1
+        || reply.header.payload_len != 64
+        || reply.header.handle_count != 0
+    {
+        process_exit(199);
+    }
+    match DisplayScanoutInfo::decode_inline(&reply.payload) {
+        Ok(info) => info,
+        Err(_) => process_exit(200),
+    }
 }
 
 #[panic_handler]
 fn panic(_info: &PanicInfo<'_>) -> ! {
-    process_exit(199)
+    process_exit(209)
 }

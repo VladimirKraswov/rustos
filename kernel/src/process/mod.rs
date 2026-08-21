@@ -68,6 +68,8 @@ pub(super) enum CapabilityKind {
     GraphicsBuffer(u16),
     /// Монотонный explicit-sync timeline.
     SyncTimeline(rustos_microkernel::TimelineId),
+    /// Эксклюзивный display controller; выдаётся только ring-3 displayd.
+    DisplayScanout(u8),
     /// Однонаправленный byte stream; READ/WRITE различаются rights одного object.
     Pipe(u16),
     /// Raw block device выдаётся только storage service, не приложениям.
@@ -202,6 +204,11 @@ pub fn run_preemptive_milestone(info: &rustos_abi::BootInfo) -> Result<(), Proce
 /// Оставляет ring-3 `vfsd` запущенным после диагностических milestones.
 pub fn start_interactive_services() -> Result<(), ProcessError> {
     manager::start_interactive_services()
+}
+
+/// Выполняет bounded supervisor tick постоянных display services.
+pub fn pump_interactive_services() -> Result<(), ProcessError> {
+    manager::pump_interactive_services()
 }
 
 /// Выполняет одну команду из GUI terminal и захватывает объединённый

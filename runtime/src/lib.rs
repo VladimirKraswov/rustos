@@ -13,6 +13,7 @@ mod arch;
 
 pub use rustos_abi::{
     block::BlockIoRequest,
+    display::{DisplayAtomicPresent, DisplayScanoutInfo, DisplayVblankWait},
     graphics_buffer::GraphicsBufferDesc,
     ipc::Message,
     memory::{SharedMemoryCreate, SharedMemoryMap, VmFlags, VmMapRequest},
@@ -305,6 +306,47 @@ pub fn sync_timeline_wait_many(request: &SyncWaitMany) -> i64 {
             syscall::number::SYNC_TIMELINE_WAIT_MANY,
             request as *const SyncWaitMany as u64,
             0,
+            0,
+        )
+    }
+}
+
+/// Читает неизменяемый snapshot активного output и mode generation.
+pub fn display_get_info(scanout: Handle, info: &mut DisplayScanoutInfo) -> i64 {
+    unsafe {
+        syscall3(
+            syscall::number::DISPLAY_GET_INFO,
+            scanout.0 as u64,
+            info as *mut DisplayScanoutInfo as u64,
+            0,
+        )
+    }
+}
+
+/// Публикует полностью готовый graphics buffer. Положительный результат —
+/// sequence, которую затем нужно передать [`display_wait_vblank`].
+pub fn display_atomic_present(
+    scanout: Handle,
+    buffer: Handle,
+    request: &DisplayAtomicPresent,
+) -> i64 {
+    unsafe {
+        syscall3(
+            syscall::number::DISPLAY_ATOMIC_PRESENT,
+            scanout.0 as u64,
+            buffer.0 as u64,
+            request as *const DisplayAtomicPresent as u64,
+        )
+    }
+}
+
+/// Блокирует thread до refresh boundary без busy-spin.
+pub fn display_wait_vblank(scanout: Handle, request: &DisplayVblankWait) -> i64 {
+    unsafe {
+        syscall3(
+            syscall::number::DISPLAY_WAIT_VBLANK,
+            scanout.0 as u64,
+            request as *const DisplayVblankWait as u64,
             0,
         )
     }

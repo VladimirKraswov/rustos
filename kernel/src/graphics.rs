@@ -24,7 +24,7 @@ use rustos_video::{
 };
 
 use crate::{
-    display::VirtioGpu,
+    display::scanout,
     memory::{self, FrameBlock},
     serial,
 };
@@ -36,8 +36,9 @@ use crate::{
 pub struct Framebuffer {
     /// Видимый linear framebuffer. В него пишет только `present*`.
     front: *mut u8,
-    /// Native virtio scanout. `None` означает firmware framebuffer fallback.
-    gpu: Option<VirtioGpu>,
+    /// Native virtio scanout живёт в единственном kernel broker. Поле хранит
+    /// только выбор backend'а и не дублирует владение устройством.
+    native_scanout: bool,
     /// Невидимый программный кадр в обычной usable RAM. Плотно упакован
     /// (stride = width), в отличие от scanout со своим stride.
     back: *mut u32,
@@ -92,31 +93,31 @@ impl Framebuffer {
             format: firmware_format.unwrap_or(CpuPixelFormat::Bgr888),
             refresh_millihertz: 0,
         };
-        let gpu = match VirtioGpu::initialize(fallback) {
-            Ok(gpu) => {
+        let native_mode = match scanout::initialize(fallback) {
+            Ok(mode) => {
                 #[cfg(target_arch = "x86_64")]
                 serial::put_str("[video] virtio-gpu modern PCI controlq ready\n");
                 #[cfg(target_arch = "aarch64")]
                 serial::put_str("[video] virtio-gpu modern MMIO controlq ready\n");
-                Some(gpu)
+                Some(mode)
             }
             Err(_) => {
                 serial::put_str("[video] virtio-gpu unavailable; using firmware framebuffer\n");
                 None
             }
         };
-        if gpu.is_none() && !firmware_valid {
+        if native_mode.is_none() && !firmware_valid {
             return None;
         }
-        let selected = gpu.as_ref().map_or(fallback, VirtioGpu::mode);
+        let selected = native_mode.unwrap_or(fallback);
         let width = selected.width;
         let height = selected.height;
-        let scanout_format = if gpu.is_some() {
+        let scanout_format = if native_mode.is_some() {
             CpuPixelFormat::Bgr888
         } else {
             firmware_format?
         };
-        let stride = if gpu.is_some() {
+        let stride = if native_mode.is_some() {
             width.checked_mul(4)?
         } else {
             info.stride
@@ -148,7 +149,7 @@ impl Framebuffer {
 
         Some(Self {
             front: info.phys_addr as *mut u8,
-            gpu,
+            native_scanout: native_mode.is_some(),
             back,
             back_block,
             back_phys: back_block.phys,
@@ -192,7 +193,7 @@ impl Framebuffer {
 
     /// Имя bootstrap display driver'а для диагностики и GUI.
     pub const fn driver_name(&self) -> &'static str {
-        if self.gpu.is_some() {
+        if self.native_scanout {
             "virtio-gpu"
         } else if self.source == FRAMEBUFFER_SOURCE_GRUB {
             "grub-fb"
@@ -894,15 +895,21 @@ impl Scanout for Framebuffer {
     }
 
     fn capabilities(&self) -> ScanoutCapabilities {
-        self.gpu.as_ref().map_or(
+        if self.native_scanout {
+            scanout::capabilities().unwrap_or(ScanoutCapabilities {
+                page_flip: false,
+                vsync_event: false,
+                hardware_cursor: false,
+                multiple_outputs: false,
+            })
+        } else {
             ScanoutCapabilities {
                 page_flip: false,
                 vsync_event: false,
                 hardware_cursor: false,
                 multiple_outputs: false,
-            },
-            VirtioGpu::capabilities,
-        )
+            }
+        }
     }
 
     fn present(
@@ -914,8 +921,11 @@ impl Scanout for Framebuffer {
         if source.width() != self.width || source.height() != self.height {
             return Err(ScanoutError::InvalidSurface);
         }
-        if let Some(gpu) = self.gpu.as_mut() {
-            return gpu.present(source, damage, sequence);
+        if self.native_scanout {
+            return scanout::present(source, damage, sequence).map_err(|error| match error {
+                scanout::DisplayBrokerError::InvalidSurface => ScanoutError::InvalidSurface,
+                _ => ScanoutError::DeviceLost,
+            });
         }
         let bounds = Rect::new(0, 0, self.width, self.height);
         if damage.len() == 1
@@ -989,8 +999,10 @@ impl Scanout for Framebuffer {
 
 impl DisplayDriver for Framebuffer {
     fn connector(&self) -> ConnectorInfo {
-        if let Some(gpu) = self.gpu.as_ref() {
-            return gpu.connector();
+        if self.native_scanout {
+            if let Ok(connector) = scanout::connector() {
+                return connector;
+            }
         }
         ConnectorInfo {
             kind: ConnectorKind::FirmwareFramebuffer,
@@ -1002,8 +1014,10 @@ impl DisplayDriver for Framebuffer {
     }
 
     fn modes(&self, output: &mut [DisplayMode]) -> usize {
-        if let Some(gpu) = self.gpu.as_ref() {
-            return gpu.modes(output);
+        if self.native_scanout {
+            if let Ok(count) = scanout::modes(output) {
+                return count;
+            }
         }
         if let Some(first) = output.first_mut() {
             *first = self.mode();
@@ -1021,19 +1035,23 @@ impl DisplayDriver for Framebuffer {
         {
             return Ok(current);
         }
-        let Some(gpu) = self.gpu.as_mut() else {
+        if !self.native_scanout {
             return Err(ModeSetError::RequiresReboot);
-        };
+        }
         let bytes =
             frame_bytes(requested.width, requested.height).ok_or(ModeSetError::UnsupportedMode)?;
         let new_back = reserve_back_buffer(bytes).ok_or(ModeSetError::OutOfMemory)?;
         let new_background = reserve_back_buffer(bytes);
-        if let Err(error) = gpu.set_mode(requested) {
+        if let Err(error) = scanout::set_mode(requested) {
             let _ = memory::free(new_back);
             if let Some(block) = new_background {
                 let _ = memory::free(block);
             }
-            return Err(error);
+            return Err(match error {
+                scanout::DisplayBrokerError::UnsupportedMode => ModeSetError::UnsupportedMode,
+                scanout::DisplayBrokerError::OutOfMemory => ModeSetError::OutOfMemory,
+                _ => ModeSetError::DeviceLost,
+            });
         }
         unsafe {
             core::ptr::write_bytes(

@@ -8,6 +8,7 @@
 
 use core::ptr;
 
+use rustos_abi::graphics_buffer::{GraphicsBufferDesc, PixelFormatCode};
 use rustos_video::{
     ConnectorInfo, ConnectorKind, CpuPixelFormat, CpuSurface, DisplayMode, ModeSetError,
     PresentStats, Rect, ScanoutCapabilities, ScanoutError,
@@ -395,6 +396,80 @@ impl VirtioGpu {
             sequence,
             rectangles,
             pixels,
+        })
+    }
+
+    /// Публикует full-frame из capability-backed scatter/gather памяти.
+    ///
+    /// Driver получает только функцию преобразования page index в физический
+    /// адрес. Поэтому object table, capability handles и process policy не
+    /// протекают в virtio protocol layer. Копирование выполняется построчно и
+    /// корректно пересекает границы физических extents.
+    pub fn present_pages<PhysicalPage>(
+        &mut self,
+        descriptor: GraphicsBufferDesc,
+        mut physical_page: PhysicalPage,
+        sequence: u64,
+    ) -> Result<PresentStats, ScanoutError>
+    where
+        PhysicalPage: FnMut(usize) -> Option<u64>,
+    {
+        const PAGE_BYTES: usize = 4096;
+
+        if descriptor.validate().is_err()
+            || descriptor.width != self.mode.width
+            || descriptor.height != self.mode.height
+            || !matches!(
+                descriptor.format,
+                PixelFormatCode::B8G8R8X8_UNORM | PixelFormatCode::B8G8R8A8_UNORM
+            )
+        {
+            return Err(ScanoutError::InvalidSurface);
+        }
+        let plane = descriptor.planes[0];
+        let row_bytes = usize::try_from(descriptor.width)
+            .ok()
+            .and_then(|width| width.checked_mul(4))
+            .ok_or(ScanoutError::InvalidSurface)?;
+        let stride = plane.stride_bytes as usize;
+        let plane_offset =
+            usize::try_from(plane.offset).map_err(|_| ScanoutError::InvalidSurface)?;
+        let target = self.resource.backing.phys as *mut u8;
+        for y in 0..descriptor.height as usize {
+            let mut source_offset = plane_offset
+                .checked_add(y.checked_mul(stride).ok_or(ScanoutError::InvalidSurface)?)
+                .ok_or(ScanoutError::InvalidSurface)?;
+            let destination_offset = y
+                .checked_mul(row_bytes)
+                .ok_or(ScanoutError::InvalidSurface)?;
+            let mut copied = 0usize;
+            while copied < row_bytes {
+                let page_index = source_offset / PAGE_BYTES;
+                let within_page = source_offset % PAGE_BYTES;
+                let chunk = (PAGE_BYTES - within_page).min(row_bytes - copied);
+                let physical = physical_page(page_index).ok_or(ScanoutError::InvalidSurface)?;
+                // SAFETY: graphics object владеет полной source page, chunk
+                // не пересекает её границу; target resource выделен driver'ом
+                // минимум на width*height*4 и source/target не совпадают.
+                unsafe {
+                    ptr::copy_nonoverlapping(
+                        (physical as *const u8).add(within_page),
+                        target.add(destination_offset + copied),
+                        chunk,
+                    )
+                };
+                copied += chunk;
+                source_offset += chunk;
+            }
+        }
+        let full = Rect::new(0, 0, self.mode.width, self.mode.height);
+        self.transfer(full)
+            .and_then(|_| self.flush(full))
+            .map_err(|_| ScanoutError::DeviceLost)?;
+        Ok(PresentStats {
+            sequence,
+            rectangles: 1,
+            pixels: u64::from(self.mode.width) * u64::from(self.mode.height),
         })
     }
 
