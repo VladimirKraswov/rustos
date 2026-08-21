@@ -27,7 +27,7 @@ cleanup() {
         kill -TERM "$QPID" 2>/dev/null || true
         wait "$QPID" 2>/dev/null || true
     fi
-    for file in serial.log qemu-stderr.log triangle.ppm; do
+    for file in serial.log qemu-stderr.log hmp.log triangle.ppm; do
         [[ -f "$RUN_DIR/$file" ]] && cp -f "$RUN_DIR/$file" "$RESULT_DIR/$file"
     done
 }
@@ -71,8 +71,9 @@ if [[ "$ready" != 1 ]]; then
     exit 1
 fi
 
+HMP_LOG="$RUN_DIR/hmp.log"
 printf 'screendump %s/triangle.ppm\n' "$RUN_DIR" | \
-    "$HMP_TOOL" "$RUN_DIR/monitor.sock" >/dev/null
+    "$HMP_TOOL" "$RUN_DIR/monitor.sock" >"$HMP_LOG"
 # HMP принимает команду синхронно, но display backend завершает запись PPM
 # асинхронно. Небольшое bounded-ожидание не скрывает ошибку и исключает гонку
 # между закрытием monitor socket и первым write файла.
@@ -80,7 +81,11 @@ for _ in {1..50}; do
     [[ -s "$RUN_DIR/triangle.ppm" ]] && break
     sleep 0.1
 done
-[[ -s "$RUN_DIR/triangle.ppm" ]] || { echo "[virgl-test] empty screenshot" >&2; exit 1; }
+if [[ ! -s "$RUN_DIR/triangle.ppm" ]]; then
+    echo "[virgl-test] QEMU did not produce the screenshot" >&2
+    cat "$HMP_LOG" >&2
+    exit 1
+fi
 "$CHECK_TOOL" --virgl "$RUN_DIR/triangle.ppm"
 grep -Fq '[virgl] ring3 renderd async-fence triangle zero-copy scanout verified' \
     "$RUN_DIR/serial.log"

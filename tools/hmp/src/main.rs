@@ -46,7 +46,7 @@ fn run() -> Result<(), String> {
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
         .map_err(|e| format!("set timeout: {e}"))?;
-    wait_for_prompt(&mut stream).map_err(|e| format!("initial prompt: {e}"))?;
+    wait_for_prompt(&mut stream, false).map_err(|e| format!("initial prompt: {e}"))?;
 
     let stdin = io::stdin();
     for line in stdin.lock().split(b'\n') {
@@ -61,7 +61,7 @@ fn run() -> Result<(), String> {
             .map_err(|e| format!("write command: {e}"))?;
         stream.flush().map_err(|e| format!("flush: {e}"))?;
         if !is_quit {
-            wait_for_prompt(&mut stream).map_err(|e| format!("command prompt: {e}"))?;
+            wait_for_prompt(&mut stream, true).map_err(|e| format!("command prompt: {e}"))?;
         }
         if delay_ms != 0 {
             thread::sleep(Duration::from_millis(delay_ms));
@@ -71,7 +71,7 @@ fn run() -> Result<(), String> {
 }
 
 /// Читает байты до появления `PROMPT` (скользящее окно), EOF до prompt — ошибка.
-fn wait_for_prompt(stream: &mut UnixStream) -> io::Result<()> {
+fn wait_for_prompt(stream: &mut UnixStream, mirror: bool) -> io::Result<()> {
     let mut window = [0u8; PROMPT.len()];
     let mut filled = 0usize;
     let mut byte = [0u8; 1];
@@ -81,6 +81,9 @@ fn wait_for_prompt(stream: &mut UnixStream) -> io::Result<()> {
                 io::ErrorKind::UnexpectedEof,
                 "monitor closed before prompt",
             ));
+        }
+        if mirror {
+            io::stdout().write_all(&byte)?;
         }
         if filled < window.len() {
             window[filled] = byte[0];
