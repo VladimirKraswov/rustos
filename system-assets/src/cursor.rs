@@ -181,16 +181,16 @@ fn standard_cursor(image: CursorImage, x: u16, y: u16) -> CursorPixel {
 }
 
 fn arrow(x: i32, y: i32) -> CursorPixel {
-    let main = y >= 1 && y <= 17 && x >= 1 && x <= y / 2 + 2;
-    let stem = y >= 12 && y <= 21 && x >= 7 && x <= 10;
+    let main = (1..=17).contains(&y) && x >= 1 && x <= y / 2 + 2;
+    let stem = (12..=21).contains(&y) && (7..=10).contains(&x);
     if !main && !stem {
-        return if y >= 3 && y <= 22 && x >= 3 && x <= y / 2 + 4 {
+        return if (3..=22).contains(&y) && x >= 3 && x <= y / 2 + 4 {
             CursorPixel::Shadow
         } else {
             CursorPixel::Transparent
         };
     }
-    let boundary = x <= 2 || x >= y / 2 + 1 || y <= 2 || (stem && (x == 7 || x == 10));
+    let boundary = x <= 2 || x > y / 2 || y <= 2 || (stem && (x == 7 || x == 10));
     if boundary {
         CursorPixel::Outline
     } else {
@@ -199,9 +199,9 @@ fn arrow(x: i32, y: i32) -> CursorPixel {
 }
 
 fn text(x: i32, y: i32) -> CursorPixel {
-    let bar =
-        (x >= 5 && x <= 18 && (y == 3 || y == 20)) || (x >= 10 && x <= 13 && y >= 3 && y <= 20);
-    let inside = x >= 11 && x <= 12 && y >= 5 && y <= 18;
+    let bar = ((5..=18).contains(&x) && (y == 3 || y == 20))
+        || ((10..=13).contains(&x) && (3..=20).contains(&y));
+    let inside = (11..=12).contains(&x) && (5..=18).contains(&y);
     if inside {
         CursorPixel::Fill
     } else if bar {
@@ -213,20 +213,20 @@ fn text(x: i32, y: i32) -> CursorPixel {
 
 fn hand(x: i32, y: i32, closed: bool) -> CursorPixel {
     let palm_top = if closed { 8 } else { 10 };
-    let palm = x >= 6 && x <= 17 && y >= palm_top && y <= 20;
+    let palm = (6..=17).contains(&x) && (palm_top..=20).contains(&y);
     let finger = if closed {
-        x >= 7 && x <= 16 && y >= 5 && y <= 11
+        (7..=16).contains(&x) && (5..=11).contains(&y)
     } else {
-        (x >= 10 && x <= 13 && y >= 2 && y <= 13)
-            || (x >= 6 && x <= 9 && y >= 7 && y <= 14)
-            || (x >= 14 && x <= 17 && y >= 8 && y <= 14)
+        ((10..=13).contains(&x) && (2..=13).contains(&y))
+            || ((6..=9).contains(&x) && (7..=14).contains(&y))
+            || ((14..=17).contains(&x) && (8..=14).contains(&y))
     };
     if !(palm || finger) {
         return CursorPixel::Transparent;
     }
-    if x == 6 || x == 17 || y == 20 || (!closed && y == 2 && x >= 10 && x <= 13) {
+    if x == 6 || x == 17 || y == 20 || (!closed && y == 2 && (10..=13).contains(&x)) {
         CursorPixel::Outline
-    } else if closed && y >= 9 && y <= 11 {
+    } else if closed && (9..=11).contains(&y) {
         CursorPixel::Accent
     } else {
         CursorPixel::Fill
@@ -284,7 +284,7 @@ fn not_allowed(x: i32, y: i32) -> CursorPixel {
 }
 
 fn resize_horizontal(x: i32, y: i32) -> CursorPixel {
-    let line = y >= 10 && y <= 13 && x >= 3 && x <= 20;
+    let line = (10..=13).contains(&y) && (3..=20).contains(&x);
     let heads = (x <= 7 && (x - 3).abs() >= (y - 11).abs() * 2)
         || (x >= 16 && (20 - x).abs() >= (y - 11).abs() * 2);
     if line || heads {
@@ -308,7 +308,7 @@ fn resize_diagonal(x: i32, y: i32, rising: bool) -> CursorPixel {
     } else {
         (x - y).abs()
     };
-    let in_span = x >= 3 && x <= 20 && y >= 3 && y <= 20;
+    let in_span = (3..=20).contains(&x) && (3..=20).contains(&y);
     if in_span && distance <= 2 {
         if distance == 2 {
             CursorPixel::Outline

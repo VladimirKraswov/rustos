@@ -539,8 +539,8 @@ fn cell(
 ) {
     let left = rect.x + ((u64::from(x) * u64::from(rect.width)) / 24) as i32;
     let top = rect.y + ((u64::from(y) * u64::from(rect.height)) / 24) as i32;
-    let right = rect.x + ((u64::from(x + width) * u64::from(rect.width) + 23) / 24) as i32;
-    let bottom = rect.y + ((u64::from(y + height) * u64::from(rect.height) + 23) / 24) as i32;
+    let right = rect.x + (u64::from(x + width) * u64::from(rect.width)).div_ceil(24) as i32;
+    let bottom = rect.y + (u64::from(y + height) * u64::from(rect.height)).div_ceil(24) as i32;
     target.fill(
         Rect::new(
             left,
@@ -552,6 +552,7 @@ fn cell(
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn rounded_cell(
     target: &mut dyn IconTarget,
     rect: Rect,
@@ -564,10 +565,13 @@ fn rounded_cell(
 ) {
     let scaled = scaled_cell(rect, x, y, width, height);
     let scale = rect.width.min(rect.height).max(1);
-    let scaled_radius = ((u32::from(radius) * scale + 23) / 24).clamp(1, u32::from(u8::MAX));
+    let scaled_radius = (u32::from(radius) * scale)
+        .div_ceil(24)
+        .clamp(1, u32::from(u8::MAX));
     target.rounded_fill(scaled, scaled_radius as u8, color);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn rounded_stroke_cell(
     target: &mut dyn IconTarget,
     rect: Rect,
@@ -580,15 +584,17 @@ fn rounded_stroke_cell(
 ) {
     let scaled = scaled_cell(rect, x, y, width, height);
     let scale = rect.width.min(rect.height).max(1);
-    let scaled_radius = ((u32::from(radius) * scale + 23) / 24).clamp(1, u32::from(u8::MAX));
+    let scaled_radius = (u32::from(radius) * scale)
+        .div_ceil(24)
+        .clamp(1, u32::from(u8::MAX));
     target.rounded_stroke(scaled, scaled_radius as u8, color);
 }
 
 fn scaled_cell(rect: Rect, x: u32, y: u32, width: u32, height: u32) -> Rect {
     let left = rect.x + ((u64::from(x) * u64::from(rect.width)) / 24) as i32;
     let top = rect.y + ((u64::from(y) * u64::from(rect.height)) / 24) as i32;
-    let right = rect.x + ((u64::from(x + width) * u64::from(rect.width) + 23) / 24) as i32;
-    let bottom = rect.y + ((u64::from(y + height) * u64::from(rect.height) + 23) / 24) as i32;
+    let right = rect.x + (u64::from(x + width) * u64::from(rect.width)).div_ceil(24) as i32;
+    let bottom = rect.y + (u64::from(y + height) * u64::from(rect.height)).div_ceil(24) as i32;
     Rect::new(
         left,
         top,

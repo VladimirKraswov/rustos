@@ -656,7 +656,7 @@ fn startup_mode(preferred: DisplayMode, fallback: DisplayMode) -> DisplayMode {
 /// а свободное место становится letterbox без масштабирования bitmap.
 fn integer_fit_dimensions(host_width: u32, host_height: u32) -> Option<(u32, u32)> {
     for scale in 2..=6 {
-        if host_width % scale != 0 || host_height % scale != 0 {
+        if !host_width.is_multiple_of(scale) || !host_height.is_multiple_of(scale) {
             continue;
         }
         let desired_width = host_width / scale;

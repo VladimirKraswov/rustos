@@ -772,6 +772,9 @@ impl Terminal {
         );
     }
 
+    // Диагностическая команда печатает снимок всех независимых display
+    // metrics; структура здесь только усложнила бы однократный call boundary.
+    #[allow(clippy::too_many_arguments)]
     pub fn report_display_info(
         &mut self,
         driver: &str,
