@@ -76,8 +76,10 @@ fn main() -> ExitCode {
         return finish(7);
     }
 
-    if !verify_std_fs() {
-        return finish(8);
+    if let Err(stage) = verify_std_fs() {
+        // 30..49 однозначно указывают сломавшуюся операцию std::fs. Это
+        // существенно полезнее безликой ошибки всего smoke-теста в serial.
+        return finish(stage);
     }
     if !verify_threads() {
         return finish(10);
@@ -205,7 +207,7 @@ fn verify_threads() -> bool {
 /// Проверяет публичный `std::fs`, а не внутренние IPC helpers. Поэтому этот
 /// тест одновременно защищает привычную для переносимых Linux/Rust программ
 /// API-семантику и границу `std -> IPC -> vfsd -> VaraniaFS`.
-fn verify_std_fs() -> bool {
+fn verify_std_fs() -> Result<(), u8> {
     const DIRECTORY: &str = "/std-port-smoke";
     const FIRST: &str = "/std-port-smoke/source.txt";
     const SECOND: &str = "/std-port-smoke/result.txt";
@@ -217,16 +219,17 @@ fn verify_std_fs() -> bool {
     let _ = fs::remove_dir_all(NESTED);
     let _ = fs::remove_dir(DIRECTORY);
     if fs::create_dir(DIRECTORY).is_err() {
-        return false;
+        return Err(30);
     }
 
-    let result = (|| -> std::io::Result<bool> {
-        fs::create_dir(NESTED)?;
-        std::env::set_current_dir(DIRECTORY)?;
-        if std::env::current_dir()? != Path::new(DIRECTORY)
-            || std::env::current_exe()?.file_name() != Some(std::ffi::OsStr::new("std-smoke"))
+    let result = (|| -> Result<(), u8> {
+        fs::create_dir(NESTED).map_err(|_| 31)?;
+        std::env::set_current_dir(DIRECTORY).map_err(|_| 32)?;
+        if std::env::current_dir().map_err(|_| 33)? != Path::new(DIRECTORY)
+            || std::env::current_exe().map_err(|_| 33)?.file_name()
+                != Some(std::ffi::OsStr::new("std-smoke"))
         {
-            return Ok(false);
+            return Err(33);
         }
 
         // Относительный путь проходит через process-local CWD, а не через
@@ -237,54 +240,68 @@ fn verify_std_fs() -> bool {
             .write(true)
             .create(true)
             .truncate(true)
-            .open("source.txt")?;
-        file.write_all(CONTENT.as_bytes())?;
-        file.flush()?;
-        file.set_len(8193)?;
-        file.seek(SeekFrom::Start(8192))?;
+            .open("source.txt")
+            .map_err(|_| 34)?;
+        file.write_all(CONTENT.as_bytes()).map_err(|_| 35)?;
+        file.flush().map_err(|_| 36)?;
+        file.set_len(8193).map_err(|_| 37)?;
+        file.seek(SeekFrom::Start(8192)).map_err(|_| 38)?;
         let mut sparse_tail = [1u8; 1];
-        file.read_exact(&mut sparse_tail)?;
+        file.read_exact(&mut sparse_tail).map_err(|_| 38)?;
         if sparse_tail != [0] {
-            return Ok(false);
+            return Err(38);
         }
-        file.set_len(CONTENT.len() as u64)?;
-        file.seek(SeekFrom::Start(0))?;
+        file.set_len(CONTENT.len() as u64).map_err(|_| 39)?;
+        file.seek(SeekFrom::Start(0)).map_err(|_| 39)?;
         drop(file);
 
-        let mut file = OpenOptions::new().read(true).append(true).open(FIRST)?;
-        file.write_all(b"!")?;
-        file.seek(SeekFrom::Start(0))?;
+        let mut file = OpenOptions::new()
+            .read(true)
+            .append(true)
+            .open(FIRST)
+            .map_err(|_| 40)?;
+        file.write_all(b"!").map_err(|_| 41)?;
+        file.seek(SeekFrom::Start(0)).map_err(|_| 41)?;
         let mut actual = String::new();
-        file.read_to_string(&mut actual)?;
+        file.read_to_string(&mut actual).map_err(|_| 41)?;
         drop(file);
         if actual != "std::fs over capability IPC!" {
-            return Ok(false);
+            return Err(42);
         }
 
-        let metadata = fs::metadata(FIRST)?;
+        let metadata = fs::metadata(FIRST).map_err(|_| 43)?;
         if !metadata.is_file() || metadata.len() != (CONTENT.len() + 1) as u64 {
-            return Ok(false);
+            return Err(43);
         }
-        fs::rename(FIRST, SECOND)?;
+        fs::rename(FIRST, SECOND).map_err(|_| 44)?;
         let mut found = false;
-        for entry in fs::read_dir(DIRECTORY)? {
-            let entry = entry?;
-            if entry.file_name() == "result.txt" && entry.file_type()?.is_file() {
+        for entry in fs::read_dir(DIRECTORY).map_err(|_| 45)? {
+            let entry = entry.map_err(|_| 45)?;
+            if entry.file_name() == "result.txt" && entry.file_type().map_err(|_| 45)?.is_file() {
                 found = true;
             }
         }
-        if fs::canonicalize("nested/../result.txt")? != Path::new(SECOND) {
-            return Ok(false);
+        if fs::canonicalize("nested/../result.txt").map_err(|_| 46)? != Path::new(SECOND) {
+            return Err(46);
         }
-        std::env::set_current_dir("/")?;
-        fs::remove_dir_all(NESTED)?;
-        Ok(found)
+        std::env::set_current_dir("/").map_err(|_| 47)?;
+        fs::remove_dir_all(NESTED).map_err(|_| 48)?;
+        if !found {
+            return Err(45);
+        }
+        Ok(())
     })();
 
     let _ = std::env::set_current_dir("/");
     let _ = fs::remove_dir_all(NESTED);
     let cleanup = fs::remove_file(SECOND).and_then(|_| fs::remove_dir(DIRECTORY));
-    matches!(result, Ok(true)) && cleanup.is_ok()
+    if let Err(stage) = result {
+        Err(stage)
+    } else if cleanup.is_err() {
+        Err(49)
+    } else {
+        Ok(())
+    }
 }
 
 fn finish(status: u8) -> ExitCode {

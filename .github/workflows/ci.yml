@@ -48,7 +48,7 @@ jobs:
         run: BOOT_TEST_TIMEOUT=90 make test-boot
 
       - name: GUI keyboard/mouse integration
-        run: GUI_TEST_TIMEOUT=90 make test-gui
+        run: GUI_TEST_TIMEOUT=180 make test-gui
 
       - name: Сохранить диагностику при ошибке
         if: failure()

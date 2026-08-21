@@ -18,6 +18,12 @@ QPID=""
 GUI_TIMEOUT="${GUI_TEST_TIMEOUT:-360}"
 MEMORY_MB="${GUI_MEMORY_MB:-128}"
 CPU_MODEL="${GUI_CPU_MODEL:-max}"
+ACCEL=tcg
+case "$(uname -m)" in
+    x86_64|amd64)
+        [[ -w /dev/kvm ]] && ACCEL=kvm
+        ;;
+esac
 [[ "$MEMORY_MB" =~ ^[1-9][0-9]*$ ]] || {
     echo "GUI_MEMORY_MB должен быть положительным числом MiB" >&2
     exit 2
@@ -54,10 +60,11 @@ send_command() {
     # пауза после отпускания клавиши не переполняют виртуальный 8042. Guest
     # обновляет только dirty-строку ввода, поэтому полный software-render
     # больше не задерживает чтение следующего scancode.
-    # 160 ms учитывает самый медленный macOS/Apple-Silicon TCG: HMP prompt
+    # 240 ms учитывает самый медленный macOS/Apple-Silicon TCG: HMP prompt
     # подтверждает принятие команды monitor'ом, но не окончание отложенной
-    # make/break-пары PS/2 внутри гостя.
-    printf '%b' "$commands" | hmp 160
+    # make/break-пары PS/2 внутри гостя. Меньшая пауза изредка теряла соседние
+    # буквы сразу после перепрограммирования PS/2 sample rate.
+    printf '%b' "$commands" | hmp 240
     # Enter отправляем отдельно: QEMU возвращает monitor prompt раньше, чем
     # release последней буквы гарантированно покинет PS/2 output buffer.
     sleep 0.2
@@ -168,8 +175,9 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM HUP
 
+echo "[gui-test] qemu accel=$ACCEL, cpu=$CPU_MODEL, memory=${MEMORY_MB}MiB, timeout=${GUI_TIMEOUT}s"
 qemu-system-x86_64 \
-    -machine q35 -cpu "$CPU_MODEL" -smp 2 -m "$MEMORY_MB" -accel tcg \
+    -machine q35 -cpu "$CPU_MODEL" -smp 2 -m "$MEMORY_MB" -accel "$ACCEL" \
     -device virtio-vga,edid=on,xres=1280,yres=800 \
     -drive if=pflash,format=raw,readonly=on,file=build/ovmf/OVMF_CODE.fd \
     -drive if=pflash,format=raw,file="$RUN_DIR/VARS.fd" \

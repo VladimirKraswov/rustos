@@ -289,7 +289,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        format::{format_empty, Superblock, FIRST_ALLOCATABLE_BLOCK},
+        format::{self, format_empty, Superblock, FIRST_ALLOCATABLE_BLOCK},
         tree::{BlockDevice, TransactionWorkspace},
         BLOCK_SIZE, MIN_VOLUME_BLOCKS,
     };
@@ -324,6 +324,14 @@ mod tests {
         }
         let mounted = Superblock::decode(&disk.0[0], MIN_VOLUME_BLOCKS).unwrap();
         (disk, mounted)
+    }
+
+    fn remount(disk: &mut Disk) -> Superblock {
+        format::recover_latest(MIN_VOLUME_BLOCKS, |number, output| {
+            disk.read(number, output).is_ok()
+        })
+        .unwrap()
+        .superblock
     }
 
     #[test]
@@ -393,5 +401,69 @@ mod tests {
             resolve(&mut transaction, b"/a/../b"),
             Err(NamespaceError::InvalidPath)
         );
+    }
+
+    /// Программы `std` не держат одну гигантскую transaction: почти каждый
+    /// вызов `std::fs` становится отдельным IPC-запросом и durable commit.
+    /// Поэтому lifecycle каталога обязательно проверяем с теми же границами,
+    /// включая повторное использование имени после полного удаления дерева.
+    #[test]
+    fn committed_directory_lifecycle_can_repeat_after_remount() {
+        let (mut disk, mut mounted) = disk();
+        let mut workspace = TransactionWorkspace::new();
+
+        for cycle in 0..32u64 {
+            let mut transaction = Transaction::begin(&mut disk, mounted, &mut workspace).unwrap();
+            create(
+                &mut transaction,
+                b"/std-port-smoke",
+                InodeKind::Directory,
+                cycle,
+            )
+            .unwrap();
+            transaction.commit().unwrap();
+            mounted = remount(&mut disk);
+
+            let mut transaction = Transaction::begin(&mut disk, mounted, &mut workspace).unwrap();
+            create(
+                &mut transaction,
+                b"/std-port-smoke/nested",
+                InodeKind::Directory,
+                cycle,
+            )
+            .unwrap();
+            create(
+                &mut transaction,
+                b"/std-port-smoke/source.txt",
+                InodeKind::File,
+                cycle,
+            )
+            .unwrap();
+            transaction.commit().unwrap();
+            mounted = remount(&mut disk);
+
+            let mut transaction = Transaction::begin(&mut disk, mounted, &mut workspace).unwrap();
+            rename(
+                &mut transaction,
+                b"/std-port-smoke/source.txt",
+                b"/std-port-smoke/result.txt",
+            )
+            .unwrap();
+            transaction.commit().unwrap();
+            mounted = remount(&mut disk);
+
+            let mut transaction = Transaction::begin(&mut disk, mounted, &mut workspace).unwrap();
+            unlink(&mut transaction, b"/std-port-smoke/nested").unwrap();
+            unlink(&mut transaction, b"/std-port-smoke/result.txt").unwrap();
+            unlink(&mut transaction, b"/std-port-smoke").unwrap();
+            transaction.commit().unwrap();
+            mounted = remount(&mut disk);
+
+            let mut transaction = Transaction::begin(&mut disk, mounted, &mut workspace).unwrap();
+            assert_eq!(
+                resolve(&mut transaction, b"/std-port-smoke"),
+                Err(NamespaceError::NotFound)
+            );
+        }
     }
 }
