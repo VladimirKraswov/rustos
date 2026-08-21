@@ -143,8 +143,12 @@ pub fn kernel_main(info: &BootInfo) -> ! {
                     serial::put_str("[virgl-test] FATAL: accelerated device unavailable\n");
                     exit_kernel(0x54);
                 }
+                if process::run_interactive_gpu_demo(48).is_err() {
+                    serial::put_str("[virgl-test] FATAL: Aurora 3D application failed\n");
+                    exit_kernel(0x55);
+                }
                 serial::put_str(
-                    "[virgl-test] TRIANGLE_READY scanout=graphics-buffer cpu-raster=no\n",
+                    "[virgl-test] MESA_SHOWCASE_READY scanout=graphics-buffer cpu-raster=no\n",
                 );
                 // Не объявляем этот цикл безусловно бесконечным: при потере
                 // render device тест выходит в recovery GUI. Это сохраняет

@@ -976,6 +976,7 @@ impl DesktopSession {
             && y < self.framebuffer.height() as i32 - TASKBAR_HEIGHT as i32
             && self.top_window_at(x, y).is_none()
             && !self.desktop_terminal_icon().contains(x, y)
+            && !self.desktop_gpu_demo_icon().contains(x, y)
             && !self.desktop_trash_icon().contains(x, y)
     }
 
@@ -1465,6 +1466,26 @@ impl DesktopSession {
             }
             return Redraw::DesktopIcon;
         }
+        if self.desktop_gpu_demo_icon().contains(x, y) {
+            let click = self.click_tracker.pressed(
+                arch::monotonic_milliseconds(),
+                x,
+                y,
+                self.input.mouse_settings(),
+            );
+            if click == ClickKind::Double {
+                match process::run_interactive_gpu_demo(180) {
+                    Ok(()) => {
+                        serial::put_str("[desktop] Aurora 3D completed; desktop scanout restored\n")
+                    }
+                    Err(_) => serial::put_str(
+                        "[desktop] Aurora 3D unavailable: VirGL capability is absent\n",
+                    ),
+                }
+                return Redraw::Scene;
+            }
+            return Redraw::None;
+        }
         self.desktop_icon_selected = false;
 
         if let Some(id) = self.task_window_at(x, y) {
@@ -1608,6 +1629,7 @@ impl DesktopSession {
                 if self.shell.interactive_at(x, y)
                     || self.task_window_at(x, y).is_some()
                     || self.desktop_terminal_icon().contains(x, y)
+                    || self.desktop_gpu_demo_icon().contains(x, y)
                     || self.desktop_trash_icon().contains(x, y)
                 {
                     PointerCursor::Link
@@ -2350,6 +2372,19 @@ impl DesktopSession {
 
     fn render_desktop_icons(&mut self) {
         self.render_terminal_desktop_icon();
+        let demo = self.desktop_gpu_demo_icon();
+        self.draw_system_icon(
+            IconKind::GpuDemo,
+            Rect::new(demo.x + 12, demo.y + 3, 48, 48),
+        );
+        font::draw_text(
+            &mut self.framebuffer,
+            demo.x + 2,
+            demo.y + 61,
+            "Aurora 3D",
+            Theme::TEXT,
+            font::UI_SMALL.bold().scaled(self.ui_scale_milli),
+        );
         let trash = self.desktop_trash_icon();
         self.draw_system_icon(
             IconKind::Trash,
@@ -2645,6 +2680,15 @@ impl DesktopSession {
 
     fn desktop_terminal_icon(&self) -> Rect {
         Rect::new(self.desktop_terminal_x, self.desktop_terminal_y, 74, 86)
+    }
+
+    fn desktop_gpu_demo_icon(&self) -> Rect {
+        Rect::new(
+            self.desktop_terminal_x + 84,
+            self.desktop_terminal_y,
+            74,
+            86,
+        )
     }
 
     fn desktop_trash_icon(&self) -> Rect {

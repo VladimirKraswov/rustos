@@ -182,7 +182,7 @@ desktop останется только аварийным fallback. Паден�
 
 OpenGL должен рендерить не в firmware framebuffer, а в GraphicsBuffer
 приложения. SwapBuffers станет surface commit: compositor заберёт последний
-полностью готовый buffer и отбросит устаревшие кадры. Первый VirGL triangle
+полностью готовый buffer и отбросит устаревшие кадры. Aurora 3D/Mesa milestone
 уже проходит через ring-3 renderer без guest CPU rasterization. Следующий
 практичный путь — Mesa Gallium VirGL winsys; software rasterizer остаётся
 fallback для устройств без 3D.

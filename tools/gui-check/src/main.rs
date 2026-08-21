@@ -220,7 +220,7 @@ fn main() {
             Ok(image) => image,
             Err(error) => fatal(error),
         };
-        verify_virgl_triangle(&image);
+        verify_virgl_showcase(&image);
         if let Some(output) = args.next() {
             if let Err(error) = image.write_ppm(Path::new(&output)) {
                 fatal(error);
@@ -312,13 +312,11 @@ fn main() {
     );
 }
 
-fn verify_virgl_triangle(image: &Image) {
-    // XWD содержит весь виртуальный X11 screen, а не только QEMU window.
-    // Находим bounding box фирменного clear-color (примерно 9,14,28), после
-    // чего проверяем цветной raster внутри него. Так тест не зависит от
-    // положения GTK window и наличия window manager decorations.
-    let expected_background = [9u8, 14, 28];
-    let mut background_pixels = 0usize;
+fn verify_virgl_showcase(image: &Image) {
+    // XWD содержит весь X11 screen. Stage Aurora отличается от чёрного Xvfb
+    // blue-dominant градиентом; по нему находим QEMU surface независимо от
+    // положения окна и декораций window manager.
+    let mut stage_pixels = 0usize;
     let mut min_x = image.width;
     let mut min_y = image.height;
     let mut max_x = 0usize;
@@ -326,11 +324,11 @@ fn verify_virgl_triangle(image: &Image) {
     for y in 0..image.height {
         for x in 0..image.width {
             let pixel = image.rgb(x, y);
-            if pixel[0].abs_diff(expected_background[0]) <= 5
-                && pixel[1].abs_diff(expected_background[1]) <= 5
-                && pixel[2].abs_diff(expected_background[2]) <= 7
+            if pixel[2] >= 18
+                && pixel[2] > pixel[0].saturating_add(7)
+                && pixel[2] > pixel[1].saturating_add(4)
             {
-                background_pixels += 1;
+                stage_pixels += 1;
                 min_x = min_x.min(x);
                 min_y = min_y.min(y);
                 max_x = max_x.max(x);
@@ -338,50 +336,44 @@ fn verify_virgl_triangle(image: &Image) {
             }
         }
     }
-    if background_pixels < 20_000 || max_x <= min_x + 320 || max_y <= min_y + 240 {
+    if stage_pixels < 100_000 || max_x <= min_x + 900 || max_y <= min_y + 560 {
         fatal(format!(
-            "VirGL clear target was not found: pixels={background_pixels}, bounds={min_x},{min_y}..{max_x},{max_y}"
+            "Aurora stage was not found: pixels={stage_pixels}, bounds={min_x},{min_y}..{max_x},{max_y}"
         ));
     }
-    let background = image.rgb(min_x, min_y);
-    let center = image.rgb((min_x + max_x) / 2, (min_y + max_y) / 2);
-    let distance = center
-        .iter()
-        .zip(background)
-        .map(|(value, base)| value.abs_diff(base) as usize)
-        .sum::<usize>();
-    if distance < 90 {
-        fatal(format!(
-            "center was not rasterized by triangle pipeline: bg={background:?}, center={center:?}"
-        ));
-    }
-    let mut colored = 0usize;
+
+    let mut lit = 0usize;
+    let mut cyan = 0usize;
+    let mut violet = 0usize;
     let horizontal_margin = (max_x - min_x) / 5;
     let vertical_margin = (max_y - min_y) / 5;
-    for y in (min_y + vertical_margin..max_y - vertical_margin).step_by(4) {
-        for x in (min_x + horizontal_margin..max_x - horizontal_margin).step_by(4) {
+    for y in (min_y + vertical_margin..max_y - vertical_margin).step_by(3) {
+        for x in (min_x + horizontal_margin..max_x - horizontal_margin).step_by(3) {
             let pixel = image.rgb(x, y);
-            let delta = pixel
-                .iter()
-                .zip(background)
-                .map(|(value, base)| value.abs_diff(base) as usize)
-                .sum::<usize>();
-            colored += usize::from(delta > 80);
+            let highest = pixel.iter().copied().max().unwrap_or(0);
+            let lowest = pixel.iter().copied().min().unwrap_or(0);
+            lit += usize::from(highest >= 70 && highest.saturating_sub(lowest) >= 35);
+            cyan += usize::from(
+                pixel[2] >= 90 && pixel[1] >= 45 && pixel[2] > pixel[0].saturating_add(30),
+            );
+            violet += usize::from(
+                pixel[2] >= 70 && pixel[0] >= 45 && pixel[1].saturating_add(20) < pixel[2],
+            );
         }
     }
-    if colored < 1000 {
+    if lit < 1200 || cyan < 250 || violet < 120 {
         fatal(format!(
-            "VirGL triangle area is too small or absent: samples={colored}"
+            "lit 3D object is absent: lit={lit}, cyan={cyan}, violet={violet}"
         ));
     }
     println!(
-        "VirGL verify OK: {}x{}, GPU triangle covers {} sampled pixels",
-        image.width, image.height, colored
+        "Mesa/VirGL verify OK: {}x{}, stage={} lit={} cyan={} violet={}",
+        image.width, image.height, stage_pixels, lit, cyan, violet
     );
 }
 
 fn usage() {
-    eprintln!("usage: rustos-gui-check <terminal.ppm> <dragged.ppm> <minimized.ppm> | --virgl <triangle.ppm|screen.xwd> [converted.ppm]");
+    eprintln!("usage: rustos-gui-check <terminal.ppm> <dragged.ppm> <minimized.ppm> | --virgl <showcase.ppm|screen.xwd> [converted.ppm]");
 }
 
 fn fatal(message: String) -> ! {

@@ -17,6 +17,18 @@ pub const GPU_RENDER_REQUEST_OPCODE: u16 = 0x5100;
 pub const GPU_RENDERED_FRAME_OPCODE: u16 = 0x5101;
 /// Число handles в `GPU_RENDERED_FRAME_OPCODE`.
 pub const GPU_RENDERED_FRAME_HANDLE_COUNT: u16 = 2;
+/// gpu-demo → compositord: запустить bounded полноэкранную демонстрацию.
+pub const GPU_DEMO_START_OPCODE: u16 = 0x5110;
+/// compositord → future launcher: демонстрация завершила последний present.
+pub const GPU_DEMO_DONE_OPCODE: u16 = 0x5111;
+
+/// Биты [`GpuRenderFrame::flags`].
+pub mod frame_flag {
+    /// Renderd должен сформировать анимированную Aurora 3D scene.
+    pub const AURORA_SHOWCASE: u32 = 1 << 0;
+    /// Все известные флаги.
+    pub const KNOWN: u32 = AURORA_SHOWCASE;
+}
 
 /// Биты [`GpuDeviceInfo::features`].
 pub mod feature {
@@ -87,11 +99,11 @@ pub struct GpuContextCreate {
     pub version: u16,
     /// Размер структуры.
     pub size: u16,
-    /// В версии 1 равно нулю.
+    /// [`frame_flag`]; ноль сохраняет диагностический треугольник.
     pub flags: u32,
     /// Короткое диагностическое имя; UTF-8, хвост заполнен нулями.
     pub debug_name: [u8; 48],
-    /// Зарезервировано.
+    /// `[scene_frame, acquire_value, 0, 0]`; acquire равен нулю в запросе.
     pub reserved: [u64; 1],
 }
 
@@ -399,10 +411,40 @@ impl GpuRenderFrame {
         }
     }
 
+    /// Создаёт запрос анимированного showcase frame.
+    pub const fn aurora_request(width: u32, height: u32, frame_id: u64, scene_frame: u32) -> Self {
+        Self {
+            version: GPU_ABI_VERSION,
+            size: core::mem::size_of::<Self>() as u16,
+            flags: frame_flag::AURORA_SHOWCASE,
+            width,
+            height,
+            frame_id,
+            fence_id: 0,
+            reserved: [scene_frame as u64, 0, 0, 0],
+        }
+    }
+
+    /// Номер анимационного кадра либо ноль diagnostic pipeline.
+    pub const fn scene_frame(&self) -> u32 {
+        self.reserved[0] as u32
+    }
+
+    /// Значение acquire timeline, опубликованное renderd в ответе.
+    pub const fn acquire_value(&self) -> u64 {
+        self.reserved[1]
+    }
+
     /// Проверяет общий record.
     pub fn validate(&self) -> Result<(), GpuAbiError> {
         validate_prefix(self.version, self.size, core::mem::size_of::<Self>())?;
-        if self.flags != 0 || self.reserved != [0; 4] {
+        if self.flags & !frame_flag::KNOWN != 0
+            || self.reserved[2..] != [0; 2]
+            || self.reserved[0] > u64::from(u32::MAX)
+            || (self.flags == 0 && self.reserved[0] != 0)
+            || (self.fence_id == 0 && self.reserved[1] != 0)
+            || (self.fence_id != 0 && self.reserved[1] == 0)
+        {
             return Err(GpuAbiError::ReservedNonZero);
         }
         if self.width == 0 || self.height == 0 || self.frame_id == 0 {
@@ -432,6 +474,76 @@ impl GpuRenderFrame {
     }
 }
 
+/// Bounded запуск системной 3D-демонстрации.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GpuDemoRequest {
+    /// [`GPU_ABI_VERSION`].
+    pub version: u16,
+    /// Размер структуры.
+    pub size: u16,
+    /// Зарезервировано; равно нулю.
+    pub flags: u32,
+    /// Число кадров, после которого scanout возвращается desktop.
+    pub frame_count: u32,
+    /// Желаемый интервал; vblank остаётся окончательным pacing source.
+    pub frame_interval_ms: u32,
+    /// Детерминированный seed сцены.
+    pub seed: u64,
+    /// Зарезервировано.
+    pub reserved: [u64; 5],
+}
+
+impl GpuDemoRequest {
+    /// Создаёт запрос с разумным 60 Hz pacing hint.
+    pub const fn new(frame_count: u32) -> Self {
+        Self {
+            version: GPU_ABI_VERSION,
+            size: core::mem::size_of::<Self>() as u16,
+            flags: 0,
+            frame_count,
+            frame_interval_ms: 16,
+            seed: 0x4155_524f_5241_3344,
+            reserved: [0; 5],
+        }
+    }
+
+    /// Проверяет bounded duration и все зарезервированные поля.
+    pub fn validate(&self) -> Result<(), GpuAbiError> {
+        validate_prefix(self.version, self.size, core::mem::size_of::<Self>())?;
+        if self.flags != 0 || self.reserved != [0; 5] {
+            return Err(GpuAbiError::ReservedNonZero);
+        }
+        if self.frame_count == 0
+            || self.frame_count > 600
+            || !(1..=1000).contains(&self.frame_interval_ms)
+        {
+            return Err(GpuAbiError::InvalidValue);
+        }
+        Ok(())
+    }
+
+    /// Копирует wire record в inline IPC payload.
+    pub fn encode_inline(&self) -> [u8; 64] {
+        let mut bytes = [0u8; 64];
+        let source = unsafe {
+            core::slice::from_raw_parts(
+                (self as *const Self).cast::<u8>(),
+                core::mem::size_of::<Self>(),
+            )
+        };
+        bytes.copy_from_slice(source);
+        bytes
+    }
+
+    /// Декодирует и валидирует inline request.
+    pub fn decode_inline(bytes: &[u8; 64]) -> Result<Self, GpuAbiError> {
+        let value = unsafe { (bytes.as_ptr() as *const Self).read_unaligned() };
+        value.validate()?;
+        Ok(value)
+    }
+}
+
 fn validate_prefix(version: u16, size: u16, expected: usize) -> Result<(), GpuAbiError> {
     if version != GPU_ABI_VERSION {
         return Err(GpuAbiError::UnsupportedVersion);
@@ -448,6 +560,7 @@ const _: () = assert!(core::mem::size_of::<GpuResourceImport>() == 32);
 const _: () = assert!(core::mem::size_of::<GpuResourceCreate>() == 56);
 const _: () = assert!(core::mem::size_of::<GpuSubmit>() == 64);
 const _: () = assert!(core::mem::size_of::<GpuRenderFrame>() == 64);
+const _: () = assert!(core::mem::size_of::<GpuDemoRequest>() == 64);
 
 #[cfg(test)]
 mod tests {
@@ -490,5 +603,20 @@ mod tests {
             GpuRenderFrame::decode_inline(&request.encode_inline()),
             Ok(request)
         );
+    }
+
+    #[test]
+    fn showcase_and_demo_requests_validate_reserved_fields() {
+        let frame = GpuRenderFrame::aurora_request(1280, 800, 9, 37);
+        assert_eq!(frame.validate(), Ok(()));
+        assert_eq!(frame.scene_frame(), 37);
+        let request = GpuDemoRequest::new(180);
+        assert_eq!(
+            GpuDemoRequest::decode_inline(&request.encode_inline()),
+            Ok(request)
+        );
+        let mut invalid = request;
+        invalid.frame_count = 0;
+        assert_eq!(invalid.validate(), Err(GpuAbiError::InvalidValue));
     }
 }

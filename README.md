@@ -41,9 +41,9 @@ RustOS — учебная 64-битная микроядерная операц�
 - настоящие kernel objects `GraphicsBuffer`/`SyncTimeline`, эксклюзивная
   scanout capability и atomic present с оценочным vblank через постоянные
   supervisor-сервисы `compositord`/`displayd`;
-- асинхронная Virtio GPU command queue, изолированный ring-3 `renderd` и
-  VirGL triangle, передаваемый через GraphicsBuffer на scanout без guest CPU
-  rasterization или копирования пикселей;
+- асинхронная Virtio GPU command queue, Mesa/Gallium platform layer,
+  изолированный ring-3 `renderd` и системное приложение **Aurora 3D** с
+  shader/lighting scene без guest CPU rasterization или копирования пикселей;
 - PS/2 input на PC и virtio-input keyboard/mouse на ARM VM;
 - desktop, taskbar, Start menu и icons;
 - window manager: drag, minimize, maximize, restore и close;
@@ -148,6 +148,7 @@ surface queues, input и desktop к этим ring-3 сервисам ещё вп
 [графическая подсистема](docs/GUI.md), [видеосистема](docs/VIDEO.md), [VFS](docs/VFS.md),
 [ADR современной графической архитектуры](docs/adr/0001-modern-graphics-architecture.md),
 [graphics objects ABI](docs/GRAPHICS_ABI.md), [GPU rendering](docs/GPU_RENDERING.md),
+[Mesa и Aurora 3D](docs/MESA.md),
 [микроядро](docs/MICROKERNEL.md), [DLL](docs/DYNAMIC_LIBRARIES.md),
 [IPC](docs/IPC.md), [процессы и память ABI](docs/PROCESS_MEMORY_ABI.md),
 [self-hosting Rust](docs/SELF_HOSTING.md),

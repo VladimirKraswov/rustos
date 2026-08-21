@@ -24,6 +24,7 @@ members = [
     "libs/elf-loader",
     "libs/rune-loader",
     "libs/virgl",
+    "libs/mesa",
     "libs/loader-fixture",
     "libs/loader-root",
     "rune-format",

@@ -215,6 +215,11 @@ pub fn pump_interactive_services() -> Result<(), ProcessError> {
     manager::pump_interactive_services()
 }
 
+/// Запускает bounded аппаратную Aurora 3D-демонстрацию.
+pub fn run_interactive_gpu_demo(frame_count: u32) -> Result<(), ProcessError> {
+    manager::run_interactive_gpu_demo(frame_count)
+}
+
 /// Выполняет одну команду из GUI terminal и захватывает объединённый
 /// stdout/stderr. Большой вывод дренируется порциями, поэтому процесс не
 /// зависнет на заполненном pipe.

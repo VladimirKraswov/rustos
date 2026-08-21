@@ -1,0 +1,11 @@
+[package]
+name = "rustos-mesa"
+description = "Mesa/Gallium platform layer and VirGL winsys for RustOS"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+rustos-virgl = { path = "../virgl" }

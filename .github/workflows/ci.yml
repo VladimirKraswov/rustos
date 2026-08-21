@@ -79,7 +79,7 @@ jobs:
             --target x86_64-unknown-uefi
           rustup override set nightly-2026-08-18
 
-      - name: VirGL triangle integration
+      - name: Mesa/VirGL Aurora 3D integration
         run: make test-virgl
 
       - name: Сохранить VirGL framebuffer и serial

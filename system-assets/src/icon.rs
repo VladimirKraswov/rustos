@@ -34,6 +34,8 @@ pub enum IconKind {
     Drive,
     /// Терминал.
     Terminal,
+    /// Аппаратная демонстрация Aurora 3D.
+    GpuDemo,
     /// Настройки.
     Settings,
     /// Корзина.
@@ -279,6 +281,7 @@ fn standard_icon(target: &mut dyn IconTarget, kind: IconKind, rect: Rect, p: Ico
         IconKind::Folder => folder(target, rect, p, false),
         IconKind::FolderOpen => folder(target, rect, p, true),
         IconKind::Terminal => terminal(target, rect, p),
+        IconKind::GpuDemo => gpu_demo(target, rect, p),
         IconKind::Trash => trash(target, rect, p),
         IconKind::Drive => drive(target, rect, p),
         IconKind::Settings => settings(target, rect, p),
@@ -318,6 +321,25 @@ fn folder(target: &mut dyn IconTarget, rect: Rect, p: IconPalette, open: bool) {
         cell(target, rect, 2, 14, 19, 6, p.folder);
         cell(target, rect, 5, 14, 13, 1, p.surface_light);
     }
+}
+
+fn gpu_demo(target: &mut dyn IconTarget, rect: Rect, p: IconPalette) {
+    // Не bitmap: scalable geometry остаётся резкой при HiDPI и во всех
+    // подключаемых icon packs. Три грани различаются тоном 3D-кристалла.
+    rounded_cell(target, rect, 1, 1, 22, 22, 5, p.outline);
+    rounded_cell(target, rect, 2, 2, 20, 20, 4, Color::rgb(16, 28, 62));
+    cell(target, rect, 11, 5, 2, 2, p.surface_light);
+    cell(target, rect, 9, 7, 6, 2, p.surface_light);
+    cell(target, rect, 7, 9, 10, 2, p.accent);
+    cell(target, rect, 6, 11, 6, 2, p.accent);
+    cell(target, rect, 12, 11, 6, 2, Color::rgb(118, 82, 238));
+    cell(target, rect, 7, 13, 5, 2, Color::rgb(38, 184, 232));
+    cell(target, rect, 12, 13, 5, 2, Color::rgb(88, 54, 210));
+    cell(target, rect, 9, 15, 3, 2, Color::rgb(32, 146, 220));
+    cell(target, rect, 12, 15, 3, 2, Color::rgb(74, 42, 176));
+    cell(target, rect, 4, 5, 2, 2, Color::rgb(61, 205, 255));
+    cell(target, rect, 18, 7, 1, 1, Color::rgb(236, 116, 255));
+    cell(target, rect, 5, 18, 1, 1, p.surface_light);
 }
 
 #[derive(Clone, Copy)]
@@ -674,6 +696,7 @@ mod tests {
             IconKind::Archive,
             IconKind::Drive,
             IconKind::Terminal,
+            IconKind::GpuDemo,
             IconKind::Settings,
             IconKind::Trash,
             IconKind::Home,

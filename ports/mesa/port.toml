@@ -1,0 +1,17 @@
+name = "Mesa"
+version = "26.2.0"
+source = "https://archive.mesa3d.org/mesa-26.2.0.tar.xz"
+sha256 = "efd4bb08cdb7c365a812cd4e6c9202ab55b2f22cdcd13c7d6c4f9647b799a4ef"
+license = "MIT"
+
+[rustos]
+platform_crate = "rustos-mesa"
+winsys = "rustos-virgl"
+guest_driver = "gallium/virgl"
+status = "platform-seed"
+
+[next_dependencies]
+libc = "not-yet-complete"
+pthreads = "not-yet-complete"
+dlopen = "not-yet-complete"
+meson_cross_file = "not-yet-complete"

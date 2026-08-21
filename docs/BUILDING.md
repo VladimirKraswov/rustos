@@ -31,7 +31,8 @@ make test-boot   GRUB/Multiboot2 + CPL3 RUNE/VFS/fault/reclaim test
 make test-arm-boot AAVMF + EL0/EL1/GICv3/PSCI/VFS test
 make test-arm-gui AAVMF + virtio GPU/input + SystemUI smoke test
 make test-gui    keyboard/mouse/window framebuffer test
-make test-virgl  ring-3 VirGL triangle -> GraphicsBuffer -> scanout test
+make test-virgl  ring-3 Mesa/VirGL Aurora 3D -> GraphicsBuffer -> scanout test
+make bootstrap-mesa скачать и проверить закреплённый upstream Mesa source
 make test        полный test suite
 make clean       удалить генерируемые артефакты
 ```

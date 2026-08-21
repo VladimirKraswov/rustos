@@ -19,8 +19,9 @@ GraphicsBuffer + acquire timeline -> validate/forward ----------> atomic present
                                                                scanout
 ```
 
-Первый вертикальный срез рисует RGB-треугольник. Guest CPU передаёт только
-вершины, TGSI shaders и состояние pipeline. Очистку, rasterization,
+Рабочий вертикальный срез запускает системное ring-3 приложение **Aurora 3D**.
+`rustos-mesa` строит perspective mesh, lighting state и TGSI shader pipeline;
+guest CPU передаёт только вершины и команды. Очистку, rasterization,
 интерполяцию и запись пикселей выполняет VirGL renderer. Render target не имеет
 `CPU_READ`, `CPU_WRITE` или `MAP`, поэтому `renderd` физически не может
 подменить тест программной растеризацией.
@@ -69,7 +70,7 @@ Host renderer дополнительно разрешает resource handles т�
 готовый кадр `displayd`. Драйвер делает `SET_SCANOUT` и `RESOURCE_FLUSH` того
 же VirGL resource: между 3D render target и экраном нет guest CPU copy.
 
-## Проверка треугольника
+## Проверка Aurora 3D
 
 Нужен QEMU, собранный с `virglrenderer` и `virtio-vga-gl`:
 
@@ -79,8 +80,8 @@ make test-virgl
 ```
 
 `test-virgl` собирает специальный образ, запускает QEMU с OpenGL display,
-ждёт device fence, снимает scanout через monitor и проверяет реальный цветной
-треугольник, а не только serial marker. Результаты сохраняются в
+ждёт 48 device-fenced/vblank-paced кадров, снимает scanout и проверяет
+реальный цветной 3D stage, а не только serial marker. Результаты сохраняются в
 `build/test-results/virgl/`.
 
 Обычный Homebrew QEMU 11.1.0 на macOS не содержит `virtio-vga-gl`. Скрипты
@@ -99,26 +100,26 @@ headless CI означает host-side llvmpipe: guest по-прежнему н�
 Успешный тест требует сразу три свидетельства:
 
 ```text
-[virgl] ring3 renderd async-fence triangle zero-copy scanout verified
-[virgl-test] TRIANGLE_READY scanout=graphics-buffer cpu-raster=no
-rustos-gui-check: цветная область треугольника присутствует в screenshot
+[gpu-demo] AURORA_3D_READY frames=48 renderer=mesa-virgl cpu-raster=no
+[virgl-test] MESA_SHOWCASE_READY scanout=graphics-buffer cpu-raster=no
+rustos-gui-check: stage и освещённый объект присутствуют в screenshot
 ```
 
 ## Текущая честная граница
 
-Этот milestone доказывает весь путь 3D-команда → fence → GraphicsBuffer →
-compositor → scanout, но ещё не заменяет Mesa:
+Этот milestone доказывает весь путь Mesa state → 3D-команда → fence →
+GraphicsBuffer → compositor → scanout, но ещё не является полной upstream Mesa:
 
-- encoder поддерживает только bounded pipeline треугольника;
+- platform seed поддерживает одну bounded OpenGL-core-подобную сцену;
 - один context и один in-flight submission на process ABI;
 - первый DMA import требует один физически непрерывный extent;
 - нет device-local allocator, eviction, reset/replay и приоритетных engines;
 - Virtio/VirGL — виртуальная GPU-модель, а не native V3D/Mali/Intel/AMD driver.
 
-Следующий этап — расширить ABI до массивов scatter/gather и нескольких
-очередей, добавить capability blob query и перенести Mesa Gallium VirGL winsys.
-После этого `compositord` сможет собирать SystemUI GPU-командами, сохраняя
-нынешние `GraphicsBuffer` и `SyncTimeline` контракты.
+Точный статус upstream-порта, закреплённая версия и C/POSIX зависимости
+описаны в [MESA.md](MESA.md). Следующий этап — Meson cross-build
+`gallium/virgl` поверх нынешнего winsys. После этого `compositord` сможет
+собирать SystemUI GPU-командами, сохраняя `GraphicsBuffer` и `SyncTimeline`.
 
 Протокол сверяется с
 [Virtio 1.2 GPU Device](https://docs.oasis-open.org/virtio/virtio/v1.2/virtio-v1.2.html#x1-3720007),

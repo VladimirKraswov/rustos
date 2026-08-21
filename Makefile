@@ -16,19 +16,19 @@ SHELL := /bin/bash
 HOST_CRATES := \
 	rustos-abi rustos-microkernel rustos-video rustos-system-ui \
 	rustos-system-assets rustos-rune-format rustos-runtime rustos-vfs-client \
-	rustos-elf-loader rustos-rune-loader rustos-virgl varaniafs rustos-image rustos-pack \
+	rustos-elf-loader rustos-rune-loader rustos-virgl rustos-mesa varaniafs rustos-image rustos-pack \
 	rustos-gui-check rustos-hmp rustos-vfs-image rustos-rune rustos-rui
 HOST_CRATE_ARGS := $(addprefix -p ,$(HOST_CRATES))
 
 DOC_CRATES := \
 	rustos-abi rustos-microkernel rustos-video rustos-system-ui \
 	rustos-system-assets rustos-rune-format rustos-runtime rustos-vfs-client \
-	rustos-elf-loader rustos-rune-loader rustos-virgl varaniafs
+	rustos-elf-loader rustos-rune-loader rustos-virgl rustos-mesa varaniafs
 DOC_CRATE_ARGS := $(addprefix -p ,$(DOC_CRATES))
 
 RUSTOS_CRATES := \
 	rustos-kernel rustos-runtime rustos-crt rustos-bootstrap-apps \
-	rustos-vfs-client rustos-vfs-dll rustos-elf-loader rustos-rune-loader rustos-virgl
+	rustos-vfs-client rustos-vfs-dll rustos-elf-loader rustos-rune-loader rustos-virgl rustos-mesa
 RUSTOS_CRATE_ARGS := $(addprefix -p ,$(RUSTOS_CRATES))
 
 HOST_SYSTEM := $(shell uname -s)
@@ -44,12 +44,15 @@ endif
 
 .PHONY: all bootstrap build build-x86 run run-x86 boot test test-host test-arch \
         test-boot test-arm test-arm-boot test-arm-gui test-gui bootstrap-arm build-arm \
-        run-arm run-virgl test-virgl format lint clean
+        bootstrap-mesa run-arm run-virgl test-virgl format lint clean
 
 all: build
 
 bootstrap:
 	bash scripts/bootstrap-ovmf.sh
+
+bootstrap-mesa:
+	bash scripts/bootstrap-mesa.sh
 
 build: $(DEFAULT_BUILD_TARGET)
 

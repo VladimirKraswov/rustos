@@ -1,8 +1,9 @@
 //! Постоянный ring-3 `compositord` bootstrap service.
 //!
-//! Сервис формирует client-owned surface frame, публикует buffer в displayd и
-//! блокируется на release timeline через wait-many. Ни pixel data, ни
-//! process-local pointer через IPC не передаются.
+//! Сервис владеет политикой кадров, но не scanout и не GPU. Обычный CPU
+//! surface и GPU-only `GraphicsBuffer` проходят один atomic-present protocol.
+//! Системное `gpu-demo` отправляет только bounded request; compositor pacing
+//! выполняется vblank feedback'ом от изолированного displayd.
 
 #![no_std]
 #![no_main]
@@ -16,34 +17,34 @@ use rustos_abi::{
         DISPLAY_QUERY_HANDLE_COUNT, DISPLAY_QUERY_OPCODE,
     },
     gpu::{
-        GpuRenderFrame, GPU_RENDERED_FRAME_HANDLE_COUNT, GPU_RENDERED_FRAME_OPCODE,
-        GPU_RENDER_REQUEST_OPCODE,
+        GpuDemoRequest, GpuRenderFrame, GPU_DEMO_START_OPCODE, GPU_RENDERED_FRAME_HANDLE_COUNT,
+        GPU_RENDERED_FRAME_OPCODE, GPU_RENDER_REQUEST_OPCODE,
     },
     graphics_buffer::{BufferUsage, GraphicsBufferDesc, MemoryDomain, PixelFormatCode},
     ipc::TransferredHandle,
     memory::MEMORY_ABI_VERSION,
     surface::{SurfaceCommit, SurfaceCreateRequest, SurfaceMetrics},
     sync::{
-        SyncPoint, SyncTimelineCreate, SyncTimelineSignal, SyncWaitMany, SyncWaitMode,
-        SYNC_TIMEOUT_INFINITE,
+        SyncPoint, SyncTimelineCreate, SyncTimelineSignal, SyncTimelineWait, SYNC_TIMEOUT_INFINITE,
     },
 };
 use rustos_runtime::{
     graphics_buffer_create, graphics_buffer_get_info, graphics_buffer_map, handle_close,
-    ipc_receive, ipc_send, process_exit, shared_memory_create, shared_memory_map,
-    sync_timeline_create, sync_timeline_signal, sync_timeline_wait_many, syscall, vm_unmap, Handle,
-    Message, Rights, SharedMemoryCreate, SharedMemoryMap, VmFlags,
+    ipc_receive, ipc_send, process_exit, sync_timeline_create, sync_timeline_signal,
+    sync_timeline_wait, syscall, vm_unmap, Handle, Message, Rights, SharedMemoryMap, VmFlags,
 };
 
 const FRAME_MAGIC: u64 = 0x5255_5354_4f53_4758;
 const GPU_MODE_FLAG: u64 = 1 << 63;
 const GPU_FRAME_ENDPOINT: Handle = Handle(4);
 const GPU_CONTROL_ENDPOINT: Handle = Handle(5);
+const DEMO_CONTROL_ENDPOINT: Handle = Handle(6);
 
 struct PreparedFrame {
     descriptor: GraphicsBufferDesc,
     buffer: Handle,
     acquire: Handle,
+    acquire_value: u64,
 }
 
 #[no_mangle]
@@ -55,50 +56,85 @@ pub extern "C" fn _start(display_endpoint: u64, feedback_endpoint: u64, abi_vers
     let display_endpoint = Handle(display_endpoint as u32);
     let feedback_endpoint = Handle(feedback_endpoint as u32);
     let info = query_display(display_endpoint, feedback_endpoint);
-    let prepared = if gpu_mode {
-        prepare_gpu_frame(info)
+    let mut frame_id = 1u64;
+    let first = if gpu_mode {
+        prepare_gpu_frame(info, frame_id, Some(0))
     } else {
         prepare_cpu_frame(info)
     };
-    let descriptor = prepared.descriptor;
-    let buffer = prepared.buffer;
-    let acquire = prepared.acquire;
-    let mapping = SharedMemoryMap {
-        version: MEMORY_ABI_VERSION,
-        reserved: 0,
-        address: 0,
-        offset: 0,
-        length: descriptor.byte_size.div_ceil(4096) * 4096,
-        flags: VmFlags::READ.union(VmFlags::WRITE),
-    };
+    present_frame(display_endpoint, feedback_endpoint, info, first, frame_id);
 
+    if !gpu_mode {
+        loop {
+            let mut idle = Message::EMPTY;
+            if ipc_receive(feedback_endpoint, &mut idle) != syscall::status::OK {
+                process_exit(197);
+            }
+        }
+    }
+
+    loop {
+        let mut control = Message::EMPTY;
+        if ipc_receive(DEMO_CONTROL_ENDPOINT, &mut control) != syscall::status::OK
+            || control.header.opcode != GPU_DEMO_START_OPCODE
+            || control.header.payload_len != 64
+            || control.header.handle_count != 0
+            || control.header.sender_pid == 0
+        {
+            process_exit(210);
+        }
+        let request = match GpuDemoRequest::decode_inline(&control.payload) {
+            Ok(request) => request,
+            Err(_) => process_exit(211),
+        };
+        // Каждый present ждёт release/vblank, поэтому очередь не убегает от
+        // monitor refresh и остаётся bounded даже при медленном GPU.
+        for scene_frame in 0..request.frame_count {
+            frame_id = frame_id.saturating_add(1);
+            let frame = prepare_gpu_frame(info, frame_id, Some(scene_frame));
+            present_frame(display_endpoint, feedback_endpoint, info, frame, frame_id);
+        }
+    }
+}
+
+fn present_frame(
+    display: Handle,
+    feedback_endpoint: Handle,
+    info: DisplayScanoutInfo,
+    prepared: PreparedFrame,
+    frame_id: u64,
+) {
     let release_value = sync_timeline_create(&SyncTimelineCreate::new(0));
     if release_value <= 0 {
         process_exit(187);
     }
     let release = Handle(release_value as u32);
-
     let metrics = SurfaceMetrics::new(info.width, info.height, info.width, info.height, 1000);
     let surface = SurfaceCreateRequest::new(metrics, 3);
-    let mut commit = SurfaceCommit::full_damage(Handle(0x7fff), buffer, metrics, 1);
-    commit.acquire = SyncPoint::new(acquire, 1);
+    let mut commit = SurfaceCommit::full_damage(Handle(0x7fff), prepared.buffer, metrics, frame_id);
+    commit.acquire = SyncPoint::new(prepared.acquire, prepared.acquire_value);
     if surface.validate().is_err() || commit.validate().is_err() {
         process_exit(189);
     }
-    let present = DisplayPresentRequest::from_buffer(commit.frame_id, &descriptor, 1, 1);
+    let present = DisplayPresentRequest::from_buffer(
+        frame_id,
+        &prepared.descriptor,
+        prepared.acquire_value,
+        1,
+    );
     let mut message = Message::EMPTY;
     message.header.opcode = DISPLAY_PRESENT_OPCODE;
-    message.header.request_id = commit.frame_id;
+    message.header.request_id = frame_id;
     message.header.payload_len = 64;
     message.header.handle_count = DISPLAY_PRESENT_HANDLE_COUNT;
     message.payload = present.encode_inline();
     message.handles[0] = TransferredHandle {
-        handle: buffer,
+        handle: prepared.buffer,
         reserved: 0,
         rights: Rights::READ,
     };
     message.handles[1] = TransferredHandle {
-        handle: acquire,
+        handle: prepared.acquire,
         reserved: 0,
         rights: Rights::WAIT,
     };
@@ -112,57 +148,17 @@ pub extern "C" fn _start(display_endpoint: u64, feedback_endpoint: u64, abi_vers
         reserved: 0,
         rights: Rights::SEND,
     };
-    if ipc_send(display_endpoint, &message) != syscall::status::OK {
+    if ipc_send(display, &message) != syscall::status::OK
+        || sync_timeline_wait(&SyncTimelineWait::new(release, 1, SYNC_TIMEOUT_INFINITE))
+            != syscall::status::OK
+    {
         process_exit(190);
     }
 
-    let points_create = SharedMemoryCreate {
-        version: MEMORY_ABI_VERSION,
-        reserved: 0,
-        length: 4096,
-        flags: VmFlags::READ.union(VmFlags::WRITE),
-    };
-    let points_value = shared_memory_create(&points_create);
-    if points_value <= 0 {
-        process_exit(191);
-    }
-    let points_memory = Handle(points_value as u32);
-    let points_address = shared_memory_map(
-        points_memory,
-        &SharedMemoryMap {
-            length: 4096,
-            ..mapping
-        },
-    );
-    if points_address <= 0 {
-        process_exit(192);
-    }
-    unsafe {
-        (points_address as *mut SyncPoint).write(SyncPoint::new(acquire, 1));
-        (points_address as *mut SyncPoint)
-            .add(1)
-            .write(SyncPoint::new(release, 1));
-    }
-    let wait = SyncWaitMany::new(
-        points_memory,
-        0,
-        2,
-        SyncWaitMode::ALL,
-        SYNC_TIMEOUT_INFINITE,
-    );
-    if sync_timeline_wait_many(&wait) != syscall::status::OK
-        || vm_unmap(points_address as u64, 4096) != syscall::status::OK
-        || handle_close(points_memory) != syscall::status::OK
-        || handle_close(buffer) != syscall::status::OK
-        || handle_close(acquire) != syscall::status::OK
-        || handle_close(release) != syscall::status::OK
-    {
-        process_exit(193);
-    }
     let mut feedback_message = Message::EMPTY;
     if ipc_receive(feedback_endpoint, &mut feedback_message) != syscall::status::OK
         || feedback_message.header.opcode != DISPLAY_FEEDBACK_OPCODE
-        || feedback_message.header.request_id != commit.frame_id
+        || feedback_message.header.request_id != frame_id
         || feedback_message.header.payload_len != 64
         || feedback_message.header.handle_count != 0
     {
@@ -172,15 +168,14 @@ pub extern "C" fn _start(display_endpoint: u64, feedback_endpoint: u64, abi_vers
         Ok(feedback) => feedback,
         Err(_) => process_exit(195),
     };
-    if feedback.frame_id != commit.frame_id || feedback.output != info.output {
+    if feedback.frame_id != frame_id || feedback.output != info.output {
         process_exit(196);
     }
-
-    loop {
-        let mut idle = Message::EMPTY;
-        if ipc_receive(feedback_endpoint, &mut idle) != syscall::status::OK {
-            process_exit(197);
-        }
+    if handle_close(prepared.buffer) != syscall::status::OK
+        || handle_close(prepared.acquire) != syscall::status::OK
+        || handle_close(release) != syscall::status::OK
+    {
+        process_exit(193);
     }
 }
 
@@ -216,9 +211,7 @@ fn prepare_cpu_frame(info: DisplayScanoutInfo) -> PreparedFrame {
         length: mapped_length,
         flags: VmFlags::READ.union(VmFlags::WRITE),
     };
-    // GraphicsBuffer — отдельный object kind; shared-memory syscall не имеет
-    // права трактовать его как обычный byte container.
-    if shared_memory_map(buffer, &mapping) != syscall::status::ACCESS_DENIED {
+    if rustos_runtime::shared_memory_map(buffer, &mapping) != syscall::status::ACCESS_DENIED {
         process_exit(184);
     }
     let address = graphics_buffer_map(buffer, &mapping);
@@ -233,7 +226,6 @@ fn prepare_cpu_frame(info: DisplayScanoutInfo) -> PreparedFrame {
     if vm_unmap(address as u64, mapped_length) != syscall::status::OK {
         process_exit(186);
     }
-
     let acquire_value = sync_timeline_create(&SyncTimelineCreate::new(0));
     if acquire_value <= 0 {
         process_exit(187);
@@ -245,16 +237,25 @@ fn prepare_cpu_frame(info: DisplayScanoutInfo) -> PreparedFrame {
     {
         process_exit(188);
     }
-
     PreparedFrame {
         descriptor,
         buffer,
         acquire,
+        acquire_value: 1,
     }
 }
 
-fn prepare_gpu_frame(info: DisplayScanoutInfo) -> PreparedFrame {
-    let request = GpuRenderFrame::request(info.width, info.height, 1);
+fn prepare_gpu_frame(
+    info: DisplayScanoutInfo,
+    frame_id: u64,
+    scene_frame: Option<u32>,
+) -> PreparedFrame {
+    let request = match scene_frame {
+        Some(scene_frame) => {
+            GpuRenderFrame::aurora_request(info.width, info.height, frame_id, scene_frame)
+        }
+        None => GpuRenderFrame::request(info.width, info.height, frame_id),
+    };
     let mut message = Message::EMPTY;
     message.header.opcode = GPU_RENDER_REQUEST_OPCODE;
     message.header.request_id = request.frame_id;
@@ -276,13 +277,16 @@ fn prepare_gpu_frame(info: DisplayScanoutInfo) -> PreparedFrame {
         Ok(rendered)
             if rendered.fence_id != 0
                 && rendered.width == info.width
-                && rendered.height == info.height =>
+                && rendered.height == info.height
+                && rendered.flags == request.flags
+                && rendered.scene_frame() == request.scene_frame() =>
         {
             rendered
         }
         _ => process_exit(203),
     };
     let _fence = rendered.fence_id;
+    let acquire_value = rendered.acquire_value();
     let buffer = frame.handles[0].handle;
     let acquire = frame.handles[1].handle;
     let mut descriptor = empty_descriptor();
@@ -300,6 +304,7 @@ fn prepare_gpu_frame(info: DisplayScanoutInfo) -> PreparedFrame {
         descriptor,
         buffer,
         acquire,
+        acquire_value,
     }
 }
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # End-to-end: ring-3 renderd -> async Virtio fence -> GraphicsBuffer ->
-# compositord -> displayd -> VirGL scanout. Скриншот проверяет сам треугольник.
+# compositord -> displayd -> VirGL scanout. Скриншот проверяет Aurora 3D scene.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -31,7 +31,7 @@ cleanup() {
         kill -TERM "$XVFB_PID" 2>/dev/null || true
         wait "$XVFB_PID" 2>/dev/null || true
     fi
-    for file in serial.log qemu-stderr.log xvfb-stderr.log triangle.ppm triangle.xwd; do
+    for file in serial.log qemu-stderr.log xvfb-stderr.log showcase.ppm showcase.xwd; do
         [[ -f "$RUN_DIR/$file" ]] && cp -f "$RUN_DIR/$file" "$RESULT_DIR/$file"
     done
 }
@@ -85,7 +85,7 @@ QPID=$!
 
 ready=0
 for _ in $(seq 1 "${VIRGL_TEST_TIMEOUT:-240}"); do
-    if grep -Fq '[virgl-test] TRIANGLE_READY scanout=graphics-buffer cpu-raster=no' \
+    if grep -Fq '[virgl-test] MESA_SHOWCASE_READY scanout=graphics-buffer cpu-raster=no' \
         "$RUN_DIR/serial.log" 2>/dev/null; then
         ready=1
         break
@@ -94,7 +94,7 @@ for _ in $(seq 1 "${VIRGL_TEST_TIMEOUT:-240}"); do
     sleep 1
 done
 if [[ "$ready" != 1 ]]; then
-    echo "[virgl-test] triangle marker timeout" >&2
+    echo "[virgl-test] Mesa showcase marker timeout" >&2
     tail -80 "$RUN_DIR/serial.log" >&2 2>/dev/null || true
     cat "$RUN_DIR/qemu-stderr.log" >&2 2>/dev/null || true
     exit 1
@@ -104,12 +104,12 @@ fi
 # Кадр статичен, поэтому одна bounded-пауза даёт display thread завершить
 # swap без внесения недетерминированности в содержимое.
 sleep 1
-cp -f "$RUN_DIR/Xvfb_screen0" "$RUN_DIR/triangle.xwd"
-[[ -s "$RUN_DIR/triangle.xwd" ]] || {
+cp -f "$RUN_DIR/Xvfb_screen0" "$RUN_DIR/showcase.xwd"
+[[ -s "$RUN_DIR/showcase.xwd" ]] || {
     echo "[virgl-test] Xvfb display surface is empty" >&2
     exit 1
 }
-"$CHECK_TOOL" --virgl "$RUN_DIR/triangle.xwd" "$RUN_DIR/triangle.ppm"
-grep -Fq '[virgl] ring3 renderd async-fence triangle zero-copy scanout verified' \
+"$CHECK_TOOL" --virgl "$RUN_DIR/showcase.xwd" "$RUN_DIR/showcase.ppm"
+grep -Fq '[gpu-demo] AURORA_3D_READY frames=48 renderer=mesa-virgl cpu-raster=no' \
     "$RUN_DIR/serial.log"
-echo "[virgl-test] PASS: 3D triangle reached scanout without guest CPU rasterization"
+echo "[virgl-test] PASS: Mesa/VirGL Aurora 3D reached scanout without guest CPU rasterization"

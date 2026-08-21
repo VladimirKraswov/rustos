@@ -1,9 +1,10 @@
 //! Минимальный безопасный encoder VirGL command stream.
 //!
-//! Это не замена Mesa. Модуль намеренно покрывает только один проверяемый
-//! bootstrap pipeline: color target, vertex buffer, TGSI shaders и draw VBO.
-//! Он нужен, чтобы проверить весь путь от ring 3 до host 3D renderer до того,
-//! как в систему будет перенесён полноценный Gallium/VirGL driver Mesa.
+//! Это низкоуровневый winsys transport, а не реализация OpenGL. Модуль
+//! сериализует небольшой, строго ограниченный набор Gallium/VirGL команд;
+//! выбор сцены, математика и Mesa-like state tracking живут уровнем выше в
+//! `rustos-mesa`. Такое разделение оставляет kernel только валидатором и
+//! транспортом команд, а не переносит графическую политику в TCB.
 
 #![no_std]
 
@@ -44,8 +45,30 @@ DCL OUT[1], COLOR\n\
 const FRAGMENT_SHADER: &[u8] = b"FRAG\n\
 DCL IN[0], COLOR, LINEAR\n\
 DCL OUT[0], COLOR\n\
-  0: MOV OUT[0], IN[0]\n\
+IMM[0] FLT32 { 0.9400, 0.9400, 0.9400, 1.0000 }\n\
+IMM[1] FLT32 { 0.0150, 0.0200, 0.0450, 0.0000 }\n\
+  0: MAD OUT[0], IN[0], IMM[0], IMM[1]\n\
   1: END\n\0";
+
+/// Одна interleaved вершина bootstrap Gallium pipeline.
+///
+/// Координаты уже находятся в clip space. Цвет содержит результат расчёта
+/// освещения state tracker'ом; fragment shader выполняет финальный tone pass.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Vertex {
+    /// Homogeneous clip-space position.
+    pub position: [f32; 4],
+    /// Linear RGBA color.
+    pub color: [f32; 4],
+}
+
+impl Vertex {
+    /// Создаёт вершину без скрытого преобразования координат.
+    pub const fn new(position: [f32; 4], color: [f32; 4]) -> Self {
+        Self { position, color }
+    }
+}
 
 /// Ошибка формирования bounded command buffer.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -54,6 +77,8 @@ pub enum EncodeError {
     BufferTooSmall,
     /// Размер render target не представим корректным viewport.
     InvalidExtent,
+    /// Поток поддерживает только непустой список полных треугольников.
+    InvalidVertexCount,
 }
 
 /// Строит один полный кадр: тёмный фон и RGB-треугольник.
@@ -67,94 +92,190 @@ pub fn encode_triangle(
     color_resource: u32,
     vertex_resource: u32,
 ) -> Result<usize, EncodeError> {
+    const VERTICES: [Vertex; 3] = [
+        Vertex::new([-0.72, -0.68, 0.0, 1.0], [0.96, 0.24, 0.34, 1.0]),
+        Vertex::new([0.72, -0.68, 0.0, 1.0], [0.16, 0.72, 0.98, 1.0]),
+        Vertex::new([0.0, 0.72, 0.0, 1.0], [0.40, 0.93, 0.52, 1.0]),
+    ];
+    encode_mesh(
+        output,
+        width,
+        height,
+        color_resource,
+        vertex_resource,
+        &VERTICES,
+        [0.035, 0.055, 0.11, 1.0],
+    )
+}
+
+/// Кодирует один GPU frame с произвольным bounded triangle mesh.
+///
+/// Функция не хранит состояние и не разыменовывает GPU addresses. Именно этот
+/// узкий API реализует transport-часть winsys для `rustos-mesa`.
+pub fn encode_mesh(
+    output: &mut [u32],
+    width: u32,
+    height: u32,
+    color_resource: u32,
+    vertex_resource: u32,
+    vertices: &[Vertex],
+    clear: [f32; 4],
+) -> Result<usize, EncodeError> {
+    encode_mesh_with_pipeline(
+        output,
+        width,
+        height,
+        color_resource,
+        vertex_resource,
+        vertices,
+        clear,
+        true,
+    )
+}
+
+/// Кодирует следующий кадр, повторно используя созданные первым submission
+/// immutable objects. Повторный `CREATE_OBJECT` с тем же handle запрещён
+/// VirGL, поэтому многокадровый renderer обязан явно выбрать этот путь.
+pub fn encode_mesh_update(
+    output: &mut [u32],
+    width: u32,
+    height: u32,
+    color_resource: u32,
+    vertex_resource: u32,
+    vertices: &[Vertex],
+    clear: [f32; 4],
+) -> Result<usize, EncodeError> {
+    encode_mesh_with_pipeline(
+        output,
+        width,
+        height,
+        color_resource,
+        vertex_resource,
+        vertices,
+        clear,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_mesh_with_pipeline(
+    output: &mut [u32],
+    width: u32,
+    height: u32,
+    color_resource: u32,
+    vertex_resource: u32,
+    vertices: &[Vertex],
+    clear: [f32; 4],
+    initialize_pipeline: bool,
+) -> Result<usize, EncodeError> {
     if width == 0 || height == 0 || width > 16_384 || height > 16_384 {
         return Err(EncodeError::InvalidExtent);
+    }
+    if vertices.is_empty() || !vertices.len().is_multiple_of(3) || vertices.len() > 48 {
+        return Err(EncodeError::InvalidVertexCount);
     }
     let mut encoder = Encoder::new(output);
 
     // Surface object 1 связывает VirGL render target с capability-backed
     // resource. Уровень и диапазон layers равны нулю: это обычная 2D texture.
-    encoder.command(CCMD_CREATE_OBJECT, OBJECT_SURFACE, 5)?;
-    encoder.words(&[1, color_resource, FORMAT_BGRX8888, 0, 0])?;
-    encoder.command(CCMD_SET_FRAMEBUFFER_STATE, 0, 3)?;
-    encoder.words(&[1, 0, 1])?;
+    if initialize_pipeline {
+        encoder.command(CCMD_CREATE_OBJECT, OBJECT_SURFACE, 5)?;
+        encoder.words(&[1, color_resource, FORMAT_BGRX8888, 0, 0])?;
+        encoder.command(CCMD_SET_FRAMEBUFFER_STATE, 0, 3)?;
+        encoder.words(&[1, 0, 1])?;
+    }
 
     // Фон очищает host 3D renderer. Guest CPU не пишет ни одного пикселя.
     encoder.command(CCMD_CLEAR, 0, 8)?;
     encoder.words(&[
         CLEAR_COLOR0,
-        0.035f32.to_bits(),
-        0.055f32.to_bits(),
-        0.11f32.to_bits(),
-        1.0f32.to_bits(),
+        clear[0].to_bits(),
+        clear[1].to_bits(),
+        clear[2].to_bits(),
+        clear[3].to_bits(),
         0,
         0,
         0,
     ])?;
 
     // Две RGBA32F вершины на vertex: position и interpolated color.
-    encoder.command(CCMD_CREATE_OBJECT, OBJECT_VERTEX_ELEMENTS, 9)?;
-    encoder.words(&[
-        2,
-        0,
-        0,
-        0,
-        FORMAT_RGBA32_FLOAT,
-        16,
-        0,
-        0,
-        FORMAT_RGBA32_FLOAT,
-    ])?;
-    encoder.command(CCMD_BIND_OBJECT, OBJECT_VERTEX_ELEMENTS, 1)?;
-    encoder.word(2)?;
+    if initialize_pipeline {
+        encoder.command(CCMD_CREATE_OBJECT, OBJECT_VERTEX_ELEMENTS, 9)?;
+        encoder.words(&[
+            2,
+            0,
+            0,
+            0,
+            FORMAT_RGBA32_FLOAT,
+            16,
+            0,
+            0,
+            FORMAT_RGBA32_FLOAT,
+        ])?;
+        encoder.command(CCMD_BIND_OBJECT, OBJECT_VERTEX_ELEMENTS, 1)?;
+        encoder.word(2)?;
+    }
 
     // Inline-write передаёт только 3D vertex input. Это не rasterization:
     // покрытие, интерполяцию и запись framebuffer выполняет VirGL renderer.
-    const VERTICES: [[f32; 8]; 3] = [
-        [-0.72, -0.68, 0.0, 1.0, 0.96, 0.24, 0.34, 1.0],
-        [0.72, -0.68, 0.0, 1.0, 0.16, 0.72, 0.98, 1.0],
-        [0.0, 0.72, 0.0, 1.0, 0.40, 0.93, 0.52, 1.0],
-    ];
-    encoder.command(CCMD_RESOURCE_INLINE_WRITE, 0, 11 + 24)?;
-    encoder.words(&[vertex_resource, 0, 0, 96, 0, 0, 0, 0, 96, 1, 1])?;
-    for vertex in VERTICES {
-        for component in vertex {
+    let vertex_bytes =
+        u32::try_from(core::mem::size_of_val(vertices)).map_err(|_| EncodeError::BufferTooSmall)?;
+    let vertex_dwords =
+        u16::try_from(vertices.len() * 8).map_err(|_| EncodeError::BufferTooSmall)?;
+    encoder.command(CCMD_RESOURCE_INLINE_WRITE, 0, 11 + vertex_dwords)?;
+    encoder.words(&[
+        vertex_resource,
+        0,
+        0,
+        vertex_bytes,
+        0,
+        0,
+        0,
+        0,
+        vertex_bytes,
+        1,
+        1,
+    ])?;
+    for vertex in vertices {
+        for component in vertex.position.into_iter().chain(vertex.color) {
             encoder.word(component.to_bits())?;
         }
     }
     encoder.command(CCMD_SET_VERTEX_BUFFERS, 0, 3)?;
     encoder.words(&[32, 0, vertex_resource])?;
 
-    encoder.shader(3, SHADER_VERTEX, VERTEX_SHADER)?;
-    encoder.shader(4, SHADER_FRAGMENT, FRAGMENT_SHADER)?;
-    encoder.command(CCMD_LINK_SHADER, 0, 6)?;
-    encoder.words(&[3, 4, 0, 0, 0, 0])?;
+    if initialize_pipeline {
+        encoder.shader(3, SHADER_VERTEX, VERTEX_SHADER)?;
+        encoder.shader(4, SHADER_FRAGMENT, FRAGMENT_SHADER)?;
+        encoder.command(CCMD_LINK_SHADER, 0, 6)?;
+        encoder.words(&[3, 4, 0, 0, 0, 0])?;
 
-    // Стандартные immutable pipeline states из reference virglrenderer test.
-    encoder.command(CCMD_CREATE_OBJECT, OBJECT_BLEND, 11)?;
-    encoder.words(&[5, 0, 0, 0x7800_0000, 0, 0, 0, 0, 0, 0, 0])?;
-    encoder.command(CCMD_BIND_OBJECT, OBJECT_BLEND, 1)?;
-    encoder.word(5)?;
+        // Стандартные immutable pipeline states из reference virglrenderer test.
+        encoder.command(CCMD_CREATE_OBJECT, OBJECT_BLEND, 11)?;
+        encoder.words(&[5, 0, 0, 0x7800_0000, 0, 0, 0, 0, 0, 0, 0])?;
+        encoder.command(CCMD_BIND_OBJECT, OBJECT_BLEND, 1)?;
+        encoder.word(5)?;
 
-    encoder.command(CCMD_CREATE_OBJECT, OBJECT_DSA, 5)?;
-    encoder.words(&[6, 6, 0, 0, 0])?;
-    encoder.command(CCMD_BIND_OBJECT, OBJECT_DSA, 1)?;
-    encoder.word(6)?;
+        encoder.command(CCMD_CREATE_OBJECT, OBJECT_DSA, 5)?;
+        encoder.words(&[6, 6, 0, 0, 0])?;
+        encoder.command(CCMD_BIND_OBJECT, OBJECT_DSA, 1)?;
+        encoder.word(6)?;
 
-    encoder.command(CCMD_CREATE_OBJECT, OBJECT_RASTERIZER, 9)?;
-    encoder.words(&[
-        7,
-        (1 << 1) | (1 << 29) | (1 << 30),
-        1.0f32.to_bits(),
-        0,
-        0,
-        1.0f32.to_bits(),
-        0,
-        0,
-        0,
-    ])?;
-    encoder.command(CCMD_BIND_OBJECT, OBJECT_RASTERIZER, 1)?;
-    encoder.word(7)?;
+        encoder.command(CCMD_CREATE_OBJECT, OBJECT_RASTERIZER, 9)?;
+        encoder.words(&[
+            7,
+            (1 << 1) | (1 << 29) | (1 << 30),
+            1.0f32.to_bits(),
+            0,
+            0,
+            1.0f32.to_bits(),
+            0,
+            0,
+            0,
+        ])?;
+        encoder.command(CCMD_BIND_OBJECT, OBJECT_RASTERIZER, 1)?;
+        encoder.word(7)?;
+    }
 
     let half_width = width as f32 * 0.5;
     let half_height = height as f32 * 0.5;
@@ -170,7 +291,20 @@ pub fn encode_triangle(
     ])?;
 
     encoder.command(CCMD_DRAW_VBO, 0, 12)?;
-    encoder.words(&[0, 3, PRIM_TRIANGLES, 0, 1, 0, 0, 0, 0, 0, 2, 0])?;
+    encoder.words(&[
+        0,
+        vertices.len() as u32,
+        PRIM_TRIANGLES,
+        0,
+        1,
+        0,
+        0,
+        0,
+        0,
+        0,
+        2,
+        0,
+    ])?;
     Ok(encoder.finish())
 }
 
@@ -260,5 +394,32 @@ mod tests {
             encode_triangle(&mut words, 640, 480, 1, 2),
             Err(EncodeError::BufferTooSmall)
         );
+    }
+
+    #[test]
+    fn update_stream_reuses_immutable_object_handles() {
+        let vertices = [
+            Vertex::new([-0.5, -0.5, 0.0, 1.0], [1.0, 0.0, 0.0, 1.0]),
+            Vertex::new([0.5, -0.5, 0.0, 1.0], [0.0, 1.0, 0.0, 1.0]),
+            Vertex::new([0.0, 0.5, 0.0, 1.0], [0.0, 0.0, 1.0, 1.0]),
+        ];
+        let mut words = [0u32; 768];
+        let count = encode_mesh_update(
+            &mut words,
+            1280,
+            800,
+            41,
+            42,
+            &vertices,
+            [0.0, 0.0, 0.0, 1.0],
+        )
+        .unwrap();
+        let mut cursor = 0;
+        while cursor < count {
+            let header = words[cursor];
+            assert_ne!(header as u8, CCMD_CREATE_OBJECT);
+            cursor += (header >> 16) as usize + 1;
+        }
+        assert_eq!(cursor, count);
     }
 }

@@ -307,6 +307,7 @@ dependencies = [
  "rustos-abi",
  "rustos-crt",
  "rustos-elf-loader",
+ "rustos-mesa",
  "rustos-rune-format",
  "rustos-rune-loader",
  "rustos-runtime",
@@ -368,6 +369,13 @@ version = "0.1.0"
 [[package]]
 name = "rustos-loader-root"
 version = "0.1.0"
+
+[[package]]
+name = "rustos-mesa"
+version = "0.1.0"
+dependencies = [
+ "rustos-virgl",
+]
 
 [[package]]
 name = "rustos-microkernel"

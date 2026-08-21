@@ -57,7 +57,7 @@ use super::{
 
 const MAX_PROCESSES: usize = 12;
 const MAX_THREADS: usize = 24;
-const MAX_ENDPOINTS: usize = 6;
+const MAX_ENDPOINTS: usize = 7;
 const ENDPOINT_QUEUE_CAPACITY: usize = 8;
 const ENDPOINT_SLOT: usize = 2;
 const MAX_SHARED_OBJECTS: usize = 8;
@@ -4750,9 +4750,7 @@ pub(super) fn run_milestone(info: &rustos_abi::BootInfo) -> Result<(), ProcessEr
             "[graphics-abi-v7] graphics-buffer sync-timeline atomic-present supervisor-restart verified\n",
         );
         if scanout::render_info().is_ok() {
-            serial::put_str(
-                "[virgl] ring3 renderd async-fence triangle zero-copy scanout verified\n",
-            );
+            serial::put_str("[virgl] ring3 renderd async-fence zero-copy scanout verified\n");
         } else {
             serial::put_str("[virgl] unavailable: device did not negotiate VIRTIO_GPU_F_VIRGL\n");
         }
@@ -4906,6 +4904,7 @@ pub(super) fn pump_interactive_services() -> Result<(), ProcessError> {
     manager.endpoints[3] = Endpoint::EMPTY;
     manager.endpoints[4] = Endpoint::EMPTY;
     manager.endpoints[5] = Endpoint::EMPTY;
+    manager.endpoints[6] = Endpoint::EMPTY;
     let restarted = spawn_graphics_services(manager)?;
     manager.run()?;
     if !graphics_services_blocked(manager, restarted) {
@@ -4916,6 +4915,62 @@ pub(super) fn pump_interactive_services() -> Result<(), ProcessError> {
     serial::put_str("[supervisor] display stack restarted count=");
     serial::put_u32(u32::from(restarts + 1));
     serial::put_str("\n");
+    Ok(())
+}
+
+/// Запускает ring-3 control application и ждёт, пока compositor покажет все
+/// кадры Aurora 3D. Ни kernel desktop, ни launcher не получают GPU handles.
+pub(super) fn run_interactive_gpu_demo(frame_count: u32) -> Result<(), ProcessError> {
+    const DEMO_CONTROL_ENDPOINT: u8 = 6;
+    const DEMO_CONTROL_SLOT: usize = 2;
+
+    if !unsafe { INTERACTIVE_SERVICES_READY } || !(1..=600).contains(&frame_count) {
+        return Err(ProcessError::UnexpectedExit);
+    }
+    let services = unsafe { INTERACTIVE_GRAPHICS_SERVICES }
+        .filter(|services| services.render.is_some())
+        .ok_or(ProcessError::UnexpectedExit)?;
+    let manager = unsafe { &mut *ptr::addr_of_mut!(MANAGER) };
+    if manager.endpoints[DEMO_CONTROL_ENDPOINT as usize].receiver != services.compositor {
+        return Err(ProcessError::UnexpectedExit);
+    }
+    let mut capabilities = [EMPTY_CAPABILITY; MAX_CAPABILITIES];
+    capabilities[DEMO_CONTROL_SLOT] = CapabilityEntry {
+        kind: CapabilityKind::Endpoint(DEMO_CONTROL_ENDPOINT),
+        rights: Rights::SEND,
+    };
+    let demo = manager.spawn_internal(
+        "system/bin/gpu-demo.rune",
+        SpawnOptions {
+            parent: ProcessId::KERNEL,
+            priority: PriorityClass::Interactive,
+            boot_arguments: [
+                DEMO_CONTROL_SLOT as u64,
+                u64::from(frame_count),
+                syscall::ABI_VERSION,
+            ],
+            expected: Some(ExpectedExit {
+                status: 0,
+                exception: 0,
+            }),
+        },
+        capabilities,
+        None,
+    )?;
+    manager.run()?;
+    if !graphics_services_blocked(manager, services)
+        || !manager
+            .processes
+            .iter()
+            .flatten()
+            .any(|process| process.pid == demo && process.exited)
+    {
+        return Err(ProcessError::UnexpectedExit);
+    }
+    manager.reap_process(demo);
+    serial::put_str("[gpu-demo] AURORA_3D_READY frames=");
+    serial::put_u32(frame_count);
+    serial::put_str(" renderer=mesa-virgl cpu-raster=no\n");
     Ok(())
 }
 
@@ -5304,6 +5359,7 @@ fn run_graphics_service_phase(manager: &mut ProcessManager) -> Result<bool, Proc
     manager.endpoints[3] = Endpoint::EMPTY;
     manager.endpoints[4] = Endpoint::EMPTY;
     manager.endpoints[5] = Endpoint::EMPTY;
+    manager.endpoints[6] = Endpoint::EMPTY;
     let restarted = spawn_graphics_services(manager)?;
     if let Err(error) = manager.run() {
         manager.cleanup();
@@ -5322,10 +5378,12 @@ fn spawn_graphics_services(manager: &mut ProcessManager) -> Result<GraphicsServi
     const FEEDBACK_ENDPOINT: u8 = 3;
     const GPU_FRAME_ENDPOINT: u8 = 4;
     const GPU_CONTROL_ENDPOINT: u8 = 5;
+    const DEMO_CONTROL_ENDPOINT: u8 = 6;
     const DISPLAY_SLOT: usize = 2;
     const DEVICE_OR_FEEDBACK_SLOT: usize = 3;
     const GPU_FRAME_SLOT: usize = 4;
     const GPU_CONTROL_SLOT: usize = 5;
+    const DEMO_CONTROL_SLOT: usize = 6;
     const GPU_MODE_FLAG: u64 = 1 << 63;
     let use_gpu = scanout::render_info().is_ok();
 
@@ -5372,6 +5430,10 @@ fn spawn_graphics_services(manager: &mut ProcessManager) -> Result<GraphicsServi
         compositor_caps[GPU_CONTROL_SLOT] = CapabilityEntry {
             kind: CapabilityKind::Endpoint(GPU_CONTROL_ENDPOINT),
             rights: Rights::SEND,
+        };
+        compositor_caps[DEMO_CONTROL_SLOT] = CapabilityEntry {
+            kind: CapabilityKind::Endpoint(DEMO_CONTROL_ENDPOINT),
+            rights: Rights::RECEIVE,
         };
     }
     let compositor = manager.spawn_internal(
@@ -5421,6 +5483,7 @@ fn spawn_graphics_services(manager: &mut ProcessManager) -> Result<GraphicsServi
         )?;
         manager.endpoints[GPU_FRAME_ENDPOINT as usize].receiver = compositor;
         manager.endpoints[GPU_CONTROL_ENDPOINT as usize].receiver = render;
+        manager.endpoints[DEMO_CONTROL_ENDPOINT as usize].receiver = compositor;
         Some(render)
     } else {
         None
@@ -5434,7 +5497,11 @@ fn spawn_graphics_services(manager: &mut ProcessManager) -> Result<GraphicsServi
 
 fn graphics_services_blocked(manager: &ProcessManager, services: GraphicsServices) -> bool {
     service_blocked_on(manager, services.display, 0)
-        && service_blocked_on(manager, services.compositor, 3)
+        && service_blocked_on(
+            manager,
+            services.compositor,
+            if services.render.is_some() { 6 } else { 3 },
+        )
         && services
             .render
             .is_none_or(|render| service_blocked_on(manager, render, 5))

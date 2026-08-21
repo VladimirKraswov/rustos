@@ -56,6 +56,10 @@ name = "rustos-renderd"
 path = "src/renderd.rs"
 
 [[bin]]
+name = "rustos-gpu-demo"
+path = "src/gpu_demo.rs"
+
+[[bin]]
 name = "rustos-vfs-test"
 path = "src/vfs_test.rs"
 
@@ -104,3 +108,4 @@ rustos-rune-loader = { path = "../../libs/rune-loader" }
 rustos-rune-format = { path = "../../rune-format" }
 varaniafs = { path = "../../varaniafs" }
 rustos-virgl = { path = "../../libs/virgl" }
+rustos-mesa = { path = "../../libs/mesa" }
