@@ -32,22 +32,39 @@ layout/event/display-list pipeline и UI Gallery описаны в
 
 ## Pixel mapping и HiDPI
 
-Интерактивный `make run` теперь запрашивает 1280×800 и открывает QEMU с
-`zoom-to-fit=off`, без fullscreen. Host window подстраивается под framebuffer,
-а не растягивает его до произвольного размера: это режим отладки `1:1`, в
-котором шрифт, линия и checkbox не проходят вторую интерполяцию. Старое
-поведение можно включить явно, когда важнее заполнить окно, чем получить
-эталонную резкость:
+На macOS интерактивный `make run` использует policy `integer`: читает размер
+Cocoa backing surface основного экрана, подбирает wide guest mode не больше
+1600×900 и открывает его fullscreen с целым коэффициентом ×2/×3/×4. Например,
+2880×1800 получает guest 1440×900 ×2, а внешний 2048×1152 — 1024×576 ×2.
+QEMU zoom interpolation отключён, поэтому каждый guest pixel превращается в
+одинаковый квадрат физических пикселей, но окно остаётся крупным.
+
+Доступны три явные policy:
 
 ```sh
-RUSTOS_FIT_TO_WINDOW=1 RUSTOS_FULLSCREEN=1 make run
+make run                                  # integer-fit на основном экране macOS
+RUSTOS_DISPLAY_POLICY=actual make run    # маленькое эталонное окно 1:1
+RUSTOS_DISPLAY_POLICY=fit make run       # заполнение экрана, scale может быть дробным
 ```
 
-EDID-размер задаётся независимо:
+Для нескольких экранов `RUSTOS_HOST_DISPLAY=0|1|...` выбирает профиль, а
+launcher печатает host surface, guest mode и коэффициент до запуска. EDID можно
+переопределить вручную; оба размера задаются вместе:
 
 ```sh
 RUSTOS_DISPLAY_WIDTH=1920 RUSTOS_DISPLAY_HEIGHT=1080 make run
 ```
+
+Cocoa не предоставляет QEMU аргумент для принудительного выбора монитора:
+нужный экран должен быть основным/активным при открытии fullscreen. Поэтому
+virtio-gpu повторяет расчёт уже из фактической host surface во время загрузки;
+если предварительный профиль launcher не совпал с экраном окна, scanout всё
+равно получает корректный integer mode.
+
+`RUSTOS_FULLSCREEN` и `RUSTOS_FIT_TO_WINDOW` остаются низкоуровневыми
+override'ами policy. На Linux безопасный default — `actual`, потому что Wayland
+и X11 не дают одного переносимого способа определить backing surface; integer
+mode можно указать вручную после просмотра разрешения host.
 
 На уровне UI уже действует отдельный `WindowMetrics`: logical size, physical
 raster surface и `device_scale_milli`. Значение хранится как fixed-point

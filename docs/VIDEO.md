@@ -21,12 +21,14 @@ firmware linear framebuffer. В этом режиме смена разреше�
 возвращает `RequiresReboot`: уже переданный firmware framebuffer не
 имеет runtime mode-set API.
 
-Host display frontend не является частью scanout contract. `scripts/run.sh`
-по умолчанию отключает QEMU `zoom-to-fit`, поэтому один уже отрисованный guest
-pixel не масштабируется compositor'ом VM с дробным коэффициентом. Опция
-`RUSTOS_FIT_TO_WINDOW=1` предназначена только для явно выбранного preview.
-Настоящий HiDPI выполняется до rasterization через `WindowMetrics`; scanout и
-compositor по-прежнему получают physical surface и публикуют её `1:1`.
+Host display frontend не является частью scanout contract. На macOS
+`scripts/run.sh` выбирает guest mode, который целое число раз помещается в
+Cocoa backing surface, включает fullscreen и отключает zoom interpolation.
+Так интерфейс остаётся крупным без дробной фильтрации готового framebuffer.
+Policy `actual` сохраняет строгое окно 1:1 для pixel-level диагностики, а
+обычный дробный `fit` доступен только как явный выбор. Настоящий HiDPI внутри ОС
+выполняется до rasterization через `WindowMetrics`; scanout и compositor
+по-прежнему получают physical surface и публикуют её `1:1`.
 
 ## Virtio-gpu 2D
 

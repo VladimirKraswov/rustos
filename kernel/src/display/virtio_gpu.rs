@@ -47,6 +47,8 @@ const MAX_HEIGHT: u32 = 2160;
 /// выбирает комфортный широкий logical scanout не больше 1600×900.
 const STARTUP_MAX_WIDTH: u32 = 1600;
 const STARTUP_MAX_HEIGHT: u32 = 900;
+const INTEGER_MIN_WIDTH: u32 = 800;
+const INTEGER_MIN_HEIGHT: u32 = 540;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -246,6 +248,9 @@ impl VirtioGpu {
             ..preferred
         };
         let startup = startup_mode(connector_preferred, fallback);
+        // Автоматически выведенный integer-fit mode обязан быть виден через
+        // DISPLAY MODES наравне с EDID и стандартными режимами.
+        gpu.add_mode(startup);
         let resource = gpu.allocate_resource(startup)?;
         if let Err(error) = gpu.set_scanout_resource(resource.id, startup) {
             let _ = gpu.detach_resource(resource.id);
@@ -592,6 +597,17 @@ fn startup_mode(preferred: DisplayMode, fallback: DisplayMode) -> DisplayMode {
     {
         return preferred;
     }
+    if preferred_is_usable {
+        if let Some((width, height)) = integer_fit_dimensions(preferred.width, preferred.height) {
+            return DisplayMode {
+                width,
+                height,
+                stride_pixels: width,
+                format: PixelFormat::Bgr888,
+                refresh_millihertz: preferred.refresh_millihertz.max(60_000),
+            };
+        }
+    }
     let fallback_is_usable = fallback.width >= MIN_WIDTH
         && fallback.height >= MIN_HEIGHT
         && fallback.width <= STARTUP_MAX_WIDTH
@@ -610,6 +626,32 @@ fn startup_mode(preferred: DisplayMode, fallback: DisplayMode) -> DisplayMode {
         format: PixelFormat::Bgr888,
         refresh_millihertz: preferred.refresh_millihertz.max(60_000),
     }
+}
+
+/// Подбирает surface, которую host увеличит на целое число.
+///
+/// Cocoa сообщает virtio-gpu fullscreen backing size ещё до старта kernel:
+/// например, 2880×1800. Прежний clamp превращал его в 1600×900 и давал
+/// дробный коэффициент 1.8. Теперь выбирается 1440×900 ×2. Если только одна
+/// ось выходит за startup budget, вторая остаётся точной ограничивающей осью,
+/// а свободное место становится letterbox без масштабирования bitmap.
+fn integer_fit_dimensions(host_width: u32, host_height: u32) -> Option<(u32, u32)> {
+    for scale in 2..=6 {
+        if host_width % scale != 0 || host_height % scale != 0 {
+            continue;
+        }
+        let desired_width = host_width / scale;
+        let desired_height = host_height / scale;
+        if desired_width > STARTUP_MAX_WIDTH && desired_height > STARTUP_MAX_HEIGHT {
+            continue;
+        }
+        let width = desired_width.min(STARTUP_MAX_WIDTH);
+        let height = desired_height.min(STARTUP_MAX_HEIGHT);
+        if width >= INTEGER_MIN_WIDTH && height >= INTEGER_MIN_HEIGHT {
+            return Some((width, height));
+        }
+    }
+    None
 }
 
 impl Drop for VirtioGpu {
