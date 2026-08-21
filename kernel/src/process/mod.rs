@@ -3,6 +3,7 @@
 //! trap/fault/lifecycle ABI останется тем же.
 
 mod elf;
+mod graphics_objects;
 #[path = "manager_v2.rs"]
 mod manager;
 mod rune;
@@ -63,6 +64,10 @@ pub(super) enum CapabilityKind {
     Process(ProcessId),
     Thread(rustos_abi::ThreadId),
     SharedMemory(u16),
+    /// Разделяемая графическая память с неизменяемым pixel descriptor.
+    GraphicsBuffer(u16),
+    /// Монотонный explicit-sync timeline.
+    SyncTimeline(rustos_microkernel::TimelineId),
     /// Однонаправленный byte stream; READ/WRITE различаются rights одного object.
     Pipe(u16),
     /// Raw block device выдаётся только storage service, не приложениям.

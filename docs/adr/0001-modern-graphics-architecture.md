@@ -57,12 +57,14 @@ reset. Оно не реализует Vulkan, OpenGL, оконную полит�
 
 ## Порядок реализации
 
-1. Версионированные `GraphicsBufferDesc`, multi-plane metadata,
-   `SyncPoint`/timeline и surface commit/release/feedback ABI.
+1. **Готово:** версионированные `GraphicsBufferDesc`, multi-plane metadata,
+   `SyncPoint`/timeline, kernel objects и surface commit/release/feedback ABI;
+   headless ring-3 `compositord -> displayd` проходит boot-test.
 2. PCI bridges, ECAM, MSI/MSI-X, IRQ capabilities, scatter/gather DMA и IOMMU.
 3. Асинхронный virtio transport, несколько запросов in-flight, fences,
    cursor queue, blob resources и несколько outputs.
-4. Ring-3 `displayd`/`compositord` с client-owned buffer queues.
+4. Выдать ring-3 `displayd` scanout capability и сделать постоянный
+   `compositord` с client-owned buffer queues.
 5. Mesa platform, `libdrm-rustos`, EGL platform и Vulkan WSI.
 6. VirGL как первый ускоренный end-to-end milestone, затем Venus.
 7. GPU backend SystemUI без изменения API компонентов.

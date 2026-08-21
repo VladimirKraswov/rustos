@@ -80,6 +80,7 @@ struct UserPage {
 pub enum UserPageBacking {
     Private,
     Shared(u16),
+    Graphics(u16),
 }
 
 const EMPTY_PAGE: UserPage = UserPage {
@@ -203,6 +204,28 @@ impl AddressSpace {
             flags,
             allowed_flags,
             UserPageBacking::Shared(object),
+        )
+    }
+
+    /// Отображает страницу graphics-buffer object. Отдельный backing tag не
+    /// даёт `vm_unmap` ошибочно уменьшить refcount обычной shared memory.
+    pub fn map_graphics_page(
+        &mut self,
+        virtual_address: u64,
+        physical_address: u64,
+        flags: UserPageFlags,
+        allowed_flags: UserPageFlags,
+        object: u16,
+    ) -> Result<(), AddressSpaceError> {
+        if self.find_page(virtual_address).is_some() {
+            return Err(AddressSpaceError::AlreadyMapped);
+        }
+        self.map_physical_page(
+            virtual_address,
+            physical_address,
+            flags,
+            allowed_flags,
+            UserPageBacking::Graphics(object),
         )
     }
 
@@ -337,6 +360,16 @@ impl AddressSpace {
             .filter(|index| {
                 let page = self.page(*index);
                 page.used && page.backing == UserPageBacking::Shared(object)
+            })
+            .count()
+    }
+
+    /// Число mapping references конкретного graphics buffer.
+    pub fn graphics_mapping_pages(&self, object: u16) -> usize {
+        (0..self.page_len)
+            .filter(|index| {
+                let page = self.page(*index);
+                page.used && page.backing == UserPageBacking::Graphics(object)
             })
             .count()
     }

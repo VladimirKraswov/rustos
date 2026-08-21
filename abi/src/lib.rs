@@ -21,6 +21,7 @@
 
 pub mod block;
 pub mod bootinfo;
+pub mod display;
 pub mod dll;
 pub mod graphics_buffer;
 pub mod handle;

@@ -64,10 +64,12 @@ Platform-independent `rustos-video` разделяет локальные
 `CpuSurface`/`CpuPixelFormat` для software fallback и межпроцессный graphics
 contract. `GraphicsBufferDesc` описывает packed/multi-plane память, color,
 usage/domain и modifier; `SyncPoint` и `SurfaceCommit` задают явное владение
-кадром, damage, buffer release и presentation feedback. Kernel desktop пока
-использует только CPU raster/damage часть поверх firmware/virtio scanout.
-Новые renderer/display/media процессы будут использовать capability buffers,
-а не заимствованные slices. Решение описано в
+кадром, damage, buffer release и presentation feedback. Kernel objects уже
+предоставляют generation-safe GraphicsBuffer/SyncTimeline handles, mapping
+lifetime и блокирующий wait-many. Два RUNE-процесса `compositord`/`displayd`
+проходят headless present при boot; интерактивный desktop пока использует CPU
+raster/damage bootstrap поверх firmware/virtio scanout. Контракт описан в
+[GRAPHICS_ABI.md](GRAPHICS_ABI.md) и
 [ADR-0001](adr/0001-modern-graphics-architecture.md).
 
 MADT перечисляет CPU, BSP последовательно выполняет INIT–SIPI–SIPI. AP
@@ -94,8 +96,9 @@ MADT перечисляет CPU, BSP последовательно выполн
 8. **готов runtime S1:** upstream target `std`, CRT, threads/futex,
    process/pipes/stdio, запуск RUNE с VFS и масштабируемая COW VaraniaFS;
    дальше постоянный supervisor, native Rust toolchain и package/build services;
-9. **переходно:** persistent ring-3 `vfsd` и GUI `RUN` bridge готовы;
-   дальше `inputd`, `displayd`, compositor и terminal как отдельные процессы;
+9. **переходно:** persistent ring-3 `vfsd`, GUI `RUN` bridge и изолированный
+   headless present `compositord -> displayd` готовы; дальше scanout capability,
+   постоянные display/input services и terminal как отдельный процесс;
 10. supervisor применяет restart policy к реальным service manifests.
 
 UI API уже отделён от framebuffer ownership, поэтому widget logic не должна

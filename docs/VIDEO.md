@@ -149,13 +149,16 @@ video decoder не обязан предварительно превращат�
 
 Timeline point `NONE` означает уже завершённую зависимость; частично
 заполненная пустая point запрещена. `SyncWaitMany` атомарно ждёт `ALL`/`ANY`
-из bounded shared-memory массива, не заставляя CPU spin'иться. Surface commit несёт monotonically
-increasing `frame_id`, режим FIFO/mailbox/immediate/adaptive, logical/physical
+из bounded shared-memory массива, не заставляя CPU spin'иться. Surface commit
+несёт monotonically increasing `frame_id`, режим
+FIFO/mailbox/immediate/adaptive, logical/physical
 size, fractional scale и target presentation time. ABI проверяет
 `physical = ceil(logical × scale)`, поэтому растягивание уже растрированного
-bitmap нельзя случайно выдать за HiDPI. Реализация kernel objects и
-ring-3 сервиса является следующим отдельным этапом; наличие ABI не объявляет
-их готовыми.
+bitmap нельзя случайно выдать за HiDPI. Kernel objects уже реализуют
+generation-safe lifetime, отдельные capability/mapping references и
+блокирующий wait/wait-many. Boot-test проводит один frame между изолированными
+ring-3 `compositord` и `displayd`; детали и честная граница headless backend
+описаны в [GRAPHICS_ABI.md](GRAPHICS_ABI.md).
 
 ## Много окон и изоляция
 
@@ -164,10 +167,11 @@ slice видимых layers. Bounded только список damage rectangles
 переполнение никогда не теряет картинку — области объединяются в более дорогой
 bounding rectangle.
 
-Следующий шаг изоляции — реализация user-space `displayd`/`compositord` поверх
-готового surface protocol. Только displayd получит scanout capability. Падение
-клиента удалит его buffer queue и layers, но не остановит desktop. Координаты,
-размеры, planes, поколение capability и sync points проверяются до отображения.
+Следующий шаг изоляции — выдать только `displayd` настоящий scanout capability
+и перевести headless present на atomic modeset/vblank. После этого постоянный
+`compositord` примет независимые surface queues приложений, а bootstrap kernel
+desktop останется аварийным fallback. Падение клиента должно удалять только
+его buffer queue и layers, не останавливая desktop.
 
 ## Software OpenGL и видео
 

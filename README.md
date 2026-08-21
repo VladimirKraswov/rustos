@@ -25,7 +25,7 @@ RustOS — учебная 64-битная микроядерная операц�
 - ACPI MADT discovery и INIT–SIPI–SIPI запуск AP-ядер через 16/32/64-битный
   trampoline; AP пока безопасно parked до per-CPU TSS/IDT;
 - dynamic create/exit/reap с generation-safe PID/TID и полным reclaim;
-- process/capability ABI v4: ring-3 `spawn/wait/kill`, несколько потоков с
+- process/capability ABI v5: ring-3 `spawn/wait/kill`, несколько потоков с
   `create/join`, argv/environment, FS-base/TPIDR TLS и monotonic clock;
 - anonymous `map/unmap/protect` с W^X и shared-memory objects с раздельным
   учётом capability/mapping references;
@@ -38,6 +38,8 @@ RustOS — учебная 64-битная микроядерная операц�
 - современный graphics ABI: capability buffers, packed/multi-plane RGB/YUV,
   color metadata, explicit timeline sync, surface queues и presentation
   feedback;
+- настоящие kernel objects `GraphicsBuffer`/`SyncTimeline` и проверяемый
+  ring-3 headless present через отдельные `compositord`/`displayd` процессы;
 - PS/2 input на PC и virtio-input keyboard/mouse на ARM VM;
 - desktop, taskbar, Start menu и icons;
 - window manager: drag, minimize, maximize, restore и close;
@@ -130,14 +132,16 @@ process manager выполняет настоящую preemptive-сессию: t
 user context, scheduler выбирает другой TID, меняется CR3/TTBR0, а
 `iretq`/`eret` возвращает уже другой процесс. На обеих ISA второй CPU реально
 запускается и подтверждает online, но пока parked: следующий рубеж — per-CPU
-runtime, interrupt routing, TLB shootdown и work stealing. Затем display/input
-и desktop переносятся в изолированные процессы. Нативный `rustc` ещё не
-заявлен готовым.
+runtime, interrupt routing, TLB shootdown и work stealing. Headless
+`compositord -> displayd` уже изолирован; затем displayd получит scanout
+capability, а input и desktop переедут из bootstrap kernel. Нативный `rustc`
+ещё не заявлен готовым.
 
 Подробнее: [архитектуры CPU](docs/ARCHITECTURES.md), [архитектура системы](docs/ARCHITECTURE.md),
 [графическая подсистема](docs/GUI.md), [видеосистема](docs/VIDEO.md), [VFS](docs/VFS.md),
 [ADR современной графической архитектуры](docs/adr/0001-modern-graphics-architecture.md),
+[graphics objects ABI](docs/GRAPHICS_ABI.md),
 [микроядро](docs/MICROKERNEL.md), [DLL](docs/DYNAMIC_LIBRARIES.md),
-[IPC](docs/IPC.md), [процессы и память ABI v4](docs/PROCESS_MEMORY_ABI.md),
+[IPC](docs/IPC.md), [процессы и память ABI v5](docs/PROCESS_MEMORY_ABI.md),
 [self-hosting Rust](docs/SELF_HOSTING.md),
 [сборка](docs/BUILDING.md).

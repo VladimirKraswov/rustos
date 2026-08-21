@@ -13,12 +13,14 @@ mod arch;
 
 pub use rustos_abi::{
     block::BlockIoRequest,
+    graphics_buffer::GraphicsBufferDesc,
     ipc::Message,
     memory::{SharedMemoryCreate, SharedMemoryMap, VmFlags, VmMapRequest},
     process::{
         ProcessSpawnRequest, ProcessSpawnResult, ProcessStartInfo, StartupCapability, StartupRole,
         ThreadCreateRequest, ThreadCreateResult,
     },
+    sync::{SyncTimelineCreate, SyncTimelineSignal, SyncTimelineWait, SyncWaitMany},
     syscall, ExitReason, Handle, Rights,
 };
 
@@ -218,6 +220,91 @@ pub fn shared_memory_seal(handle: Handle, flags: VmFlags) -> i64 {
             syscall::number::SHARED_MEMORY_SEAL,
             handle.0 as u64,
             flags.0,
+            0,
+        )
+    }
+}
+
+/// Создаёт capability-backed graphics buffer. Kernel фиксирует descriptor на
+/// весь lifetime object'а и возвращает отдельный, не shared-memory handle.
+pub fn graphics_buffer_create(descriptor: &GraphicsBufferDesc) -> i64 {
+    unsafe {
+        syscall3(
+            syscall::number::GRAPHICS_BUFFER_CREATE,
+            descriptor as *const GraphicsBufferDesc as u64,
+            0,
+            0,
+        )
+    }
+}
+
+/// Отображает доступный CPU диапазон graphics buffer.
+pub fn graphics_buffer_map(handle: Handle, request: &SharedMemoryMap) -> i64 {
+    unsafe {
+        syscall3(
+            syscall::number::GRAPHICS_BUFFER_MAP,
+            handle.0 as u64,
+            request as *const SharedMemoryMap as u64,
+            0,
+        )
+    }
+}
+
+/// Читает неизменяемое описание импортированного graphics buffer.
+pub fn graphics_buffer_get_info(handle: Handle, descriptor: &mut GraphicsBufferDesc) -> i64 {
+    unsafe {
+        syscall3(
+            syscall::number::GRAPHICS_BUFFER_GET_INFO,
+            handle.0 as u64,
+            descriptor as *mut GraphicsBufferDesc as u64,
+            0,
+        )
+    }
+}
+
+/// Создаёт explicit-sync timeline; результат — capability handle.
+pub fn sync_timeline_create(request: &SyncTimelineCreate) -> i64 {
+    unsafe {
+        syscall3(
+            syscall::number::SYNC_TIMELINE_CREATE,
+            request as *const SyncTimelineCreate as u64,
+            0,
+            0,
+        )
+    }
+}
+
+/// Монотонно продвигает timeline и будит подходящих waiters.
+pub fn sync_timeline_signal(request: &SyncTimelineSignal) -> i64 {
+    unsafe {
+        syscall3(
+            syscall::number::SYNC_TIMELINE_SIGNAL,
+            request as *const SyncTimelineSignal as u64,
+            0,
+            0,
+        )
+    }
+}
+
+/// Ждёт одну timeline point без busy-spin.
+pub fn sync_timeline_wait(request: &SyncTimelineWait) -> i64 {
+    unsafe {
+        syscall3(
+            syscall::number::SYNC_TIMELINE_WAIT,
+            request as *const SyncTimelineWait as u64,
+            0,
+            0,
+        )
+    }
+}
+
+/// Ждёт все либо любую из bounded набора timeline points.
+pub fn sync_timeline_wait_many(request: &SyncWaitMany) -> i64 {
+    unsafe {
+        syscall3(
+            syscall::number::SYNC_TIMELINE_WAIT_MANY,
+            request as *const SyncWaitMany as u64,
+            0,
             0,
         )
     }

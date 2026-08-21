@@ -10,6 +10,7 @@ mod ipc;
 mod process_table;
 mod scheduler;
 mod supervisor;
+mod sync;
 
 pub use ipc::{
     derive_capability_rights, prepare_message, CapabilityTransferError, EndpointQueue,
@@ -18,6 +19,7 @@ pub use ipc::{
 pub use process_table::{ProcessError, ProcessInfo, ProcessState, ProcessTable};
 pub use scheduler::{Scheduler, SchedulerError, ThreadInfo, ThreadState, DRIVER_BURST_LIMIT};
 pub use supervisor::{RestartDecision, RestartPolicy, SupervisorState};
+pub use sync::{TimelineError, TimelineId, TimelineTable};
 
 use rustos_abi::{ExitReason, PriorityClass};
 

@@ -134,7 +134,7 @@ per-CPU GDT/TSS/IDT, ring-0 interrupt stack, run queue и TLB shootdown inbox.
 5. TLB shootdown и PCID optimization;
 6. тест параллельной записи разных user pages двумя CPU с fault/GUI heartbeat.
 
-Process ABI v4 предоставляет spawn/kill/wait, несколько потоков, anonymous
+Process ABI v5 предоставляет spawn/kill/wait, несколько потоков, anonymous
 VM, sealed shared-memory capabilities, args/env, TLS и monotonic clock.
 Streaming VFS IPC, persistent VaraniaFS и user-space RUNE DLL loader уже
 проходят boot-test. `std::process::Command` умеет выполнять RUNE с VFS через
@@ -177,6 +177,7 @@ PID/TID, изоляцию process fault и supervisor backoff. `make test-boot` 
 [isolation] concurrent #UD terminated one process; survivor exited=22
 [ipc] queued block/wake and attenuated VFS capability verified
 [abi-v4] spawn/wait/kill threads VM shared-memory TLS clock verified
+[graphics-abi-v5] GraphicsBuffer SyncTimeline ring3 displayd/compositord verified
 [std] allocator fs threads futex process pipes stdio native SDK and VFS executable verified in ring3 RUNE
 [vfsd] restart recovered committed VaraniaFS metadata and file data
 [loader] RUNE interfaces imports ABI TLS RELRO and cross-process shared RX verified

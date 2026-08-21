@@ -14,6 +14,7 @@ use core::{
 use rustos_abi::{
     block::{BlockIoRequest, BLOCK_ABI_VERSION},
     bootinfo::BootInitramfs,
+    graphics_buffer::{BufferUsage, GraphicsBufferDesc, MemoryDomain},
     ipc::{Message, IPC_MAX_HANDLES},
     memory::{SharedMemoryCreate, SharedMemoryMap, VmFlags, VmMapRequest, MEMORY_ABI_VERSION},
     pipe::{PipeCreateResult, PIPE_ABI_VERSION},
@@ -22,12 +23,16 @@ use rustos_abi::{
         StartupCapability, StartupRole, ThreadCreateRequest, ThreadCreateResult,
         PROCESS_ABI_VERSION, PROCESS_SPAWN_MAX_CAPABILITIES, PROCESS_START_INFO_ADDRESS,
     },
+    sync::{
+        SyncPoint, SyncTimelineCreate, SyncTimelineSignal, SyncTimelineWait, SyncWaitMany,
+        SyncWaitMode, SYNC_MAX_WAIT_POINTS, SYNC_TIMEOUT_INFINITE,
+    },
     syscall::{self, status},
     ExitReason, Handle, PriorityClass, ProcessId, Rights, ThreadId, PAGE_SIZE,
 };
 use rustos_microkernel::{
     derive_capability_rights, prepare_message, CapabilityTransferError, EndpointQueue,
-    IpcQueueError, ProcessTable, Scheduler, ThreadState,
+    IpcQueueError, ProcessTable, Scheduler, ThreadState, TimelineError, TimelineId, TimelineTable,
 };
 
 use crate::{
@@ -38,6 +43,7 @@ use crate::{
 };
 
 use super::{
+    graphics_objects::{make_id as graphics_id, GraphicsBufferPool, MAX_GRAPHICS_BUFFERS},
     load_executable, CapabilityEntry, CapabilityKind, InteractiveExit, ProcessError,
     EMPTY_CAPABILITY, MAX_CAPABILITIES, VFS_ROOT_SLOT,
 };
@@ -49,6 +55,8 @@ const ENDPOINT_QUEUE_CAPACITY: usize = 8;
 const ENDPOINT_SLOT: usize = 2;
 const MAX_SHARED_OBJECTS: usize = 8;
 const MAX_SHARED_PAGES: usize = 64;
+const MAX_SYNC_TIMELINES: usize = 32;
+const MAX_SYNC_WAITS: usize = MAX_THREADS;
 /// Один mapping ограничен 1 GiB: достаточно для compiler arenas, но ошибка в
 /// user-space всё ещё не может одним syscall переполнить арифметику/metadata.
 const MAX_VM_SYSCALL_PAGES: u64 = 256 * 1024;
@@ -109,6 +117,40 @@ struct PendingPipe {
 }
 
 #[derive(Clone, Copy)]
+struct PendingSyncPoint {
+    timeline: TimelineId,
+    value: u64,
+}
+
+impl PendingSyncPoint {
+    const EMPTY: Self = Self {
+        timeline: TimelineId(0),
+        value: 0,
+    };
+}
+
+#[derive(Clone, Copy)]
+struct SyncWaitSlot {
+    used: bool,
+    thread: ThreadId,
+    points: [PendingSyncPoint; SYNC_MAX_WAIT_POINTS as usize],
+    point_count: usize,
+    mode: SyncWaitMode,
+    deadline_ns: u64,
+}
+
+impl SyncWaitSlot {
+    const EMPTY: Self = Self {
+        used: false,
+        thread: ThreadId::INVALID,
+        points: [PendingSyncPoint::EMPTY; SYNC_MAX_WAIT_POINTS as usize],
+        point_count: 0,
+        mode: SyncWaitMode::ALL,
+        deadline_ns: SYNC_TIMEOUT_INFINITE,
+    };
+}
+
+#[derive(Clone, Copy)]
 enum PendingOperation {
     None,
     Receive(PendingReceive),
@@ -116,6 +158,7 @@ enum PendingOperation {
     ThreadJoin(PendingJoin),
     Futex(PendingFutex),
     Pipe(PendingPipe),
+    Sync(u8),
 }
 
 struct ManagedThread {
@@ -324,6 +367,38 @@ impl SharedMemoryPool {
         Ok(())
     }
 
+    /// Копирует небольшой control-plane диапазон прямо из объекта. Это нужно
+    /// bounded wait-many parser'у: kernel не доверяет user mapping и не
+    /// хранит process-local pointer после блокировки.
+    fn copy_bytes(&self, id: u16, offset: u64, output: &mut [u8]) -> Result<(), i64> {
+        let object = self.get(id)?;
+        let length = u64::try_from(output.len()).map_err(|_| status::INVALID_ARGUMENT)?;
+        if offset
+            .checked_add(length)
+            .is_none_or(|end| end > object.pages as u64 * PAGE_SIZE)
+        {
+            return Err(status::INVALID_ARGUMENT);
+        }
+        let mut copied = 0usize;
+        while copied < output.len() {
+            let absolute = offset + copied as u64;
+            let page = (absolute / PAGE_SIZE) as usize;
+            let page_offset = (absolute % PAGE_SIZE) as usize;
+            let count = (PAGE_SIZE as usize - page_offset).min(output.len() - copied);
+            // SAFETY: object удерживается capability вызывающего процесса,
+            // page проверен диапазоном выше, physical frame identity-mapped.
+            unsafe {
+                ptr::copy_nonoverlapping(
+                    (object.frames[page].phys as *const u8).add(page_offset),
+                    output[copied..copied + count].as_mut_ptr(),
+                    count,
+                );
+            }
+            copied += count;
+        }
+        Ok(())
+    }
+
     fn release_mappings(&mut self, id: u16, count: usize) {
         let index = shared_index(id);
         let Some(object) = self.objects.get_mut(index) else {
@@ -516,6 +591,9 @@ struct ProcessManager {
     scheduler: Scheduler<MAX_THREADS, 1>,
     endpoints: [Endpoint; MAX_ENDPOINTS],
     shared: SharedMemoryPool,
+    graphics: GraphicsBufferPool,
+    timelines: TimelineTable<MAX_SYNC_TIMELINES>,
+    sync_waits: [SyncWaitSlot; MAX_SYNC_WAITS],
     pipes: PipePool,
     current: ThreadId,
     kernel_root: u64,
@@ -538,6 +616,9 @@ impl ProcessManager {
             scheduler: Scheduler::new(),
             endpoints: [Endpoint::EMPTY; MAX_ENDPOINTS],
             shared: SharedMemoryPool::new(),
+            graphics: GraphicsBufferPool::new(),
+            timelines: TimelineTable::new(),
+            sync_waits: [SyncWaitSlot::EMPTY; MAX_SYNC_WAITS],
             pipes: PipePool::new(),
             current: ThreadId::INVALID,
             kernel_root: 0,
@@ -559,6 +640,9 @@ impl ProcessManager {
         self.process_table = ProcessTable::new();
         self.scheduler = Scheduler::new();
         self.shared = SharedMemoryPool::new();
+        self.graphics = GraphicsBufferPool::new();
+        self.timelines = TimelineTable::new();
+        self.sync_waits = [SyncWaitSlot::EMPTY; MAX_SYNC_WAITS];
         self.pipes = PipePool::new();
         self.initramfs = initramfs;
         self.counter_hz = counter_hz;
@@ -928,6 +1012,7 @@ impl ProcessManager {
             self.timer_ticks = self.timer_ticks.saturating_add(1);
             arch::rearm_scheduler_timer(self.counter_hz);
             self.wake_expired_futexes();
+            self.wake_expired_sync_waiters();
             return self.schedule_next(frame);
         }
         if kind == TrapKind::Syscall {
@@ -1161,6 +1246,50 @@ impl ProcessManager {
                 frame.set_syscall_result(result);
                 0
             }
+            syscall::number::GRAPHICS_BUFFER_CREATE => {
+                let result = self.graphics_buffer_create(process_index, arg0);
+                frame.set_syscall_result(result);
+                0
+            }
+            syscall::number::GRAPHICS_BUFFER_MAP => {
+                let result = self.graphics_buffer_map(process_index, Handle(arg0 as u32), arg1);
+                frame.set_syscall_result(result);
+                0
+            }
+            syscall::number::GRAPHICS_BUFFER_GET_INFO => {
+                let result =
+                    self.graphics_buffer_get_info(process_index, Handle(arg0 as u32), arg1);
+                frame.set_syscall_result(result);
+                0
+            }
+            syscall::number::SYNC_TIMELINE_CREATE => {
+                let result = self.sync_timeline_create(process_index, arg0);
+                frame.set_syscall_result(result);
+                0
+            }
+            syscall::number::SYNC_TIMELINE_SIGNAL => {
+                let result = self.sync_timeline_signal(process_index, arg0);
+                frame.set_syscall_result(result);
+                0
+            }
+            syscall::number::SYNC_TIMELINE_WAIT => {
+                match self.sync_timeline_wait(thread_index, arg0) {
+                    BlockingResult::Return(result) => {
+                        frame.set_syscall_result(result);
+                        0
+                    }
+                    BlockingResult::Blocked => self.schedule_next(frame),
+                }
+            }
+            syscall::number::SYNC_TIMELINE_WAIT_MANY => {
+                match self.sync_timeline_wait_many(thread_index, arg0) {
+                    BlockingResult::Return(result) => {
+                        frame.set_syscall_result(result);
+                        0
+                    }
+                    BlockingResult::Blocked => self.schedule_next(frame),
+                }
+            }
             syscall::number::FUTEX_WAIT => {
                 match self.futex_wait(thread_index, arg0, arg1 as u32, arg2) {
                     BlockingResult::Return(result) => {
@@ -1298,6 +1427,7 @@ impl ProcessManager {
         {
             return;
         }
+        self.cancel_sync_wait_for_thread(tid);
         let _ = self.scheduler.exit(tid, reason);
         let thread = self.threads[index].as_mut().expect("thread");
         thread.exited = true;
@@ -1345,6 +1475,7 @@ impl ProcessManager {
                 .is_some_and(|thread| thread.pid == pid && !thread.exited);
             if should_finish {
                 let tid = self.threads[index].as_ref().expect("thread").tid;
+                self.cancel_sync_wait_for_thread(tid);
                 let _ = self.scheduler.exit(tid, reason);
                 let thread = self.threads[index].as_mut().expect("thread");
                 thread.exited = true;
@@ -2142,6 +2273,7 @@ impl ProcessManager {
                 .unmap_page(address + page * PAGE_SIZE);
             match backing {
                 Ok(UserPageBacking::Shared(object)) => self.shared.release_mappings(object, 1),
+                Ok(UserPageBacking::Graphics(object)) => self.graphics.release_mappings(object, 1),
                 Ok(UserPageBacking::Private) => {}
                 Err(_) => return status::INVALID_ARGUMENT,
             }
@@ -2379,6 +2511,478 @@ impl ProcessManager {
             .capabilities[handle.0 as usize]
             .rights = rights;
         status::OK
+    }
+
+    fn graphics_buffer_create(&mut self, process_index: usize, descriptor_address: u64) -> i64 {
+        let descriptor =
+            match self.read_struct::<GraphicsBufferDesc>(process_index, descriptor_address) {
+                Ok(descriptor) => descriptor,
+                Err(error) => return error,
+            };
+        if descriptor.validate().is_err() {
+            return status::INVALID_ARGUMENT;
+        }
+        let Some(slot) = self.processes[process_index]
+            .as_ref()
+            .expect("process")
+            .free_capability_slot()
+        else {
+            return status::LIMIT_REACHED;
+        };
+        let object = match self.graphics.create(descriptor) {
+            Ok(object) => object,
+            Err(error) => return error,
+        };
+        let mut rights = Rights::MAP;
+        if descriptor.usage.contains(BufferUsage::CPU_READ) {
+            rights = rights.union(Rights::READ);
+        }
+        if descriptor.usage.contains(BufferUsage::CPU_WRITE) {
+            rights = rights.union(Rights::WRITE);
+        }
+        if descriptor.memory_domains.contains(MemoryDomain::SHARED) {
+            rights = rights.union(Rights::TRANSFER);
+        }
+        self.processes[process_index]
+            .as_mut()
+            .expect("process")
+            .capabilities[slot] = CapabilityEntry {
+            kind: CapabilityKind::GraphicsBuffer(object),
+            rights,
+        };
+        slot as i64
+    }
+
+    fn graphics_buffer_map(
+        &mut self,
+        process_index: usize,
+        handle: Handle,
+        request_address: u64,
+    ) -> i64 {
+        let request = match self.read_struct::<SharedMemoryMap>(process_index, request_address) {
+            Ok(request) => request,
+            Err(error) => return error,
+        };
+        let Some(flags) = valid_vm_flags(request.flags) else {
+            return status::INVALID_ARGUMENT;
+        };
+        if request.version != MEMORY_ABI_VERSION
+            || request.reserved != 0
+            || !request.offset.is_multiple_of(PAGE_SIZE)
+            || flags.contains(VmFlags::EXECUTE)
+        {
+            return status::INVALID_ARGUMENT;
+        }
+        let pages = match checked_page_count(request.length) {
+            Ok(pages) => pages,
+            Err(error) => return error,
+        };
+        let required = vm_rights(flags).union(Rights::MAP);
+        let object = match self.processes[process_index]
+            .as_ref()
+            .expect("process")
+            .capability(handle, required)
+        {
+            Ok(CapabilityEntry {
+                kind: CapabilityKind::GraphicsBuffer(object),
+                ..
+            }) => object,
+            Ok(_) => return status::ACCESS_DENIED,
+            Err(error) => return error,
+        };
+        let offset_pages = request.offset / PAGE_SIZE;
+        let (object_pages, maximum_flags) = match self.graphics.pages_and_flags(object) {
+            Ok(info) => info,
+            Err(error) => return error,
+        };
+        if flags.0 & !maximum_flags.0 != 0
+            || offset_pages
+                .checked_add(pages)
+                .is_none_or(|end| end > object_pages as u64)
+        {
+            return status::ACCESS_DENIED;
+        }
+        let address = {
+            let space = &self.processes[process_index]
+                .as_ref()
+                .expect("process")
+                .address_space;
+            if request.address == 0 {
+                match space.find_free_range(request.length) {
+                    Ok(address) => address,
+                    Err(_) => return status::LIMIT_REACHED,
+                }
+            } else if space.range_is_free(request.address, request.length) {
+                request.address
+            } else {
+                return status::INVALID_ARGUMENT;
+            }
+        };
+        let actual_flags = page_flags(flags);
+        let allowed_flags = page_flags(maximum_flags);
+        let mut mapped = 0u64;
+        while mapped < pages {
+            let physical = match self
+                .graphics
+                .physical_page(object, (offset_pages + mapped) as usize)
+            {
+                Ok(physical) => physical,
+                Err(error) => return error,
+            };
+            let result = self.processes[process_index]
+                .as_mut()
+                .expect("process")
+                .address_space
+                .map_graphics_page(
+                    address + mapped * PAGE_SIZE,
+                    physical,
+                    actual_flags,
+                    allowed_flags,
+                    object,
+                );
+            if result.is_err() {
+                for rollback in 0..mapped {
+                    let _ = self.processes[process_index]
+                        .as_mut()
+                        .expect("process")
+                        .address_space
+                        .unmap_page(address + rollback * PAGE_SIZE);
+                    self.graphics.release_mappings(object, 1);
+                }
+                return status::OUT_OF_MEMORY;
+            }
+            if self.graphics.retain_mapping(object).is_err() {
+                let _ = self.processes[process_index]
+                    .as_mut()
+                    .expect("process")
+                    .address_space
+                    .unmap_page(address + mapped * PAGE_SIZE);
+                for rollback in 0..mapped {
+                    let _ = self.processes[process_index]
+                        .as_mut()
+                        .expect("process")
+                        .address_space
+                        .unmap_page(address + rollback * PAGE_SIZE);
+                    self.graphics.release_mappings(object, 1);
+                }
+                return status::LIMIT_REACHED;
+            }
+            mapped += 1;
+        }
+        self.flush_process(process_index);
+        address as i64
+    }
+
+    fn graphics_buffer_get_info(
+        &self,
+        process_index: usize,
+        handle: Handle,
+        descriptor_address: u64,
+    ) -> i64 {
+        if !self.user_writable(
+            process_index,
+            descriptor_address,
+            size_of::<GraphicsBufferDesc>(),
+        ) {
+            return status::INVALID_ARGUMENT;
+        }
+        let object = match self.processes[process_index]
+            .as_ref()
+            .expect("process")
+            .capability(handle, Rights::READ)
+        {
+            Ok(CapabilityEntry {
+                kind: CapabilityKind::GraphicsBuffer(object),
+                ..
+            }) => object,
+            Ok(_) => return status::ACCESS_DENIED,
+            Err(error) => return error,
+        };
+        let descriptor = match self.graphics.descriptor(object) {
+            Ok(descriptor) => descriptor,
+            Err(error) => return error,
+        };
+        self.write_struct(process_index, descriptor_address, &descriptor)
+            .map(|_| status::OK)
+            .unwrap_or(status::INVALID_ARGUMENT)
+    }
+
+    fn sync_timeline_create(&mut self, process_index: usize, request_address: u64) -> i64 {
+        let request = match self.read_struct::<SyncTimelineCreate>(process_index, request_address) {
+            Ok(request) => request,
+            Err(error) => return error,
+        };
+        if request.validate().is_err() {
+            return status::INVALID_ARGUMENT;
+        }
+        let Some(slot) = self.processes[process_index]
+            .as_ref()
+            .expect("process")
+            .free_capability_slot()
+        else {
+            return status::LIMIT_REACHED;
+        };
+        let timeline = match self.timelines.create(request.initial_value) {
+            Ok(timeline) => timeline,
+            Err(error) => return timeline_status(error),
+        };
+        self.processes[process_index]
+            .as_mut()
+            .expect("process")
+            .capabilities[slot] = CapabilityEntry {
+            kind: CapabilityKind::SyncTimeline(timeline),
+            rights: Rights::WAIT.union(Rights::WRITE).union(Rights::TRANSFER),
+        };
+        slot as i64
+    }
+
+    fn sync_timeline_signal(&mut self, process_index: usize, request_address: u64) -> i64 {
+        let request = match self.read_struct::<SyncTimelineSignal>(process_index, request_address) {
+            Ok(request) => request,
+            Err(error) => return error,
+        };
+        if request.validate().is_err() {
+            return status::INVALID_ARGUMENT;
+        }
+        let timeline = match self.processes[process_index]
+            .as_ref()
+            .expect("process")
+            .capability(request.timeline, Rights::WRITE)
+        {
+            Ok(CapabilityEntry {
+                kind: CapabilityKind::SyncTimeline(timeline),
+                ..
+            }) => timeline,
+            Ok(_) => return status::ACCESS_DENIED,
+            Err(error) => return error,
+        };
+        if let Err(error) = self.timelines.signal(timeline, request.value) {
+            return timeline_status(error);
+        }
+        self.wake_ready_sync_waiters();
+        status::OK
+    }
+
+    fn sync_timeline_wait(&mut self, thread_index: usize, request_address: u64) -> BlockingResult {
+        let process_index = self
+            .process_index(self.threads[thread_index].as_ref().expect("thread").pid)
+            .expect("process");
+        let request = match self.read_struct::<SyncTimelineWait>(process_index, request_address) {
+            Ok(request) => request,
+            Err(error) => return BlockingResult::Return(error),
+        };
+        if request.validate().is_err() {
+            return BlockingResult::Return(status::INVALID_ARGUMENT);
+        }
+        let timeline = match self.processes[process_index]
+            .as_ref()
+            .expect("process")
+            .capability(request.timeline, Rights::WAIT)
+        {
+            Ok(CapabilityEntry {
+                kind: CapabilityKind::SyncTimeline(timeline),
+                ..
+            }) => timeline,
+            Ok(_) => return BlockingResult::Return(status::ACCESS_DENIED),
+            Err(error) => return BlockingResult::Return(error),
+        };
+        let slot = match self.prepare_sync_wait_slot() {
+            Ok(slot) => slot,
+            Err(error) => return BlockingResult::Return(error),
+        };
+        if let Err(error) = self.timelines.retain(timeline) {
+            return BlockingResult::Return(timeline_status(error));
+        }
+        self.sync_waits[slot].points[0] = PendingSyncPoint {
+            timeline,
+            value: request.value,
+        };
+        self.sync_waits[slot].point_count = 1;
+        self.commit_sync_wait(thread_index, slot, SyncWaitMode::ALL, request.timeout_ns)
+    }
+
+    fn sync_timeline_wait_many(
+        &mut self,
+        thread_index: usize,
+        request_address: u64,
+    ) -> BlockingResult {
+        let process_index = self
+            .process_index(self.threads[thread_index].as_ref().expect("thread").pid)
+            .expect("process");
+        let request = match self.read_struct::<SyncWaitMany>(process_index, request_address) {
+            Ok(request) => request,
+            Err(error) => return BlockingResult::Return(error),
+        };
+        if request.validate().is_err() {
+            return BlockingResult::Return(status::INVALID_ARGUMENT);
+        }
+        let memory = match self.processes[process_index]
+            .as_ref()
+            .expect("process")
+            .capability(request.points_memory, Rights::READ)
+        {
+            Ok(CapabilityEntry {
+                kind: CapabilityKind::SharedMemory(memory),
+                ..
+            }) => memory,
+            Ok(_) => return BlockingResult::Return(status::ACCESS_DENIED),
+            Err(error) => return BlockingResult::Return(error),
+        };
+        let slot = match self.prepare_sync_wait_slot() {
+            Ok(slot) => slot,
+            Err(error) => return BlockingResult::Return(error),
+        };
+        for index in 0..request.point_count as usize {
+            let offset = request.points_offset + index as u64 * size_of::<SyncPoint>() as u64;
+            let point = match self.read_shared_struct::<SyncPoint>(memory, offset) {
+                Ok(point) => point,
+                Err(error) => {
+                    self.release_sync_wait_slot(slot);
+                    return BlockingResult::Return(error);
+                }
+            };
+            if point.validate().is_err() || point.is_none() {
+                self.release_sync_wait_slot(slot);
+                return BlockingResult::Return(status::INVALID_ARGUMENT);
+            }
+            let timeline = match self.processes[process_index]
+                .as_ref()
+                .expect("process")
+                .capability(point.timeline, Rights::WAIT)
+            {
+                Ok(CapabilityEntry {
+                    kind: CapabilityKind::SyncTimeline(timeline),
+                    ..
+                }) => timeline,
+                Ok(_) => {
+                    self.release_sync_wait_slot(slot);
+                    return BlockingResult::Return(status::ACCESS_DENIED);
+                }
+                Err(error) => {
+                    self.release_sync_wait_slot(slot);
+                    return BlockingResult::Return(error);
+                }
+            };
+            if let Err(error) = self.timelines.retain(timeline) {
+                self.release_sync_wait_slot(slot);
+                return BlockingResult::Return(timeline_status(error));
+            }
+            self.sync_waits[slot].points[index] = PendingSyncPoint {
+                timeline,
+                value: point.value,
+            };
+            self.sync_waits[slot].point_count += 1;
+        }
+        self.commit_sync_wait(thread_index, slot, request.mode, request.timeout_ns)
+    }
+
+    fn prepare_sync_wait_slot(&self) -> Result<usize, i64> {
+        self.sync_waits
+            .iter()
+            .position(|wait| !wait.used && wait.point_count == 0)
+            .ok_or(status::LIMIT_REACHED)
+    }
+
+    fn commit_sync_wait(
+        &mut self,
+        thread_index: usize,
+        slot: usize,
+        mode: SyncWaitMode,
+        timeout_ns: u64,
+    ) -> BlockingResult {
+        self.sync_waits[slot].mode = mode;
+        if self.sync_wait_reached(slot) {
+            self.release_sync_wait_slot(slot);
+            return BlockingResult::Return(status::OK);
+        }
+        if timeout_ns == 0 {
+            self.release_sync_wait_slot(slot);
+            return BlockingResult::Return(status::TIMED_OUT);
+        }
+        let now = self.monotonic_nanoseconds().max(0) as u64;
+        let deadline_ns = if timeout_ns == SYNC_TIMEOUT_INFINITE {
+            SYNC_TIMEOUT_INFINITE
+        } else {
+            now.saturating_add(timeout_ns)
+        };
+        let tid = self.threads[thread_index].as_ref().expect("thread").tid;
+        if self.scheduler.block(tid).is_err() {
+            self.release_sync_wait_slot(slot);
+            return BlockingResult::Return(status::BUSY);
+        }
+        self.sync_waits[slot].used = true;
+        self.sync_waits[slot].thread = tid;
+        self.sync_waits[slot].deadline_ns = deadline_ns;
+        self.threads[thread_index].as_mut().expect("thread").pending =
+            PendingOperation::Sync(slot as u8);
+        BlockingResult::Blocked
+    }
+
+    fn sync_wait_reached(&self, slot: usize) -> bool {
+        let wait = &self.sync_waits[slot];
+        let reached = |point: &PendingSyncPoint| {
+            self.timelines
+                .reached(point.timeline, point.value)
+                .unwrap_or(false)
+        };
+        if wait.mode == SyncWaitMode::ANY {
+            wait.points[..wait.point_count].iter().any(reached)
+        } else {
+            wait.points[..wait.point_count].iter().all(reached)
+        }
+    }
+
+    fn wake_ready_sync_waiters(&mut self) {
+        for slot in 0..MAX_SYNC_WAITS {
+            if self.sync_waits[slot].used && self.sync_wait_reached(slot) {
+                self.finish_sync_wait(slot, status::OK);
+            }
+        }
+    }
+
+    fn wake_expired_sync_waiters(&mut self) {
+        let now = self.monotonic_nanoseconds().max(0) as u64;
+        for slot in 0..MAX_SYNC_WAITS {
+            let wait = self.sync_waits[slot];
+            if wait.used && wait.deadline_ns != SYNC_TIMEOUT_INFINITE && wait.deadline_ns <= now {
+                self.finish_sync_wait(slot, status::TIMED_OUT);
+            }
+        }
+    }
+
+    fn finish_sync_wait(&mut self, slot: usize, result: i64) {
+        let tid = self.sync_waits[slot].thread;
+        self.release_sync_wait_slot(slot);
+        let Some(thread_index) = self.thread_index(tid) else {
+            return;
+        };
+        if matches!(self.threads[thread_index].as_ref().expect("thread").pending, PendingOperation::Sync(wait_slot) if wait_slot as usize == slot)
+        {
+            let thread = self.threads[thread_index].as_mut().expect("thread");
+            thread.pending = PendingOperation::None;
+            thread.context.set_syscall_result(result);
+            let _ = self.scheduler.wake(tid);
+        }
+    }
+
+    fn release_sync_wait_slot(&mut self, slot: usize) {
+        let count = self.sync_waits[slot].point_count;
+        for point in self.sync_waits[slot].points.iter().take(count) {
+            let _ = self.timelines.release(point.timeline);
+        }
+        self.sync_waits[slot] = SyncWaitSlot::EMPTY;
+    }
+
+    fn cancel_sync_wait_for_thread(&mut self, tid: ThreadId) {
+        let Some(thread_index) = self.thread_index(tid) else {
+            return;
+        };
+        let PendingOperation::Sync(slot) =
+            self.threads[thread_index].as_ref().expect("thread").pending
+        else {
+            return;
+        };
+        self.release_sync_wait_slot(slot as usize);
     }
 
     fn handle_close(&mut self, process_index: usize, handle: Handle) -> i64 {
@@ -3015,6 +3619,17 @@ impl ProcessManager {
                 self.shared.release_mappings(object, count);
             }
         }
+        for graphics_index in 0..MAX_GRAPHICS_BUFFERS {
+            let object = graphics_id(graphics_index, self.graphics.generation_at(graphics_index));
+            let count = self.processes[process_index]
+                .as_ref()
+                .expect("process")
+                .address_space
+                .graphics_mapping_pages(object);
+            if count != 0 {
+                self.graphics.release_mappings(object, count);
+            }
+        }
         let capabilities = self.processes[process_index]
             .as_ref()
             .expect("process")
@@ -3089,6 +3704,12 @@ impl ProcessManager {
             CapabilityKind::SharedMemory(object) => {
                 let _ = self.shared.retain_capability(object);
             }
+            CapabilityKind::GraphicsBuffer(object) => {
+                let _ = self.graphics.retain_capability(object);
+            }
+            CapabilityKind::SyncTimeline(timeline) => {
+                let _ = self.timelines.retain(timeline);
+            }
             CapabilityKind::Pipe(pipe) => {
                 let _ = self.pipes.retain(pipe, entry.rights);
             }
@@ -3099,6 +3720,10 @@ impl ProcessManager {
     fn release_capability(&mut self, entry: CapabilityEntry) {
         match entry.kind {
             CapabilityKind::SharedMemory(object) => self.shared.release_capability(object),
+            CapabilityKind::GraphicsBuffer(object) => self.graphics.release_capability(object),
+            CapabilityKind::SyncTimeline(timeline) => {
+                let _ = self.timelines.release(timeline);
+            }
             CapabilityKind::Pipe(pipe) => {
                 let had_read = entry.rights.contains(Rights::READ);
                 let had_write = entry.rights.contains(Rights::WRITE);
@@ -3134,6 +3759,17 @@ impl ProcessManager {
         let bytes =
             unsafe { slice::from_raw_parts_mut(value.as_mut_ptr().cast::<u8>(), size_of::<T>()) };
         self.copy_from_process(process_index, address, bytes)?;
+        Ok(unsafe { value.assume_init() })
+    }
+
+    fn read_shared_struct<T: Copy>(&self, object: u16, offset: u64) -> Result<T, i64> {
+        let mut value = MaybeUninit::<T>::uninit();
+        // SAFETY: `value` занимает ровно size_of::<T>(); объектный reader
+        // полностью заполняет slice либо возвращает ошибку.
+        let bytes =
+            unsafe { slice::from_raw_parts_mut(value.as_mut_ptr().cast::<u8>(), size_of::<T>()) };
+        self.shared.copy_bytes(object, offset, bytes)?;
+        // SAFETY: все bytes T записаны выше; wire T ограничен Copy records.
         Ok(unsafe { value.assume_init() })
     }
 
@@ -3200,6 +3836,11 @@ impl ProcessManager {
     }
 
     fn cleanup(&mut self) {
+        for slot in 0..MAX_SYNC_WAITS {
+            if self.sync_waits[slot].used || self.sync_waits[slot].point_count != 0 {
+                self.release_sync_wait_slot(slot);
+            }
+        }
         for index in 0..MAX_THREADS {
             if let Some(thread) = self.threads[index].take() {
                 if self
@@ -3222,6 +3863,14 @@ impl ProcessManager {
                         self.shared.release_mappings(object, count);
                     }
                 }
+                for graphics_index in 0..MAX_GRAPHICS_BUFFERS {
+                    let object =
+                        graphics_id(graphics_index, self.graphics.generation_at(graphics_index));
+                    let count = process.address_space.graphics_mapping_pages(object);
+                    if count != 0 {
+                        self.graphics.release_mappings(object, count);
+                    }
+                }
                 for entry in process.capabilities {
                     self.release_capability(entry);
                 }
@@ -3237,6 +3886,7 @@ impl ProcessManager {
             }
         }
         self.shared.cleanup();
+        self.graphics.cleanup();
         self.pipes.cleanup();
     }
 }
@@ -3378,6 +4028,11 @@ pub(super) fn run_milestone(info: &rustos_abi::BootInfo) -> Result<(), ProcessEr
     }
     serial::put_str("[abi-v4] spawn/wait/kill threads VM shared-memory TLS clock verified\n");
     manager.cleanup();
+
+    run_graphics_service_phase(manager)?;
+    serial::put_str(
+        "[graphics-abi-v5] GraphicsBuffer SyncTimeline ring3 displayd/compositord verified\n",
+    );
 
     run_std_startup_phase(manager)?;
     serial::put_str("[std-startup] ordinary fn main argv and process-local environment verified\n");
@@ -3793,6 +4448,50 @@ fn run_vfs_phase(
     Ok(())
 }
 
+/// Первый end-to-end графический data plane. `displayd` намеренно не получает
+/// framebuffer/MMIO capability, поэтому тест проверяет headless present и
+/// release; hardware scanout станет отдельным driver-capability milestone.
+fn run_graphics_service_phase(manager: &mut ProcessManager) -> Result<(), ProcessError> {
+    const DISPLAY_ENDPOINT: u8 = 0;
+    const DISPLAY_SLOT: usize = 2;
+
+    manager.begin_phase();
+    let mut display_caps = [EMPTY_CAPABILITY; MAX_CAPABILITIES];
+    display_caps[DISPLAY_SLOT] = CapabilityEntry {
+        kind: CapabilityKind::Endpoint(DISPLAY_ENDPOINT),
+        rights: Rights::RECEIVE,
+    };
+    let display = manager.spawn(
+        "system/bin/displayd.rune",
+        PriorityClass::System,
+        [DISPLAY_SLOT as u64, syscall::ABI_VERSION, 0],
+        0,
+        0,
+        display_caps,
+    )?;
+    manager.endpoints[DISPLAY_ENDPOINT as usize].receiver = display;
+
+    let mut compositor_caps = [EMPTY_CAPABILITY; MAX_CAPABILITIES];
+    compositor_caps[DISPLAY_SLOT] = CapabilityEntry {
+        kind: CapabilityKind::Endpoint(DISPLAY_ENDPOINT),
+        rights: Rights::SEND,
+    };
+    manager.spawn(
+        "system/bin/compositord.rune",
+        PriorityClass::Interactive,
+        [DISPLAY_SLOT as u64, syscall::ABI_VERSION, 0],
+        0,
+        0,
+        compositor_caps,
+    )?;
+    if let Err(error) = manager.run() {
+        manager.cleanup();
+        return Err(error);
+    }
+    manager.cleanup();
+    Ok(())
+}
+
 fn run_ipc_phase(
     manager: &mut ProcessManager,
     receiver_priority: PriorityClass,
@@ -4003,6 +4702,14 @@ fn next_u8_generation(generation: u8) -> u8 {
         1
     } else {
         next
+    }
+}
+
+fn timeline_status(error: TimelineError) -> i64 {
+    match error {
+        TimelineError::LimitReached => status::LIMIT_REACHED,
+        TimelineError::InvalidId => status::BAD_HANDLE,
+        TimelineError::NonMonotonic => status::INVALID_ARGUMENT,
     }
 }
 

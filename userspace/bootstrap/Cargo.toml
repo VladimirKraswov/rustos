@@ -44,6 +44,14 @@ name = "rustos-vfsd"
 path = "src/vfsd.rs"
 
 [[bin]]
+name = "rustos-displayd"
+path = "src/displayd.rs"
+
+[[bin]]
+name = "rustos-compositord"
+path = "src/compositord.rs"
+
+[[bin]]
 name = "rustos-vfs-test"
 path = "src/vfs_test.rs"
 

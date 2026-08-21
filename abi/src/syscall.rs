@@ -8,7 +8,7 @@
 /// инструкции `svc` равно нулю.
 pub const INTERRUPT_VECTOR: u8 = 0x80;
 /// Версия syscall ABI, передаваемая вторым bootstrap-аргументом.
-pub const ABI_VERSION: u64 = 4;
+pub const ABI_VERSION: u64 = 5;
 
 /// Номера операций (`RAX`).
 pub mod number {
@@ -88,6 +88,22 @@ pub mod number {
     pub const HANDLE_DUPLICATE: u64 = 30;
     /// Неблокирующая проверка процесса. `arg0=handle, arg1=*mut ExitReason`.
     pub const PROCESS_TRY_WAIT: u64 = 31;
+    /// Создать graphics-buffer object из проверенного descriptor.
+    /// `arg0=*const GraphicsBufferDesc`; результат — capability handle.
+    pub const GRAPHICS_BUFFER_CREATE: u64 = 32;
+    /// Отобразить graphics-buffer object. `arg0=handle, arg1=*SharedMemoryMap`.
+    pub const GRAPHICS_BUFFER_MAP: u64 = 33;
+    /// Получить неизменяемый descriptor импортированного buffer'а.
+    /// `arg0=handle, arg1=*mut GraphicsBufferDesc`.
+    pub const GRAPHICS_BUFFER_GET_INFO: u64 = 34;
+    /// Создать монотонный timeline. `arg0=*const SyncTimelineCreate`.
+    pub const SYNC_TIMELINE_CREATE: u64 = 35;
+    /// Продвинуть timeline. `arg0=*const SyncTimelineSignal`.
+    pub const SYNC_TIMELINE_SIGNAL: u64 = 36;
+    /// Блокировать поток до одной sync point. `arg0=*const SyncTimelineWait`.
+    pub const SYNC_TIMELINE_WAIT: u64 = 37;
+    /// Блокировать поток до bounded wait-set. `arg0=*const SyncWaitMany`.
+    pub const SYNC_TIMELINE_WAIT_MANY: u64 = 38;
 }
 
 /// Отрицательные результаты syscall. Не совпадают с Unix errno намеренно:
