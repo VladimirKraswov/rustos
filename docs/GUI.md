@@ -52,6 +52,19 @@ PS/2 service объединяет накопившиеся движения с �
 движение курсора публикует две маленькие dirty-области, а ввод символа — только
 текущую строку terminal.
 
+Hover проходит сквозным incremental path: component runtime возвращает bounds
+старого и нового target, window server перерисовывает только display commands
+этого application viewport, compositor добавляет старую/новую позицию курсора,
+а `virtio-gpu` получает те же rectangles. `consumed=true` без изменения state
+не считается repaint. Первый реальный кадр каждого scope отмечается marker'ом
+`[compositor] repaint=incremental ... full-screen=no`; GUI-тест ограничивает
+application hover бюджетом 299 kpx против 1024 kpx полного кадра 1280×800.
+
+Примитивы UI не являются «низкоразрешёнными bitmap». Прямые участки cards,
+buttons, checkbox, radio и toggle остаются быстрыми span-fill, а их curved edge
+использует 4×4 coverage supersampling только внутри небольших corner tiles.
+Поэтому скругления сглажены, но стоимость не зависит от полной площади окна.
+
 Размер буферов вычисляется из выбранного monitor mode и не ограничен константой:
 1280×800 занимает около 4 MiB на слой, 4K — около 32 MiB. Если для второго
 слоя не хватает непрерывной RAM, GUI остаётся работоспособным и использует

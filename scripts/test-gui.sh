@@ -371,6 +371,12 @@ wait_for_serial '[app] spawn id=0x05 kind=EXPLORER'
 wait_for_serial '[explorer] operation=READY path=/'
 # id=5: rect≈(232,104,1040,640), центр «Новая папка»≈(719,165).
 move_mouse -507 42 4
+# Первый переход hover после полного кадра обязан пройти application-local
+# damage path. При 1280×800 полный кадр равен 1024 kpx; лимит 299 kpx ловит
+# возврат регрессии «один control → present всего framebuffer».
+wait_for_serial '[compositor] repaint=incremental scope=application'
+grep -Eq '\[compositor\] repaint=incremental scope=application rects=[1-9][0-9]* present-kpx=([0-9]{1,2}|[12][0-9]{2}) full-screen=no' \
+    "$RUN_DIR/serial.log"
 printf 'mouse_button 1\n' | hmp
 sleep 0.08
 printf 'mouse_button 0\n' | hmp

@@ -257,9 +257,10 @@ impl Framebuffer {
         }
     }
 
-    /// Заливает скруглённый прямоугольник. Геометрия вычисляется целыми
-    /// числами и ограничивается небольшим радиусом, поэтому primitive пригоден
-    /// для CPU renderer без FPU и heap.
+    /// Заливает скруглённый прямоугольник. Прямые участки остаются быстрыми
+    /// span-fill, а только маленькие corner tiles получают 4×4 coverage
+    /// supersampling. Поэтому checkbox/toggle/card имеют гладкий силуэт без
+    /// FPU, heap и дорогого supersampling всей площади control.
     pub fn fill_rounded_rect(&mut self, rect: Rect, radius: u8, color: Color) {
         let clip = Rect::new(0, 0, self.width, self.height);
         self.fill_rounded_rect_clipped(rect, radius, color, clip);
@@ -278,32 +279,42 @@ impl Framebuffer {
             return;
         }
 
-        let middle = Rect::new(
-            rect.x,
-            rect.y.saturating_add(radius as i32),
-            rect.width,
-            rect.height.saturating_sub(radius.saturating_mul(2)),
+        self.fill_rect(
+            Rect::new(
+                rect.x.saturating_add(radius as i32),
+                rect.y,
+                rect.width.saturating_sub(radius.saturating_mul(2)),
+                rect.height,
+            )
+            .intersection(clip),
+            color,
         );
-        self.fill_rect(middle.intersection(clip), color);
+        self.fill_rect(
+            Rect::new(
+                rect.x,
+                rect.y.saturating_add(radius as i32),
+                rect.width,
+                rect.height.saturating_sub(radius.saturating_mul(2)),
+            )
+            .intersection(clip),
+            color,
+        );
         for row in 0..radius {
-            let inset = rounded_row_inset(row, radius);
-            let width = rect.width.saturating_sub(inset.saturating_mul(2));
-            self.fill_horizontal_clipped(
-                rect.x.saturating_add(inset as i32),
-                rect.y.saturating_add(row as i32),
-                width,
-                color,
-                clip,
-            );
-            let bottom = rect.bottom().saturating_sub(row as i32 + 1);
-            if bottom != rect.y.saturating_add(row as i32) {
-                self.fill_horizontal_clipped(
-                    rect.x.saturating_add(inset as i32),
-                    bottom,
-                    width,
-                    color,
-                    clip,
-                );
+            for column in 0..radius {
+                let coverage = rounded_corner_coverage(column as i32, row as i32, radius);
+                if coverage == 0 {
+                    continue;
+                }
+                for (x, y) in rounded_corner_pixels(rect, column, row) {
+                    if !clip.contains(x, y) {
+                        continue;
+                    }
+                    if coverage == u8::MAX {
+                        self.put_pixel(x, y, color);
+                    } else {
+                        self.blend_pixel(x, y, color, coverage);
+                    }
+                }
             }
         }
     }
@@ -367,41 +378,64 @@ impl Framebuffer {
             return;
         }
 
-        let inner_width = rect.width.saturating_sub(border.saturating_mul(2));
-        let inner_height = rect.height.saturating_sub(border.saturating_mul(2));
+        let straight_width = rect.width.saturating_sub(radius.saturating_mul(2));
+        let straight_height = rect.height.saturating_sub(radius.saturating_mul(2));
+        self.fill_rect(
+            Rect::new(
+                rect.x.saturating_add(radius as i32),
+                rect.y,
+                straight_width,
+                border,
+            )
+            .intersection(clip),
+            color,
+        );
+        self.fill_rect(
+            Rect::new(
+                rect.x.saturating_add(radius as i32),
+                rect.bottom().saturating_sub(border as i32),
+                straight_width,
+                border,
+            )
+            .intersection(clip),
+            color,
+        );
+        self.fill_rect(
+            Rect::new(
+                rect.x,
+                rect.y.saturating_add(radius as i32),
+                border,
+                straight_height,
+            )
+            .intersection(clip),
+            color,
+        );
+        self.fill_rect(
+            Rect::new(
+                rect.right().saturating_sub(border as i32),
+                rect.y.saturating_add(radius as i32),
+                border,
+                straight_height,
+            )
+            .intersection(clip),
+            color,
+        );
+
         let inner_radius = radius.saturating_sub(border);
-        for row in 0..rect.height {
-            let outer_inset = rounded_inset_for_height(row, rect.height, radius);
-            let outer_left = outer_inset;
-            let outer_right = rect.width.saturating_sub(outer_inset);
-            if row < border || row >= rect.height.saturating_sub(border) || inner_height == 0 {
-                self.fill_horizontal_clipped(
-                    rect.x.saturating_add(outer_left as i32),
-                    rect.y.saturating_add(row as i32),
-                    outer_right.saturating_sub(outer_left),
-                    color,
-                    clip,
-                );
-                continue;
+        for row in 0..radius {
+            for column in 0..radius {
+                let outer = rounded_corner_coverage(column as i32, row as i32, radius);
+                let inner = inner_corner_coverage(column, row, border, inner_radius);
+                let coverage = outer.saturating_sub(inner);
+                if coverage == 0 {
+                    continue;
+                }
+                for (x, y) in rounded_corner_pixels(rect, column, row) {
+                    if clip.contains(x, y) {
+                        self.blend_pixel(x, y, color, coverage);
+                    }
+                }
             }
-            let inner_row = row.saturating_sub(border);
-            let inner_inset = rounded_inset_for_height(inner_row, inner_height, inner_radius);
-            let inner_left = border.saturating_add(inner_inset);
-            let inner_right = border.saturating_add(inner_width.saturating_sub(inner_inset));
-            self.fill_horizontal_clipped(
-                rect.x.saturating_add(outer_left as i32),
-                rect.y.saturating_add(row as i32),
-                inner_left.saturating_sub(outer_left),
-                color,
-                clip,
-            );
-            self.fill_horizontal_clipped(
-                rect.x.saturating_add(inner_right as i32),
-                rect.y.saturating_add(row as i32),
-                outer_right.saturating_sub(inner_right),
-                color,
-                clip,
-            );
         }
     }
 
@@ -442,13 +476,6 @@ impl Framebuffer {
             rect.height.saturating_add(4),
         );
         self.fill_rounded_rect_clipped(shadow, radius.saturating_add(3), color, clip);
-    }
-
-    fn fill_horizontal_clipped(&mut self, x: i32, y: i32, width: u32, color: Color, clip: Rect) {
-        if width == 0 {
-            return;
-        }
-        self.fill_rect(Rect::new(x, y, width, 1).intersection(clip), color);
     }
 
     fn blended_rounded_border_clipped(
@@ -729,6 +756,63 @@ fn rounded_radius(rect: Rect, requested: u8) -> u32 {
     u32::from(requested)
         .min(rect.width / 2)
         .min(rect.height / 2)
+}
+
+/// Покрытие одного corner pixel по 16 subpixel samples. Координаты sample
+/// умножены на восемь, поэтому circle test остаётся полностью целочисленным.
+fn rounded_corner_coverage(x: i32, y: i32, radius: u32) -> u8 {
+    if radius == 0 {
+        return u8::MAX;
+    }
+    let center = radius as i32 * 8;
+    let radius_squared = center.saturating_mul(center);
+    let mut inside = 0u16;
+    for sample_y in 0..4i32 {
+        for sample_x in 0..4i32 {
+            let point_x = x.saturating_mul(8).saturating_add(sample_x * 2 + 1);
+            let point_y = y.saturating_mul(8).saturating_add(sample_y * 2 + 1);
+            let dx = center.saturating_sub(point_x);
+            let dy = center.saturating_sub(point_y);
+            if dx.saturating_mul(dx).saturating_add(dy.saturating_mul(dy)) <= radius_squared {
+                inside += 1;
+            }
+        }
+    }
+    ((inside * 255 + 8) / 16) as u8
+}
+
+fn inner_corner_coverage(column: u32, row: u32, border: u32, radius: u32) -> u8 {
+    if column < border || row < border {
+        return 0;
+    }
+    let x = column - border;
+    let y = row - border;
+    if radius == 0 || x >= radius || y >= radius {
+        u8::MAX
+    } else {
+        rounded_corner_coverage(x as i32, y as i32, radius)
+    }
+}
+
+fn rounded_corner_pixels(rect: Rect, column: u32, row: u32) -> [(i32, i32); 4] {
+    [
+        (
+            rect.x.saturating_add(column as i32),
+            rect.y.saturating_add(row as i32),
+        ),
+        (
+            rect.right().saturating_sub(column as i32 + 1),
+            rect.y.saturating_add(row as i32),
+        ),
+        (
+            rect.x.saturating_add(column as i32),
+            rect.bottom().saturating_sub(row as i32 + 1),
+        ),
+        (
+            rect.right().saturating_sub(column as i32 + 1),
+            rect.bottom().saturating_sub(row as i32 + 1),
+        ),
+    ]
 }
 
 fn rounded_row_inset(row: u32, radius: u32) -> u32 {

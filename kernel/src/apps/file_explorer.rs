@@ -19,10 +19,11 @@ use crate::{
 use rustos_abi::{bootinfo::BootInitramfs, input::MouseSettings};
 use rustos_system_assets::{icon_for_path, IconKind, IconPack};
 use rustos_system_ui::{
-    style_class, Align, CommandId, ComponentKind, Content, Edges, FontSpec, InputEvent, LayoutSpec,
-    Length, NodeId, NodeSpec, NodeState, PointerEvent, PointerKind, RenderBackend, ResourceId,
-    Runtime, SemanticRole, Theme,
+    style_class, Align, CommandId, ComponentKind, Content, Edges, FontSpec, FrameResult,
+    InputEvent, LayoutSpec, Length, NodeId, NodeSpec, NodeState, PointerEvent, PointerKind,
+    RenderBackend, ResourceId, Runtime, SemanticRole, Theme,
 };
+use rustos_video::DamageRegion;
 
 const MAX_ENTRIES: usize = 32;
 const NAME_CAPACITY: usize = 64;
@@ -102,6 +103,15 @@ const IMAGE_ENTRY_BASE: u32 = 300;
 
 type ExplorerRuntime = Runtime<128, 512, 24>;
 type PopupRuntime = Runtime<20, 72, 8>;
+/// Основное дерево и два popup вместе могут вернуть не более 40 независимых
+/// dirty-прямоугольников. Этот бюджет передаётся compositor'у без heap.
+pub type ExplorerFrame = DamageRegion<40>;
+
+fn append_frame<const D: usize>(damage: &mut ExplorerFrame, frame: FrameResult<D>) {
+    for rect in frame.damage().iter().copied() {
+        damage.add(rect);
+    }
+}
 
 /// Три стандартных представления каталога. Файловая модель у них одна и та
 /// же; переключается только component composition.
@@ -369,7 +379,7 @@ impl FileExplorer {
                 if result.command != CommandId(0) {
                     self.execute(result.command, now_ms, x, y);
                 }
-                return result.changed || result.consumed || result.command != CommandId(0);
+                return result.changed || result.command != CommandId(0);
             }
             if kind == PointerKind::Down {
                 self.close_popups();
@@ -385,7 +395,7 @@ impl FileExplorer {
                 if result.command != CommandId(0) {
                     self.execute(result.command, now_ms, x, y);
                 }
-                return result.changed || result.consumed || result.command != CommandId(0);
+                return result.changed || result.command != CommandId(0);
             }
             if kind == PointerKind::Down {
                 self.close_popups();
@@ -403,7 +413,11 @@ impl FileExplorer {
         } else if result.command != CommandId(0) {
             self.execute(result.command, now_ms, x, y);
         }
-        result.changed || result.consumed || result.command != CommandId(0)
+        // `consumed` означает только маршрутизацию события. Обычный Move над
+        // тем же самым control consumed=true, но визуально ничего не меняет.
+        // Считать его repaint'ом означало перерисовывать окно на каждый пакет
+        // мыши — именно это раньше создавало тяжёлые hover-тормоза.
+        result.changed || result.command != CommandId(0)
     }
 
     /// Вторичная кнопка приходит отдельно от primary pointer dispatcher.
@@ -492,10 +506,15 @@ impl FileExplorer {
         } else if result.command != CommandId(0) {
             self.execute(result.command, now_ms, 0, 0);
         }
-        result.changed || result.consumed || result.command != CommandId(0)
+        result.changed || result.command != CommandId(0)
     }
 
-    pub fn draw(&mut self, framebuffer: &mut Framebuffer, icons: IconPack, full: bool) {
+    pub fn draw(
+        &mut self,
+        framebuffer: &mut Framebuffer,
+        icons: IconPack,
+        full: bool,
+    ) -> ExplorerFrame {
         if full {
             self.runtime.invalidate_all();
             if self.popup_open {
@@ -518,13 +537,30 @@ impl FileExplorer {
             resources: &resources,
             icons,
         };
-        let _ = self.runtime.render(&mut backend);
+        let mut damage = ExplorerFrame::new(self.viewport);
+        append_frame(
+            &mut damage,
+            self.runtime
+                .render(&mut backend)
+                .unwrap_or_else(|_| FrameResult::empty()),
+        );
         if self.popup_open {
-            let _ = self.popup.render(&mut backend);
+            append_frame(
+                &mut damage,
+                self.popup
+                    .render(&mut backend)
+                    .unwrap_or_else(|_| FrameResult::empty()),
+            );
         }
         if self.create_popup_open {
-            let _ = self.create_popup.render(&mut backend);
+            append_frame(
+                &mut damage,
+                self.create_popup
+                    .render(&mut backend)
+                    .unwrap_or_else(|_| FrameResult::empty()),
+            );
         }
+        damage
     }
 
     fn execute(&mut self, command: CommandId, _now_ms: u64, _x: i32, _y: i32) {

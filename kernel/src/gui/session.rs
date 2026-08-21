@@ -41,7 +41,7 @@ use rustos_system_assets::{
     wallpaper, IconKind, IconPack, PackId, PackRegistry, ResourcePack, WallpaperId,
     AURORA_ICON_PACK, CLASSIC_ICON_PACK, MIDNIGHT_ICON_PACK, MONO_ICON_PACK,
 };
-use rustos_system_ui::{Key as UiKey, PointerKind as UiPointerKind};
+use rustos_system_ui::{FrameResult, Key as UiKey, PointerKind as UiPointerKind};
 use rustos_video::{
     hit_test_resize, resize_from_edges, ColorMode, DamageRegion, DisplayDriver, DisplayMode,
     ManagedWindow, ModeSetError, PixelFormat, ResizeEdges, Scanout, WindowEventQueue,
@@ -66,6 +66,10 @@ const EXPLORER_MIN_HEIGHT: u32 = 440;
 /// поэтому лимит можно менять независимо от размера kernel stack.
 const MAX_WINDOWS: usize = 16;
 const WINDOW_EVENT_CAPACITY: usize = 128;
+/// Сюда объединяются dirty rectangles одного приложения/shell и старого с
+/// новым курсора. Переполнение безопасно схлопывается `DamageRegion` в один
+/// bounding rectangle, но не приводит к скрытой allocation.
+const INCREMENTAL_DAMAGE_CAPACITY: usize = 64;
 
 pub fn run(info: &BootInfo) -> ! {
     let Some(framebuffer) = Framebuffer::from_boot(info) else {
@@ -342,6 +346,8 @@ struct DesktopSession {
     drag_packets: u32,
     drag_present_pixels: u64,
     drag_preview_visible: bool,
+    incremental_application_logged: bool,
+    incremental_shell_logged: bool,
     desktop_icon_selected: bool,
     desktop_icon_pressed: bool,
     desktop_terminal_x: i32,
@@ -400,6 +406,8 @@ impl DesktopSession {
             drag_packets: 0,
             drag_present_pixels: 0,
             drag_preview_visible: false,
+            incremental_application_logged: false,
+            incremental_shell_logged: false,
             desktop_icon_selected: false,
             desktop_icon_pressed: false,
             desktop_terminal_x: 28,
@@ -426,11 +434,18 @@ impl DesktopSession {
                 };
 
                 let mut terminal_line = None;
+                let mut incremental_damage = None;
                 let mut drag_cached = false;
                 match redraw {
                     Redraw::Scene => self.render_scene(),
                     Redraw::TerminalLine => {
                         terminal_line = self.draw_focused_terminal_line();
+                    }
+                    Redraw::Application(window) | Redraw::Ui(window) => {
+                        incremental_damage = Some(self.render_application_incremental(window));
+                    }
+                    Redraw::Shell => {
+                        incremental_damage = Some(self.render_shell_incremental());
                     }
                     Redraw::DragMove {
                         window,
@@ -463,6 +478,30 @@ impl DesktopSession {
                             self.framebuffer.present_rect(line);
                         }
                         self.framebuffer.present_rect(self.cursor.rect());
+                    }
+                    Redraw::Application(_) | Redraw::Ui(_) | Redraw::Shell => {
+                        let bounds =
+                            Rect::new(0, 0, self.framebuffer.width(), self.framebuffer.height());
+                        let mut damage = incremental_damage.unwrap_or_else(|| {
+                            DamageRegion::<INCREMENTAL_DAMAGE_CAPACITY>::new(bounds)
+                        });
+                        // Курсор рисуется software-композитором поверх client
+                        // surface, поэтому его старое и новое положение входят
+                        // в тот же единственный incremental present.
+                        damage.add(old_cursor);
+                        damage.add(self.cursor.rect());
+                        match redraw {
+                            Redraw::Ui(_) if !self.incremental_application_logged => {
+                                log_incremental_damage("application", &damage);
+                                self.incremental_application_logged = true;
+                            }
+                            Redraw::Shell if !self.incremental_shell_logged => {
+                                log_incremental_damage("shell", &damage);
+                                self.incremental_shell_logged = true;
+                            }
+                            _ => {}
+                        }
+                        self.framebuffer.present_damage(&damage);
                     }
                     Redraw::DragMove {
                         window,
@@ -566,7 +605,7 @@ impl DesktopSession {
                 }
                 if result.changed || result.consumed {
                     return if result.changed {
-                        Redraw::Scene
+                        Redraw::Shell
                     } else {
                         Redraw::None
                     };
@@ -597,7 +636,7 @@ impl DesktopSession {
                     _ => false,
                 };
                 if changed {
-                    Redraw::Scene
+                    Redraw::Ui(id)
                 } else {
                     Redraw::None
                 }
@@ -623,7 +662,7 @@ impl DesktopSession {
                     _ => false,
                 };
                 if changed {
-                    Redraw::Scene
+                    Redraw::Ui(id)
                 } else {
                     Redraw::None
                 }
@@ -691,7 +730,7 @@ impl DesktopSession {
             self.apply_desktop_settings_action(result.action);
             Redraw::Scene
         } else if result.changed {
-            Redraw::Scene
+            Redraw::Ui(id)
         } else {
             Redraw::None
         }
@@ -712,7 +751,7 @@ impl DesktopSession {
             self.apply_desktop_settings_action(result.action);
             Redraw::Scene
         } else if result.changed {
-            Redraw::Scene
+            Redraw::Ui(id)
         } else {
             Redraw::None
         }
@@ -821,7 +860,7 @@ impl DesktopSession {
         match action {
             TerminalAction::None => Redraw::None,
             TerminalAction::RedrawInputLine => Redraw::TerminalLine,
-            TerminalAction::RedrawAll => Redraw::Scene,
+            TerminalAction::RedrawAll => Redraw::Application(id),
             TerminalAction::DisplayInfo => {
                 let mode = self.framebuffer.mode();
                 let connector = self.framebuffer.connector();
@@ -1174,7 +1213,7 @@ impl DesktopSession {
         }
         if shell_result.changed || shell_result.consumed {
             return if shell_result.changed {
-                Redraw::Scene
+                Redraw::Shell
             } else {
                 Redraw::None
             };
@@ -1206,7 +1245,7 @@ impl DesktopSession {
                             _ => false,
                         };
                         if changed {
-                            return Redraw::Scene;
+                            return Redraw::Ui(id);
                         }
                     }
                     Some(ApplicationKind::DesktopSettings) => {
@@ -1222,7 +1261,7 @@ impl DesktopSession {
                             _ => false,
                         };
                         if changed {
-                            return Redraw::Scene;
+                            return Redraw::Ui(id);
                         }
                     }
                     Some(ApplicationKind::Terminal) | None => {}
@@ -1320,19 +1359,17 @@ impl DesktopSession {
                         }
                         _ => false,
                     };
-                    return if changed || focus_changed {
+                    return if focus_changed {
                         Redraw::Scene
+                    } else if changed {
+                        Redraw::Ui(id)
                     } else {
                         Redraw::None
                     };
                 }
                 Some(ApplicationKind::DesktopSettings) => {
                     let redraw = self.handle_settings_pointer(id, UiPointerKind::Down, x, y);
-                    return if redraw == Redraw::None && focus_changed {
-                        Redraw::Scene
-                    } else {
-                        redraw
-                    };
+                    return if focus_changed { Redraw::Scene } else { redraw };
                 }
                 Some(ApplicationKind::FileExplorer) => {
                     let now_ms = arch::monotonic_milliseconds();
@@ -1343,8 +1380,10 @@ impl DesktopSession {
                         }
                         _ => false,
                     };
-                    return if changed || focus_changed {
+                    return if focus_changed {
                         Redraw::Scene
+                    } else if changed {
+                        Redraw::Ui(id)
                     } else {
                         Redraw::None
                     };
@@ -1843,6 +1882,78 @@ impl DesktopSession {
         let _ = self.apply_window_command(command);
     }
 
+    /// Исполняет display list только одного приложения с уже накопленным в
+    /// его runtime damage. Window chrome, wallpaper и остальные окна при
+    /// hover не меняются и поэтому здесь принципиально не рисуются.
+    fn render_application_incremental(
+        &mut self,
+        id: WindowId,
+    ) -> DamageRegion<INCREMENTAL_DAMAGE_CAPACITY> {
+        let bounds = Rect::new(0, 0, self.framebuffer.width(), self.framebuffer.height());
+        let mut damage = DamageRegion::new(bounds);
+        let Some(content) = self.window_content_rect(id) else {
+            return damage;
+        };
+        let Some(index) = self.window_slot_index(id) else {
+            return damage;
+        };
+        let icon_pack = active_icon_or_default(self.icon_packs.active());
+        let (framebuffer, windows) = (&mut self.framebuffer, &mut self.windows);
+        let Some(slot) = windows[index].as_mut() else {
+            return damage;
+        };
+        match slot.application.get_mut() {
+            Application::Terminal(terminal) => {
+                terminal.draw(framebuffer, content);
+                damage.add(content);
+            }
+            Application::FileExplorer(explorer) => {
+                explorer.resize(content);
+                let frame = explorer.draw(framebuffer, icon_pack, false);
+                for rect in frame.iter().copied() {
+                    damage.add(rect);
+                }
+            }
+            Application::UiShowcase(showcase) => {
+                showcase.resize(content);
+                append_frame_damage(&mut damage, showcase.draw(framebuffer, false));
+            }
+            Application::DesktopSettings(settings) => {
+                settings.resize(content);
+                append_frame_damage(&mut damage, settings.draw(framebuffer, false));
+            }
+        }
+        damage
+    }
+
+    /// Shell состоит из независимых runtime'ов. Их damage объединяется, но
+    /// неизменившийся фон taskbar/desktop повторно не растеризуется.
+    fn render_shell_incremental(&mut self) -> DamageRegion<INCREMENTAL_DAMAGE_CAPACITY> {
+        let bounds = Rect::new(0, 0, self.framebuffer.width(), self.framebuffer.height());
+        let mut damage = DamageRegion::new(bounds);
+        let icon_pack = active_icon_or_default(self.icon_packs.active());
+        append_frame_damage(
+            &mut damage,
+            self.shell
+                .draw_launcher(&mut self.framebuffer, icon_pack, false),
+        );
+        if self.shell.is_open() {
+            append_frame_damage(
+                &mut damage,
+                self.shell
+                    .draw_menu(&mut self.framebuffer, icon_pack, false),
+            );
+        }
+        if self.shell.desktop_menu_is_open() {
+            append_frame_damage(
+                &mut damage,
+                self.shell
+                    .draw_desktop_menu(&mut self.framebuffer, icon_pack, false),
+            );
+        }
+        damage
+    }
+
     fn render_all(&mut self) {
         self.render_scene();
         self.cursor
@@ -2196,7 +2307,7 @@ impl DesktopSession {
             Application::Terminal(terminal) => terminal.draw(framebuffer, content),
             Application::FileExplorer(explorer) => {
                 explorer.resize(content);
-                explorer.draw(framebuffer, icon_pack, true);
+                let _ = explorer.draw(framebuffer, icon_pack, true);
             }
             Application::UiShowcase(showcase) => {
                 showcase.resize(content);
@@ -2349,6 +2460,14 @@ impl DesktopSession {
 enum Redraw {
     None,
     TerminalLine,
+    /// Перерисовать только изменившиеся controls одного client viewport.
+    Application(WindowId),
+    /// Тот же локальный путь, но причина — state/damage component runtime.
+    /// Разделение нужно regression telemetry: terminal full-content redraw не
+    /// должен подменять собой измерение hover budget.
+    Ui(WindowId),
+    /// Перерисовать только dirty controls taskbar/Start/context menu.
+    Shell,
     Scene,
     DragMove {
         window: WindowId,
@@ -2361,6 +2480,25 @@ enum Redraw {
         visible: bool,
         resized: bool,
     },
+}
+
+fn append_frame_damage<const D: usize>(
+    damage: &mut DamageRegion<INCREMENTAL_DAMAGE_CAPACITY>,
+    frame: FrameResult<D>,
+) {
+    for rect in frame.damage().iter().copied() {
+        damage.add(rect);
+    }
+}
+
+fn log_incremental_damage(scope: &str, damage: &DamageRegion<INCREMENTAL_DAMAGE_CAPACITY>) {
+    serial::put_str("[compositor] repaint=incremental scope=");
+    serial::put_str(scope);
+    serial::put_str(" rects=");
+    serial::put_u32(damage.len() as u32);
+    serial::put_str(" present-kpx=");
+    serial::put_u32((damage.covered_pixels() / 1_000) as u32);
+    serial::put_str(" full-screen=no\n");
 }
 
 fn remove_id(order: &mut [WindowId; MAX_WINDOWS], count: &mut usize, id: WindowId) {

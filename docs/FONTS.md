@@ -15,10 +15,14 @@
   соответствует Arial/Helvetica, но не копирует их метрики или имя.
 
 Latin растеризуется из M+ Code/M+ 1 в 4-bit grayscale. Кириллица берётся из
-X11 Cyrillic (console) и Inconsolata Cyrillic (sans); это не fallback-квадраты,
-а полные русские глифы U+0400..U+052F, включая `Ё` и `ё`. M+ распространяется
-по SIL Open Font License; данные X11/Inconsolata поставляются через
-лицензированный набор U8g2.
+X11 Cyrillic (console) и Inconsolata Cyrillic (sans); это полные русские глифы
+U+0400..U+052F, включая `Ё` и `ё`. M+ распространяется по SIL Open Font
+License; данные X11/Inconsolata поставляются через лицензированный набор U8g2.
+
+Host-макрос готовит coverage bitmap в 24 px. Kernel не растягивает отдельные
+source pixels прямоугольниками: уменьшение использует bounded 4×4 box filter,
+а увеличение — fixed-point bilinear filter. Поэтому размеры 10..=48 остаются
+сглаженными без TTF-парсера, FPU и heap в раннем ядре.
 
 ## API
 
@@ -66,7 +70,6 @@ stack. Невалидный UTF-8 показывается символом за
 
 - есть Basic Latin, Latin-1 и Cyrillic; полного Unicode пока нет;
 - нет ligatures, bidi, shaping и font fallback для сложных письменностей;
-- scaling 10..=48 integer/nearest для bitmap; Latin использует 4-bit
-  antialiasing в базовом размере;
+- scaling 10..=48 использует 4-bit antialiasing и box/bilinear resampling;
 - keyboard layout пока вводит ASCII, но русский UTF-8 уже корректно приходит
   из файлов, IPC и stdout программ.

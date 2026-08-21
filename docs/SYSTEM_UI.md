@@ -184,9 +184,11 @@ CPU, GPU, remote или headless target; backend без curved/shadow accelerati
 имеет корректный прямоугольный/no-op fallback.
 
 CPU backend использует целочисленную геометрию: середина rounded surface
-заливается одним прямоугольником, отдельно обрабатываются только несколько
-строк углов. Тень карточки — одна смещённая системная поверхность, закрываемая
-самой карточкой. Тень окна использует три полупрозрачных perimeter contour.
+заливается быстрыми span-ами, а 4×4 coverage рассчитывается только для
+небольших corner tiles. Так curves checkbox/toggle/card не имеют ступенек и
+не требуют supersampling полной поверхности. Тень карточки — одна смещённая
+системная поверхность, закрываемая самой карточкой. Тень окна использует три
+полупрозрачных perimeter contour.
 Такой budget выбран по GUI regression: восемь alpha-контуров на каждую
 карточку заметно задерживали первый сложный кадр под TCG, не улучшая вид.
 
@@ -203,8 +205,9 @@ Runtime хранит три независимых dirty flags. Изменени
 4. исполняет только commands, пересекающие damage;
 5. передаёт те же rectangles scanout driver'у.
 
-Это проверяет unit-тест: damage кнопки меньше четверти окна. Перестроение
-display list в v1 полное, raster/present инкрементальны. Следующая оптимизация
+Это проверяет unit-тест и booted GUI budget: damage кнопки меньше четверти окна,
+а compositor не заменяет его full-screen present. Перестроение display list в
+v1 полное, raster/present инкрементальны. Следующая оптимизация
 — cached command ranges на subtree и reusable layers; API при этом не меняется.
 
 Общесистемный resource cache индексируется `(package capability, resource id,
