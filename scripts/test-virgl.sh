@@ -12,8 +12,7 @@ if ! "$QEMU" -device help 2>&1 | grep -Eq 'name "virtio-vga-gl"([,[:space:]]|$)'
 fi
 
 bash scripts/bootstrap-ovmf.sh >/dev/null
-cargo build -q -p rustos-hmp -p rustos-gui-check
-HMP_TOOL="$ROOT/target/debug/rustos-hmp"
+cargo build -q -p rustos-gui-check
 CHECK_TOOL="$ROOT/target/debug/rustos-gui-check"
 RUN_DIR="$(mktemp -d "${TMPDIR:-/tmp}/rustos-virgl-test.XXXXXX")"
 RESULT_DIR="$ROOT/build/test-results/virgl"
@@ -21,17 +20,47 @@ mkdir -p "$RESULT_DIR"
 cp -f build/ovmf/OVMF_VARS.fd "$RUN_DIR/VARS.fd"
 
 QPID=""
+XVFB_PID=""
 cleanup() {
     trap - EXIT INT TERM HUP
     if [[ -n "$QPID" ]] && kill -0 "$QPID" 2>/dev/null; then
         kill -TERM "$QPID" 2>/dev/null || true
         wait "$QPID" 2>/dev/null || true
     fi
-    for file in serial.log qemu-stderr.log hmp.log triangle.ppm; do
+    if [[ -n "$XVFB_PID" ]] && kill -0 "$XVFB_PID" 2>/dev/null; then
+        kill -TERM "$XVFB_PID" 2>/dev/null || true
+        wait "$XVFB_PID" 2>/dev/null || true
+    fi
+    for file in serial.log qemu-stderr.log xvfb-stderr.log triangle.ppm triangle.xwd; do
         [[ -f "$RUN_DIR/$file" ]] && cp -f "$RUN_DIR/$file" "$RESULT_DIR/$file"
     done
 }
 trap cleanup EXIT INT TERM HUP
+
+if ! command -v Xvfb >/dev/null 2>&1; then
+    echo "[virgl-test] FAIL: Xvfb нужен для захвата GL scanout" >&2
+    exit 2
+fi
+
+# HMP `screendump` принципиально не видит GL/dmabuf scanout (`no surface`).
+# Xvfb с `-fbdir` публикует реальную X11 display surface в XWD-файле. Именно
+# её мы проверяем: это уже выход host VirGL renderer, показанный QEMU GTK.
+DISPLAY_NUMBER_FILE="$RUN_DIR/xvfb-display"
+Xvfb -displayfd 3 -screen 0 1600x1000x24 -fbdir "$RUN_DIR" \
+    -nolisten tcp -noreset 3>"$DISPLAY_NUMBER_FILE" \
+    >/dev/null 2>"$RUN_DIR/xvfb-stderr.log" &
+XVFB_PID=$!
+for _ in {1..50}; do
+    [[ -s "$DISPLAY_NUMBER_FILE" ]] && break
+    kill -0 "$XVFB_PID" 2>/dev/null || break
+    sleep 0.1
+done
+[[ -s "$DISPLAY_NUMBER_FILE" ]] || {
+    echo "[virgl-test] Xvfb did not publish a display" >&2
+    cat "$RUN_DIR/xvfb-stderr.log" >&2 2>/dev/null || true
+    exit 1
+}
+VIRGL_DISPLAY=":$(tr -d '\r\n' <"$DISPLAY_NUMBER_FILE")"
 
 QEMU_ARGS=(
     -machine q35 -cpu max -smp 2 -m 512 -accel tcg
@@ -43,15 +72,12 @@ QEMU_ARGS=(
     -drive "if=virtio,format=raw,readonly=on,file=build/esp.img"
     -serial file:"$RUN_DIR/serial.log"
     -monitor "unix:$RUN_DIR/monitor.sock,server=on,wait=off"
-    -display "gtk,gl=on" -snapshot -no-reboot -no-shutdown
+    -display "gtk,gl=on,show-menubar=off,show-tabs=off,zoom-to-fit=off"
+    -snapshot -no-reboot -no-shutdown
 )
 
-if [[ -z "${DISPLAY:-}" ]] && command -v xvfb-run >/dev/null 2>&1; then
-    xvfb-run -a env LIBGL_ALWAYS_SOFTWARE="${LIBGL_ALWAYS_SOFTWARE:-1}" \
-        "$QEMU" "${QEMU_ARGS[@]}" >/dev/null 2>"$RUN_DIR/qemu-stderr.log" &
-else
+env DISPLAY="$VIRGL_DISPLAY" LIBGL_ALWAYS_SOFTWARE="${LIBGL_ALWAYS_SOFTWARE:-1}" \
     "$QEMU" "${QEMU_ARGS[@]}" >/dev/null 2>"$RUN_DIR/qemu-stderr.log" &
-fi
 QPID=$!
 
 ready=0
@@ -71,22 +97,16 @@ if [[ "$ready" != 1 ]]; then
     exit 1
 fi
 
-HMP_LOG="$RUN_DIR/hmp.log"
-printf 'screendump %s/triangle.ppm\n' "$RUN_DIR" | \
-    "$HMP_TOOL" "$RUN_DIR/monitor.sock" >"$HMP_LOG"
-# HMP принимает команду синхронно, но display backend завершает запись PPM
-# асинхронно. Небольшое bounded-ожидание не скрывает ошибку и исключает гонку
-# между закрытием monitor socket и первым write файла.
-for _ in {1..50}; do
-    [[ -s "$RUN_DIR/triangle.ppm" ]] && break
-    sleep 0.1
-done
-if [[ ! -s "$RUN_DIR/triangle.ppm" ]]; then
-    echo "[virgl-test] QEMU did not produce the screenshot" >&2
-    cat "$HMP_LOG" >&2
+# GTK получает dmabuf после atomic present асинхронно относительно serial.
+# Кадр статичен, поэтому одна bounded-пауза даёт display thread завершить
+# swap без внесения недетерминированности в содержимое.
+sleep 1
+cp -f "$RUN_DIR/Xvfb_screen0" "$RUN_DIR/triangle.xwd"
+[[ -s "$RUN_DIR/triangle.xwd" ]] || {
+    echo "[virgl-test] Xvfb display surface is empty" >&2
     exit 1
-fi
-"$CHECK_TOOL" --virgl "$RUN_DIR/triangle.ppm"
+}
+"$CHECK_TOOL" --virgl "$RUN_DIR/triangle.xwd" "$RUN_DIR/triangle.ppm"
 grep -Fq '[virgl] ring3 renderd async-fence triangle zero-copy scanout verified' \
     "$RUN_DIR/serial.log"
 echo "[virgl-test] PASS: 3D triangle reached scanout without guest CPU rasterization"
