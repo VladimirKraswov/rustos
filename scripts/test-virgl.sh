@@ -46,9 +46,9 @@ fi
 # Xvfb с `-fbdir` публикует реальную X11 display surface в XWD-файле. Именно
 # её мы проверяем: это уже выход host VirGL renderer, показанный QEMU GTK.
 DISPLAY_NUMBER_FILE="$RUN_DIR/xvfb-display"
-Xvfb -displayfd 3 -screen 0 1600x1000x24 -fbdir "$RUN_DIR" \
-    -nolisten tcp -noreset 3>"$DISPLAY_NUMBER_FILE" \
-    >/dev/null 2>"$RUN_DIR/xvfb-stderr.log" &
+Xvfb -displayfd 1 -screen 0 1600x1000x24 -fbdir "$RUN_DIR" \
+    -nolisten tcp -noreset >"$DISPLAY_NUMBER_FILE" \
+    2>"$RUN_DIR/xvfb-stderr.log" &
 XVFB_PID=$!
 for _ in {1..50}; do
     [[ -s "$DISPLAY_NUMBER_FILE" ]] && break
