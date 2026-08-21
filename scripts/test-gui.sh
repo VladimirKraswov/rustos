@@ -552,8 +552,18 @@ wait_for_serial '[app] spawn id=0x06 kind=SETTINGS'
 wait_for_serial '[desktop-menu] command=properties'
 
 # Settings rect≈(260,134,760,620): work-area clamp поднимает окно целиком над
-# taskbar. Выбираем осенние обои и UI scale 125%.
-move_mouse -161 81 3
+# taskbar. QEMU HMP не публикует wheel packet для negotiated PS/2 mouse во
+# всех версиях, поэтому интеграционно проверяем тот же ScrollModel через
+# фокусированный пункт + PageDown. Wheel routing покрыт SystemUI unit tests.
+move_mouse_to 600 390
+printf 'mouse_button 1\n' | hmp
+sleep 0.08
+printf 'mouse_button 0\n' | hmp
+printf 'sendkey pgdn 20\n' | hmp
+wait_for_serial '[settings] resolution-list scrolled input=keyboard'
+# Выбираем осенние обои и UI scale 125%. Абсолютная постановка делает тест
+# независимым от числа wheel packets виртуального PS/2 устройства.
+move_mouse_to 639 595
 printf 'mouse_button 1\n' | hmp
 sleep 0.08
 printf 'mouse_button 0\n' | hmp

@@ -22,7 +22,10 @@ use super::{
 };
 
 const MAX_SCANOUTS: usize = 16;
-const MAX_MODES: usize = 20;
+// Preferred + до 16 EDID timings + полный набор стандартных режимов. Лимит
+// остаётся bounded, но больше не отбрасывает low-resolution fallback после
+// Retina/UltraWide timings монитора.
+const MAX_MODES: usize = 48;
 const GPU_FORMAT_B8G8R8X8_UNORM: u32 = 2;
 const CMD_GET_DISPLAY_INFO: u32 = 0x0100;
 const CMD_RESOURCE_CREATE_2D: u32 = 0x0101;
@@ -226,13 +229,29 @@ impl VirtioGpu {
         // любой ресурс в пределах безопасного размера драйвера.
         for (width, height) in [
             (3840, 2160),
+            (3840, 1600),
+            (3440, 1440),
+            (3200, 1800),
+            (2880, 1800),
+            (2560, 1600),
             (2560, 1440),
+            (2560, 1080),
+            (2048, 1152),
+            (1920, 1200),
             (1920, 1080),
+            (1680, 1050),
             (1600, 900),
+            (1440, 900),
+            (1440, 810),
             (1366, 768),
+            (1280, 1024),
             (1280, 800),
             (1280, 720),
+            (1152, 648),
             (1024, 768),
+            (1024, 600),
+            (800, 600),
+            (640, 480),
         ] {
             gpu.add_mode(DisplayMode {
                 width,

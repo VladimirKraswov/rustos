@@ -13,13 +13,10 @@ use rustos_system_assets::{wallpaper, WallpaperId};
 use rustos_system_ui::{
     style_class, CommandId, ComponentKind, Content, DispatchResult, Edges, FontSpec, FrameResult,
     InputEvent, Key, KeyEvent, LayoutSpec, Length, NodeId, NodeSpec, NodeState, PointerEvent,
-    PointerKind, RenderBackend, ResourceId, Runtime, SemanticRole, Theme,
+    PointerKind, RenderBackend, ResourceId, Runtime, ScrollUnit, SemanticRole, Theme,
 };
-use rustos_video::ColorMode;
+use rustos_video::{ColorMode, DisplayMode};
 
-const COMMAND_RESOLUTION_720: CommandId = CommandId(1);
-const COMMAND_RESOLUTION_800: CommandId = CommandId(2);
-const COMMAND_RESOLUTION_900: CommandId = CommandId(3);
 const COMMAND_COLOR_24: CommandId = CommandId(4);
 const COMMAND_COLOR_16: CommandId = CommandId(5);
 const COMMAND_COLOR_GRAY: CommandId = CommandId(6);
@@ -34,9 +31,6 @@ const TEXT_TITLE: ResourceId = ResourceId(1);
 const TEXT_SUBTITLE: ResourceId = ResourceId(2);
 const IMAGE_WALLPAPER: ResourceId = ResourceId(3);
 const TEXT_RESOLUTION: ResourceId = ResourceId(4);
-const TEXT_1280_720: ResourceId = ResourceId(5);
-const TEXT_1280_800: ResourceId = ResourceId(6);
-const TEXT_1600_900: ResourceId = ResourceId(7);
 const TEXT_COLOR: ResourceId = ResourceId(8);
 const TEXT_COLOR_24: ResourceId = ResourceId(9);
 const TEXT_COLOR_16: ResourceId = ResourceId(10);
@@ -50,7 +44,60 @@ const TEXT_SCALE_100: ResourceId = ResourceId(17);
 const TEXT_SCALE_125: ResourceId = ResourceId(18);
 const TEXT_SCALE_150: ResourceId = ResourceId(19);
 
-type SettingsRuntime = Runtime<40, 112, 12>;
+const RESOLUTION_COMMAND_BASE: u32 = 100;
+const RESOLUTION_TEXT_BASE: u32 = 100;
+const RESOLUTION_ROW_HEIGHT: u16 = 36;
+const RESOLUTION_LIST_HEIGHT: u16 = 86;
+
+/// Стандартные режимы, которые умеет создать virtio-gpu 2D scanout. Сначала
+/// идут комфортные широкоформатные варианты, чтобы они были доступны без
+/// прокрутки; legacy 4:3 сохранены внизу для совместимости и тестов.
+const RESOLUTION_OPTIONS: [ResolutionOption; 24] = [
+    resolution(1280, 800, 0),
+    resolution(1280, 720, 1),
+    resolution(1366, 768, 2),
+    resolution(1440, 810, 3),
+    resolution(1440, 900, 4),
+    resolution(1600, 900, 5),
+    resolution(1680, 1050, 6),
+    resolution(1920, 1080, 7),
+    resolution(1920, 1200, 8),
+    resolution(2048, 1152, 9),
+    resolution(2560, 1080, 10),
+    resolution(2560, 1440, 11),
+    resolution(2560, 1600, 12),
+    resolution(2880, 1800, 13),
+    resolution(3200, 1800, 14),
+    resolution(3440, 1440, 15),
+    resolution(3840, 1600, 16),
+    resolution(3840, 2160, 17),
+    resolution(1152, 648, 18),
+    resolution(1024, 600, 19),
+    resolution(1024, 768, 20),
+    resolution(1280, 1024, 21),
+    resolution(800, 600, 22),
+    resolution(640, 480, 23),
+];
+const RESOLUTION_COUNT: usize = RESOLUTION_OPTIONS.len();
+
+#[derive(Clone, Copy)]
+struct ResolutionOption {
+    width: u32,
+    height: u32,
+    label: ResourceId,
+    command: CommandId,
+}
+
+const fn resolution(width: u32, height: u32, index: u32) -> ResolutionOption {
+    ResolutionOption {
+        width,
+        height,
+        label: ResourceId(RESOLUTION_TEXT_BASE + index),
+        command: CommandId(RESOLUTION_COMMAND_BASE + index),
+    }
+}
+
+type SettingsRuntime = Runtime<72, 256, 12>;
 
 /// Снимок состояния, которым desktop service синхронизирует controls после
 /// успешной операции или честного отказа display driver'а.
@@ -84,16 +131,21 @@ pub struct DesktopSettingsInput {
 pub struct DesktopSettings {
     runtime: SettingsRuntime,
     snapshot: DesktopSettingsSnapshot,
-    resolution: [NodeId; 3],
+    resolution: [NodeId; RESOLUTION_COUNT],
     colors: [NodeId; 3],
     wallpapers: [NodeId; 3],
     scales: [NodeId; 3],
 }
 
 impl DesktopSettings {
-    pub fn new(viewport: Rect, snapshot: DesktopSettingsSnapshot) -> Self {
+    pub fn new(
+        viewport: Rect,
+        snapshot: DesktopSettingsSnapshot,
+        available_modes: &[DisplayMode],
+        recommended_mode: DisplayMode,
+    ) -> Self {
         let mut runtime = SettingsRuntime::new(viewport, theme(snapshot.ui_scale_milli));
-        let mut resolution = [NodeId::NONE; 3];
+        let mut resolution = [NodeId::NONE; RESOLUTION_COUNT];
         let mut colors = [NodeId::NONE; 3];
         let mut wallpapers = [NodeId::NONE; 3];
         let mut scales = [NodeId::NONE; 3];
@@ -103,6 +155,8 @@ impl DesktopSettings {
             &mut colors,
             &mut wallpapers,
             &mut scales,
+            available_modes,
+            recommended_mode,
         );
         let mut result = Self {
             runtime,
@@ -128,15 +182,11 @@ impl DesktopSettings {
             current_theme.scale_milli = snapshot.ui_scale_milli;
             self.runtime.set_theme(current_theme);
         }
-        select_group(
-            &mut self.runtime,
-            self.resolution,
-            [
-                snapshot.width == 1280 && snapshot.height == 720,
-                snapshot.width == 1280 && snapshot.height == 800,
-                snapshot.width == 1600 && snapshot.height == 900,
-            ],
-        );
+        let mut selected_resolution = [false; RESOLUTION_COUNT];
+        for (selected, option) in selected_resolution.iter_mut().zip(RESOLUTION_OPTIONS) {
+            *selected = snapshot.width == option.width && snapshot.height == option.height;
+        }
+        select_group(&mut self.runtime, self.resolution, selected_resolution);
         select_group(
             &mut self.runtime,
             self.colors,
@@ -173,6 +223,16 @@ impl DesktopSettings {
         self.dispatch(InputEvent::Pointer(PointerEvent::at(kind, x, y)))
     }
 
+    /// Прокрутка приходит в логических координатах окна и проходит тот же
+    /// nested-scroll dispatcher, что ListView Проводника и галереи.
+    pub fn scroll(&mut self, x: i32, y: i32, wheel_x: i16, wheel_y: i16) -> bool {
+        let mut pointer = PointerEvent::at(PointerKind::Scroll, x, y);
+        pointer.scroll_x = wheel_x;
+        pointer.scroll_y = wheel_y;
+        pointer.scroll_unit = ScrollUnit::Line;
+        self.runtime.dispatch(InputEvent::Pointer(pointer)).changed
+    }
+
     pub fn key(&mut self, key: Key, shift: bool) -> DesktopSettingsInput {
         self.dispatch(InputEvent::Key(KeyEvent {
             key,
@@ -207,10 +267,12 @@ impl DesktopSettings {
 
 fn build_tree(
     runtime: &mut SettingsRuntime,
-    resolution: &mut [NodeId; 3],
+    resolution: &mut [NodeId; RESOLUTION_COUNT],
     colors: &mut [NodeId; 3],
     wallpapers: &mut [NodeId; 3],
     scales: &mut [NodeId; 3],
+    available_modes: &[DisplayMode],
+    recommended_mode: DisplayMode,
 ) {
     let root = runtime.tree().root();
     let mut ui = runtime.builder();
@@ -233,20 +295,12 @@ fn build_tree(
         TEXT_WALLPAPER,
         LayoutSpec {
             width: Length::Fill(1),
-            height: Length::Px(100),
+            height: Length::Px(60),
             ..LayoutSpec::default()
         },
     );
     add_text(&mut ui, page, TEXT_RESOLUTION, 24, style_class::HEADING);
-    *resolution = add_choices(
-        &mut ui,
-        page,
-        [
-            (TEXT_1280_720, COMMAND_RESOLUTION_720),
-            (TEXT_1280_800, COMMAND_RESOLUTION_800),
-            (TEXT_1600_900, COMMAND_RESOLUTION_900),
-        ],
-    );
+    *resolution = add_resolution_choices(&mut ui, page, available_modes, recommended_mode);
     add_text(&mut ui, page, TEXT_COLOR, 24, style_class::HEADING);
     *colors = add_choices(
         &mut ui,
@@ -277,6 +331,66 @@ fn build_tree(
             (TEXT_SCALE_150, COMMAND_SCALE_150),
         ],
     );
+}
+
+fn add_resolution_choices<const N: usize>(
+    ui: &mut rustos_system_ui::UiBuilder<'_, N>,
+    parent: NodeId,
+    available_modes: &[DisplayMode],
+    recommended_mode: DisplayMode,
+) -> [NodeId; RESOLUTION_COUNT] {
+    let Ok(list) = ui.list_view(
+        parent,
+        LayoutSpec {
+            width: Length::Fill(1),
+            height: Length::Px(RESOLUTION_LIST_HEIGHT),
+            padding: Edges::symmetric(4, 3),
+            gap: 4,
+            ..LayoutSpec::default()
+        },
+    ) else {
+        return [NodeId::NONE; RESOLUTION_COUNT];
+    };
+
+    let mut result = [NodeId::NONE; RESOLUTION_COUNT];
+    let recommended_index = RESOLUTION_OPTIONS.iter().position(|option| {
+        option.width == recommended_mode.width && option.height == recommended_mode.height
+    });
+    for order in 0..RESOLUTION_COUNT {
+        // Рекомендованный EDID/startup mode всегда первый. NodeId при этом
+        // сохраняется в slot исходного option, поэтому sync не зависит от
+        // визуальной сортировки.
+        let index = match recommended_index {
+            Some(recommended) if order == 0 => recommended,
+            Some(recommended) if order <= recommended => order - 1,
+            _ => order,
+        };
+        let option = RESOLUTION_OPTIONS[index];
+        let mut spec = NodeSpec::new(ComponentKind::Button);
+        spec.layout = LayoutSpec {
+            width: Length::Fill(1),
+            height: Length::Px(RESOLUTION_ROW_HEIGHT),
+            ..LayoutSpec::default()
+        };
+        spec.content = Content::Text(option.label);
+        spec.command = option.command;
+        spec.role = SemanticRole::ListItem;
+        spec.accessible_name = option.label;
+        if Some(index) == recommended_index {
+            spec.style = style_class::PRIMARY;
+        }
+        if !mode_available(option, available_modes) {
+            spec.state.insert(NodeState::DISABLED);
+        }
+        result[index] = ui.component(list, spec).unwrap_or(NodeId::NONE);
+    }
+    result
+}
+
+fn mode_available(option: ResolutionOption, available_modes: &[DisplayMode]) -> bool {
+    available_modes
+        .iter()
+        .any(|mode| mode.width == option.width && mode.height == option.height)
 }
 
 fn add_text<const N: usize>(
@@ -335,7 +449,11 @@ fn add_choices<const N: usize>(
     result
 }
 
-fn select_group(runtime: &mut SettingsRuntime, nodes: [NodeId; 3], selected: [bool; 3]) {
+fn select_group<const N: usize>(
+    runtime: &mut SettingsRuntime,
+    nodes: [NodeId; N],
+    selected: [bool; N],
+) {
     for (node, active) in nodes.into_iter().zip(selected) {
         let Some(current) = runtime.tree().get(node).map(|value| value.state) else {
             continue;
@@ -353,19 +471,16 @@ fn select_group(runtime: &mut SettingsRuntime, nodes: [NodeId; 3], selected: [bo
 }
 
 fn action_for(result: DispatchResult) -> DesktopSettingsAction {
+    if let Some(option) = RESOLUTION_OPTIONS
+        .iter()
+        .find(|option| option.command == result.command)
+    {
+        return DesktopSettingsAction::SetResolution {
+            width: option.width,
+            height: option.height,
+        };
+    }
     match result.command {
-        COMMAND_RESOLUTION_720 => DesktopSettingsAction::SetResolution {
-            width: 1280,
-            height: 720,
-        },
-        COMMAND_RESOLUTION_800 => DesktopSettingsAction::SetResolution {
-            width: 1280,
-            height: 800,
-        },
-        COMMAND_RESOLUTION_900 => DesktopSettingsAction::SetResolution {
-            width: 1600,
-            height: 900,
-        },
         COMMAND_COLOR_24 => DesktopSettingsAction::SetColor(ColorMode::TrueColor24),
         COMMAND_COLOR_16 => DesktopSettingsAction::SetColor(ColorMode::HighColor16),
         COMMAND_COLOR_GRAY => DesktopSettingsAction::SetColor(ColorMode::Grayscale8),
@@ -464,11 +579,32 @@ fn draw_border(framebuffer: &mut Framebuffer, rect: Rect, color: Color, clip: Re
 fn text_resource(resource: ResourceId) -> &'static str {
     match resource {
         TEXT_TITLE => "Параметры рабочего стола",
-        TEXT_SUBTITLE => "Изменения применяются сразу",
+        TEXT_SUBTITLE => "Первый режим рекомендован и выбирается автоматически",
         TEXT_RESOLUTION => "Разрешение экрана",
-        TEXT_1280_720 => "1280 × 720",
-        TEXT_1280_800 => "1280 × 800",
-        TEXT_1600_900 => "1600 × 900",
+        ResourceId(100) => "1280 × 800 · 16:10",
+        ResourceId(101) => "1280 × 720 · 16:9",
+        ResourceId(102) => "1366 × 768 · 16:9",
+        ResourceId(103) => "1440 × 810 · 16:9",
+        ResourceId(104) => "1440 × 900 · 16:10",
+        ResourceId(105) => "1600 × 900 · 16:9",
+        ResourceId(106) => "1680 × 1050 · 16:10",
+        ResourceId(107) => "1920 × 1080 · Full HD",
+        ResourceId(108) => "1920 × 1200 · 16:10",
+        ResourceId(109) => "2048 × 1152 · 16:9",
+        ResourceId(110) => "2560 × 1080 · UltraWide",
+        ResourceId(111) => "2560 × 1440 · QHD",
+        ResourceId(112) => "2560 × 1600 · 16:10",
+        ResourceId(113) => "2880 × 1800 · Retina 16:10",
+        ResourceId(114) => "3200 × 1800 · QHD+",
+        ResourceId(115) => "3440 × 1440 · UltraWide",
+        ResourceId(116) => "3840 × 1600 · UltraWide",
+        ResourceId(117) => "3840 × 2160 · 4K UHD",
+        ResourceId(118) => "1152 × 648 · 16:9",
+        ResourceId(119) => "1024 × 600 · Wide",
+        ResourceId(120) => "1024 × 768 · 4:3",
+        ResourceId(121) => "1280 × 1024 · 5:4",
+        ResourceId(122) => "800 × 600 · 4:3",
+        ResourceId(123) => "640 × 480 · 4:3",
         TEXT_COLOR => "Глубина цвета",
         TEXT_COLOR_24 => "24 бита",
         TEXT_COLOR_16 => "16 бит",

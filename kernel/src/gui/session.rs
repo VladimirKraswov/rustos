@@ -66,6 +66,9 @@ const EXPLORER_MIN_HEIGHT: u32 = 440;
 /// поэтому лимит можно менять независимо от размера kernel stack.
 const MAX_WINDOWS: usize = 16;
 const WINDOW_EVENT_CAPACITY: usize = 128;
+/// Preferred mode, EDID timings и стандартные режимы virtio-gpu помещаются в
+/// один bounded snapshot без heap allocation.
+const DISPLAY_MODE_CAPACITY: usize = 48;
 /// Сюда объединяются dirty rectangles одного приложения/shell и старого с
 /// новым курсора. Переполнение безопасно схлопывается `DamageRegion` в один
 /// bounding rectangle, но не приводит к скрытой allocation.
@@ -363,6 +366,9 @@ impl ClickTracker {
 
 struct DesktopSession {
     framebuffer: Framebuffer,
+    /// Режим, автоматически выбранный из EDID при старте. Ручной mode-set не
+    /// перезаписывает рекомендацию, поэтому Settings всегда может её показать.
+    recommended_display_mode: DisplayMode,
     input: PlatformInput,
     usable_ram_mib: u64,
     initramfs: BootInitramfs,
@@ -413,6 +419,7 @@ impl DesktopSession {
     fn new(framebuffer: Framebuffer, usable_ram_mib: u64, initramfs: BootInitramfs) -> Self {
         let screen_width = framebuffer.width();
         let screen_height = framebuffer.height();
+        let recommended_display_mode = framebuffer.mode();
         let display_metrics = WindowMetrics::one_to_one(screen_width, screen_height);
         let mut icon_packs = PackRegistry::new();
         let _ = icon_packs.install(AURORA_ICON_PACK);
@@ -434,6 +441,7 @@ impl DesktopSession {
         serial::put_str("\n");
         Self {
             framebuffer,
+            recommended_display_mode,
             input: PlatformInput::new(),
             usable_ram_mib,
             initramfs,
@@ -829,6 +837,14 @@ impl DesktopSession {
             Some(Application::DesktopSettings(settings)) => settings.key(key, false),
             _ => return Redraw::None,
         };
+        if result.changed
+            && matches!(
+                key,
+                UiKey::PageUp | UiKey::PageDown | UiKey::Home | UiKey::End
+            )
+        {
+            serial::put_str("[settings] resolution-list scrolled input=keyboard\n");
+        }
         if result.action != DesktopSettingsAction::None {
             self.apply_desktop_settings_action(result.action);
             Redraw::Scene
@@ -994,7 +1010,7 @@ impl DesktopSession {
                 Redraw::Scene
             }
             TerminalAction::DisplayModes => {
-                let mut modes = [self.framebuffer.mode(); 20];
+                let mut modes = [self.framebuffer.mode(); DISPLAY_MODE_CAPACITY];
                 let count = self.framebuffer.modes(&mut modes);
                 if let Some(Application::Terminal(terminal)) = self.application_mut(id) {
                     terminal.report_display_modes(&modes[..count]);
@@ -1188,7 +1204,8 @@ impl DesktopSession {
                 showcase.pointer(UiPointerKind::Scroll, x, y, wheel_y)
             }
             Some(Application::FileExplorer(explorer)) => explorer.scroll(x, y, wheel_x, wheel_y),
-            Some(Application::Terminal(_)) | Some(Application::DesktopSettings(_)) | None => false,
+            Some(Application::DesktopSettings(settings)) => settings.scroll(x, y, wheel_x, wheel_y),
+            Some(Application::Terminal(_)) | None => false,
         };
         if changed {
             serial::put_str("[pointer] wheel window=0x");
@@ -1670,9 +1687,15 @@ impl DesktopSession {
                 showcase.set_scale(self.ui_scale_milli);
                 showcase
             }),
-            ApplicationKind::DesktopSettings => ApplicationMemory::new(kind, || {
-                DesktopSettings::new(content, self.desktop_settings_snapshot())
-            }),
+            ApplicationKind::DesktopSettings => {
+                let snapshot = self.desktop_settings_snapshot();
+                let recommended = self.recommended_display_mode;
+                let mut modes = [self.framebuffer.mode(); DISPLAY_MODE_CAPACITY];
+                let count = self.framebuffer.modes(&mut modes);
+                ApplicationMemory::new(kind, move || {
+                    DesktopSettings::new(content, snapshot, &modes[..count], recommended)
+                })
+            }
         }?;
         let frames = memory.frames();
         self.windows[slot_index] = Some(WindowSlot {
