@@ -124,7 +124,7 @@ pub enum MesaError {
     Transport(EncodeError),
 }
 
-const SHOWCASE_VERTEX_COUNT: usize = 42;
+const SHOWCASE_VERTEX_COUNT: usize = 48;
 
 #[derive(Clone, Copy)]
 struct Vec3 {
@@ -151,52 +151,60 @@ impl Vec3 {
 
 #[derive(Clone, Copy)]
 struct Face {
-    corners: [usize; 4],
+    corners: [usize; 3],
     normal: Vec3,
     color: [f32; 3],
 }
 
-const CUBE: [Vec3; 8] = [
-    Vec3::new(-1.0, -1.0, -1.0),
-    Vec3::new(1.0, -1.0, -1.0),
-    Vec3::new(1.0, 1.0, -1.0),
-    Vec3::new(-1.0, 1.0, -1.0),
-    Vec3::new(-1.0, -1.0, 1.0),
-    Vec3::new(1.0, -1.0, 1.0),
-    Vec3::new(1.0, 1.0, 1.0),
-    Vec3::new(-1.0, 1.0, 1.0),
+const CRYSTAL: [Vec3; 6] = [
+    Vec3::new(0.0, 1.35, 0.0),
+    Vec3::new(0.0, -1.35, 0.0),
+    Vec3::new(-1.0, 0.0, 0.0),
+    Vec3::new(0.0, 0.0, -1.0),
+    Vec3::new(1.0, 0.0, 0.0),
+    Vec3::new(0.0, 0.0, 1.0),
 ];
 
-const FACES: [Face; 6] = [
+const FACES: [Face; 8] = [
     Face {
-        corners: [0, 1, 2, 3],
-        normal: Vec3::new(0.0, 0.0, -1.0),
-        color: [0.18, 0.34, 1.00],
+        corners: [0, 2, 3],
+        normal: Vec3::new(-0.58, 0.43, -0.69),
+        color: [0.26, 0.38, 1.00],
     },
     Face {
-        corners: [5, 4, 7, 6],
-        normal: Vec3::new(0.0, 0.0, 1.0),
-        color: [0.16, 0.94, 0.88],
+        corners: [0, 3, 4],
+        normal: Vec3::new(0.58, 0.43, -0.69),
+        color: [0.16, 0.74, 1.00],
     },
     Face {
-        corners: [4, 0, 3, 7],
-        normal: Vec3::new(-1.0, 0.0, 0.0),
-        color: [0.56, 0.26, 1.00],
+        corners: [0, 4, 5],
+        normal: Vec3::new(0.58, 0.43, 0.69),
+        color: [0.78, 0.24, 1.00],
     },
     Face {
-        corners: [1, 5, 6, 2],
-        normal: Vec3::new(1.0, 0.0, 0.0),
-        color: [0.08, 0.72, 1.00],
+        corners: [0, 5, 2],
+        normal: Vec3::new(-0.58, 0.43, 0.69),
+        color: [0.98, 0.28, 0.72],
     },
     Face {
-        corners: [3, 2, 6, 7],
-        normal: Vec3::new(0.0, 1.0, 0.0),
-        color: [0.98, 0.31, 0.70],
+        corners: [1, 3, 2],
+        normal: Vec3::new(-0.58, -0.43, -0.69),
+        color: [0.13, 0.48, 0.92],
     },
     Face {
-        corners: [4, 5, 1, 0],
-        normal: Vec3::new(0.0, -1.0, 0.0),
-        color: [0.20, 0.48, 0.92],
+        corners: [1, 4, 3],
+        normal: Vec3::new(0.58, -0.43, -0.69),
+        color: [0.08, 0.78, 0.86],
+    },
+    Face {
+        corners: [1, 5, 4],
+        normal: Vec3::new(0.58, -0.43, 0.69),
+        color: [0.54, 0.22, 0.90],
+    },
+    Face {
+        corners: [1, 2, 5],
+        normal: Vec3::new(-0.58, -0.43, 0.69),
+        color: [0.12, 0.62, 1.00],
     },
 ];
 
@@ -218,30 +226,61 @@ fn build_showcase_mesh(
     ];
     output[..backdrop.len()].copy_from_slice(&backdrop);
 
+    // Светящаяся «сцена» под объектом создаёт ощущение пространства без
+    // texture sampling. Это по-прежнему два аппаратно растеризованных triangle.
+    const FLOOR: [Vertex; 6] = [
+        Vertex::new([-1.0, -1.0, 0.90, 1.0], [0.02, 0.08, 0.18, 1.0]),
+        Vertex::new([1.0, -1.0, 0.90, 1.0], [0.08, 0.02, 0.18, 1.0]),
+        Vertex::new([0.72, -0.32, 0.90, 1.0], [0.03, 0.18, 0.27, 1.0]),
+        Vertex::new([-1.0, -1.0, 0.90, 1.0], [0.02, 0.08, 0.18, 1.0]),
+        Vertex::new([0.72, -0.32, 0.90, 1.0], [0.03, 0.18, 0.27, 1.0]),
+        Vertex::new([-0.72, -0.32, 0.90, 1.0], [0.08, 0.04, 0.22, 1.0]),
+    ];
+    output[backdrop.len()..backdrop.len() + FLOOR.len()].copy_from_slice(&FLOOR);
+
     let turns = frame as f32 / 240.0;
     let sy = sin_turns(turns);
     let cy = sin_turns(turns + 0.25);
     let sx = sin_turns(turns * 0.61 + 0.08) * 0.48;
     let cx = positive_sqrt(1.0 - sx * sx);
     let aspect = height as f32 / width as f32;
-    let pulse = 1.0 + 0.055 * sin_turns(turns * 2.0);
+    let pulse = 1.0 + 0.045 * sin_turns(turns * 2.0);
 
-    let mut transformed = [Vec3::new(0.0, 0.0, 0.0); 8];
-    for (target, source) in transformed.iter_mut().zip(CUBE) {
+    // Четыре orbit shards подчёркивают анимацию даже на одном screenshot:
+    // неодинаковая яркость кодирует phase и создаёт depth cue.
+    let mut cursor = backdrop.len() + FLOOR.len();
+    for shard in 0usize..4 {
+        let phase = turns * 1.7 + shard as f32 * 0.25;
+        let orbit_x = sin_turns(phase + 0.25) * 0.72;
+        let orbit_y = sin_turns(phase) * 0.36 + 0.04;
+        let size = 0.035 + 0.018 * (1.0 + sin_turns(phase + 0.12));
+        let color = if shard.is_multiple_of(2) {
+            [0.10, 0.76, 1.00, 1.0]
+        } else {
+            [0.90, 0.22, 1.00, 1.0]
+        };
+        output[cursor] = Vertex::new([orbit_x, orbit_y + size * 1.8, 0.50, 1.0], color);
+        output[cursor + 1] = Vertex::new([orbit_x - size, orbit_y - size, 0.50, 1.0], color);
+        output[cursor + 2] = Vertex::new([orbit_x + size, orbit_y - size, 0.50, 1.0], color);
+        cursor += 3;
+    }
+
+    let mut transformed = [Vec3::new(0.0, 0.0, 0.0); 6];
+    for (target, source) in transformed.iter_mut().zip(CRYSTAL) {
         *target = source.rotate(sy, cy, sx, cx);
     }
 
-    // Painter order достаточен для непрозрачного convex cube и позволяет не
+    // Painter order достаточен для непрозрачного convex crystal и позволяет не
     // вводить depth resource до следующего расширения winsys ABI.
-    let mut order = [0usize, 1, 2, 3, 4, 5];
-    let mut depth = [0.0f32; 6];
+    let mut order = [0usize, 1, 2, 3, 4, 5, 6, 7];
+    let mut depth = [0.0f32; 8];
     for (index, face) in FACES.iter().enumerate() {
         depth[index] = face
             .corners
             .iter()
             .map(|corner| transformed[*corner].z)
             .sum::<f32>()
-            * 0.25;
+            / 3.0;
     }
     for left in 0..order.len() {
         for right in left + 1..order.len() {
@@ -252,27 +291,26 @@ fn build_showcase_mesh(
     }
 
     let light = Vec3::new(-0.36, 0.67, 0.65);
-    let indices = [0usize, 1, 2, 0, 2, 3];
-    let mut cursor = backdrop.len();
     for face_index in order {
         let face = FACES[face_index];
         let normal = face.normal.rotate(sy, cy, sx, cx);
         let diffuse = (normal.x * light.x + normal.y * light.y + normal.z * light.z).max(0.0);
         let specular = diffuse * diffuse * diffuse * diffuse;
-        let illumination = 0.17 + diffuse * 0.72 + specular * 0.32;
-        let color = [
-            (face.color[0] * illumination + specular * 0.18).min(1.0),
-            (face.color[1] * illumination + specular * 0.22).min(1.0),
-            (face.color[2] * illumination + specular * 0.28).min(1.0),
-            1.0,
-        ];
-        for corner in indices {
-            let point = transformed[face.corners[corner]];
+        let illumination = 0.16 + diffuse * 0.74 + specular * 0.38;
+        for (vertex_in_face, corner) in face.corners.into_iter().enumerate() {
+            let point = transformed[corner];
             let camera_depth = 4.2 - point.z;
+            let facet_gradient = 0.82 + vertex_in_face as f32 * 0.09;
+            let color = [
+                (face.color[0] * illumination * facet_gradient + specular * 0.18).min(1.0),
+                (face.color[1] * illumination * facet_gradient + specular * 0.24).min(1.0),
+                (face.color[2] * illumination * facet_gradient + specular * 0.32).min(1.0),
+                1.0,
+            ];
             output[cursor] = Vertex::new(
                 [
-                    point.x * 2.15 * aspect * pulse / camera_depth,
-                    point.y * 2.15 * pulse / camera_depth,
+                    point.x * 2.35 * aspect * pulse / camera_depth,
+                    point.y * 2.35 * pulse / camera_depth + 0.03,
                     0.05,
                     1.0,
                 ],
