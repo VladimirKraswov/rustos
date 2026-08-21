@@ -71,6 +71,15 @@ send_command() {
     printf 'sendkey ret 20\n' | hmp 100
 }
 
+# Две пары down/up идут через одно HMP-соединение. Если создавать четыре
+# отдельных host-процесса, загруженный CI runner может потратить на connect и
+# prompt больше guest double-click interval, хотя сами PS/2 события корректны.
+# 60 ms между состояниями кнопки оставляет устройству несколько polling ticks
+# и при этом удерживает down-to-down заметно ниже стандартных 450 ms.
+double_click_mouse() {
+    printf 'mouse_button 1\nmouse_button 0\nmouse_button 1\nmouse_button 0\n' | hmp 60
+}
+
 # Большие relative jumps QEMU раскладывает на несколько PS/2 packets. Если
 # сразу поставить mouse-down, он может обогнать хвост движения в 8042 queue.
 # Дробим автоматические перемещения так же, как это делает физическая мышь.
@@ -249,13 +258,7 @@ sleep 0.2
 # стартовая точка курсора детерминирована (640,400), icon — около (65,78).
 move_mouse_to 65 78
 sleep 0.4
-printf 'mouse_button 1\n' | hmp
-sleep 0.08
-printf 'mouse_button 0\n' | hmp
-sleep 0.12
-printf 'mouse_button 1\n' | hmp
-sleep 0.08
-printf 'mouse_button 0\n' | hmp
+double_click_mouse
 wait_for_serial '[app] spawn id=0x02 kind=TERMINAL'
 wait_for_serial '[desktop] new terminal requested by double-click'
 move_mouse 575 322 4
@@ -279,13 +282,7 @@ wait_for_serial '[app] exit id=0x02 kind=TERMINAL released-frames='
 grep -q 'windows=1' "$RUN_DIR/serial.log"
 # Снова double-click по desktop icon; ID не переиспользуется.
 move_mouse_to 65 78
-printf 'mouse_button 1\n' | hmp
-sleep 0.08
-printf 'mouse_button 0\n' | hmp
-sleep 0.12
-printf 'mouse_button 1\n' | hmp
-sleep 0.08
-printf 'mouse_button 0\n' | hmp
+double_click_mouse
 wait_for_serial '[app] spawn id=0x03 kind=TERMINAL'
 move_mouse 575 322 4
 sleep 0.25
