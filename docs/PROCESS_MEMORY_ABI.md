@@ -134,6 +134,6 @@ make test-boot
 
 ```text
 [abi-v4] spawn/wait/kill threads VM shared-memory TLS clock verified
-[graphics-abi-v6] exclusive scanout atomic-present estimated-vblank supervisor-restart verified
+[graphics-abi-v7] graphics-buffer sync-timeline atomic-present supervisor-restart verified
 [process-manager] ABI v4 VM/shared-memory frames reclaimed
 ```

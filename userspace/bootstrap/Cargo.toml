@@ -52,6 +52,10 @@ name = "rustos-compositord"
 path = "src/compositord.rs"
 
 [[bin]]
+name = "rustos-renderd"
+path = "src/renderd.rs"
+
+[[bin]]
 name = "rustos-vfs-test"
 path = "src/vfs_test.rs"
 
@@ -99,3 +103,4 @@ rustos-elf-loader = { path = "../../libs/elf-loader" }
 rustos-rune-loader = { path = "../../libs/rune-loader" }
 rustos-rune-format = { path = "../../rune-format" }
 varaniafs = { path = "../../varaniafs" }
+rustos-virgl = { path = "../../libs/virgl" }

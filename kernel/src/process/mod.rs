@@ -70,6 +70,10 @@ pub(super) enum CapabilityKind {
     SyncTimeline(rustos_microkernel::TimelineId),
     /// Эксклюзивный display controller; выдаётся только ring-3 displayd.
     DisplayScanout(u8),
+    /// Эксклюзивная render authority; MMIO/virtqueue остаются в kernel.
+    GpuRender(u8),
+    /// Изолированный VirGL context доверенного ring-3 renderd.
+    GpuContext(u8),
     /// Однонаправленный byte stream; READ/WRITE различаются rights одного object.
     Pipe(u16),
     /// Raw block device выдаётся только storage service, не приложениям.

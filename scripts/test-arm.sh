@@ -139,7 +139,7 @@ patterns=(
     "\[isolation\] concurrent #UD terminated one process; survivor exited=22"
     "\[ipc\] queued block/wake and attenuated VFS capability verified"
     "\[abi-v4\] spawn/wait/kill threads VM shared-memory TLS clock verified"
-    "\[graphics-abi-v6\] exclusive scanout atomic-present estimated-vblank supervisor-restart verified"
+    "\[graphics-abi-v7\] graphics-buffer sync-timeline atomic-present supervisor-restart verified"
     "\[std\] allocator fs threads futex process pipes stdio native SDK and VFS executable verified in ring3 RUNE"
     "\[vfsd\] restart recovered committed VaraniaFS metadata and file data"
     "\[loader\] RUNE interfaces imports ABI TLS RELRO and cross-process shared RX verified"

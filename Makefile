@@ -16,19 +16,19 @@ SHELL := /bin/bash
 HOST_CRATES := \
 	rustos-abi rustos-microkernel rustos-video rustos-system-ui \
 	rustos-system-assets rustos-rune-format rustos-runtime rustos-vfs-client \
-	rustos-elf-loader rustos-rune-loader varaniafs rustos-image rustos-pack \
+	rustos-elf-loader rustos-rune-loader rustos-virgl varaniafs rustos-image rustos-pack \
 	rustos-gui-check rustos-hmp rustos-vfs-image rustos-rune rustos-rui
 HOST_CRATE_ARGS := $(addprefix -p ,$(HOST_CRATES))
 
 DOC_CRATES := \
 	rustos-abi rustos-microkernel rustos-video rustos-system-ui \
 	rustos-system-assets rustos-rune-format rustos-runtime rustos-vfs-client \
-	rustos-elf-loader rustos-rune-loader varaniafs
+	rustos-elf-loader rustos-rune-loader rustos-virgl varaniafs
 DOC_CRATE_ARGS := $(addprefix -p ,$(DOC_CRATES))
 
 RUSTOS_CRATES := \
 	rustos-kernel rustos-runtime rustos-crt rustos-bootstrap-apps \
-	rustos-vfs-client rustos-vfs-dll rustos-elf-loader rustos-rune-loader
+	rustos-vfs-client rustos-vfs-dll rustos-elf-loader rustos-rune-loader rustos-virgl
 RUSTOS_CRATE_ARGS := $(addprefix -p ,$(RUSTOS_CRATES))
 
 HOST_SYSTEM := $(shell uname -s)
@@ -44,7 +44,7 @@ endif
 
 .PHONY: all bootstrap build build-x86 run run-x86 boot test test-host test-arch \
         test-boot test-arm test-arm-boot test-arm-gui test-gui bootstrap-arm build-arm \
-        run-arm format lint clean
+        run-arm run-virgl test-virgl format lint clean
 
 all: build
 
@@ -60,6 +60,13 @@ run: $(DEFAULT_RUN_TARGET)
 
 run-x86: build-x86
 	bash scripts/run.sh
+
+run-virgl: build-x86
+	bash scripts/run-virgl.sh
+
+test-virgl:
+	RUSTOS_VIRGL_TEST=1 bash scripts/build.sh
+	bash scripts/test-virgl.sh
 
 boot: run
 

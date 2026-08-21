@@ -33,14 +33,20 @@ pub extern "C" fn _start(server: u64, reply: u64, abi_version: u64) -> ! {
         Ok(file) => file,
         Err(_) => process_exit(162),
     };
-    if client.write(file, &WRITE_DATA) != Ok(WRITE_DATA.len())
-        || client.seek(file, 0, seek_from::START) != Ok(0)
-    {
-        process_exit(163);
+    match client.write(file, &WRITE_DATA) {
+        Ok(written) if written == WRITE_DATA.len() => {}
+        Ok(_) => process_exit(163),
+        // В serial остаётся точный VFS status: например IO(-109) -> 309.
+        Err(error) => process_exit(200 + error.saturating_abs()),
+    }
+    match client.seek(file, 0, seek_from::START) {
+        Ok(0) => {}
+        Ok(_) => process_exit(164),
+        Err(error) => process_exit(400 + error.saturating_abs()),
     }
     let read = unsafe { &mut *core::ptr::addr_of_mut!(READ_DATA) };
     if client.read(file, read) != Ok(read.len()) || read != &WRITE_DATA {
-        process_exit(164);
+        process_exit(165);
     }
     if client.close(file).is_err()
         || client
@@ -50,11 +56,11 @@ pub extern "C" fn _start(server: u64, reply: u64, abi_version: u64) -> ! {
             )
             .is_err()
     {
-        process_exit(165);
+        process_exit(166);
     }
     let directory = match client.open("/tmp/vfsd-test", open_flags::READ | open_flags::DIRECTORY) {
         Ok(directory) => directory,
-        Err(_) => process_exit(166),
+        Err(_) => process_exit(167),
     };
     let mut found = false;
     while let Ok(Some(entry)) = client.read_dir(directory) {
@@ -68,7 +74,7 @@ pub extern "C" fn _start(server: u64, reply: u64, abi_version: u64) -> ! {
         || client.sync().is_err()
         || client.shutdown_service().is_err()
     {
-        process_exit(167);
+        process_exit(168);
     }
     process_exit(0)
 }

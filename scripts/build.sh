@@ -33,7 +33,7 @@ RUNE_APP_DIR="$ROOT/build/rune-system/apps"
 mkdir -p "$RUNE_DIR" "$RUNE_LIB_DIR" "$RUNE_APP_DIR"
 for program in \
     init fault-test preempt-a preempt-b ipc-receiver ipc-sender \
-    abi-lifecycle abi-child displayd compositord vfsd vfs-test vfs-persistence \
+    abi-lifecycle abi-child displayd compositord renderd vfsd vfs-test vfs-persistence \
     loader-test loader-child rune-runner std-smoke std-main std-child rune
 do
     PROGRAM_ELF="$ROOT/target/x86_64-unknown-rustos/debug/rustos-$program"
@@ -71,7 +71,12 @@ echo "[build] 2/9 kernel (x86_64-unknown-rustos, build-std=core)"
 # Только ядро имеет фиксированный физический layout для GRUB. Пользовательские
 # программы выше уже собраны PIE и продолжают загружаться RUNE-loader'ом.
 KERNEL_RUSTFLAGS="-C force-unwind-tables=no -C relocation-model=static -C link-arg=-no-pie -C link-arg=-T$ROOT/kernel/x86_64-grub.ld"
-if [[ "${RUSTOS_BOOT_TEST:-0}" == "1" ]]; then
+if [[ "${RUSTOS_VIRGL_TEST:-0}" == "1" ]]; then
+    echo "[build] kernel mode: virgl-test"
+    CARGO_PROFILE_DEV_DEBUG=0 RUSTFLAGS="$KERNEL_RUSTFLAGS" \
+        cargo -Zjson-target-spec -Zbuild-std=core build -p rustos-kernel \
+        --target targets/x86_64-unknown-rustos.json --features virgl-test
+elif [[ "${RUSTOS_BOOT_TEST:-0}" == "1" ]]; then
     echo "[build] kernel mode: boot-test"
     CARGO_PROFILE_DEV_DEBUG=0 RUSTFLAGS="$KERNEL_RUSTFLAGS" \
         cargo -Zjson-target-spec -Zbuild-std=core build -p rustos-kernel \

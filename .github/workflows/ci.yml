@@ -57,3 +57,35 @@ jobs:
           name: rustos-test-results
           path: build/test-results/
           if-no-files-found: ignore
+
+  virgl:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Получить исходники
+        uses: actions/checkout@v7
+
+      - name: Установить VirGL/QEMU и software GL host backend
+        run: |
+          sudo apt-get update --quiet
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install \
+            --yes --no-install-recommends qemu-system-x86 qemu-system-gui ovmf \
+            libgl1-mesa-dri libegl1 xvfb
+
+      - name: Установить зафиксированный Rust toolchain
+        run: |
+          rustup toolchain install nightly-2026-08-18 \
+            --profile minimal --component rust-src,rustfmt \
+            --target x86_64-unknown-uefi
+          rustup override set nightly-2026-08-18
+
+      - name: VirGL triangle integration
+        run: make test-virgl
+
+      - name: Сохранить VirGL framebuffer и serial
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: rustos-virgl-results
+          path: build/test-results/virgl/
+          if-no-files-found: ignore

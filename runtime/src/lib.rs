@@ -14,6 +14,7 @@ mod arch;
 pub use rustos_abi::{
     block::BlockIoRequest,
     display::{DisplayAtomicPresent, DisplayScanoutInfo, DisplayVblankWait},
+    gpu::{GpuContextCreate, GpuDeviceInfo, GpuResourceCreate, GpuResourceImport, GpuSubmit},
     graphics_buffer::GraphicsBufferDesc,
     ipc::Message,
     memory::{SharedMemoryCreate, SharedMemoryMap, VmFlags, VmMapRequest},
@@ -347,6 +348,78 @@ pub fn display_wait_vblank(scanout: Handle, request: &DisplayVblankWait) -> i64 
             syscall::number::DISPLAY_WAIT_VBLANK,
             scanout.0 as u64,
             request as *const DisplayVblankWait as u64,
+            0,
+        )
+    }
+}
+
+/// Читает capabilities из эксклюзивной render authority.
+pub fn gpu_get_info(render: Handle, info: &mut GpuDeviceInfo) -> i64 {
+    unsafe {
+        syscall3(
+            syscall::number::GPU_GET_INFO,
+            render.0 as u64,
+            info as *mut GpuDeviceInfo as u64,
+            0,
+        )
+    }
+}
+
+/// Создаёт изолированный VirGL context; результат — capability handle.
+pub fn gpu_context_create(render: Handle, request: &GpuContextCreate) -> i64 {
+    unsafe {
+        syscall3(
+            syscall::number::GPU_CONTEXT_CREATE,
+            render.0 as u64,
+            request as *const GpuContextCreate as u64,
+            0,
+        )
+    }
+}
+
+/// Импортирует GraphicsBuffer в GPU context; результат — context-local resource id.
+pub fn gpu_resource_import(context: Handle, buffer: Handle, request: &GpuResourceImport) -> i64 {
+    unsafe {
+        syscall3(
+            syscall::number::GPU_RESOURCE_IMPORT,
+            context.0 as u64,
+            buffer.0 as u64,
+            request as *const GpuResourceImport as u64,
+        )
+    }
+}
+
+/// Создаёт context-local resource без CPU-visible backing.
+pub fn gpu_resource_create(context: Handle, request: &GpuResourceCreate) -> i64 {
+    unsafe {
+        syscall3(
+            syscall::number::GPU_RESOURCE_CREATE,
+            context.0 as u64,
+            request as *const GpuResourceCreate as u64,
+            0,
+        )
+    }
+}
+
+/// Ставит VirGL command stream в очередь; положительный результат — fence id.
+pub fn gpu_submit(context: Handle, request: &GpuSubmit) -> i64 {
+    unsafe {
+        syscall3(
+            syscall::number::GPU_SUBMIT,
+            context.0 as u64,
+            request as *const GpuSubmit as u64,
+            0,
+        )
+    }
+}
+
+/// Возвращает итоговый status завершённого fence.
+pub fn gpu_completion_status(context: Handle, fence: u64) -> i64 {
+    unsafe {
+        syscall3(
+            syscall::number::GPU_COMPLETION_STATUS,
+            context.0 as u64,
+            fence,
             0,
         )
     }

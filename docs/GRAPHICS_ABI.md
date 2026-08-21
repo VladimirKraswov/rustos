@@ -1,6 +1,6 @@
 # GraphicsBuffer, SyncTimeline и ring-3 display path
 
-Syscall ABI v6 разделяет пиксельную память, синхронизацию и право управлять
+Syscall ABI v7 разделяет пиксельную память, синхронизацию, право рендеринга и право управлять
 экраном на три разных kernel object. Ядро проверяет память, lifetime, права,
 очереди ожидания и доступ к устройству. Политика окон и композиция остаются в
 ring 3.
@@ -21,10 +21,13 @@ kinds, поэтому syscall для объекта другого типа во
 - CPU mapping требует `MAP`;
 - только domain `SHARED` разрешает `TRANSFER` другому процессу.
 
-Текущий allocator предоставляет linear host-visible system memory.
+Текущий allocator предоставляет linear system memory. Обычные CPU surfaces
+получают host mapping, а GPU-only render targets создаются без `CPU_READ`,
+`CPU_WRITE` и `MAP`: приложение не может растрировать в них пиксели CPU.
 Device-local, protected и vendor-modifier buffers пока возвращают
 `NOT_SUPPORTED`. Один buffer ограничен 32 МиБ, общий bootstrap budget —
-96 МиБ и шесть объектов. Кадры хранятся bounded scatter/gather extents.
+96 МиБ и шесть объектов. Кадры хранятся bounded scatter/gather extents;
+первый VirGL import временно требует один непрерывный extent.
 
 Capability references и mapping references считаются отдельно. Закрытие
 последнего handle не уничтожает ещё отображённый buffer; завершение процесса
@@ -72,28 +75,37 @@ vblank IRQ. Поэтому `DisplayScanoutInfo` и feedback явно содер�
 deadlock bootstrap scheduler, boundary завершается на подтверждённом FLUSH.
 Это не заявляется как точный аппаратный vblank.
 
-## Постоянные displayd и compositord
+## Эксклюзивная render capability
+
+При negotiated `VIRTIO_GPU_F_VIRGL` supervisor добавляет третий постоянный
+сервис — `renderd`. Только он получает непередаваемую `GpuRender` capability.
+Kernel создаёт изолированный context, импортирует GPU-only `GraphicsBuffer`,
+принимает bounded VirGL stream и связывает device fence с `SyncTimeline`.
+
+`renderd` не владеет scanout; `displayd` не может отправлять 3D-команды;
+`compositord` не получает ни одно из этих аппаратных прав. Готовый buffer и
+acquire timeline переходят по обычному capability IPC. Подробный контракт,
+ограничения и end-to-end triangle test описаны в
+[GPU_RENDERING.md](GPU_RENDERING.md).
+
+## Постоянные renderd, displayd и compositord
 
 При доступном native scanout интерактивная сессия запускает оба процесса как
 supervisor services:
 
 ```text
-compositord                           displayd                 virtio-gpu
-    | query + feedback endpoint          | get_info                |
-    |----------------------------------->|                         |
-    |<-------------- mode info ----------|                         |
-    | create/map GraphicsBuffer          |                         |
-    | CPU raster, signal acquire         |                         |
-    | buffer + acquire + release + reply |                         |
-    |----------------------------------->| wait acquire            |
-    | wait release + feedback             | atomic_present -------->|
-    |                                     | wait estimated vblank   |
-    |<--------- release + feedback -------|                         |
-    | block for next surface request      | block for next present  |
+renderd                 compositord                   displayd          virtio-gpu
+   | async VirGL submit       |                           |                 |
+   |--------------------------+---------------------------+---------------->|
+   | wait device timeline     |                           |                 |
+   | buffer + acquire ------->| validate/forward          |                 |
+   |                          | buffer + timelines ------>| atomic present  |
+   |                          |                           |---------------->|
+   |                          |<----- release + feedback --|                 |
 ```
 
-Оба сервиса остаются живы после первого кадра. `displayd` работает в классе
-`Driver`, compositor — `System`. При падении одного процесса supervisor
+Все сервисы остаются живы после первого кадра. `displayd` и `renderd` работают
+в классе `Driver`, compositor — `System`. При падении одного процесса supervisor
 отзывает capabilities/mappings, сбрасывает private endpoints и перезапускает
 пару с новыми PID и handles. Boot-test принудительно завершает оба сервиса,
 перезапускает их и требует прохождения второго atomic present: stale
@@ -117,6 +129,6 @@ ring-3 compositor и оставить kernel renderer только для panic/
 Критерий integration test:
 
 ```text
-[graphics-abi-v6] exclusive scanout atomic-present estimated-vblank supervisor-restart verified
-[supervisor] persistent displayd/compositord atomic-present services ready
+[graphics-abi-v7] graphics-buffer sync-timeline atomic-present supervisor-restart verified
+[supervisor] persistent renderd/compositord/displayd services ready
 ```

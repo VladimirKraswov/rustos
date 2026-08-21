@@ -27,6 +27,7 @@ GRUB 2 / Multiboot2 --> BootInfo v3 --> kernel
                                   |-- MADT + AP long-mode trampoline
                                   |-- GRUB/virtio scanout + CPU fallback
                                   |-- graphics-buffer/surface/sync ABI
+                                  |-- async virtio-gpu/VirGL render ABI
                                   |-- damage/layer CPU compositor
                                   |-- PS/2 input
                                   |-- bootstrap RIFS + RAM overlay
@@ -67,10 +68,12 @@ usage/domain и modifier; `SyncPoint` и `SurfaceCommit` задают явное
 кадром, damage, buffer release и presentation feedback. Kernel objects уже
 предоставляют generation-safe GraphicsBuffer/SyncTimeline handles, mapping
 lifetime и блокирующий wait-many. Постоянный RUNE `displayd` эксклюзивно
-владеет непередаваемой scanout capability; `compositord` выполняет atomic
-present, ждёт оценочный vblank и получает feedback. Интерактивный desktop пока
+владеет непередаваемой scanout capability. При VirGL постоянный `renderd`
+отдельно владеет render capability, отправляет асинхронные 3D-команды и
+передаёт GPU-only buffer compositor'у; `compositord` выполняет atomic present,
+ждёт оценочный vblank и получает feedback. Интерактивный desktop пока
 использует CPU raster/damage bootstrap через тот же broker. Контракт описан в
-[GRAPHICS_ABI.md](GRAPHICS_ABI.md) и
+[GRAPHICS_ABI.md](GRAPHICS_ABI.md), [GPU_RENDERING.md](GPU_RENDERING.md) и
 [ADR-0001](adr/0001-modern-graphics-architecture.md).
 
 MADT перечисляет CPU, BSP последовательно выполняет INIT–SIPI–SIPI. AP
@@ -97,7 +100,8 @@ MADT перечисляет CPU, BSP последовательно выполн
 8. **готов runtime S1:** upstream target `std`, CRT, threads/futex,
    process/pipes/stdio, запуск RUNE с VFS и масштабируемая COW VaraniaFS;
    дальше постоянный supervisor, native Rust toolchain и package/build services;
-9. **переходно:** persistent ring-3 `vfsd`, `displayd` и `compositord` готовы;
+9. **переходно:** persistent ring-3 `vfsd`, `renderd`, `displayd` и
+   `compositord` готовы;
    displayd эксклюзивно владеет scanout, atomic present/vblank feedback и
    bounded supervisor restart проходят boot-test; дальше оконные surface
    queues, постоянный input service и terminal как отдельный процесс;

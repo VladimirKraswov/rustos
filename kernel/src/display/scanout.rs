@@ -12,6 +12,7 @@ use core::{
 
 use rustos_abi::{
     display::{scanout_capabilities, DisplayScanoutInfo, DISPLAY_SCANOUT_ABI_VERSION},
+    gpu::{GpuDeviceInfo, GpuResourceCreate},
     graphics_buffer::GraphicsBufferDesc,
     surface::OutputId,
 };
@@ -20,7 +21,7 @@ use rustos_video::{
     ScanoutError,
 };
 
-use super::VirtioGpu;
+use super::{virtio_gpu::RenderCompletion, VirtioGpu};
 
 const DEFAULT_REFRESH_MILLIHERTZ: u32 = 60_000;
 
@@ -183,6 +184,7 @@ pub fn present(
 
 /// Прямой full-frame commit capability-backed buffer'а.
 pub fn present_graphics<PhysicalPage>(
+    graphics_object: u16,
     descriptor: GraphicsBufferDesc,
     physical_page: PhysicalPage,
     sequence: u64,
@@ -191,13 +193,115 @@ where
     PhysicalPage: FnMut(usize) -> Option<u64>,
 {
     let mut guard = DEVICE.acquire()?;
+    let device = guard
+        .get()
+        .as_mut()
+        .ok_or(DisplayBrokerError::Unavailable)?;
+    if let Some(stats) = device
+        .gpu
+        .present_imported(graphics_object, sequence)
+        .map_err(map_scanout_error)?
+    {
+        return Ok(stats);
+    }
+    device
+        .gpu
+        .present_pages(descriptor, physical_page, sequence)
+        .map_err(map_scanout_error)
+}
+
+pub fn render_info() -> Result<GpuDeviceInfo, DisplayBrokerError> {
+    let mut guard = DEVICE.acquire()?;
+    guard
+        .get()
+        .as_ref()
+        .and_then(|device| device.gpu.render_info())
+        .ok_or(DisplayBrokerError::Unavailable)
+}
+
+pub fn create_render_context(context: u32, name: &[u8]) -> Result<(), DisplayBrokerError> {
+    let mut guard = DEVICE.acquire()?;
     guard
         .get()
         .as_mut()
         .ok_or(DisplayBrokerError::Unavailable)?
         .gpu
-        .present_pages(descriptor, physical_page, sequence)
-        .map_err(map_scanout_error)
+        .create_render_context(context, name)
+        .map_err(map_mode_error)
+}
+
+pub fn import_render_target(
+    context: u32,
+    graphics_object: u16,
+    descriptor: GraphicsBufferDesc,
+    backing: crate::memory::FrameBlock,
+) -> Result<u32, DisplayBrokerError> {
+    let mut guard = DEVICE.acquire()?;
+    guard
+        .get()
+        .as_mut()
+        .ok_or(DisplayBrokerError::Unavailable)?
+        .gpu
+        .import_render_target(context, graphics_object, descriptor, backing)
+        .map_err(map_mode_error)
+}
+
+pub fn create_render_resource(
+    context: u32,
+    request: GpuResourceCreate,
+) -> Result<u32, DisplayBrokerError> {
+    let mut guard = DEVICE.acquire()?;
+    guard
+        .get()
+        .as_mut()
+        .ok_or(DisplayBrokerError::Unavailable)?
+        .gpu
+        .create_render_resource(context, request)
+        .map_err(map_mode_error)
+}
+
+pub fn submit_render(context: u32, commands: &[u8]) -> Result<u64, DisplayBrokerError> {
+    let mut guard = DEVICE.acquire()?;
+    guard
+        .get()
+        .as_mut()
+        .ok_or(DisplayBrokerError::Unavailable)?
+        .gpu
+        .submit_render(context, commands)
+        .map_err(map_mode_error)
+}
+
+pub fn poll_render() -> Result<Option<RenderCompletion>, DisplayBrokerError> {
+    let mut guard = DEVICE.acquire()?;
+    guard
+        .get()
+        .as_mut()
+        .ok_or(DisplayBrokerError::Unavailable)?
+        .gpu
+        .poll_render()
+        .map_err(map_mode_error)
+}
+
+/// Безопасно осушает очередь перед уничтожением GPU context. Это не часть
+/// кадрового hot path: blocking разрешён только при завершении/падении renderd.
+pub fn drain_render(fence_id: u64) -> Result<RenderCompletion, DisplayBrokerError> {
+    let mut guard = DEVICE.acquire()?;
+    guard
+        .get()
+        .as_mut()
+        .ok_or(DisplayBrokerError::Unavailable)?
+        .gpu
+        .drain_render(fence_id)
+        .map_err(map_mode_error)
+}
+
+pub fn destroy_render_context(context: u32) {
+    let Ok(mut guard) = DEVICE.acquire() else {
+        return;
+    };
+    if let Some(device) = guard.get().as_mut() {
+        device.gpu.destroy_render_context(context);
+    }
 }
 
 /// Wire snapshot для process ABI. Virtio-gpu 2D завершает fenced FLUSH, но

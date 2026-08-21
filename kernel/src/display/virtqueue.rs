@@ -1,9 +1,9 @@
-//! Modern virtio-pci transport и одна split control queue.
+//! Modern virtio-pci transport и асинхронная split control queue.
 //!
-//! Очередь синхронная только на bootstrap-этапе: один producer CPU0, два
-//! descriptor'а на команду (request + response), bounded polling timeout.
-//! Формат очереди уже соответствует Virtio 1.x и позже может получить IRQ,
-//! несколько in-flight commands и fences без изменения GPU protocol layer.
+//! Bootstrap-команды всё ещё имеют удобную синхронную обёртку, но сама
+//! очередь поддерживает несколько независимых descriptor chains. Ring-3
+//! render submission только публикует chain; timer tick забирает used entry
+//! и fence без многомиллионного busy-spin.
 
 use core::{
     mem, ptr,
@@ -20,12 +20,20 @@ const STATUS_DRIVER_OK: u8 = 4;
 const STATUS_FEATURES_OK: u8 = 8;
 const STATUS_FAILED: u8 = 128;
 const VIRTIO_F_VERSION_1_HIGH: u32 = 1;
+const VIRTIO_GPU_F_VIRGL: u32 = 1 << 0;
 const VIRTIO_GPU_F_EDID: u32 = 1 << 1;
 const DESC_NEXT: u16 = 1;
 const DESC_WRITE: u16 = 2;
 const CONTROL_QUEUE: u16 = 0;
 const MAX_QUEUE_SIZE: u16 = 64;
 const POLL_LIMIT: usize = 50_000_000;
+const COMMAND_SLOTS: usize = 4;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AsyncCompletion {
+    pub fence_id: u64,
+    pub response_kind: u32,
+}
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -34,6 +42,26 @@ struct Descriptor {
     length: u32,
     flags: u16,
     next: u16,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct UsedElement {
+    id: u32,
+    length: u32,
+}
+
+#[derive(Clone, Copy)]
+struct CommandSlot {
+    generation: u16,
+    state: u8,
+}
+
+impl CommandSlot {
+    const FREE: Self = Self {
+        generation: 1,
+        state: 0,
+    };
 }
 
 pub struct ModernTransport {
@@ -47,8 +75,11 @@ pub struct ModernTransport {
     used_offset: u64,
     notify_offset: u64,
     dma: FrameBlock,
-    last_used: u16,
+    slot_count: usize,
+    slots: [CommandSlot; COMMAND_SLOTS],
+    device_used: u16,
     edid: bool,
+    virgl: bool,
 }
 
 impl ModernTransport {
@@ -83,7 +114,7 @@ impl ModernTransport {
             unsafe { write_u8(common, 20, STATUS_FAILED) };
             return Err(TransportError::Unsupported);
         }
-        let accepted_low = device_features_low & VIRTIO_GPU_F_EDID;
+        let accepted_low = device_features_low & (VIRTIO_GPU_F_EDID | VIRTIO_GPU_F_VIRGL);
         unsafe {
             write_u32(common, 8, 0);
             write_u32(common, 12, accepted_low);
@@ -115,7 +146,8 @@ impl ModernTransport {
         let queue_bytes = used_offset + used_bytes;
         let queue = memory::allocate(queue_bytes.div_ceil(4096), 1)
             .map_err(|_| TransportError::OutOfMemory)?;
-        let dma = match memory::allocate(2, 1) {
+        let slot_count = (usize::from(queue_size) / 2).min(COMMAND_SLOTS);
+        let dma = match memory::allocate((slot_count * 2) as u64, 1) {
             Ok(block) => block,
             Err(_) => {
                 let _ = memory::free(queue);
@@ -125,7 +157,7 @@ impl ModernTransport {
         };
         unsafe {
             ptr::write_bytes(queue.phys as *mut u8, 0, (queue.frames * 4096) as usize);
-            ptr::write_bytes(dma.phys as *mut u8, 0, 8192);
+            ptr::write_bytes(dma.phys as *mut u8, 0, slot_count * 8192);
             write_u16(common, 24, queue_size);
             write_u64(common, 32, queue.phys);
             write_u64(common, 40, queue.phys + available_offset);
@@ -160,13 +192,27 @@ impl ModernTransport {
             used_offset,
             notify_offset,
             dma,
-            last_used: 0,
+            slot_count,
+            slots: [CommandSlot::FREE; COMMAND_SLOTS],
+            device_used: 0,
             edid: accepted_low & VIRTIO_GPU_F_EDID != 0,
+            virgl: accepted_low & VIRTIO_GPU_F_VIRGL != 0,
         })
     }
 
     pub const fn edid_supported(&self) -> bool {
         self.edid
+    }
+
+    pub const fn virgl_supported(&self) -> bool {
+        self.virgl
+    }
+
+    pub fn num_capsets(&self) -> u32 {
+        if self.device_length < 16 {
+            return 0;
+        }
+        unsafe { read_u32(self.device, 12) }
     }
 
     pub fn num_scanouts(&self) -> u32 {
@@ -185,30 +231,104 @@ impl ModernTransport {
         if request_size == 0 || request_size > 4096 || response_size == 0 || response_size > 4096 {
             return Err(TransportError::InvalidConfiguration);
         }
+        let request_bytes = unsafe {
+            core::slice::from_raw_parts((request as *const Request).cast::<u8>(), request_size)
+        };
+        let token = self.submit_bytes(request_bytes, &[], response_size)?;
+        for _ in 0..POLL_LIMIT {
+            self.poll_used()?;
+            let index = token_index(token);
+            if self.slots[index].state == 2
+                && self.slots[index].generation == token_generation(token)
+            {
+                let response =
+                    unsafe { (self.response_address(index) as *const Response).read_volatile() };
+                self.release_slot(index);
+                return Ok(response);
+            }
+            core::hint::spin_loop();
+        }
+        Err(TransportError::Timeout)
+    }
+
+    /// Публикует command без ожидания device. Prefix и payload копируются в
+    /// отдельную DMA page, поэтому возврат в ring 3 не создаёт TOCTOU.
+    pub fn submit_bytes(
+        &mut self,
+        prefix: &[u8],
+        payload: &[u8],
+        response_size: usize,
+    ) -> Result<u32, TransportError> {
+        let request_size = prefix
+            .len()
+            .checked_add(payload.len())
+            .ok_or(TransportError::InvalidConfiguration)?;
+        if request_size == 0 || request_size > 4096 || !(24..=4096).contains(&response_size) {
+            return Err(TransportError::InvalidConfiguration);
+        }
+        self.poll_used()?;
+        let index = self.slots[..self.slot_count]
+            .iter()
+            .position(|slot| slot.state == 0)
+            .ok_or(TransportError::Busy)?;
+        let request_address = self.request_address(index);
+        let response_address = self.response_address(index);
         unsafe {
-            ptr::write_bytes(self.dma.phys as *mut u8, 0, 8192);
-            (self.dma.phys as *mut Request).write_volatile(*request);
+            ptr::write_bytes(request_address as *mut u8, 0, 4096);
+            ptr::write_bytes(response_address as *mut u8, 0, 4096);
+            ptr::copy_nonoverlapping(prefix.as_ptr(), request_address as *mut u8, prefix.len());
+            ptr::copy_nonoverlapping(
+                payload.as_ptr(),
+                (request_address as *mut u8).add(prefix.len()),
+                payload.len(),
+            );
+            let head = index * 2;
             self.write_descriptor(
-                0,
+                head,
                 Descriptor {
-                    address: self.dma.phys,
+                    address: request_address,
                     length: request_size as u32,
                     flags: DESC_NEXT,
-                    next: 1,
+                    next: (head + 1) as u16,
                 },
             );
             self.write_descriptor(
-                1,
+                head + 1,
                 Descriptor {
-                    address: self.dma.phys + 4096,
+                    address: response_address,
                     length: response_size as u32,
                     flags: DESC_WRITE,
                     next: 0,
                 },
             );
         }
-        self.submit(0)?;
-        Ok(unsafe { ((self.dma.phys + 4096) as *const Response).read_volatile() })
+        let generation = next_generation(self.slots[index].generation);
+        self.slots[index] = CommandSlot {
+            generation,
+            state: 1,
+        };
+        self.publish((index * 2) as u16);
+        Ok(make_token(index, generation))
+    }
+
+    /// Забирает одно завершение. Вызов неблокирующий и подходит для timer/IRQ
+    /// bottom half; отсутствие used entry — нормальный `Ok(None)`.
+    pub fn poll_completion(&mut self) -> Result<Option<AsyncCompletion>, TransportError> {
+        self.poll_used()?;
+        let Some(index) = self.slots[..self.slot_count]
+            .iter()
+            .position(|slot| slot.state == 2)
+        else {
+            return Ok(None);
+        };
+        let response = self.response_address(index);
+        let response_kind = unsafe { (response as *const u32).read_volatile() };
+        let fence_id = unsafe { ((response + 8) as *const u64).read_volatile() };
+        self.release_slot(index);
+        Ok(Some(AsyncCompletion {
+            fence_id,
+            response_kind,
+        }))
     }
 
     unsafe fn write_descriptor(&self, index: usize, descriptor: Descriptor) {
@@ -220,7 +340,7 @@ impl ModernTransport {
         }
     }
 
-    fn submit(&mut self, head: u16) -> Result<(), TransportError> {
+    fn publish(&mut self, head: u16) {
         let available = (self.queue.phys + self.available_offset) as *mut u8;
         let available_index = unsafe { available.add(2).cast::<u16>().read_volatile() };
         let slot = usize::from(available_index % self.queue_size);
@@ -241,17 +361,46 @@ impl ModernTransport {
                 .cast::<u16>()
                 .write_volatile(CONTROL_QUEUE);
         }
-        let used_index = (self.queue.phys + self.used_offset + 2) as *const u16;
-        let wanted = self.last_used.wrapping_add(1);
-        for _ in 0..POLL_LIMIT {
-            fence(Ordering::Acquire);
-            if unsafe { used_index.read_volatile() } == wanted {
-                self.last_used = wanted;
-                return Ok(());
+    }
+
+    fn poll_used(&mut self) -> Result<(), TransportError> {
+        let used = (self.queue.phys + self.used_offset) as *const u8;
+        let available = unsafe { used.add(2).cast::<u16>().read_volatile() };
+        // Сначала наблюдаем новый used.idx, затем запрещаем процессору читать
+        // элементы кольца и response page раньше публикации этого индекса
+        // устройством. Это обычная acquire-сторона протокола Virtqueue.
+        fence(Ordering::Acquire);
+        while self.device_used != available {
+            let ring_index = usize::from(self.device_used % self.queue_size);
+            let element = unsafe {
+                used.add(4 + ring_index * core::mem::size_of::<UsedElement>())
+                    .cast::<UsedElement>()
+                    .read_volatile()
+            };
+            let head = usize::try_from(element.id).map_err(|_| TransportError::DeviceError)?;
+            if !head.is_multiple_of(2) || head / 2 >= self.slot_count {
+                return Err(TransportError::DeviceError);
             }
-            core::hint::spin_loop();
+            let slot = &mut self.slots[head / 2];
+            if slot.state != 1 {
+                return Err(TransportError::DeviceError);
+            }
+            slot.state = 2;
+            self.device_used = self.device_used.wrapping_add(1);
         }
-        Err(TransportError::Timeout)
+        Ok(())
+    }
+
+    fn request_address(&self, index: usize) -> u64 {
+        self.dma.phys + index as u64 * 8192
+    }
+
+    fn response_address(&self, index: usize) -> u64 {
+        self.request_address(index) + 4096
+    }
+
+    fn release_slot(&mut self, index: usize) {
+        self.slots[index].state = 0;
     }
 }
 
@@ -260,6 +409,27 @@ impl Drop for ModernTransport {
         unsafe { write_u8(self.common, 20, 0) };
         let _ = memory::free(self.queue);
         let _ = memory::free(self.dma);
+    }
+}
+
+const fn make_token(index: usize, generation: u16) -> u32 {
+    ((generation as u32) << 8) | index as u32
+}
+
+const fn token_index(token: u32) -> usize {
+    (token & 0xff) as usize
+}
+
+const fn token_generation(token: u32) -> u16 {
+    (token >> 8) as u16
+}
+
+const fn next_generation(generation: u16) -> u16 {
+    let next = generation.wrapping_add(1);
+    if next == 0 {
+        1
+    } else {
+        next
     }
 }
 

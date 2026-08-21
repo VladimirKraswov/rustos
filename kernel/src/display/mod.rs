@@ -25,4 +25,6 @@ enum TransportError {
     OutOfMemory,
     RejectedFeatures,
     Timeout,
+    Busy,
+    DeviceError,
 }

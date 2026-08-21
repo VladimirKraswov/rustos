@@ -74,14 +74,10 @@ impl GraphicsBufferPool {
             .validate()
             .map_err(|_| status::INVALID_ARGUMENT)?;
         if !descriptor.memory_domains.contains(MemoryDomain::SYSTEM)
-            || !descriptor
-                .memory_domains
-                .contains(MemoryDomain::HOST_VISIBLE)
             || descriptor
                 .memory_domains
                 .contains(MemoryDomain::DEVICE_LOCAL)
             || descriptor.memory_domains.contains(MemoryDomain::PROTECTED)
-            || !descriptor.usage.contains(BufferUsage::CPU_READ)
             || descriptor.modifier != rustos_abi::graphics_buffer::modifier::LINEAR
         {
             return Err(status::NOT_SUPPORTED);
@@ -148,8 +144,10 @@ impl GraphicsBufferPool {
         }
         let maximum_flags = if descriptor.usage.contains(BufferUsage::CPU_WRITE) {
             VmFlags::READ.union(VmFlags::WRITE)
-        } else {
+        } else if descriptor.usage.contains(BufferUsage::CPU_READ) {
             VmFlags::READ
+        } else {
+            VmFlags(0)
         };
         object.capability_refs = 1;
         object.maximum_flags = maximum_flags;
@@ -180,6 +178,17 @@ impl GraphicsBufferPool {
             base_page += extent_pages;
         }
         Err(status::BAD_HANDLE)
+    }
+
+    /// Возвращает единственный DMA extent. Первый VirGL milestone намеренно
+    /// не строит переменный attach-backing request на 256 SG entries; если
+    /// allocator не смог дать contiguous target, syscall честно отказывает.
+    pub(super) fn contiguous_backing(&self, id: u16) -> Result<FrameBlock, i64> {
+        let object = self.get(id)?;
+        if object.extent_count != 1 {
+            return Err(status::NOT_SUPPORTED);
+        }
+        Ok(object.extents[0])
     }
 
     pub(super) fn retain_capability(&mut self, id: u16) -> Result<(), i64> {

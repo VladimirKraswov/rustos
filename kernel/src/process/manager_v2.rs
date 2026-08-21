@@ -1,4 +1,4 @@
-//! CPU0 process manager ABI v6: процессы, несколько потоков, VM, shared
+//! CPU0 process manager ABI v7: процессы, несколько потоков, VM, shared
 //! memory, capability IPC, graphics objects и монотонные часы.
 //!
 //! Здесь сознательно используются ограниченные статические таблицы: раннее
@@ -15,6 +15,10 @@ use rustos_abi::{
     block::{BlockIoRequest, BLOCK_ABI_VERSION},
     bootinfo::BootInitramfs,
     display::{DisplayAtomicPresent, DisplayScanoutInfo, DisplayVblankWait},
+    gpu::{
+        GpuContextCreate, GpuDeviceInfo, GpuResourceCreate, GpuResourceImport, GpuSubmit,
+        GPU_MAX_COMMAND_BYTES,
+    },
     graphics_buffer::{BufferUsage, GraphicsBufferDesc, MemoryDomain},
     ipc::{Message, IPC_MAX_HANDLES},
     memory::{SharedMemoryCreate, SharedMemoryMap, VmFlags, VmMapRequest, MEMORY_ABI_VERSION},
@@ -53,13 +57,14 @@ use super::{
 
 const MAX_PROCESSES: usize = 12;
 const MAX_THREADS: usize = 24;
-const MAX_ENDPOINTS: usize = 4;
+const MAX_ENDPOINTS: usize = 6;
 const ENDPOINT_QUEUE_CAPACITY: usize = 8;
 const ENDPOINT_SLOT: usize = 2;
 const MAX_SHARED_OBJECTS: usize = 8;
 const MAX_SHARED_PAGES: usize = 64;
 const MAX_SYNC_TIMELINES: usize = 32;
 const MAX_SYNC_WAITS: usize = MAX_THREADS;
+const MAX_GPU_IMPORTS: usize = 4;
 /// Один mapping ограничен 1 GiB: достаточно для compiler arenas, но ошибка в
 /// user-space всё ещё не может одним syscall переполнить арифметику/metadata.
 const MAX_VM_SYSCALL_PAGES: u64 = 256 * 1024;
@@ -124,6 +129,13 @@ struct PendingVblank {
     sequence: u64,
     present_deadline_ns: u64,
     timeout_deadline_ns: u64,
+}
+
+#[derive(Clone, Copy)]
+struct PendingGpuSubmission {
+    fence: u64,
+    timeline: TimelineId,
+    value: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -617,6 +629,11 @@ struct ProcessManager {
     display_present_sequence: u64,
     display_completed_sequence: u64,
     display_present_deadline_ns: u64,
+    gpu_context_active: bool,
+    gpu_imports: [Option<u16>; MAX_GPU_IMPORTS],
+    gpu_submission: Option<PendingGpuSubmission>,
+    gpu_last_fence: u64,
+    gpu_last_status: i64,
     deferred_process_reap: Option<ProcessId>,
     deferred_thread_reap: Option<ThreadId>,
 }
@@ -648,6 +665,11 @@ impl ProcessManager {
             display_present_sequence: 0,
             display_completed_sequence: 0,
             display_present_deadline_ns: 0,
+            gpu_context_active: false,
+            gpu_imports: [None; MAX_GPU_IMPORTS],
+            gpu_submission: None,
+            gpu_last_fence: 0,
+            gpu_last_status: status::NOT_FOUND,
             deferred_process_reap: None,
             deferred_thread_reap: None,
         }
@@ -677,6 +699,11 @@ impl ProcessManager {
         self.display_present_sequence = 0;
         self.display_completed_sequence = 0;
         self.display_present_deadline_ns = 0;
+        self.gpu_context_active = false;
+        self.gpu_imports = [None; MAX_GPU_IMPORTS];
+        self.gpu_submission = None;
+        self.gpu_last_fence = 0;
+        self.gpu_last_status = status::NOT_FOUND;
         self.deferred_process_reap = None;
         self.deferred_thread_reap = None;
     }
@@ -1032,6 +1059,7 @@ impl ProcessManager {
             self.timer_ticks = self.timer_ticks.saturating_add(1);
             arch::rearm_scheduler_timer(self.counter_hz);
             self.wake_expired_futexes();
+            self.poll_gpu_completion();
             self.wake_expired_sync_waiters();
             self.wake_display_vblank_waiters();
             return self.schedule_next(frame);
@@ -1335,6 +1363,41 @@ impl ProcessManager {
                     BlockingResult::Blocked => self.schedule_next(frame),
                 }
             }
+            syscall::number::GPU_GET_INFO => {
+                let result = self.gpu_get_info(process_index, Handle(arg0 as u32), arg1);
+                frame.set_syscall_result(result);
+                0
+            }
+            syscall::number::GPU_CONTEXT_CREATE => {
+                let result = self.gpu_context_create(process_index, Handle(arg0 as u32), arg1);
+                frame.set_syscall_result(result);
+                0
+            }
+            syscall::number::GPU_RESOURCE_IMPORT => {
+                let result = self.gpu_resource_import(
+                    process_index,
+                    Handle(arg0 as u32),
+                    Handle(arg1 as u32),
+                    arg2,
+                );
+                frame.set_syscall_result(result);
+                0
+            }
+            syscall::number::GPU_RESOURCE_CREATE => {
+                let result = self.gpu_resource_create(process_index, Handle(arg0 as u32), arg1);
+                frame.set_syscall_result(result);
+                0
+            }
+            syscall::number::GPU_SUBMIT => {
+                let result = self.gpu_submit(process_index, Handle(arg0 as u32), arg1);
+                frame.set_syscall_result(result);
+                0
+            }
+            syscall::number::GPU_COMPLETION_STATUS => {
+                let result = self.gpu_completion_status(process_index, Handle(arg0 as u32), arg1);
+                frame.set_syscall_result(result);
+                0
+            }
             syscall::number::FUTEX_WAIT => {
                 match self.futex_wait(thread_index, arg0, arg1 as u32, arg2) {
                     BlockingResult::Return(result) => {
@@ -1423,6 +1486,9 @@ impl ProcessManager {
     fn schedule_next(&mut self, frame: &mut TrapFrame) -> u64 {
         let previous = self.current;
         let mut next = self.scheduler.schedule(0).ok().flatten();
+        if next.is_none() && self.complete_idle_gpu_submission() {
+            next = self.scheduler.schedule(0).ok().flatten();
+        }
         if next.is_none() && self.complete_idle_estimated_vblank() {
             next = self.scheduler.schedule(0).ok().flatten();
         }
@@ -2613,12 +2679,22 @@ impl ProcessManager {
             Ok(object) => object,
             Err(error) => return error,
         };
-        let mut rights = Rights::MAP;
-        if descriptor.usage.contains(BufferUsage::CPU_READ) {
+        let mut rights = Rights::NONE;
+        if descriptor.usage.contains(BufferUsage::CPU_READ)
+            || descriptor.usage.contains(BufferUsage::SCANOUT)
+            || descriptor.usage.contains(BufferUsage::TRANSFER_SOURCE)
+        {
             rights = rights.union(Rights::READ);
         }
-        if descriptor.usage.contains(BufferUsage::CPU_WRITE) {
+        if descriptor.usage.contains(BufferUsage::CPU_WRITE)
+            || descriptor.usage.contains(BufferUsage::RENDER_TARGET)
+        {
             rights = rights.union(Rights::WRITE);
+        }
+        if descriptor.usage.contains(BufferUsage::CPU_READ)
+            || descriptor.usage.contains(BufferUsage::CPU_WRITE)
+        {
+            rights = rights.union(Rights::MAP);
         }
         if descriptor.memory_domains.contains(MemoryDomain::SHARED) {
             rights = rights.union(Rights::TRANSFER);
@@ -2871,6 +2947,7 @@ impl ProcessManager {
         let sequence = self.display_present_sequence.wrapping_add(1).max(1);
         let graphics = &self.graphics;
         if let Err(error) = scanout::present_graphics(
+            object,
             descriptor,
             |page| graphics.physical_page(object, page).ok(),
             sequence,
@@ -2972,6 +3049,341 @@ impl ProcessManager {
                 let _ = self.scheduler.wake(thread.tid);
             }
         }
+    }
+
+    fn gpu_get_info(&self, process_index: usize, handle: Handle, address: u64) -> i64 {
+        if !self.user_writable(process_index, address, size_of::<GpuDeviceInfo>()) {
+            return status::INVALID_ARGUMENT;
+        }
+        if let Err(error) = self.processes[process_index]
+            .as_ref()
+            .expect("process")
+            .resolve(handle, CapabilityKind::GpuRender(0), Rights::READ)
+        {
+            return error;
+        }
+        let info = match scanout::render_info() {
+            Ok(info) => info,
+            Err(error) => return gpu_status(error),
+        };
+        self.write_struct(process_index, address, &info)
+            .map(|_| status::OK)
+            .unwrap_or(status::INVALID_ARGUMENT)
+    }
+
+    fn gpu_context_create(
+        &mut self,
+        process_index: usize,
+        render: Handle,
+        request_address: u64,
+    ) -> i64 {
+        let request = match self.read_struct::<GpuContextCreate>(process_index, request_address) {
+            Ok(request) if request.validate().is_ok() => request,
+            _ => return status::INVALID_ARGUMENT,
+        };
+        if let Err(error) = self.processes[process_index]
+            .as_ref()
+            .expect("process")
+            .resolve(render, CapabilityKind::GpuRender(0), Rights::WRITE)
+        {
+            return error;
+        }
+        if self.gpu_context_active {
+            return status::BUSY;
+        }
+        let Some(slot) = self.processes[process_index]
+            .as_ref()
+            .expect("process")
+            .free_capability_slot()
+        else {
+            return status::LIMIT_REACHED;
+        };
+        let name_length = request
+            .debug_name
+            .iter()
+            .position(|byte| *byte == 0)
+            .unwrap_or(request.debug_name.len());
+        if let Err(error) = scanout::create_render_context(1, &request.debug_name[..name_length]) {
+            return gpu_status(error);
+        }
+        self.gpu_context_active = true;
+        self.gpu_imports = [None; MAX_GPU_IMPORTS];
+        self.processes[process_index]
+            .as_mut()
+            .expect("process")
+            .capabilities[slot] = CapabilityEntry {
+            kind: CapabilityKind::GpuContext(1),
+            rights: Rights::READ.union(Rights::WRITE),
+        };
+        slot as i64
+    }
+
+    fn gpu_resource_import(
+        &mut self,
+        process_index: usize,
+        context_handle: Handle,
+        buffer_handle: Handle,
+        request_address: u64,
+    ) -> i64 {
+        let _request = match self.read_struct::<GpuResourceImport>(process_index, request_address) {
+            Ok(request) if request.validate().is_ok() => request,
+            _ => return status::INVALID_ARGUMENT,
+        };
+        if let Err(error) = self.processes[process_index]
+            .as_ref()
+            .expect("process")
+            .resolve(context_handle, CapabilityKind::GpuContext(1), Rights::WRITE)
+        {
+            return error;
+        }
+        let object = match self.processes[process_index]
+            .as_ref()
+            .expect("process")
+            .capability(buffer_handle, Rights::WRITE)
+        {
+            Ok(CapabilityEntry {
+                kind: CapabilityKind::GraphicsBuffer(object),
+                ..
+            }) => object,
+            Ok(_) => return status::ACCESS_DENIED,
+            Err(error) => return error,
+        };
+        if self
+            .gpu_imports
+            .iter()
+            .flatten()
+            .any(|import| *import == object)
+        {
+            return status::BUSY;
+        }
+        let descriptor = match self.graphics.descriptor(object) {
+            Ok(descriptor) => descriptor,
+            Err(error) => return error,
+        };
+        if !descriptor.usage.contains(BufferUsage::RENDER_TARGET)
+            || !descriptor.usage.contains(BufferUsage::SCANOUT)
+            || descriptor.usage.contains(BufferUsage::CPU_WRITE)
+            || !descriptor.memory_domains.contains(MemoryDomain::SYSTEM)
+            || !descriptor.memory_domains.contains(MemoryDomain::SHARED)
+        {
+            return status::ACCESS_DENIED;
+        }
+        let backing = match self.graphics.contiguous_backing(object) {
+            Ok(backing) => backing,
+            Err(error) => return error,
+        };
+        let Some(import_slot) = self.gpu_imports.iter().position(Option::is_none) else {
+            return status::LIMIT_REACHED;
+        };
+        // Удерживаем backing до публикации resource устройству. Так даже
+        // редкая ошибка refcount не оставит активный DMA на освобождённую RAM.
+        if self.graphics.retain_capability(object).is_err() {
+            return status::LIMIT_REACHED;
+        }
+        let resource = match scanout::import_render_target(1, object, descriptor, backing) {
+            Ok(resource) => resource,
+            Err(error) => {
+                self.graphics.release_capability(object);
+                return gpu_status(error);
+            }
+        };
+        self.gpu_imports[import_slot] = Some(object);
+        resource as i64
+    }
+
+    fn gpu_resource_create(
+        &mut self,
+        process_index: usize,
+        context_handle: Handle,
+        request_address: u64,
+    ) -> i64 {
+        let request = match self.read_struct::<GpuResourceCreate>(process_index, request_address) {
+            Ok(request) if request.validate().is_ok() => request,
+            _ => return status::INVALID_ARGUMENT,
+        };
+        if let Err(error) = self.processes[process_index]
+            .as_ref()
+            .expect("process")
+            .resolve(context_handle, CapabilityKind::GpuContext(1), Rights::WRITE)
+        {
+            return error;
+        }
+        scanout::create_render_resource(1, request)
+            .map(i64::from)
+            .unwrap_or_else(gpu_status)
+    }
+
+    fn gpu_submit(
+        &mut self,
+        process_index: usize,
+        context_handle: Handle,
+        request_address: u64,
+    ) -> i64 {
+        let request = match self.read_struct::<GpuSubmit>(process_index, request_address) {
+            Ok(request) if request.validate().is_ok() => request,
+            _ => return status::INVALID_ARGUMENT,
+        };
+        if self.gpu_submission.is_some() {
+            return status::BUSY;
+        }
+        if let Err(error) = self.processes[process_index]
+            .as_ref()
+            .expect("process")
+            .resolve(context_handle, CapabilityKind::GpuContext(1), Rights::WRITE)
+        {
+            return error;
+        }
+        let timeline = match self.processes[process_index]
+            .as_ref()
+            .expect("process")
+            .capability(request.completion_timeline, Rights::WRITE)
+        {
+            Ok(CapabilityEntry {
+                kind: CapabilityKind::SyncTimeline(timeline),
+                ..
+            }) => timeline,
+            Ok(_) => return status::ACCESS_DENIED,
+            Err(error) => return error,
+        };
+        if match self.timelines.value(timeline) {
+            Ok(value) => request.completion_value <= value,
+            Err(_) => true,
+        } {
+            return status::INVALID_ARGUMENT;
+        }
+        let mut commands = [0u8; GPU_MAX_COMMAND_BYTES as usize];
+        let command_length = request.command_bytes as usize;
+        if let Err(error) = self.copy_from_process(
+            process_index,
+            request.commands_address,
+            &mut commands[..command_length],
+        ) {
+            return error;
+        }
+        // Timeline reference должен существовать ещё до публикации descriptor
+        // в Virtqueue: очень быстрое устройство вправе завершить команду сразу.
+        if self.timelines.retain(timeline).is_err() {
+            return status::LIMIT_REACHED;
+        }
+        let fence = match scanout::submit_render(1, &commands[..command_length]) {
+            Ok(fence) => fence,
+            Err(error) => {
+                let _ = self.timelines.release(timeline);
+                return gpu_status(error);
+            }
+        };
+        self.gpu_submission = Some(PendingGpuSubmission {
+            fence,
+            timeline,
+            value: request.completion_value,
+        });
+        fence as i64
+    }
+
+    fn poll_gpu_completion(&mut self) {
+        let Some(pending) = self.gpu_submission else {
+            return;
+        };
+        let completion = match scanout::poll_render() {
+            Ok(Some(completion)) => completion,
+            Ok(None) => return,
+            Err(_) => {
+                self.finish_gpu_submission(pending, status::IO_ERROR);
+                return;
+            }
+        };
+        if completion.fence_id != pending.fence {
+            // Синхронная display-команда могла завершиться раньше render
+            // fence. Ожидаемый submission остаётся активным и будет опрошен
+            // на следующем tick.
+            self.gpu_last_fence = completion.fence_id;
+            self.gpu_last_status = status::IO_ERROR;
+            return;
+        }
+        let result = if completion.succeeded {
+            status::OK
+        } else {
+            status::IO_ERROR
+        };
+        self.finish_gpu_submission(pending, result);
+    }
+
+    fn finish_gpu_submission(&mut self, pending: PendingGpuSubmission, result: i64) {
+        self.gpu_last_fence = pending.fence;
+        self.gpu_last_status = result;
+        let _ = self.timelines.signal(pending.timeline, pending.value);
+        let _ = self.timelines.release(pending.timeline);
+        self.gpu_submission = None;
+    }
+
+    /// Bootstrap scheduler пока не имеет отдельного kernel idle thread. Если
+    /// runnable user threads закончились ровно на ожидании GPU timeline,
+    /// осушаем только этот fence и сразу будим waiter. При наличии другой
+    /// работы completion остаётся неблокирующим timer bottom half.
+    fn complete_idle_gpu_submission(&mut self) -> bool {
+        let Some(pending) = self.gpu_submission else {
+            return false;
+        };
+        let result = match scanout::drain_render(pending.fence) {
+            Ok(completion) if completion.succeeded => status::OK,
+            Ok(_) | Err(_) => status::IO_ERROR,
+        };
+        self.finish_gpu_submission(pending, result);
+        true
+    }
+
+    fn gpu_completion_status(
+        &self,
+        process_index: usize,
+        context_handle: Handle,
+        fence: u64,
+    ) -> i64 {
+        if self.processes[process_index]
+            .as_ref()
+            .expect("process")
+            .resolve(context_handle, CapabilityKind::GpuContext(1), Rights::READ)
+            .is_err()
+        {
+            return status::ACCESS_DENIED;
+        }
+        if self
+            .gpu_submission
+            .is_some_and(|submission| submission.fence == fence)
+        {
+            return status::BUSY;
+        }
+        if fence == self.gpu_last_fence {
+            self.gpu_last_status
+        } else {
+            status::NOT_FOUND
+        }
+    }
+
+    fn release_gpu_context(&mut self, context: u8) {
+        if context != 1 || !self.gpu_context_active {
+            return;
+        }
+        if let Some(pending) = self.gpu_submission.take() {
+            // Нельзя освободить GraphicsBuffer, пока host renderer ещё может
+            // писать в его кадры. На штатном пути fence уже снят timer'ом;
+            // этот drain обслуживает kill/crash renderd.
+            let completion = scanout::drain_render(pending.fence);
+            self.gpu_last_fence = pending.fence;
+            self.gpu_last_status = if completion.is_ok_and(|done| done.succeeded) {
+                status::OK
+            } else {
+                status::IO_ERROR
+            };
+            let _ = self.timelines.signal(pending.timeline, pending.value);
+            let _ = self.timelines.release(pending.timeline);
+        }
+        scanout::destroy_render_context(u32::from(context));
+        for object in self.gpu_imports.iter_mut().filter_map(Option::take) {
+            self.graphics.release_capability(object);
+        }
+        self.gpu_context_active = false;
+        self.gpu_last_fence = 0;
+        self.gpu_last_status = status::NOT_FOUND;
     }
 
     fn sync_timeline_create(&mut self, process_index: usize, request_address: u64) -> i64 {
@@ -3281,6 +3693,14 @@ impl ProcessManager {
             Ok(source) => source,
             Err(error) => return error,
         };
+        if matches!(
+            source.kind,
+            CapabilityKind::DisplayScanout(_)
+                | CapabilityKind::GpuRender(_)
+                | CapabilityKind::GpuContext(_)
+        ) {
+            return status::ACCESS_DENIED;
+        }
         let rights = match derive_capability_rights(source.rights, requested) {
             Ok(rights) => rights,
             Err(CapabilityTransferError::EmptyRights) => return status::INVALID_ARGUMENT,
@@ -4002,6 +4422,7 @@ impl ProcessManager {
                     self.wake_pipe_waiters(pipe, true);
                 }
             }
+            CapabilityKind::GpuContext(context) => self.release_gpu_context(context),
             _ => {}
         }
     }
@@ -4309,8 +4730,15 @@ pub(super) fn run_milestone(info: &rustos_abi::BootInfo) -> Result<(), ProcessEr
 
     if run_graphics_service_phase(manager)? {
         serial::put_str(
-            "[graphics-abi-v6] exclusive scanout atomic-present estimated-vblank supervisor-restart verified\n",
+            "[graphics-abi-v7] graphics-buffer sync-timeline atomic-present supervisor-restart verified\n",
         );
+        if scanout::render_info().is_ok() {
+            serial::put_str(
+                "[virgl] ring3 renderd async-fence triangle zero-copy scanout verified\n",
+            );
+        } else {
+            serial::put_str("[virgl] unavailable: device did not negotiate VIRTIO_GPU_F_VIRGL\n");
+        }
     } else {
         serial::put_str("[graphics] native scanout unavailable; kernel fallback remains active\n");
     }
@@ -4397,9 +4825,15 @@ pub(super) fn start_interactive_services() -> Result<(), ProcessError> {
     unsafe { GRAPHICS_RESTARTS = 0 };
     serial::put_str("[services] persistent ring3 vfsd ready for GUI terminal\n");
     if graphics.is_some() {
-        serial::put_str(
-            "[supervisor] persistent displayd/compositord atomic-present services ready\n",
-        );
+        if scanout::render_info().is_ok() {
+            serial::put_str(
+                "[supervisor] persistent renderd/compositord/displayd services ready\n",
+            );
+        } else {
+            serial::put_str(
+                "[supervisor] persistent displayd/compositord atomic-present services ready\n",
+            );
+        }
     } else {
         serial::put_str("[supervisor] display services omitted: firmware scanout fallback\n");
     }
@@ -4434,9 +4868,14 @@ pub(super) fn pump_interactive_services() -> Result<(), ProcessError> {
     }
     stop_service(manager, services.display, 81);
     stop_service(manager, services.compositor, 82);
+    if let Some(render) = services.render {
+        stop_service(manager, render, 83);
+    }
     manager.recover_display_master_after_exit();
     manager.endpoints[0] = Endpoint::EMPTY;
     manager.endpoints[3] = Endpoint::EMPTY;
+    manager.endpoints[4] = Endpoint::EMPTY;
+    manager.endpoints[5] = Endpoint::EMPTY;
     let restarted = spawn_graphics_services(manager)?;
     manager.run()?;
     if !graphics_services_blocked(manager, restarted) {
@@ -4795,6 +5234,7 @@ fn run_vfs_phase(
 struct GraphicsServices {
     display: ProcessId,
     compositor: ProcessId,
+    render: Option<ProcessId>,
 }
 
 /// End-to-end графический data plane: exclusive scanout capability получает
@@ -4819,11 +5259,19 @@ fn run_graphics_service_phase(manager: &mut ProcessManager) -> Result<bool, Proc
     // должен пройти тот же atomic present/vblank path без stale capability.
     manager.finish_process(first.display, normal_exit(71));
     manager.finish_process(first.compositor, normal_exit(72));
+    if let Some(render) = first.render {
+        manager.finish_process(render, normal_exit(73));
+    }
     manager.reap_process(first.display);
     manager.reap_process(first.compositor);
+    if let Some(render) = first.render {
+        manager.reap_process(render);
+    }
     manager.recover_display_master_after_exit();
     manager.endpoints[0] = Endpoint::EMPTY;
     manager.endpoints[3] = Endpoint::EMPTY;
+    manager.endpoints[4] = Endpoint::EMPTY;
+    manager.endpoints[5] = Endpoint::EMPTY;
     let restarted = spawn_graphics_services(manager)?;
     if let Err(error) = manager.run() {
         manager.cleanup();
@@ -4840,8 +5288,14 @@ fn run_graphics_service_phase(manager: &mut ProcessManager) -> Result<bool, Proc
 fn spawn_graphics_services(manager: &mut ProcessManager) -> Result<GraphicsServices, ProcessError> {
     const DISPLAY_ENDPOINT: u8 = 0;
     const FEEDBACK_ENDPOINT: u8 = 3;
+    const GPU_FRAME_ENDPOINT: u8 = 4;
+    const GPU_CONTROL_ENDPOINT: u8 = 5;
     const DISPLAY_SLOT: usize = 2;
     const DEVICE_OR_FEEDBACK_SLOT: usize = 3;
+    const GPU_FRAME_SLOT: usize = 4;
+    const GPU_CONTROL_SLOT: usize = 5;
+    const GPU_MODE_FLAG: u64 = 1 << 63;
+    let use_gpu = scanout::render_info().is_ok();
 
     let mut display_caps = [EMPTY_CAPABILITY; MAX_CAPABILITIES];
     display_caps[DISPLAY_SLOT] = CapabilityEntry {
@@ -4878,6 +5332,16 @@ fn spawn_graphics_services(manager: &mut ProcessManager) -> Result<GraphicsServi
         kind: CapabilityKind::Endpoint(FEEDBACK_ENDPOINT),
         rights: Rights::SEND.union(Rights::RECEIVE).union(Rights::TRANSFER),
     };
+    if use_gpu {
+        compositor_caps[GPU_FRAME_SLOT] = CapabilityEntry {
+            kind: CapabilityKind::Endpoint(GPU_FRAME_ENDPOINT),
+            rights: Rights::RECEIVE,
+        };
+        compositor_caps[GPU_CONTROL_SLOT] = CapabilityEntry {
+            kind: CapabilityKind::Endpoint(GPU_CONTROL_ENDPOINT),
+            rights: Rights::SEND,
+        };
+    }
     let compositor = manager.spawn_internal(
         "system/bin/compositord.rune",
         SpawnOptions {
@@ -4886,7 +5350,7 @@ fn spawn_graphics_services(manager: &mut ProcessManager) -> Result<GraphicsServi
             boot_arguments: [
                 DISPLAY_SLOT as u64,
                 DEVICE_OR_FEEDBACK_SLOT as u64,
-                syscall::ABI_VERSION,
+                syscall::ABI_VERSION | if use_gpu { GPU_MODE_FLAG } else { 0 },
             ],
             expected: None,
         },
@@ -4894,15 +5358,54 @@ fn spawn_graphics_services(manager: &mut ProcessManager) -> Result<GraphicsServi
         None,
     )?;
     manager.endpoints[FEEDBACK_ENDPOINT as usize].receiver = compositor;
+    let render = if use_gpu {
+        let mut render_caps = [EMPTY_CAPABILITY; MAX_CAPABILITIES];
+        render_caps[DISPLAY_SLOT] = CapabilityEntry {
+            kind: CapabilityKind::Endpoint(GPU_FRAME_ENDPOINT),
+            rights: Rights::SEND,
+        };
+        render_caps[DEVICE_OR_FEEDBACK_SLOT] = CapabilityEntry {
+            kind: CapabilityKind::GpuRender(0),
+            rights: Rights::READ.union(Rights::WRITE),
+        };
+        render_caps[GPU_FRAME_SLOT] = CapabilityEntry {
+            kind: CapabilityKind::Endpoint(GPU_CONTROL_ENDPOINT),
+            rights: Rights::RECEIVE,
+        };
+        let render = manager.spawn_internal(
+            "system/bin/renderd.rune",
+            SpawnOptions {
+                parent: ProcessId::KERNEL,
+                priority: PriorityClass::Driver,
+                boot_arguments: [
+                    DISPLAY_SLOT as u64,
+                    DEVICE_OR_FEEDBACK_SLOT as u64,
+                    syscall::ABI_VERSION,
+                ],
+                expected: None,
+            },
+            render_caps,
+            None,
+        )?;
+        manager.endpoints[GPU_FRAME_ENDPOINT as usize].receiver = compositor;
+        manager.endpoints[GPU_CONTROL_ENDPOINT as usize].receiver = render;
+        Some(render)
+    } else {
+        None
+    };
     Ok(GraphicsServices {
         display,
         compositor,
+        render,
     })
 }
 
 fn graphics_services_blocked(manager: &ProcessManager, services: GraphicsServices) -> bool {
     service_blocked_on(manager, services.display, 0)
         && service_blocked_on(manager, services.compositor, 3)
+        && services
+            .render
+            .is_none_or(|render| service_blocked_on(manager, render, 5))
         && manager.display_present_sequence == manager.display_completed_sequence
         && manager.display_completed_sequence != 0
 }
@@ -5167,6 +5670,10 @@ fn display_status(error: DisplayBrokerError) -> i64 {
         DisplayBrokerError::DeviceLost => status::IO_ERROR,
         DisplayBrokerError::OutOfMemory => status::OUT_OF_MEMORY,
     }
+}
+
+fn gpu_status(error: DisplayBrokerError) -> i64 {
+    display_status(error)
 }
 
 fn next_refresh_deadline(now: u64, requested: u64, interval: u64) -> u64 {

@@ -14,12 +14,13 @@
 2. **surfaces/raster** хранят пиксели приложений и выполняют CPU-операции;
 3. **compositor** собирает произвольное число окон и overlays только в damage.
 
-Сейчас основной scanout — собственный драйвер **virtio-gpu 2D** поверх
+Сейчас основной scanout — собственный драйвер **virtio-gpu** поверх
 modern virtio-pci на AMD64 и modern virtio-mmio на AArch64. Он получает EDID,
 перечисляет широкоформатные
-режимы, создаёт 32-bit BGRX resource и меняет scanout без
-перезапуска. Закрытые GPU API, VirGL и host OpenGL не нужны:
-вся отрисовка по-прежнему выполняется CPU.
+режимы, создаёт 32-bit BGRX resource и меняет scanout без перезапуска.
+Гарантированный fallback остаётся 2D/CPU, а при feature
+`VIRTIO_GPU_F_VIRGL` изолированный ring-3 `renderd` выполняет 3D-команды и
+передаёт GPU-only `GraphicsBuffer` на тот же scanout без CPU-копии.
 
 GRUB Multiboot2 framebuffer остался надёжным fallback. Если virtio-gpu нет
 или transport не прошёл negotiation, kernel продолжает работу с
@@ -36,23 +37,24 @@ Policy `actual` сохраняет строгое окно 1:1 для pixel-leve
 выполняется до rasterization через `WindowMetrics`; scanout и compositor
 по-прежнему получают physical surface и публикуют её `1:1`.
 
-## Virtio-gpu 2D
+## Virtio-gpu 2D и VirGL
 
 Драйвер разделён на независимые уровни:
 
 - `display/pci.rs` находит PCI function `1af4:1050`, BAR и vendor
   capabilities common/notify/ISR/device;
 - `display/virtqueue.rs` выполняет Virtio 1.x feature negotiation и
-  обслуживает bounded split control queue. На bootstrap-этапе в очереди
-  не больше одной команды, completion ожидается polling'ом с
-  timeout;
+  обслуживает bounded split control queue с четырьмя независимыми DMA slots;
+  bootstrap-команды имеют bounded polling, 3D submit завершается асинхронно
+  через fence/timeline;
 - `display/virtqueue_mmio.rs` предоставляет тому же GPU protocol modern MMIO
   transport QEMU ARM `virt`; scanout/mode-set код не дублируется;
 - `display/edid.rs` проверяет signature/checksum EDID 1.x и извлекает
   preferred/standard timings и физический размер монитора;
 - `display/virtio_gpu.rs` реализует `GET_DISPLAY_INFO`, `GET_EDID`,
   `RESOURCE_CREATE_2D`, `ATTACH_BACKING`, `SET_SCANOUT`,
-  `TRANSFER_TO_HOST_2D`, `RESOURCE_FLUSH`, `DETACH_BACKING` и `UNREF`.
+  `TRANSFER_TO_HOST_2D`, `RESOURCE_FLUSH`, `DETACH_BACKING`, `UNREF`, а также
+  classic VirGL contexts, 3D resources и fenced `SUBMIT_3D`.
 
 При present драйвер копирует из software surface только damage rectangles,
 после чего отправляет transfer + flush для тех же областей.
@@ -157,9 +159,10 @@ size, fractional scale и target presentation time. ABI проверяет
 bitmap нельзя случайно выдать за HiDPI. Kernel objects уже реализуют
 generation-safe lifetime, отдельные capability/mapping references и
 блокирующий wait/wait-many. Постоянный ring-3 `displayd` один получает
-непередаваемую scanout capability, публикует buffer через atomic present и
-возвращает typed feedback постоянному `compositord`. Подробности и граница
-оценочного vblank описаны в [GRAPHICS_ABI.md](GRAPHICS_ABI.md).
+непередаваемую scanout capability, а `renderd` — отдельную render capability;
+они обмениваются только buffers/fences через `compositord`. Подробности и
+граница оценочного vblank описаны в [GRAPHICS_ABI.md](GRAPHICS_ABI.md), а
+3D-путь — в [GPU_RENDERING.md](GPU_RENDERING.md).
 
 ## Много окон и изоляция
 
@@ -175,13 +178,14 @@ full-frame buffer на bounded multi-buffer queue с damage. Bootstrap kernel
 desktop останется только аварийным fallback. Падение клиента должно удалять
 только его buffer queue и layers, не останавливая desktop.
 
-## Software OpenGL и видео
+## OpenGL и видео
 
-Software OpenGL должен рендерить не в firmware framebuffer, а в ARGB/RGB surface приложения.
-SwapBuffers станет surface commit: compositor заберёт последний полностью
-готовый buffer и отбросит устаревшие кадры. Начальный практичный путь — API
-совместимости OpenGL поверх software rasterizer/softpipe; аппаратный backend
-позже реализует тот же контракт buffers/fences.
+OpenGL должен рендерить не в firmware framebuffer, а в GraphicsBuffer
+приложения. SwapBuffers станет surface commit: compositor заберёт последний
+полностью готовый buffer и отбросит устаревшие кадры. Первый VirGL triangle
+уже проходит через ring-3 renderer без guest CPU rasterization. Следующий
+практичный путь — Mesa Gallium VirGL winsys; software rasterizer остаётся
+fallback для устройств без 3D.
 
 Для видео нужен тот же путь:
 
@@ -228,10 +232,11 @@ damage и fence, а сами пиксели остаются в shared memory.
 - PCI bridge enumeration, IOMMU/DMA isolation и несколько мониторов;
 - native KMS-подобные драйверы для конкретного железа;
 - перенос compositor/input/terminal из kernel bootstrap в ring 3;
-- software OpenGL compatibility layer, затем порт Mesa по частям.
+- Mesa Gallium VirGL winsys, затем native V3D backend для Raspberry Pi 4.
 
-Текущих гарантий пока недостаточно для плавного видео: virtio-gpu backend
-синхронно ожидает transfer/flush и не имеет VSync event. Но surfaces,
+Текущих гарантий пока недостаточно для плавного видео: CPU fallback
+синхронно ожидает transfer/flush, а Virtio GPU не даёт точный VSync event.
+Но surfaces,
 alpha, damage и layer ABI уже отделены от этого ограничения и не потребуют
 переписывания при появлении asynchronous или native backend.
 

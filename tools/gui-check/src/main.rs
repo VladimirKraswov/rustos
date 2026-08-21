@@ -107,6 +107,18 @@ fn main() {
         usage();
         std::process::exit(2);
     });
+    if before_path == "--virgl" {
+        let path = args.next().unwrap_or_else(|| {
+            usage();
+            std::process::exit(2);
+        });
+        let image = match Image::read(Path::new(&path)) {
+            Ok(image) => image,
+            Err(error) => fatal(error),
+        };
+        verify_virgl_triangle(&image);
+        return;
+    }
     let dragged_path = args.next().unwrap_or_else(|| {
         usage();
         std::process::exit(2);
@@ -187,8 +199,49 @@ fn main() {
     );
 }
 
+fn verify_virgl_triangle(image: &Image) {
+    let background = image.rgb(8, 8);
+    if background[0] > 24 || background[1] > 32 || !(18..=48).contains(&background[2]) {
+        fatal(format!(
+            "VirGL background has unexpected color: {background:?}"
+        ));
+    }
+    let center = image.rgb(image.width / 2, image.height / 2);
+    let distance = center
+        .iter()
+        .zip(background)
+        .map(|(value, base)| value.abs_diff(base) as usize)
+        .sum::<usize>();
+    if distance < 90 {
+        fatal(format!(
+            "center was not rasterized by triangle pipeline: bg={background:?}, center={center:?}"
+        ));
+    }
+    let mut colored = 0usize;
+    for y in (image.height / 5..image.height * 4 / 5).step_by(4) {
+        for x in (image.width / 5..image.width * 4 / 5).step_by(4) {
+            let pixel = image.rgb(x, y);
+            let delta = pixel
+                .iter()
+                .zip(background)
+                .map(|(value, base)| value.abs_diff(base) as usize)
+                .sum::<usize>();
+            colored += usize::from(delta > 80);
+        }
+    }
+    if colored < 1000 {
+        fatal(format!(
+            "VirGL triangle area is too small or absent: samples={colored}"
+        ));
+    }
+    println!(
+        "VirGL verify OK: {}x{}, GPU triangle covers {} sampled pixels",
+        image.width, image.height, colored
+    );
+}
+
 fn usage() {
-    eprintln!("usage: rustos-gui-check <terminal.ppm> <dragged.ppm> <minimized.ppm>");
+    eprintln!("usage: rustos-gui-check <terminal.ppm> <dragged.ppm> <minimized.ppm> | --virgl <triangle.ppm>");
 }
 
 fn fatal(message: String) -> ! {

@@ -1,14 +1,15 @@
-//! Virtio GPU 2D display driver (Virtio 1.x modern PCI transport).
+//! Virtio GPU display/render driver (Virtio 1.x PCI и MMIO transport).
 //!
-//! Драйвер использует только обязательный unaccelerated 2D command set:
-//! display info/EDID, resource create, attach backing, set scanout,
-//! transfer-to-host и flush. VirGL и host-specific API намеренно не нужны:
-//! compositor остаётся CPU-only, а протокол уже пригоден для user-space
-//! `displayd` и software OpenGL surfaces.
+//! 2D command set остаётся надёжным fallback. Если device предлагает VirGL,
+//! отдельный ring-3 `renderd` получает контекст, импортирует GraphicsBuffer и
+//! отправляет fenced 3D command stream через асинхронную control queue.
 
 use core::ptr;
 
-use rustos_abi::graphics_buffer::{GraphicsBufferDesc, PixelFormatCode};
+use rustos_abi::{
+    gpu::{feature, GpuDeviceInfo, GpuResourceCreate, GPU_ABI_VERSION, GPU_MAX_COMMAND_BYTES},
+    graphics_buffer::{GraphicsBufferDesc, PixelFormatCode},
+};
 use rustos_video::{
     ConnectorInfo, ConnectorKind, CpuPixelFormat, CpuSurface, DisplayMode, ModeSetError,
     PresentStats, Rect, ScanoutCapabilities, ScanoutError,
@@ -37,10 +38,21 @@ const CMD_TRANSFER_TO_HOST_2D: u32 = 0x0105;
 const CMD_RESOURCE_ATTACH_BACKING: u32 = 0x0106;
 const CMD_RESOURCE_DETACH_BACKING: u32 = 0x0107;
 const CMD_GET_EDID: u32 = 0x010a;
+const CMD_GET_CAPSET_INFO: u32 = 0x0108;
+const CMD_CTX_CREATE: u32 = 0x0200;
+const CMD_CTX_DESTROY: u32 = 0x0201;
+const CMD_CTX_ATTACH_RESOURCE: u32 = 0x0202;
+const CMD_CTX_DETACH_RESOURCE: u32 = 0x0203;
+const CMD_RESOURCE_CREATE_3D: u32 = 0x0204;
+const CMD_SUBMIT_3D: u32 = 0x0207;
 const RESP_OK_NODATA: u32 = 0x1100;
 const RESP_OK_DISPLAY_INFO: u32 = 0x1101;
 const RESP_OK_EDID: u32 = 0x1104;
+const RESP_OK_CAPSET_INFO: u32 = 0x1102;
 const FLAG_FENCE: u32 = 1;
+const RESOURCE_FLAG_Y_0_TOP: u32 = 1;
+const MAX_RENDER_RESOURCES: usize = 4;
+const NO_GRAPHICS_OBJECT: u16 = u16::MAX;
 const MIN_WIDTH: u32 = 640;
 const MIN_HEIGHT: u32 = 480;
 const MAX_WIDTH: u32 = 3840;
@@ -180,11 +192,93 @@ struct FlushRequest {
     padding: u32,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct GetCapsetInfoRequest {
+    header: ControlHeader,
+    index: u32,
+    padding: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct CapsetInfoResponse {
+    header: ControlHeader,
+    id: u32,
+    max_version: u32,
+    max_size: u32,
+    padding: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ContextCreateRequest {
+    header: ControlHeader,
+    name_length: u32,
+    context_init: u32,
+    name: [u8; 64],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Create3dRequest {
+    header: ControlHeader,
+    resource: u32,
+    target: u32,
+    format: u32,
+    bind: u32,
+    width: u32,
+    height: u32,
+    depth: u32,
+    array_size: u32,
+    last_level: u32,
+    samples: u32,
+    flags: u32,
+    padding: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Submit3dRequest {
+    header: ControlHeader,
+    size: u32,
+    padding: u32,
+}
+
 #[derive(Clone, Copy)]
 struct Resource {
     id: u32,
     backing: FrameBlock,
     bytes: u32,
+}
+
+#[derive(Clone, Copy)]
+struct RenderResource {
+    used: bool,
+    id: u32,
+    context: u32,
+    graphics_object: u16,
+    width: u32,
+    height: u32,
+    has_backing: bool,
+}
+
+impl RenderResource {
+    const EMPTY: Self = Self {
+        used: false,
+        id: 0,
+        context: 0,
+        graphics_object: NO_GRAPHICS_OBJECT,
+        width: 0,
+        height: 0,
+        has_backing: false,
+    };
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RenderCompletion {
+    pub fence_id: u64,
+    pub succeeded: bool,
 }
 
 pub struct VirtioGpu {
@@ -198,6 +292,12 @@ pub struct VirtioGpu {
     width_mm: u16,
     height_mm: u16,
     fence: u64,
+    active_scanout_resource: u32,
+    capset_id: u32,
+    capset_version: u32,
+    capset_size: u32,
+    render_context: u32,
+    render_resources: [RenderResource; MAX_RENDER_RESOURCES],
 }
 
 impl VirtioGpu {
@@ -225,7 +325,14 @@ impl VirtioGpu {
             width_mm: 0,
             height_mm: 0,
             fence: 0,
+            active_scanout_resource: 0,
+            capset_id: 0,
+            capset_version: 0,
+            capset_size: 0,
+            render_context: 0,
+            render_resources: [RenderResource::EMPTY; MAX_RENDER_RESOURCES],
         };
+        gpu.discover_capset();
         let (scanout, preferred) = gpu.display_info().unwrap_or((0, fallback));
         gpu.scanout = scanout;
         gpu.add_mode(preferred);
@@ -363,6 +470,8 @@ impl VirtioGpu {
         if source.width() != self.mode.width || source.height() != self.mode.height {
             return Err(ScanoutError::InvalidSurface);
         }
+        self.ensure_primary_scanout()
+            .map_err(|_| ScanoutError::DeviceLost)?;
         let bounds = Rect::new(0, 0, self.mode.width, self.mode.height);
         let target = self.resource.backing.phys as *mut u32;
         let mut rectangles = 0u32;
@@ -426,6 +535,8 @@ impl VirtioGpu {
         {
             return Err(ScanoutError::InvalidSurface);
         }
+        self.ensure_primary_scanout()
+            .map_err(|_| ScanoutError::DeviceLost)?;
         let plane = descriptor.planes[0];
         let row_bytes = usize::try_from(descriptor.width)
             .ok()
@@ -471,6 +582,280 @@ impl VirtioGpu {
             rectangles: 1,
             pixels: u64::from(self.mode.width) * u64::from(self.mode.height),
         })
+    }
+
+    /// Возможности render path. Отсутствие VirGL выражается `None`, а не
+    /// software fallback: caller не сможет случайно принять CPU за GPU.
+    pub fn render_info(&self) -> Option<GpuDeviceInfo> {
+        (self.transport.virgl_supported() && self.capset_id != 0).then_some(GpuDeviceInfo {
+            version: GPU_ABI_VERSION,
+            size: core::mem::size_of::<GpuDeviceInfo>() as u16,
+            reserved_header: 0,
+            features: feature::VIRGL | feature::ASYNC_FENCE | feature::ZERO_COPY_SCANOUT,
+            max_command_bytes: GPU_MAX_COMMAND_BYTES,
+            // Transport держит четыре DMA slot, однако process ABI намеренно
+            // допускает один незавершённый submit на bootstrap-контекст. Так
+            // нельзя случайно переиспользовать timeline/ресурс раньше fence.
+            max_inflight: 1,
+            max_contexts: 1,
+            capset_id: self.capset_id,
+            capset_version: self.capset_version,
+            capset_size: self.capset_size,
+            reserved: [0; 3],
+        })
+    }
+
+    pub fn create_render_context(&mut self, context: u32, name: &[u8]) -> Result<(), ModeSetError> {
+        if self.render_info().is_none() || context == 0 || self.render_context != 0 {
+            return Err(ModeSetError::RequiresReboot);
+        }
+        let mut request = ContextCreateRequest {
+            header: self.header(CMD_CTX_CREATE),
+            name_length: name.len().min(64) as u32,
+            // CONTEXT_INIT — отдельный negotiated feature. Classic VirGL
+            // context выбирает capset не этим полем, поэтому оно равно нулю.
+            context_init: 0,
+            name: [0; 64],
+        };
+        request.header.context_id = context;
+        request.name[..request.name_length as usize]
+            .copy_from_slice(&name[..request.name_length as usize]);
+        self.command_nodata(&request)?;
+        self.render_context = context;
+        Ok(())
+    }
+
+    pub fn import_render_target(
+        &mut self,
+        context: u32,
+        graphics_object: u16,
+        descriptor: GraphicsBufferDesc,
+        backing: FrameBlock,
+    ) -> Result<u32, ModeSetError> {
+        if context != self.render_context
+            || context == 0
+            || descriptor.format != PixelFormatCode::B8G8R8X8_UNORM
+            || backing.frames * 4096 < descriptor.byte_size
+            || descriptor.byte_size > u64::from(u32::MAX)
+            || self
+                .render_resources
+                .iter()
+                .any(|resource| resource.used && resource.graphics_object == graphics_object)
+        {
+            return Err(ModeSetError::UnsupportedMode);
+        }
+        let slot_index = self
+            .render_resources
+            .iter()
+            .position(|candidate| !candidate.used)
+            .ok_or(ModeSetError::OutOfMemory)?;
+        let resource = self.create_3d_resource(
+            context,
+            2,
+            GPU_FORMAT_B8G8R8X8_UNORM,
+            (1 << 1) | (1 << 8),
+            descriptor.width,
+            descriptor.height,
+            1,
+            1,
+            RESOURCE_FLAG_Y_0_TOP,
+        )?;
+        let attach = AttachBackingRequest {
+            header: self.header(CMD_RESOURCE_ATTACH_BACKING),
+            resource,
+            entries: 1,
+            entry: MemoryEntry {
+                address: backing.phys,
+                length: descriptor.byte_size as u32,
+                padding: 0,
+            },
+        };
+        if self.command_nodata(&attach).is_err() || self.attach_context(context, resource).is_err()
+        {
+            let _ = self.detach_resource(resource);
+            let _ = self.unref_resource(resource);
+            return Err(ModeSetError::DeviceLost);
+        }
+        self.render_resources[slot_index] = RenderResource {
+            used: true,
+            id: resource,
+            context,
+            graphics_object,
+            width: descriptor.width,
+            height: descriptor.height,
+            has_backing: true,
+        };
+        Ok(resource)
+    }
+
+    pub fn create_render_resource(
+        &mut self,
+        context: u32,
+        request: GpuResourceCreate,
+    ) -> Result<u32, ModeSetError> {
+        if context != self.render_context || request.validate().is_err() {
+            return Err(ModeSetError::UnsupportedMode);
+        }
+        let slot_index = self
+            .render_resources
+            .iter()
+            .position(|candidate| !candidate.used)
+            .ok_or(ModeSetError::OutOfMemory)?;
+        let resource = self.create_3d_resource(
+            context,
+            request.target,
+            request.format,
+            request.bind,
+            request.width,
+            request.height,
+            request.depth,
+            request.array_size,
+            0,
+        )?;
+        if self.attach_context(context, resource).is_err() {
+            let _ = self.unref_resource(resource);
+            return Err(ModeSetError::DeviceLost);
+        }
+        self.render_resources[slot_index] = RenderResource {
+            used: true,
+            id: resource,
+            context,
+            graphics_object: NO_GRAPHICS_OBJECT,
+            width: request.width,
+            height: request.height,
+            has_backing: false,
+        };
+        Ok(resource)
+    }
+
+    pub fn submit_render(&mut self, context: u32, commands: &[u8]) -> Result<u64, ModeSetError> {
+        if context != self.render_context || !valid_virgl_stream(commands) {
+            return Err(ModeSetError::UnsupportedMode);
+        }
+        let mut request = Submit3dRequest {
+            header: self.header(CMD_SUBMIT_3D),
+            size: commands.len() as u32,
+            padding: 0,
+        };
+        request.header.context_id = context;
+        let fence = request.header.fence_id;
+        let prefix = unsafe {
+            core::slice::from_raw_parts(
+                (&request as *const Submit3dRequest).cast::<u8>(),
+                core::mem::size_of::<Submit3dRequest>(),
+            )
+        };
+        self.transport
+            .submit_bytes(prefix, commands, core::mem::size_of::<ControlHeader>())
+            .map_err(map_transport)?;
+        Ok(fence)
+    }
+
+    pub fn poll_render(&mut self) -> Result<Option<RenderCompletion>, ModeSetError> {
+        self.transport
+            .poll_completion()
+            .map(|completion| {
+                completion.map(|completion| RenderCompletion {
+                    fence_id: completion.fence_id,
+                    succeeded: completion.response_kind == RESP_OK_NODATA,
+                })
+            })
+            .map_err(map_transport)
+    }
+
+    /// Дожидается конкретного fence только при аварийном teardown процесса.
+    /// Обычный render path всегда неблокирующий и завершается из timer bottom
+    /// half. Здесь ожидание необходимо, чтобы QEMU/реальный GPU не продолжал
+    /// DMA после освобождения capability-backed кадров.
+    pub fn drain_render(&mut self, fence_id: u64) -> Result<RenderCompletion, ModeSetError> {
+        for _ in 0..50_000_000 {
+            if let Some(completion) = self.poll_render()? {
+                if completion.fence_id == fence_id {
+                    return Ok(completion);
+                }
+            }
+            core::hint::spin_loop();
+        }
+        Err(ModeSetError::DeviceLost)
+    }
+
+    pub fn present_imported(
+        &mut self,
+        graphics_object: u16,
+        sequence: u64,
+    ) -> Result<Option<PresentStats>, ScanoutError> {
+        let Some(resource) = self
+            .render_resources
+            .iter()
+            .copied()
+            .find(|resource| resource.used && resource.graphics_object == graphics_object)
+        else {
+            return Ok(None);
+        };
+        if resource.width != self.mode.width || resource.height != self.mode.height {
+            return Err(ScanoutError::InvalidSurface);
+        }
+        if self.active_scanout_resource != resource.id {
+            self.set_scanout_resource(resource.id, self.mode)
+                .map_err(|_| ScanoutError::DeviceLost)?;
+        }
+        self.flush_resource(
+            resource.id,
+            Rect::new(0, 0, self.mode.width, self.mode.height),
+        )
+        .map_err(|_| ScanoutError::DeviceLost)?;
+        Ok(Some(PresentStats {
+            sequence,
+            rectangles: 1,
+            pixels: u64::from(self.mode.width) * u64::from(self.mode.height),
+        }))
+    }
+
+    pub fn destroy_render_context(&mut self, context: u32) {
+        if context == 0 || context != self.render_context {
+            return;
+        }
+        let _ = self.ensure_primary_scanout();
+        for index in 0..self.render_resources.len() {
+            let resource = self.render_resources[index];
+            if !resource.used || resource.context != context {
+                continue;
+            }
+            let _ = self.detach_context(context, resource.id);
+            if resource.has_backing {
+                let _ = self.detach_resource(resource.id);
+            }
+            let _ = self.unref_resource(resource.id);
+            self.render_resources[index] = RenderResource::EMPTY;
+        }
+        let mut request = self.header(CMD_CTX_DESTROY);
+        request.context_id = context;
+        let _ = self.command_nodata(&request);
+        self.render_context = 0;
+    }
+
+    fn discover_capset(&mut self) {
+        if !self.transport.virgl_supported() {
+            return;
+        }
+        for index in 0..self.transport.num_capsets().min(64) {
+            let request = GetCapsetInfoRequest {
+                header: self.header(CMD_GET_CAPSET_INFO),
+                index,
+                padding: 0,
+            };
+            let Ok(response) = self.transport.command::<_, CapsetInfoResponse>(&request) else {
+                return;
+            };
+            if response.header.kind == RESP_OK_CAPSET_INFO
+                && matches!(response.id, 1 | 2)
+                && (self.capset_id == 0 || response.id == 2)
+            {
+                self.capset_id = response.id;
+                self.capset_version = response.max_version;
+                self.capset_size = response.max_size;
+            }
+        }
     }
 
     fn display_info(&mut self) -> Result<(u32, DisplayMode), ModeSetError> {
@@ -611,6 +996,73 @@ impl VirtioGpu {
             scanout: self.scanout,
             resource,
         };
+        self.command_nodata(&request)?;
+        self.active_scanout_resource = resource;
+        Ok(())
+    }
+
+    fn ensure_primary_scanout(&mut self) -> Result<(), ModeSetError> {
+        if self.active_scanout_resource != self.resource.id {
+            self.set_scanout_resource(self.resource.id, self.mode)?;
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn create_3d_resource(
+        &mut self,
+        context: u32,
+        target: u32,
+        format: u32,
+        bind: u32,
+        width: u32,
+        height: u32,
+        depth: u32,
+        array_size: u32,
+        flags: u32,
+    ) -> Result<u32, ModeSetError> {
+        if self.render_resources.iter().all(|resource| resource.used) {
+            return Err(ModeSetError::OutOfMemory);
+        }
+        let resource = self.next_resource;
+        self.next_resource = self.next_resource.wrapping_add(1).max(1);
+        let request = Create3dRequest {
+            header: self.header(CMD_RESOURCE_CREATE_3D),
+            resource,
+            target,
+            format,
+            bind,
+            width,
+            height,
+            depth,
+            array_size,
+            last_level: 0,
+            samples: 0,
+            flags,
+            padding: 0,
+        };
+        let _ = context;
+        self.command_nodata(&request)?;
+        Ok(resource)
+    }
+
+    fn attach_context(&mut self, context: u32, resource: u32) -> Result<(), ModeSetError> {
+        let mut request = ResourceRequest {
+            header: self.header(CMD_CTX_ATTACH_RESOURCE),
+            resource,
+            padding: 0,
+        };
+        request.header.context_id = context;
+        self.command_nodata(&request)
+    }
+
+    fn detach_context(&mut self, context: u32, resource: u32) -> Result<(), ModeSetError> {
+        let mut request = ResourceRequest {
+            header: self.header(CMD_CTX_DETACH_RESOURCE),
+            resource,
+            padding: 0,
+        };
+        request.header.context_id = context;
         self.command_nodata(&request)
     }
 
@@ -654,6 +1106,10 @@ impl VirtioGpu {
     }
 
     fn flush(&mut self, rect: Rect) -> Result<(), ModeSetError> {
+        self.flush_resource(self.resource.id, rect)
+    }
+
+    fn flush_resource(&mut self, resource: u32, rect: Rect) -> Result<(), ModeSetError> {
         let request = FlushRequest {
             header: self.header(CMD_RESOURCE_FLUSH),
             rect: GpuRect {
@@ -662,7 +1118,7 @@ impl VirtioGpu {
                 width: rect.width,
                 height: rect.height,
             },
-            resource: self.resource.id,
+            resource,
             padding: 0,
         };
         self.command_nodata(&request)
@@ -684,6 +1140,39 @@ impl VirtioGpu {
             ..ControlHeader::ZERO
         }
     }
+}
+
+/// Проверяет framing VirGL stream до передачи host renderer'у. Содержимое
+/// команд остаётся задачей Mesa/renderd, но malformed length и неизвестные
+/// opcodes не могут заставить decoder выйти за command buffer.
+fn valid_virgl_stream(commands: &[u8]) -> bool {
+    if commands.is_empty()
+        || commands.len() > GPU_MAX_COMMAND_BYTES as usize
+        || !commands.len().is_multiple_of(4)
+    {
+        return false;
+    }
+    let mut offset = 0usize;
+    while offset < commands.len() {
+        let header = u32::from_le_bytes([
+            commands[offset],
+            commands[offset + 1],
+            commands[offset + 2],
+            commands[offset + 3],
+        ]);
+        let opcode = header as u8;
+        let payload = (header >> 16) as usize;
+        if payload == 0
+            || !matches!(opcode, 1 | 2 | 4 | 5 | 6 | 7 | 8 | 9 | 31 | 52)
+            || offset
+                .checked_add((payload + 1) * 4)
+                .is_none_or(|end| end > commands.len())
+        {
+            return false;
+        }
+        offset += (payload + 1) * 4;
+    }
+    offset == commands.len()
 }
 
 /// Ограничивает только начальный logical mode. Если monitor меньше лимита,
@@ -779,6 +1268,9 @@ fn map_transport(error: TransportError) -> ModeSetError {
         TransportError::Unsupported | TransportError::InvalidConfiguration => {
             ModeSetError::UnsupportedMode
         }
-        TransportError::RejectedFeatures | TransportError::Timeout => ModeSetError::DeviceLost,
+        TransportError::RejectedFeatures
+        | TransportError::Timeout
+        | TransportError::Busy
+        | TransportError::DeviceError => ModeSetError::DeviceLost,
     }
 }

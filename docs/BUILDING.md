@@ -21,6 +21,7 @@ make bootstrap   подготовить OVMF
 make build/run   ARM+HVF на Apple Silicon, AMD64 на остальных хостах
 make build-x86   явно собрать AMD64 GUI-образ
 make run-x86     явно запустить AMD64 VM
+make run-virgl   AMD64 + virtio-vga-gl; нужен QEMU с virglrenderer
 make build-arm   собрать полный ARM-образ (kernel/RUNE/VaraniaFS/AAVMF/ESP)
 make run-arm     запустить ARM-вариант (QEMU virt + UEFI)
 make lint        fmt + ShellCheck + Clippy -D warnings для host/обеих ISA/UEFI
@@ -30,6 +31,7 @@ make test-boot   GRUB/Multiboot2 + CPL3 RUNE/VFS/fault/reclaim test
 make test-arm-boot AAVMF + EL0/EL1/GICv3/PSCI/VFS test
 make test-arm-gui AAVMF + virtio GPU/input + SystemUI smoke test
 make test-gui    keyboard/mouse/window framebuffer test
+make test-virgl  ring-3 VirGL triangle -> GraphicsBuffer -> scanout test
 make test        полный test suite
 make clean       удалить генерируемые артефакты
 ```

@@ -8,7 +8,7 @@
 /// инструкции `svc` равно нулю.
 pub const INTERRUPT_VECTOR: u8 = 0x80;
 /// Версия syscall ABI, передаваемая вторым bootstrap-аргументом.
-pub const ABI_VERSION: u64 = 6;
+pub const ABI_VERSION: u64 = 7;
 
 /// Номера операций (`RAX`).
 pub mod number {
@@ -113,6 +113,18 @@ pub mod number {
     /// Блокироваться до predicted/hardware vblank sequence.
     /// `arg0=scanout, arg1=*const DisplayVblankWait`.
     pub const DISPLAY_WAIT_VBLANK: u64 = 41;
+    /// Получить render-device capabilities. `arg0=GpuRender, arg1=*mut GpuDeviceInfo`.
+    pub const GPU_GET_INFO: u64 = 42;
+    /// Создать изолированный context. `arg0=GpuRender, arg1=*const GpuContextCreate`.
+    pub const GPU_CONTEXT_CREATE: u64 = 43;
+    /// Импортировать GraphicsBuffer. `arg0=context, arg1=buffer, arg2=*GpuResourceImport`.
+    pub const GPU_RESOURCE_IMPORT: u64 = 44;
+    /// Создать context-local resource. `arg0=context, arg1=*GpuResourceCreate`.
+    pub const GPU_RESOURCE_CREATE: u64 = 45;
+    /// Асинхронно отправить VirGL stream. `arg0=context, arg1=*GpuSubmit`.
+    pub const GPU_SUBMIT: u64 = 46;
+    /// Прочитать status завершённого fence. `arg0=context, arg1=fence`.
+    pub const GPU_COMPLETION_STATUS: u64 = 47;
 }
 
 /// Отрицательные результаты syscall. Не совпадают с Unix errno намеренно:

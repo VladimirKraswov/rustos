@@ -25,7 +25,7 @@ RustOS — учебная 64-битная микроядерная операц�
 - ACPI MADT discovery и INIT–SIPI–SIPI запуск AP-ядер через 16/32/64-битный
   trampoline; AP пока безопасно parked до per-CPU TSS/IDT;
 - dynamic create/exit/reap с generation-safe PID/TID и полным reclaim;
-- process/capability ABI v6: ring-3 `spawn/wait/kill`, несколько потоков с
+- process/capability ABI v7: ring-3 `spawn/wait/kill`, несколько потоков с
   `create/join`, argv/environment, FS-base/TPIDR TLS и monotonic clock;
 - anonymous `map/unmap/protect` с W^X и shared-memory objects с раздельным
   учётом capability/mapping references;
@@ -41,6 +41,9 @@ RustOS — учебная 64-битная микроядерная операц�
 - настоящие kernel objects `GraphicsBuffer`/`SyncTimeline`, эксклюзивная
   scanout capability и atomic present с оценочным vblank через постоянные
   supervisor-сервисы `compositord`/`displayd`;
+- асинхронная Virtio GPU command queue, изолированный ring-3 `renderd` и
+  VirGL triangle, передаваемый через GraphicsBuffer на scanout без guest CPU
+  rasterization или копирования пикселей;
 - PS/2 input на PC и virtio-input keyboard/mouse на ARM VM;
 - desktop, taskbar, Start menu и icons;
 - window manager: drag, minimize, maximize, restore и close;
@@ -102,6 +105,7 @@ make lint
 make test-host
 make test-arch
 make test
+make test-virgl   # отдельный E2E-тест; нужен QEMU с virtio-vga-gl
 ```
 
 `make test` выполняет шесть разных сценариев:
@@ -134,16 +138,17 @@ user context, scheduler выбирает другой TID, меняется CR3/
 `iretq`/`eret` возвращает уже другой процесс. На обеих ISA второй CPU реально
 запускается и подтверждает online, но пока parked: следующий рубеж — per-CPU
 runtime, interrupt routing, TLB shootdown и work stealing. Постоянный
-`displayd` уже один владеет scanout capability, а `compositord` публикует кадр
-через atomic present и получает presentation feedback. Подключение оконных
+`displayd` уже один владеет scanout capability, `renderd` отдельно владеет
+3D render capability, а `compositord` передаёт готовые GraphicsBuffer через
+atomic present и получает presentation feedback. Подключение оконных
 surface queues, input и desktop к этим ring-3 сервисам ещё впереди. Нативный
 `rustc` ещё не заявлен готовым.
 
 Подробнее: [архитектуры CPU](docs/ARCHITECTURES.md), [архитектура системы](docs/ARCHITECTURE.md),
 [графическая подсистема](docs/GUI.md), [видеосистема](docs/VIDEO.md), [VFS](docs/VFS.md),
 [ADR современной графической архитектуры](docs/adr/0001-modern-graphics-architecture.md),
-[graphics objects ABI](docs/GRAPHICS_ABI.md),
+[graphics objects ABI](docs/GRAPHICS_ABI.md), [GPU rendering](docs/GPU_RENDERING.md),
 [микроядро](docs/MICROKERNEL.md), [DLL](docs/DYNAMIC_LIBRARIES.md),
-[IPC](docs/IPC.md), [процессы и память ABI v6](docs/PROCESS_MEMORY_ABI.md),
+[IPC](docs/IPC.md), [процессы и память ABI](docs/PROCESS_MEMORY_ABI.md),
 [self-hosting Rust](docs/SELF_HOSTING.md),
 [сборка](docs/BUILDING.md).

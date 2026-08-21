@@ -1,0 +1,11 @@
+[package]
+name = "rustos-virgl"
+description = "Маленький no_std VirGL encoder для bootstrap renderd RustOS"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+

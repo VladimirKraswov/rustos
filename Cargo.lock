@@ -311,6 +311,7 @@ dependencies = [
  "rustos-rune-loader",
  "rustos-runtime",
  "rustos-vfs-client",
+ "rustos-virgl",
  "varaniafs",
 ]
 
@@ -468,6 +469,10 @@ version = "0.1.0"
 dependencies = [
  "rustos-abi",
 ]
+
+[[package]]
+name = "rustos-virgl"
+version = "0.1.0"
 
 [[package]]
 name = "skrifa"

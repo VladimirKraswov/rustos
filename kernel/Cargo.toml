@@ -27,3 +27,6 @@ default = []
 # Автоматический QEMU boot-test завершается через isa-debug-exit. Обычная
 # сборка без feature запускает интерактивный GUI-сеанс.
 boot-test = []
+# Останавливается сразу после ring-3 VirGL кадра, чтобы integration test мог
+# снять scanout до запуска kernel recovery desktop.
+virgl-test = []

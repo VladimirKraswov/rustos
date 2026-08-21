@@ -137,7 +137,28 @@ pub fn kernel_main(info: &BootInfo) -> ! {
                 serial::put_str("[services] FATAL: cannot start interactive ring3 services\n");
                 exit_kernel(0x53);
             }
-            gui::session::run(info)
+            #[cfg(feature = "virgl-test")]
+            {
+                if display::scanout::render_info().is_err() {
+                    serial::put_str("[virgl-test] FATAL: accelerated device unavailable\n");
+                    exit_kernel(0x54);
+                }
+                serial::put_str(
+                    "[virgl-test] TRIANGLE_READY scanout=graphics-buffer cpu-raster=no\n",
+                );
+                // Не объявляем этот цикл безусловно бесконечным: при потере
+                // render device тест выходит в recovery GUI. Это сохраняет
+                // компиляцию всего fallback path и защищает feature-сборку от
+                // сотен ложных dead-code warnings.
+                while display::scanout::render_info().is_ok() {
+                    arch::halt();
+                }
+                gui::session::run(info)
+            }
+            #[cfg(not(feature = "virgl-test"))]
+            {
+                gui::session::run(info)
+            }
         }
         Err(code) => exit_kernel(code),
     }

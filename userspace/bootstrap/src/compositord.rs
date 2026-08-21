@@ -15,6 +15,10 @@ use rustos_abi::{
         DISPLAY_INFO_OPCODE, DISPLAY_PRESENT_HANDLE_COUNT, DISPLAY_PRESENT_OPCODE,
         DISPLAY_QUERY_HANDLE_COUNT, DISPLAY_QUERY_OPCODE,
     },
+    gpu::{
+        GpuRenderFrame, GPU_RENDERED_FRAME_HANDLE_COUNT, GPU_RENDERED_FRAME_OPCODE,
+        GPU_RENDER_REQUEST_OPCODE,
+    },
     graphics_buffer::{BufferUsage, GraphicsBufferDesc, MemoryDomain, PixelFormatCode},
     ipc::TransferredHandle,
     memory::MEMORY_ABI_VERSION,
@@ -25,84 +29,54 @@ use rustos_abi::{
     },
 };
 use rustos_runtime::{
-    graphics_buffer_create, graphics_buffer_map, handle_close, ipc_receive, ipc_send, process_exit,
-    shared_memory_create, shared_memory_map, sync_timeline_create, sync_timeline_signal,
-    sync_timeline_wait_many, syscall, vm_unmap, Handle, Message, Rights, SharedMemoryCreate,
-    SharedMemoryMap, VmFlags,
+    graphics_buffer_create, graphics_buffer_get_info, graphics_buffer_map, handle_close,
+    ipc_receive, ipc_send, process_exit, shared_memory_create, shared_memory_map,
+    sync_timeline_create, sync_timeline_signal, sync_timeline_wait_many, syscall, vm_unmap, Handle,
+    Message, Rights, SharedMemoryCreate, SharedMemoryMap, VmFlags,
 };
 
 const FRAME_MAGIC: u64 = 0x5255_5354_4f53_4758;
+const GPU_MODE_FLAG: u64 = 1 << 63;
+const GPU_FRAME_ENDPOINT: Handle = Handle(4);
+const GPU_CONTROL_ENDPOINT: Handle = Handle(5);
+
+struct PreparedFrame {
+    descriptor: GraphicsBufferDesc,
+    buffer: Handle,
+    acquire: Handle,
+}
 
 #[no_mangle]
 pub extern "C" fn _start(display_endpoint: u64, feedback_endpoint: u64, abi_version: u64) -> ! {
-    if abi_version != syscall::ABI_VERSION {
+    let gpu_mode = abi_version & GPU_MODE_FLAG != 0;
+    if abi_version & !GPU_MODE_FLAG != syscall::ABI_VERSION {
         process_exit(181);
     }
     let display_endpoint = Handle(display_endpoint as u32);
     let feedback_endpoint = Handle(feedback_endpoint as u32);
     let info = query_display(display_endpoint, feedback_endpoint);
-    let usage = BufferUsage::CPU_READ
-        .union(BufferUsage::CPU_WRITE)
-        .union(BufferUsage::RENDER_TARGET)
-        .union(BufferUsage::SCANOUT);
-    let domains = MemoryDomain::SYSTEM
-        .union(MemoryDomain::HOST_VISIBLE)
-        .union(MemoryDomain::SHARED);
-    let descriptor = match GraphicsBufferDesc::linear(
-        info.width,
-        info.height,
-        PixelFormatCode::B8G8R8A8_UNORM,
-        usage,
-        domains,
-    ) {
-        Ok(descriptor) => descriptor,
-        Err(_) => process_exit(182),
+    let prepared = if gpu_mode {
+        prepare_gpu_frame(info)
+    } else {
+        prepare_cpu_frame(info)
     };
-    let buffer_value = graphics_buffer_create(&descriptor);
-    if buffer_value <= 0 {
-        process_exit(183);
-    }
-    let buffer = Handle(buffer_value as u32);
-    let mapped_length = descriptor.byte_size.div_ceil(4096) * 4096;
+    let descriptor = prepared.descriptor;
+    let buffer = prepared.buffer;
+    let acquire = prepared.acquire;
     let mapping = SharedMemoryMap {
         version: MEMORY_ABI_VERSION,
         reserved: 0,
         address: 0,
         offset: 0,
-        length: mapped_length,
+        length: descriptor.byte_size.div_ceil(4096) * 4096,
         flags: VmFlags::READ.union(VmFlags::WRITE),
     };
-    // GraphicsBuffer — отдельный object kind; shared-memory syscall не имеет
-    // права трактовать его как обычный byte container.
-    if shared_memory_map(buffer, &mapping) != syscall::status::ACCESS_DENIED {
-        process_exit(184);
-    }
-    let address = graphics_buffer_map(buffer, &mapping);
-    if address <= 0 {
-        process_exit(185);
-    }
-    unsafe {
-        (address as *mut u64).write_volatile(FRAME_MAGIC);
-        ((address as *mut u32).add((info.width * info.height - 1) as usize))
-            .write_volatile(0xff_24_80_ff);
-    }
-    if vm_unmap(address as u64, mapped_length) != syscall::status::OK {
-        process_exit(186);
-    }
 
-    let acquire_value = sync_timeline_create(&SyncTimelineCreate::new(0));
     let release_value = sync_timeline_create(&SyncTimelineCreate::new(0));
-    if acquire_value <= 0 || release_value <= 0 {
+    if release_value <= 0 {
         process_exit(187);
     }
-    let acquire = Handle(acquire_value as u32);
     let release = Handle(release_value as u32);
-    if sync_timeline_signal(&SyncTimelineSignal::new(acquire, 1)) != syscall::status::OK
-        || sync_timeline_signal(&SyncTimelineSignal::new(acquire, 0))
-            != syscall::status::INVALID_ARGUMENT
-    {
-        process_exit(188);
-    }
 
     let metrics = SurfaceMetrics::new(info.width, info.height, info.width, info.height, 1000);
     let surface = SurfaceCreateRequest::new(metrics, 3);
@@ -121,7 +95,7 @@ pub extern "C" fn _start(display_endpoint: u64, feedback_endpoint: u64, abi_vers
     message.handles[0] = TransferredHandle {
         handle: buffer,
         reserved: 0,
-        rights: Rights::READ.union(Rights::MAP),
+        rights: Rights::READ,
     };
     message.handles[1] = TransferredHandle {
         handle: acquire,
@@ -202,15 +176,136 @@ pub extern "C" fn _start(display_endpoint: u64, feedback_endpoint: u64, abi_vers
         process_exit(196);
     }
 
-    // Bootstrap compositor остаётся живым как supervisor service. Следующие
-    // client surface commits позднее придут на отдельный endpoint; пока
-    // bounded receive доказывает persistent blocked, а не завершённый процесс.
     loop {
         let mut idle = Message::EMPTY;
         if ipc_receive(feedback_endpoint, &mut idle) != syscall::status::OK {
             process_exit(197);
         }
     }
+}
+
+fn prepare_cpu_frame(info: DisplayScanoutInfo) -> PreparedFrame {
+    let usage = BufferUsage::CPU_READ
+        .union(BufferUsage::CPU_WRITE)
+        .union(BufferUsage::RENDER_TARGET)
+        .union(BufferUsage::SCANOUT);
+    let domains = MemoryDomain::SYSTEM
+        .union(MemoryDomain::HOST_VISIBLE)
+        .union(MemoryDomain::SHARED);
+    let descriptor = match GraphicsBufferDesc::linear(
+        info.width,
+        info.height,
+        PixelFormatCode::B8G8R8A8_UNORM,
+        usage,
+        domains,
+    ) {
+        Ok(descriptor) => descriptor,
+        Err(_) => process_exit(182),
+    };
+    let buffer_value = graphics_buffer_create(&descriptor);
+    if buffer_value <= 0 {
+        process_exit(183);
+    }
+    let buffer = Handle(buffer_value as u32);
+    let mapped_length = descriptor.byte_size.div_ceil(4096) * 4096;
+    let mapping = SharedMemoryMap {
+        version: MEMORY_ABI_VERSION,
+        reserved: 0,
+        address: 0,
+        offset: 0,
+        length: mapped_length,
+        flags: VmFlags::READ.union(VmFlags::WRITE),
+    };
+    // GraphicsBuffer — отдельный object kind; shared-memory syscall не имеет
+    // права трактовать его как обычный byte container.
+    if shared_memory_map(buffer, &mapping) != syscall::status::ACCESS_DENIED {
+        process_exit(184);
+    }
+    let address = graphics_buffer_map(buffer, &mapping);
+    if address <= 0 {
+        process_exit(185);
+    }
+    unsafe {
+        (address as *mut u64).write_volatile(FRAME_MAGIC);
+        ((address as *mut u32).add((info.width * info.height - 1) as usize))
+            .write_volatile(0xff_24_80_ff);
+    }
+    if vm_unmap(address as u64, mapped_length) != syscall::status::OK {
+        process_exit(186);
+    }
+
+    let acquire_value = sync_timeline_create(&SyncTimelineCreate::new(0));
+    if acquire_value <= 0 {
+        process_exit(187);
+    }
+    let acquire = Handle(acquire_value as u32);
+    if sync_timeline_signal(&SyncTimelineSignal::new(acquire, 1)) != syscall::status::OK
+        || sync_timeline_signal(&SyncTimelineSignal::new(acquire, 0))
+            != syscall::status::INVALID_ARGUMENT
+    {
+        process_exit(188);
+    }
+
+    PreparedFrame {
+        descriptor,
+        buffer,
+        acquire,
+    }
+}
+
+fn prepare_gpu_frame(info: DisplayScanoutInfo) -> PreparedFrame {
+    let request = GpuRenderFrame::request(info.width, info.height, 1);
+    let mut message = Message::EMPTY;
+    message.header.opcode = GPU_RENDER_REQUEST_OPCODE;
+    message.header.request_id = request.frame_id;
+    message.header.payload_len = 64;
+    message.payload = request.encode_inline();
+    if ipc_send(GPU_CONTROL_ENDPOINT, &message) != syscall::status::OK {
+        process_exit(201);
+    }
+    let mut frame = Message::EMPTY;
+    if ipc_receive(GPU_FRAME_ENDPOINT, &mut frame) != syscall::status::OK
+        || frame.header.opcode != GPU_RENDERED_FRAME_OPCODE
+        || frame.header.request_id != request.frame_id
+        || frame.header.payload_len != 64
+        || frame.header.handle_count != GPU_RENDERED_FRAME_HANDLE_COUNT
+    {
+        process_exit(202);
+    }
+    let rendered = match GpuRenderFrame::decode_inline(&frame.payload) {
+        Ok(rendered)
+            if rendered.fence_id != 0
+                && rendered.width == info.width
+                && rendered.height == info.height =>
+        {
+            rendered
+        }
+        _ => process_exit(203),
+    };
+    let _fence = rendered.fence_id;
+    let buffer = frame.handles[0].handle;
+    let acquire = frame.handles[1].handle;
+    let mut descriptor = empty_descriptor();
+    if graphics_buffer_get_info(buffer, &mut descriptor) != syscall::status::OK
+        || descriptor.validate().is_err()
+        || descriptor.width != info.width
+        || descriptor.height != info.height
+        || descriptor.usage.contains(BufferUsage::CPU_WRITE)
+        || !descriptor.usage.contains(BufferUsage::RENDER_TARGET)
+        || !descriptor.usage.contains(BufferUsage::SCANOUT)
+    {
+        process_exit(204);
+    }
+    PreparedFrame {
+        descriptor,
+        buffer,
+        acquire,
+    }
+}
+
+fn empty_descriptor() -> GraphicsBufferDesc {
+    // Поля немедленно полностью перезаписывает kernel syscall до чтения.
+    unsafe { core::mem::zeroed() }
 }
 
 fn query_display(display: Handle, feedback: Handle) -> DisplayScanoutInfo {

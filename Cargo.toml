@@ -23,6 +23,7 @@ members = [
     "libs/vfs-dll",
     "libs/elf-loader",
     "libs/rune-loader",
+    "libs/virgl",
     "libs/loader-fixture",
     "libs/loader-root",
     "rune-format",
