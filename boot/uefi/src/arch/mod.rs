@@ -1,9 +1,11 @@
-//! ISA-specific переход из UEFI в ядро и ранний port I/O.
+//! ISA-specific переход из UEFI в ядро и ранний I/O.
 
 #[cfg(target_arch = "x86_64")]
 mod x86_64;
 #[cfg(target_arch = "x86_64")]
 pub use x86_64::*;
 
-#[cfg(not(target_arch = "x86_64"))]
-compile_error!("UEFI boot backend пока реализован только для x86_64; kernel/userspace уже собираются для AArch64");
+#[cfg(target_arch = "aarch64")]
+mod aarch64;
+#[cfg(target_arch = "aarch64")]
+pub use aarch64::*;

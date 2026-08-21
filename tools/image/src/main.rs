@@ -7,12 +7,15 @@
 //! ## Использование
 //!
 //! ```text
-//! rustos-image <bootloader.efi> <out.img> [--size-mb N]
+//! rustos-image <bootloader.efi> <out.img> [--size-mb N] [--efi-name NAME]
 //! ```
 //!
 //! * `bootloader.efi` — собранный UEFI-загрузчик (`rustos-boot`);
 //! * `out.img` — выходной raw-образ диска;
-//! * `--size-mb N` — размер диска в МБ (по умолчанию 256 → FAT32).
+//! * `--size-mb N` — размер диска в МБ (по умолчанию 256 → FAT32);
+//! * `--efi-name NAME` — имя EFI-файла в `EFI/BOOT/` (по умолчанию
+//!   `BOOTX64.EFI`; для AArch64-варианта — `BOOTAA64.EFI`, имя, которое
+//!   ищет EDK2/AAVMF в fallback-режиме).
 //!
 //! ## Воспроизводимость
 //!
@@ -29,9 +32,11 @@ use fatfs::{format_volume, FatType, FileSystem, FormatVolumeOptions, FsOptions};
 
 const SECTOR: usize = 512;
 const DEFAULT_SIZE_MB: u64 = 256;
+/// Имя EFI-файла по умолчанию (x86_64 fallback-boot).
+const DEFAULT_EFI_NAME: &str = "BOOTX64.EFI";
 const NUM_ENTRIES: u32 = 128;
 const ENTRY_SIZE: u32 = 128;
-/// Первая utilisable LBA (после protective MBR + GPT header + 128 записей).
+/// Первая usable LBA (после protective MBR + GPT header + 128 записей).
 const FIRST_USABLE_LBA: u64 = 34;
 /// Запас с конца диска под backup GPT (записи + заголовок).
 const TAIL_RESERVED_LBA: u64 = 34;
@@ -59,37 +64,79 @@ fn main() -> ExitCode {
     }
 }
 
+/// Разбор аргументов и режимы: сборка образа
+/// (`<efi> <out> [--size-mb N] [--efi-name NAME]`)
+/// или проверка (`--verify <img> [expected_efi] [--efi-name NAME]`).
 fn run() -> Result<(), String> {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
-    // Режим проверки: `rustos-image --verify <img> [expected_efi]`.
+    // Режим проверки: `rustos-image --verify <img> [expected_efi] [--efi-name NAME]`.
     if let Some(first) = args.first() {
         if first.as_str() == "--verify" {
-            return verify_image(args.get(1), args.get(2));
+            let mut positionals: Vec<&String> = Vec::new();
+            let mut efi_name = DEFAULT_EFI_NAME.to_string();
+            let mut i = 1;
+            while i < args.len() {
+                if args[i].as_str() == "--efi-name" {
+                    i += 1;
+                    efi_name = args
+                        .get(i)
+                        .ok_or("--efi-name: не указано значение")?
+                        .clone();
+                } else {
+                    positionals.push(&args[i]);
+                }
+                i += 1;
+            }
+            if positionals.is_empty() || positionals.len() > 2 {
+                return Err(
+                    "usage: rustos-image --verify <img> [expected_efi] [--efi-name NAME]".into(),
+                );
+            }
+            return verify_image(
+                positionals.first().copied(),
+                positionals.get(1).copied(),
+                &efi_name,
+            );
         }
     }
 
-    // Режим сборки: `rustos-image <bootloader.efi> <out.img> [--size-mb N]`.
-    if args.len() < 2 || args.len() > 4 {
+    // Режим сборки: `rustos-image <efi> <out.img> [--size-mb N] [--efi-name NAME]`.
+    if args.len() < 2 {
         return Err(
-            "usage: rustos-image <bootloader.efi> <out.img> [--size-mb N]\n\
-                   rustos-image --verify <img> [expected_efi]"
+            "usage: rustos-image <bootloader.efi> <out.img> [--size-mb N] [--efi-name NAME]\n\
+                    rustos-image --verify <img> [expected_efi] [--efi-name NAME]"
                 .into(),
         );
     }
     let efi_path = Path::new(&args[0]);
     let out_path = Path::new(&args[1]);
     let mut size_mb = DEFAULT_SIZE_MB;
-    if args.len() == 4 {
-        if args[2] != "--size-mb" {
-            return Err(format!("неизвестный флаг: {}", args[2]));
+    let mut efi_name = DEFAULT_EFI_NAME.to_string();
+    let mut i = 2;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--size-mb" => {
+                i += 1;
+                size_mb = args
+                    .get(i)
+                    .ok_or("--size-mb: не указано значение")?
+                    .parse::<u64>()
+                    .map_err(|e| format!("--size-mb: не число: {e}"))?;
+                if size_mb < 32 {
+                    return Err("--size-mb: минимум 32 МБ".into());
+                }
+            }
+            "--efi-name" => {
+                i += 1;
+                efi_name = args
+                    .get(i)
+                    .ok_or("--efi-name: не указано значение")?
+                    .clone();
+            }
+            other => return Err(format!("неизвестный флаг: {other}")),
         }
-        size_mb = args[3]
-            .parse::<u64>()
-            .map_err(|_| format!("--size-mb: не число: {}", args[3]))?;
-        if size_mb < 32 {
-            return Err("--size-mb: минимум 32 МБ".into());
-        }
+        i += 1;
     }
 
     let efi_bytes = fs::read(efi_path).map_err(|e| format!("{}: {e}", efi_path.display()))?;
@@ -103,34 +150,41 @@ fn run() -> Result<(), String> {
     // 2. GPT: protective MBR + primary/backup заголовки + записи.
     write_gpt(&mut disk, total_lbas)?;
 
-    // 3. Форматируем регион раздела как FAT32 и кладём BOOTX64.EFI.
+    // 3. Форматируем регион раздела как FAT32 и кладём EFI-файл
+    //    (BOOTX64.EFI по умолчанию; BOOTAA64.EFI для AArch64).
     let part_first = FIRST_USABLE_LBA;
     let part_last = total_lbas - TAIL_RESERVED_LBA;
     let part_start = (part_first * SECTOR as u64) as usize;
     let part_end = ((part_last + 1) * SECTOR as u64) as usize;
-    write_esp(&mut disk[part_start..part_end], &efi_bytes)?;
+    write_esp(&mut disk[part_start..part_end], &efi_bytes, &efi_name)?;
 
     // 4. Запись образа.
     fs::write(out_path, &disk).map_err(|e| format!("{}: {e}", out_path.display()))?;
 
     println!(
-        "rustos-image: OK — {} ({} МБ, {} LBA, ESP {}..{} LBA, FAT32, {} Б EFI)",
+        "rustos-image: OK — {} ({} МБ, {} LBA, ESP {}..{} LBA, FAT32, EFI/BOOT/{} {} Б)",
         out_path.display(),
         size_mb,
         total_lbas,
         part_first,
         part_last,
+        efi_name,
         efi_bytes.len(),
     );
     Ok(())
 }
 
 /// Режим `--verify <img> [expected_efi]`: валидация GPT (signature, CRC header/entries,
-/// поиск раздела ESP EF00) и read-back `EFI/BOOT/BOOTX64.EFI` с ESP (FAT).
+/// поиск раздела ESP EF00) и read-back `EFI/BOOT/<efi_name>` с ESP (FAT).
 /// Если задан `expected_efi` — байт-в-байт сравнение с эталоном.
 /// Полезен для CI и дебага до QEMU-загрузки.
-fn verify_image(img: Option<&String>, expected_efi: Option<&String>) -> Result<(), String> {
-    let img_path = img.ok_or("usage: rustos-image --verify <img> [expected_efi]")?;
+fn verify_image(
+    img: Option<&String>,
+    expected_efi: Option<&String>,
+    efi_name: &str,
+) -> Result<(), String> {
+    let img_path =
+        img.ok_or("usage: rustos-image --verify <img> [expected_efi] [--efi-name NAME]")?;
     let mut disk = fs::read(img_path).map_err(|e| format!("{}: {e}", img_path))?;
     let total_lbas = (disk.len() / SECTOR) as u64;
 
@@ -177,7 +231,7 @@ fn verify_image(img: Option<&String>, expected_efi: Option<&String>) -> Result<(
     let (part_first, part_last) = esp.ok_or("GPT: ESP-раздел (EF00) не найден")?;
     println!("verify: GPT OK — {total_lbas} LBA, ESP {part_first}..{part_last} LBA (EF00)");
 
-    // 2. FAT: read-back EFI/BOOT/BOOTX64.EFI.
+    // 2. FAT: read-back EFI/BOOT/<efi_name>.
     let part_start = (part_first * SECTOR as u64) as usize;
     let part_end = ((part_last + 1) * SECTOR as u64) as usize;
     let mut efi_on_disk = Vec::new();
@@ -195,20 +249,20 @@ fn verify_image(img: Option<&String>, expected_efi: Option<&String>) -> Result<(
             .open_dir("BOOT")
             .map_err(|e| format!("FAT: каталог EFI/BOOT: {e}"))?;
         let mut file = boot_dir
-            .open_file("BOOTX64.EFI")
-            .map_err(|e| format!("FAT: EFI/BOOT/BOOTX64.EFI: {e}"))?;
+            .open_file(efi_name)
+            .map_err(|e| format!("FAT: EFI/BOOT/{efi_name}: {e}"))?;
         Read::read_to_end(&mut file, &mut efi_on_disk)
-            .map_err(|e| format!("FAT: read BOOTX64.EFI: {e}"))?;
+            .map_err(|e| format!("FAT: read {efi_name}: {e}"))?;
     }
-    println!("verify: FAT OK — BOOTX64.EFI = {} Б", efi_on_disk.len());
+    println!("verify: FAT OK — {efi_name} = {} Б", efi_on_disk.len());
 
     // 3. Опциональное байт-в-байт сравнение с эталоном.
     if let Some(ref_e) = expected_efi {
         let ref_bytes = fs::read(ref_e).map_err(|e| format!("{}: {e}", ref_e))?;
         if ref_bytes != efi_on_disk {
-            return Err("BOOTX64.EFI на образе НЕ совпадает с эталоном".into());
+            return Err(format!("{efi_name} на образе НЕ совпадает с эталоном"));
         }
-        println!("verify: BOOTX64.EFI совпадает с эталоном ({ref_e})");
+        println!("verify: {efi_name} совпадает с эталоном ({ref_e})");
     }
 
     println!("rustos-image: verify OK");
@@ -332,8 +386,9 @@ fn build_esp_entry(first_lba: u64, last_lba: u64) -> [u8; ENTRY_SIZE as usize] {
     e
 }
 
-/// Форматирует `part` как FAT32-том с `EFI/BOOT/BOOTX64.EFI`.
-fn write_esp(part: &mut [u8], efi: &[u8]) -> Result<(), String> {
+/// Форматирует `part` как FAT32-том с `EFI/BOOT/<efi_name>` (BOOTX64.EFI
+/// по умолчанию; BOOTAA64.EFI для AArch64-варианта).
+fn write_esp(part: &mut [u8], efi: &[u8], efi_name: &str) -> Result<(), String> {
     let mut label = [0u8; 11];
     label[..3].copy_from_slice(b"ESP");
 
@@ -361,12 +416,11 @@ fn write_esp(part: &mut [u8], efi: &[u8]) -> Result<(), String> {
             .create_dir("BOOT")
             .map_err(|e| format!("create_dir EFI/BOOT: {e}"))?;
         let mut file = boot_dir
-            .create_file("BOOTX64.EFI")
-            .map_err(|e| format!("create_file BOOTX64.EFI: {e}"))?;
+            .create_file(efi_name)
+            .map_err(|e| format!("create_file {efi_name}: {e}"))?;
         file.write_all(efi)
-            .map_err(|e| format!("write BOOTX64.EFI: {e}"))?;
-        file.flush()
-            .map_err(|e| format!("flush BOOTX64.EFI: {e}"))?;
+            .map_err(|e| format!("write {efi_name}: {e}"))?;
+        file.flush().map_err(|e| format!("flush {efi_name}: {e}"))?;
     }
 
     volume.unmount().map_err(|e| format!("unmount: {e}"))?;

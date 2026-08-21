@@ -63,29 +63,41 @@ toolchain output. User stack соблюдает SysV AMD64 и AAPCS64.
 |---|---:|---:|
 | kernel/runtime/apps + RUNE converter | да | да |
 | page descriptor encoding | да | да, 4 KiB granule |
-| syscall/context ABI | работает | определён и компилируется |
-| bootloader + запуск в VM | GRUB 2/Multiboot2 + OVMF | следующий milestone |
-| interrupt controller | xAPIC/x2APIC | нужен GICv2/v3 driver |
-| SMP startup | ACPI + INIT-SIPI | нужен PSCI + DT/ACPI CPU discovery |
+| syscall/context ABI | работает: CPL3, `int 0x80` | работает: EL0, `svc #0` |
+| bootloader + запуск в VM | GRUB 2/Multiboot2 + OVMF | AAVMF + BOOTAA64.EFI |
+| interrupt controller / timer | xAPIC/x2APIC + TSC deadline | GICv3 + Generic Timer PPI 30 |
+| SMP startup | ACPI + INIT-SIPI | Device Tree + PSCI `CPU_ON` |
+| persistent block | virtio-blk PCI | virtio-blk modern MMIO |
 | input | PS/2 bootstrap | нужен virtio-input/USB HID |
 
 `make test-arch` **собирает**, а не только парсит, kernel, runtime и все
-bootstrap applications для обоих JSON targets. CI выполняет эту цель на
-каждом изменении, поэтому случайный `asm!("rdtsc")` в общем коде сразу ломает
-AArch64 build.
+bootstrap applications для обоих JSON targets. `make test-arm-boot`
+дополнительно запускает двухпроцессорную AArch64 VM: проверяет UEFI handoff,
+FDT, GICv3, timer preemption, настоящий `PSCI CPU_ON`, fault containment,
+RUNE/std/VFS/loader и маркер `RING3_MILESTONE_OK`. CI выполняет обе цели,
+поэтому случайный x86-only assembler в общем коде либо runtime-регрессия ARM
+не останутся compile-only «успехом».
 
-## Следующий ARM milestone
+## Эталонная ARM-платформа
 
-Первой эталонной ARM-платформой должна быть QEMU `virt`: она документирована,
-имеет GIC, architected timer, PL011, PSCI и virtio-mmio/PCI. Порядок работ:
+Эталонная платформа — QEMU `virt`, CPU `cortex-a72`, AAVMF и Device Tree.
+Рабочая цепочка уже включает:
 
-1. AArch64 UEFI handoff или минимальный Image/FDT boot protocol;
-2. MAIR/TCR/TTBR bootstrap tables и `VBAR_EL1` vector table;
-3. вход/выход EL0 через `eret`, `svc` и containment synchronous faults;
-4. GICv3 + Generic Timer, затем реальное вытеснение;
-5. PSCI `CPU_ON`, per-CPU state и TLB shootdown;
-6. PL011, virtio-input/block/GPU как user-space drivers;
-7. тот же boot/process/IPC/GUI test contract в `qemu-system-aarch64`.
+1. `aarch64-unknown-uefi` loader, который принимает вход AAVMF из EL1 либо
+   EL2, строит 48-битный 4-KiB identity map и передаёт FDT в `BootInfo`;
+2. полные EL0/EL1 exception frames, `eret`/`svc`, отдельные process TTBR0,
+   W^X и локализацию synchronous fault;
+3. GICv3 system-register interface и architected physical timer с настоящим
+   вытеснением пользовательских контекстов;
+4. bounded FDT parser и PSCI HVC/SMC conduit; до 64 CPU получают отдельные
+   стеки, подтверждают online и пока безопасно parked;
+5. modern virtio-mmio block transport, persistent VaraniaFS, RUNE и
+   портированный Rust `std` в ring 3.
+
+Следующая граница честно уже не «запустить ARM»: нужны per-CPU scheduler/GICR,
+TLB shootdown и распределение runnable threads, затем virtio-input и
+virtio-gpu/display service. Текущий ARM запуск serial-only, поскольку AAVMF в
+этой конфигурации не предоставляет GOP.
 
 После QEMU `virt` Raspberry Pi добавляет только platform backend (firmware
 boot, BCM interrupt/display/USB либо UEFI), не форк микроядра. Телефоны требуют

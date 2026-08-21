@@ -8,7 +8,7 @@
 channel = "nightly-2026-08-18"
 # rust-src: необходим для `-Zbuild-std` (кастомный target ядра).
 components = ["clippy", "rustfmt", "rust-src"]
-# x86_64-unknown-uefi — встроенный tier-2 target rustc (PE/COFF EFI-приложения);
-# ядро и пользовательские программы собираются под кастомный
-# target/x86_64-unknown-rustos.json (ELF64, no_std, PIE).
-targets = ["x86_64-unknown-uefi"]
+# x86_64/aarch64-unknown-uefi — встроенные tier-2 target rustc (PE/COFF
+# EFI-приложения, bootloaders); ядро и пользовательские программы собираются
+# под кастомные targets/x86_64-unknown-rustos.json / targets/aarch64-unknown-rustos.json.
+targets = ["x86_64-unknown-uefi", "aarch64-unknown-uefi"]

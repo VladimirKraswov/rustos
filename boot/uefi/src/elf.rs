@@ -1,24 +1,38 @@
-//! Загрузка ELF64-образа ядра (PIE).
+//! Загрузка ELF64-образа ядра (PIE или статический).
 //!
 //! ## Контракт
 //!
-//! * Образ — **ELF64, little-endian, ET_DYN (PIE)**: rustc собирает ядро с
-//!   `relocation-model=pic` и `file-type=pie` (см. targets/*.json).
-//! * Загрузчик копирует сегменты `PT_LOAD` в `base + (p_vaddr - min_vaddr)`
-//!   и применяет динамические релокации типа `R_X86_64_RELATIVE`
-//!   (`*loc = base + addend - min_v`). Другие типы релокаций не ожидаются
-//!   (статический PIE без dynsym-ссылок) — их появление = ошибка сборки.
-//! * Точка входа = `base + (e_entry - min_vaddr)`.
+//! * Образ — **ELF64, little-endian**, один из двух типов:
+//!   * **ET_DYN (PIE)**: rustc собирает ядро с `relocation-model=pic` и
+//!     `file-type=pie` (см. targets/*.json). Загрузчик копирует сегменты
+//!     `PT_LOAD` в `base + (p_vaddr - min_vaddr)` и применяет динамические
+//!     релокации типа RELATIVE целевой архитектуры
+//!     (`R_X86_64_RELATIVE` = 8 / `R_AARCH64_RELATIVE` = 2):
+//!     `*loc = base + addend - min_v`. Другие типы релокаций не ожидаются
+//!     (статический PIE без dynsym-ссылок) — их появление = ошибка сборки.
+//!   * **ET_EXEC (статический, фиксированная линковка)**: сегменты
+//!     загружаются по физическим vaddr — то же самое выражение при
+//!     `base = min_vaddr`. Динамических релокаций нет (и нет
+//!     `.rela.dyn`); их появление = ошибка сборки.
+//! * Точка входа = `base + (e_entry - min_vaddr)` (для ET_EXEC —
+//!   абсолютный `e_entry`).
 //!
 //! Раскладка резерва, в который кладётся образ: `main.rs` (`Layout`,
-//! `find_reservation`). Связанный формат initramfs: `tools/pack` (RIFS v1).
+//! `find_reservation` для PIE; для ET_EXEC резерв начинается ровно в
+//! `min_vaddr`). Связанный формат initramfs: `tools/pack` (RIFS v1).
 
 /// Максимум PT_LOAD-сегментов в образе ядра (реалистично: десятки).
 const MAX_LOADS: usize = 64;
 
 /// Тип ELF-образа.
+const ET_EXEC: u16 = 2;
+/// PIE-образ (movable, min_vaddr обычно 0).
 const ET_DYN: u16 = 3;
-const EM_X86_64: u16 = 0x3E;
+/// Oжидаемый e_machine ядра: зависит от целевой архитектуры.
+#[cfg(target_arch = "x86_64")]
+const EM_KERNEL: u16 = 0x3E; // EM_X86_64
+#[cfg(target_arch = "aarch64")]
+const EM_KERNEL: u16 = 183; // EM_AARCH64
 const EI_CLASS_64: u8 = 2;
 const EI_DATA_LE: u8 = 1;
 
@@ -32,11 +46,15 @@ const DT_RELSZ: i64 = 18;
 const DT_RELA: i64 = 7;
 const DT_RELASZ: i64 = 8;
 
-/// x86-64 relocation types.
-///
+/// RELATIVE-релокация целевой архитектуры — единственная ожидаемая в
+/// статическом PIE-ядре.
+#[cfg(target_arch = "x86_64")]
 /// `R_X86_64_RELATIVE` = **8** (не 1024! — 1024/1025/1026 это секционные
 /// флаги `R_X86_64_GNU_STACK`/`GNU_RELRO`, а не релокации).
-const R_X86_64_RELATIVE: u32 = 8;
+const R_RELATIVE: u32 = 8;
+#[cfg(target_arch = "aarch64")]
+/// `R_AARCH64_RELATIVE` = **2**.
+const R_RELATIVE: u32 = 2;
 
 /// Ошибка разбора/загрузки ELF.
 #[derive(Debug)]
@@ -49,8 +67,8 @@ pub enum ElfError {
     BadEncoding,
     /// Не x86-64.
     BadMachine,
-    /// Не ET_DYN (ядро обязано быть PIE).
-    NotPie,
+    /// Не ET_DYN и не ET_EXEC (ядро — PIE или статический).
+    BadType(u16),
     /// Нет PT_LOAD-сегментов.
     NoLoadSegments,
     /// Слишком много PT_LOAD-сегментов.
@@ -67,8 +85,16 @@ impl core::fmt::Display for ElfError {
             ElfError::TooShort => write!(f, "image shorter than ELF header"),
             ElfError::BadMagic => write!(f, "bad ELF magic"),
             ElfError::BadEncoding => write!(f, "expected ELF64 little-endian"),
-            ElfError::BadMachine => write!(f, "expected x86-64 (EM_X86_64)"),
-            ElfError::NotPie => write!(f, "kernel must be ET_DYN (PIE)"),
+            ElfError::BadMachine => write!(
+                f,
+                "unexpected ELF e_machine (expected kernel target architecture)"
+            ),
+            ElfError::BadType(t) => {
+                write!(
+                    f,
+                    "unexpected ELF e_type {t} (kernel must be ET_DYN or ET_EXEC)"
+                )
+            }
             ElfError::NoLoadSegments => write!(f, "no PT_LOAD segments"),
             ElfError::TooManySegments => write!(f, "too many PT_LOAD segments"),
             ElfError::BadSegment => write!(f, "segment out of bounds"),
@@ -79,6 +105,8 @@ impl core::fmt::Display for ElfError {
 
 /// ELF64-заголовок (модель данных для разбора, не `repr(C)`-маппинг).
 struct Ehdr {
+    /// e_type: ET_DYN (PIE) или ET_EXEC (статический).
+    etype: u16,
     entry: u64,
     phoff: u64,
     phentsize: u16,
@@ -139,18 +167,33 @@ fn parse_ehdr(buf: &[u8]) -> Result<Ehdr, ElfError> {
     }
     let e_type = read_at::<u16>(buf, 16).ok_or(ElfError::TooShort)?;
     let e_machine = read_at::<u16>(buf, 18).ok_or(ElfError::TooShort)?;
-    if e_machine != EM_X86_64 {
+    if e_machine != EM_KERNEL {
         return Err(ElfError::BadMachine);
     }
-    if e_type != ET_DYN {
-        return Err(ElfError::NotPie);
+    // ET_DYN — PIE-ядро (movable base), ET_EXEC — статическое ядро с
+    // фиксированной линковкой (загружается по vaddr).
+    if e_type != ET_DYN && e_type != ET_EXEC {
+        return Err(ElfError::BadType(e_type));
     }
     Ok(Ehdr {
+        etype: e_type,
         entry: read_at::<u64>(buf, 24).ok_or(ElfError::TooShort)?,
         phoff: read_at::<u64>(buf, 32).ok_or(ElfError::TooShort)?,
         phentsize: read_at::<u16>(buf, 54).ok_or(ElfError::TooShort)?,
         phnum: read_at::<u16>(buf, 56).ok_or(ElfError::TooShort)?,
     })
+}
+
+/// Информация о базе загрузки: `(статический?, min_vaddr PT_LOAD)`.
+///
+/// Для ET_EXEC загрузчик резервирует блок ровно с `min_vaddr` (сегменты
+/// копируются по физическим vaddr); для ET_DYN — по свободной верхней
+/// conventional-области (см. `main::find_reservation`).
+pub fn load_base(elf: &[u8]) -> Result<(bool, u64), ElfError> {
+    let eh = parse_ehdr(elf)?;
+    let (loads, nloads, _) = parse_phdrs(elf, &eh)?;
+    let min_v = loads[..nloads].iter().map(|p| p.vaddr).min().unwrap_or(0);
+    Ok((eh.etype == ET_EXEC, min_v))
 }
 
 /// Разбор program headers: PT_LOAD (массив по значению + счётчик) + PT_DYNAMIC.
@@ -298,7 +341,7 @@ pub unsafe fn load(elf: &[u8], base: u64) -> Result<u64, ElfError> {
 /// Применение одной релокации; любой тип, кроме RELATIVE — ошибка.
 fn apply_relative(r_info: u64, loc: *mut u64, value: u64) -> Result<(), ElfError> {
     let r_type = (r_info & 0xFFFF_FFFF) as u32;
-    if r_type != R_X86_64_RELATIVE {
+    if r_type != R_RELATIVE {
         return Err(ElfError::BadRelocation(r_type));
     }
     // SAFETY: loc — адрес в пределах загруженного образа (релокационная

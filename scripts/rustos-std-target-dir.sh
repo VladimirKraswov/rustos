@@ -16,7 +16,8 @@ PORT_HASH="$({
     printf '%s\n' \
         "$ROOT/scripts/prepare-rustos-std.sh" \
         "$ROOT/scripts/rustc-rustos-std.sh" \
-        "$ROOT/targets/x86_64-unknown-rustos.json"
+        "$ROOT/targets/x86_64-unknown-rustos.json" \
+        "$ROOT/targets/aarch64-unknown-rustos.json"
 } | LC_ALL=C sort | while IFS= read -r file; do
     printf '%s ' "${file#"$ROOT/"}"
     git hash-object "$file"

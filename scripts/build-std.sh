@@ -20,7 +20,7 @@ export CARGO_TARGET_DIR="$(bash scripts/rustos-std-target-dir.sh)"
 # `-u` гарантирует извлечение startup object даже без явного вызова из main.
 export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }-C link-arg=-u_start"
 
-echo "[std] build core + alloc + std for x86_64-unknown-rustos"
+echo "[std] build core + alloc + std for requested RustOS target"
 echo "[std] content-addressed target: $CARGO_TARGET_DIR"
 cargo -Zjson-target-spec \
     -Zbuild-std=core,alloc,std,panic_abort \

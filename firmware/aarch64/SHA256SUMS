@@ -1,0 +1,9 @@
+# SHA-256 пиннинг AArch64 UEFI-файрмваря (EDK2 A-Firmware, AAVMF layout).
+#
+# edk2-aarch64-code.fd.bz2 — bz2-архив, хранится в репозитории.
+# edk2-aarch64-code.fd     — распакованный образ (64 MiB), генерируется
+#                            scripts/bootstrap-arm-firmware.sh в build/.
+# edk2-aarch64-vars-template.fd — генерируемые 64 MiB нулей (factory NVRAM).
+c023444108b7a132fdebf70c4765cd2dd9af2a9ff7d001a743aaabe87c20a458  edk2-aarch64-code.fd.bz2
+47765fe344818cbc464b1c14ae658fb4b854f5c2ceffa982411731eb4865594d  edk2-aarch64-code.fd
+3b6a07d0d404fab4e23b6d34bc6696a6a312dd92821332385e5af7c01c421351  edk2-aarch64-vars-template.fd

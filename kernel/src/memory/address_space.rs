@@ -744,13 +744,16 @@ const fn leaf_flags(flags: UserPageFlags) -> u64 {
 
 #[cfg(target_arch = "aarch64")]
 const fn leaf_flags(flags: UserPageFlags) -> u64 {
-    // L3 page, AttrIdx=0, inner-shareable, access flag, EL0-accessible.
+    // L3 page descriptor обязан иметь type=0b11. AP[7:6]=01
+    // разрешает EL0 read/write, AP=11 — EL0 read-only. AP=00, который
+    // был здесь раньше, является supervisor-only и неизбежно даёт
+    // permission fault при первой же инструкции процесса.
     VALID
-        | (1 << 1)
-        | (1 << 6)
-        | (3 << 8)
-        | (1 << 10)
-        | if flags.writable { 0 } else { 1 << 7 }
+        | (1 << 1) // type: L3 page
+        | (1 << 6) // AP[0]: EL0 access enabled
+        | (3 << 8) // SH: inner shareable
+        | (1 << 10) // AF: access flag
+        | if flags.writable { 0 } else { 1 << 7 } // AP[1]: read-only
         | if flags.executable {
             1 << 53 // PXN: EL1 never executes user pages
         } else {

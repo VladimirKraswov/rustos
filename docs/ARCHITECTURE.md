@@ -44,11 +44,13 @@ Platform-independent crate `rustos-microkernel` содержит process/thread
 lifecycle, generation-safe PID/TID, CPU affinity, scheduler priority policy,
 bounded endpoint queue, capability attenuation и supervisor backoff. Он
 `no_std`, но тестируется на host без QEMU. Переносимый process manager
-подключён к `arch` HAL; рабочий AMD64 backend использует local APIC:
-timer trap сохраняет регистры/RSP, выбирает TID, меняет CR3 и возвращается
-через `iretq` в другой CPL3 context. AArch64 backend определяет эквивалентные
-EL0/EL1 context, TTBR и `svc` ABI и собирается в CI; GIC/PSCI boot ещё не
-объявляются работающими. Полный контракт описан в [ARCHITECTURES.md](ARCHITECTURES.md).
+подключён к `arch` HAL. AMD64 backend использует local APIC: timer trap
+сохраняет регистры/RSP, выбирает TID, меняет CR3 и возвращается через `iretq`
+в другой CPL3 context. AArch64 выполняет тот же контракт через полный
+EL0/EL1 `TrapFrame`, TTBR0 и `eret`: GICv3/Generic Timer вытесняют процессы,
+а Device Tree + PSCI запускают и безопасно паркуют AP. Оба маршрута проходят
+настоящие QEMU boot integration tests. Полный контракт описан в
+[ARCHITECTURES.md](ARCHITECTURES.md).
 
 Platform-independent `rustos-video` задаёт безопасные pixel surfaces,
 RGB/BGR/ARGB/RGB565/grayscale formats, span fill, blit, alpha composition,

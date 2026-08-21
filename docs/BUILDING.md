@@ -3,30 +3,70 @@
 ## Требования
 
 - Rust nightly `2026-08-18` с `rust-src`, `rustfmt`, `clippy`;
-- QEMU x86-64;
+- QEMU x86-64 (и `qemu-system-aarch64` для ARM-варианта);
 - стандартные POSIX shell tools.
 
 OVMF загружается `scripts/bootstrap-ovmf.sh` из зафиксированного Debian package
-и проверяется SHA-256. На macOS используется QEMU TCG, на Linux при наличии
-`/dev/kvm` автоматически выбирается KVM.
+и проверяется SHA-256. AAVMF для ARM уже лежит в репозитории
+(`firmware/aarch64/`, SHA-256 в `SHA256SUMS`), сетевая загрузка не требуется.
+На macOS используется QEMU TCG, на Linux при наличии `/dev/kvm` автоматически
+выбирается KVM.
 
 ## Цели Makefile
 
 ```text
-make bootstrap  подготовить OVMF
-make build      собрать интерактивный GUI-образ
-make run        запустить графическую VM
-make lint       fmt + Clippy -D warnings
-make test-host  ABI, scheduler/lifecycle и host-tool unit tests
-make test-arch  собрать kernel/runtime/apps для AMD64 и AArch64
-make test-boot  UEFI + CPL3 ELF/VFS/fault/reclaim test
-make test-gui   keyboard/mouse/window framebuffer test
-make test       полный test suite
-make clean      удалить генерируемые артефакты
+make bootstrap   подготовить OVMF
+make build       собрать интерактивный GUI-образ (x86_64)
+make run         запустить графическую VM (x86_64)
+make build-arm   собрать полный ARM-образ (kernel/RUNE/VaraniaFS/AAVMF/ESP)
+make run-arm     запустить ARM-вариант (QEMU virt + UEFI)
+make lint        fmt + Clippy -D warnings
+make test-host   ABI, scheduler/lifecycle и host-tool unit tests
+make test-arch   собрать kernel/runtime/apps для AMD64 и AArch64
+make test-boot   GRUB/Multiboot2 + CPL3 RUNE/VFS/fault/reclaim test
+make test-arm-boot AAVMF + EL0/EL1/GICv3/PSCI/VFS test
+make test-gui    keyboard/mouse/window framebuffer test
+make test        полный test suite
+make clean       удалить генерируемые артефакты
 ```
 
 Большие бинарные артефакты находятся в `build/` и `target/` и не хранятся в
 Git. Итоговый EFI-диск — `build/esp.img`.
+
+## ARM-вариант (AArch64, QEMU `virt` + UEFI)
+
+Цепочка `make build-arm` (`scripts/build-arm.sh`) собирает для AArch64 user
+ELF, преобразует их в проверяемые RUNE, статически размещает kernel по
+`0x40000000`, создаёт RIFS initramfs и persistent VaraniaFS, затем собирает
+UEFI loader/ESP. AAVMF берётся из `firmware/aarch64/`
+(`scripts/bootstrap-arm-firmware.sh`: vendored bz2 → homebrew fallback,
+SHA-256 check, zeroed 64 MiB NVRAM template).
+
+Сборка считается успешной только после UEFI loader и проверки GPT/FAT:
+`build/arm/esp-arm.img` обязан содержать `EFI/BOOT/BOOTAA64.EFI`.
+`build/arm/STATUS.txt` имеет `bootloader=ok` и `esp=ok`; прежнего успешного
+статуса `PARTIAL` больше нет. Основные артефакты:
+
+- `build/arm/kernel.elf`, `build/arm/initramfs.img`, `build/arm/esp-arm.img`;
+- `build/arm/system/bin/*.rune`;
+- `build/arm-system.vfs` (sparse 1-GiB persistent volume);
+- `build/arm-firmware/edk2-aarch64-{code,vars-template}.fd`.
+
+`make run-arm` (`scripts/run-arm.sh`) запускает QEMU `virt` с двумя pflash
+(code + runtime NVRAM), modern virtio-mmio VaraniaFS и ESP; serial остаётся в
+терминале. `acpi=off` обязателен: AAVMF публикует FDT, из которого kernel
+получает CPU/PSCI. Текущая AAVMF-конфигурация не даёт GOP, поэтому ARM boot
+работает serial-only.
+Переопределяемые параметры: `ARM_SMP` (2), `ARM_MEMORY_MB` (512),
+`ARM_CPU_MODEL` (cortex-a72), `RUSTOS_FULLSCREEN` (1 на macOS).
+
+`make test-arm-boot` пересобирает kernel с `boot-test`, запускает headless
+QEMU и требует: Device Tree, GICv3/Generic Timer, минимум два timer tick и
+context switch, `discovered=2 online=2` после настоящего PSCI `CPU_ON`,
+локализованный EL0 `BRK` (EC 0x3c), IPC/ABI/std/VFS/loader milestones,
+`RING3_MILESTONE_OK` и `PSCI SYSTEM_OFF`. Логи сохраняются в
+`build/test-results/arm-boot/`. Параметры теста: `ARM_BOOT_TEST_TIMEOUT`,
+`ARM_BOOT_MEMORY_MB`, `ARM_BOOT_CPUS`, `ARM_BOOT_CPU_MODEL`.
 
 GUI-тест общается с QEMU monitor через workspace tool `rustos-hmp`, поэтому
 не зависит от несовместимых вариантов `nc` на macOS и Linux.
@@ -40,7 +80,7 @@ address space и marker `RING3_MILESTONE_OK`.
 `scripts/check-architectures.sh` создаёт настоящие ELF-артефакты для
 `targets/x86_64-unknown-rustos.json` и
 `targets/aarch64-unknown-rustos.json`. Это compile contract переносимости;
-загрузка AArch64 в QEMU станет отдельным integration test после VBAR/GIC/PSCI.
+runtime-работоспособность отдельно доказывает `make test-arm-boot`.
 По умолчанию boot- и GUI-тесты запускаются с минимальным профилем 128 MiB
 RAM; значения можно переопределить, например
 `BOOT_MEMORY_MB=4096 make test-boot` или `GUI_MEMORY_MB=512 make test-gui`.

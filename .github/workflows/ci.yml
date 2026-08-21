@@ -20,13 +20,13 @@ jobs:
         run: |
           sudo apt-get update --quiet
           sudo DEBIAN_FRONTEND=noninteractive apt-get install \
-            --yes --no-install-recommends qemu-system-x86 ovmf
+            --yes --no-install-recommends qemu-system-x86 qemu-system-arm ovmf
 
       - name: Установить зафиксированный Rust toolchain
         run: |
           rustup toolchain install nightly-2026-08-18 \
             --profile minimal --component rust-src,rustfmt,clippy \
-            --target x86_64-unknown-uefi
+            --target x86_64-unknown-uefi,aarch64-unknown-uefi
           rustup override set nightly-2026-08-18
 
       - name: Форматирование и Clippy
@@ -37,6 +37,9 @@ jobs:
 
       - name: Cross-architecture compile contract
         run: make test-arch
+
+      - name: ARM boot integration (AAVMF, EL0/EL1, GICv3, PSCI)
+        run: ARM_BOOT_TEST_TIMEOUT=90 make test-arm-boot
 
       - name: UEFI boot integration
         run: BOOT_TEST_TIMEOUT=90 make test-boot

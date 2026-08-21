@@ -33,7 +33,8 @@ ELF64 остаётся явным migration fallback и build intermediate.
 
 Тот же container выбирает AArch64 slice; converter нормализует
 `R_AARCH64_RELATIVE`, а register context и syscall ABI выбираются `arch` HAL.
-Исполняемый ARM boot path появится после VBAR/GIC milestone.
+Исполняемый ARM boot path уже проходит AAVMF → EL1 → изолированный EL0,
+GICv3 preemption, PSCI SMP bring-up и тот же RUNE/VFS/loader contract.
 
 `init.rune` получает в bootstrap-регистрах ABI version и handle. Handle является
 индексом только в capability table этого процесса; число само по себе не даёт

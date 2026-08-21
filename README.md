@@ -1,13 +1,14 @@
 # RustOS
 
 RustOS — учебная 64-битная микроядерная операционная система на Rust.
-Рабочая платформа сейчас AMD64/UEFI, а ядро, runtime и приложения также
-собираются для AArch64; CPU-зависимый код изолирован для будущих QEMU `virt`,
-Raspberry Pi и других ARMv8-A платформ.
+Рабочие эталонные платформы — AMD64 (GRUB/Multiboot2) и AArch64 (QEMU `virt`
++ AAVMF). Обе запускают изолированные пользовательские RUNE-процессы,
+вытеснение, IPC, VFS и dynamic loader; CPU-зависимый код изолирован для
+будущих Raspberry Pi и других ARMv8-A платформ.
 
 Текущий рабочий вертикальный срез:
 
-- UEFI/OVMF bootloader на Rust;
+- GRUB/Multiboot2 boot на AMD64 и UEFI loader на Rust для AArch64;
 - ELF64 PIE kernel и initramfs;
 - собственные GDT/TSS/IDT, NX/WP и отдельный ring-0 trap stack;
 - 64-битная карта памяти без ограничения 4 ГиБ;
@@ -62,11 +63,24 @@ make run
 Debian/Ubuntu:
 
 ```sh
-sudo apt install qemu-system-x86 ovmf
+sudo apt install qemu-system-x86 qemu-system-arm ovmf
 make bootstrap
 make build
 make run
 ```
+
+ARM (AArch64, QEMU `virt` + UEFI):
+
+```sh
+make build-arm      # kernel/RUNE/initramfs/VaraniaFS/AAVMF/ESP
+make run-arm        # интерактивный QEMU virt; serial в терминале
+make test-arm-boot  # headless EL0/EL1/GICv3/PSCI integration test
+```
+
+Firmware для ARM (AAVMF) уже закоммичен в `firmware/aarch64/`; сетевая
+загрузка не требуется. Полный ESP находится в `build/arm/esp-arm.img`,
+канонический загрузчик — `EFI/BOOT/BOOTAA64.EFI`, persistent диск —
+`build/arm-system.vfs`.
 
 `make run` открывает графическое окно QEMU. Клавиатура сразу направлена в
 terminal. Мышью можно перемещать окно и использовать кнопки заголовка.
@@ -80,11 +94,14 @@ make test-arch
 make test
 ```
 
-`make test` выполняет три разных сценария:
+`make test` выполняет пять разных сценариев:
 
-1. Cross-build создаёт AMD64 и AArch64 ELF ядра, runtime и приложений.
-2. UEFI boot-test завершается настоящим `isa-debug-exit`.
-3. GUI-тест через настоящий PS/2 выполняет запись/чтение файлов и работу с
+1. Host unit tests проверяют ABI, scheduler, video и инструменты образов.
+2. Cross-build создаёт AMD64 и AArch64 ELF ядра, runtime и приложений.
+3. AMD64 boot-test завершается настоящим `isa-debug-exit`.
+4. AArch64 boot-test проходит AAVMF, GICv3 preemption, PSCI SMP, EL0 fault
+   containment и завершается через `PSCI SYSTEM_OFF`.
+5. GUI-тест через настоящий PS/2 выполняет запись/чтение файлов и работу с
    каталогами, перетаскивает и сворачивает terminal, получает QEMU
    screendump и проверяет геометрию и пиксели.
 
@@ -93,18 +110,18 @@ make test
 ## Архитектурный статус
 
 Обязательный первый рубеж микроядра пройден: QEMU действительно выполняет
-`system/bin/init.elf` в CPL3. Процесс получает только read-only handle корня
+`system/bin/init.rune` в CPL3/EL0. Процесс получает только read-only handle корня
 bootstrap VFS, выполняет syscall, завершается, а второй тестовый ELF вызывает
 `UD2`; ядро перехватывает fault, освобождает address space и продолжает boot.
 
 GUI пока остаётся bootstrap-сеансом CPU0 внутри kernel image. До его запуска
 process manager выполняет настоящую preemptive-сессию: timer IRQ сохраняет
-user context, scheduler выбирает другой TID, меняется CR3, а `iretq`
-возвращается уже в другой процесс. Второй CPU запускается и подтверждает APIC
-ID, но пока parked: без отдельного TSS/IDT/interrupt stack выдавать ему user
-thread небезопасно. Следующий рубеж — per-CPU runtime, IOAPIC/IRQ routing и
-work stealing, затем `vfsd`, display/input и desktop переносятся в
-изолированные процессы. Нативный `rustc` ещё не заявлен готовым.
+user context, scheduler выбирает другой TID, меняется CR3/TTBR0, а
+`iretq`/`eret` возвращает уже другой процесс. На обеих ISA второй CPU реально
+запускается и подтверждает online, но пока parked: следующий рубеж — per-CPU
+runtime, interrupt routing, TLB shootdown и work stealing. Затем display/input
+и desktop переносятся в изолированные процессы. Нативный `rustc` ещё не
+заявлен готовым.
 
 Подробнее: [архитектуры CPU](docs/ARCHITECTURES.md), [архитектура системы](docs/ARCHITECTURE.md),
 [графическая подсистема](docs/GUI.md), [видеосистема](docs/VIDEO.md), [VFS](docs/VFS.md),

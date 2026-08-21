@@ -8,6 +8,7 @@
   "dynamic-linking": true,
   "executables": true,
   "features": "+v8a,+strict-align,-neon",
+  "has-thread-local": true,
   "linker": "rust-lld",
   "linker-flavor": "gnu-lld",
   "llvm-target": "aarch64-unknown-none",
@@ -23,5 +24,6 @@
   },
   "static-position-independent-executables": true,
   "target-endian": "little",
-  "target-pointer-width": 64
+  "target-pointer-width": 64,
+  "tls-model": "initial-exec"
 }

@@ -5,8 +5,8 @@
 //! syscall'ам. После появления user-space PCI/DMA API этот backend без смены
 //! ABI переедет в `virtioblkd`, а kernel оставит IOMMU/IRQ primitives.
 
-// На AArch64 transport пока является честной заглушкой, поэтому часть
-// аппаратных ошибок там ещё не конструируется.
+// Конкретный транспорт выбирается на границе платформы: legacy PCI на
+// эталонном x86 QEMU и modern virtio-mmio на QEMU `virt` AArch64.
 #[allow(dead_code)]
 #[derive(Clone, Copy, Debug)]
 pub enum BlockError {
@@ -28,24 +28,7 @@ pub struct BlockInfo {
 mod platform;
 
 #[cfg(target_arch = "aarch64")]
-mod platform {
-    use super::{BlockError, BlockInfo};
-
-    pub fn initialize() -> Result<BlockInfo, BlockError> {
-        Err(BlockError::Unsupported)
-    }
-    pub fn info() -> Result<BlockInfo, BlockError> {
-        Err(BlockError::Unsupported)
-    }
-    pub fn read_block(_block: u64, _output: &mut [u8; 4096]) -> Result<(), BlockError> {
-        Err(BlockError::Unsupported)
-    }
-    pub fn write_block(_block: u64, _input: &[u8; 4096]) -> Result<(), BlockError> {
-        Err(BlockError::Unsupported)
-    }
-    pub fn flush() -> Result<(), BlockError> {
-        Err(BlockError::Unsupported)
-    }
-}
+#[path = "virtio_mmio.rs"]
+mod platform;
 
 pub use platform::{flush, info, initialize, read_block, write_block};

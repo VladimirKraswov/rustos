@@ -7,10 +7,13 @@
 //!    `#[panic_handler]` предоставляет feature `panic_handler`.
 //! 2. Memory map **до** exit — для выбора резерва ядра и перевода
 //!    виртуального адреса GOP-framebuffer'а.
-//! 3. Резерв ядра: верхний conventional-регион ниже 4 GiB.
+//! 3. Резерв ядра: ET_DYN (PIE) — верхний conventional-регион ниже 4 GiB;
+//!    ET_EXEC (статическое ядро) — ровно с link base (минимальный vaddr
+//!    сегментов; на AArch64 — 0x40000000, начало RAM QEMU `virt`).
 //!    Раскладка блока:
 //!    `[kernel ELF][initramfs][page tables (16 MiB)][BootInfo][scratch (1 MiB)][boot stack (512 KiB)]`.
-//! 4. Загрузка ядра (ELF64 PIE, `R_X86_64_RELATIVE`) и initramfs.
+//! 4. Загрузка ядра (ET_DYN: `R_*_RELATIVE`-релокации; ET_EXEC — сегменты
+//!    по физическим vaddr, релокаций нет) и initramfs.
 //! 5. ACPI RSDP: EFI config table (канонический способ), fallback — legacy scan.
 //! 6. Identity page tables (PGD) — ядро стартует в identity-маппинге.
 //! 7. Копия BootInfo **до** exit (память резерва переживает `ExitBootServices`).
@@ -24,9 +27,9 @@
 //!
 //! ## Контракт ядра
 //!
-//! Ядро — ELF64 PIE (см. `targets/x86_64-unknown-rustos.json`), точка входа
-//! `_start(boot_info: *const rustos_abi::BootInfo)` читает `RDI`.
-//! Все адреса в BootInfo — физические.
+//! Ядро — ELF64 (PIE или статическое, см. `targets/*.json`), точка входа
+//! `_start(boot_info: *const rustos_abi::BootInfo)` (x86 — в `RDI`,
+//! AArch64 — в `X0`). Все адреса в BootInfo — физические.
 
 #![no_main]
 #![no_std]
@@ -40,15 +43,13 @@ mod pagetable;
 use core::time::Duration;
 
 use rustos_abi::bootinfo::{
-    BootConsole, BootFirmware, BootFramebuffer, BootInitramfs, BootStack, BOOT_CONSOLE_16550_PORT,
-    BOOT_FIRMWARE_ACPI, BOOT_FIRMWARE_NONE, FRAMEBUFFER_FORMAT_BGR, FRAMEBUFFER_FORMAT_RGB,
-    KERNEL_STACK_SIZE, PAGE_TABLE_BUDGET,
+    BootFirmware, BootFramebuffer, BootInitramfs, BootStack, BOOT_FIRMWARE_NONE,
+    FRAMEBUFFER_FORMAT_BGR, FRAMEBUFFER_FORMAT_RGB, KERNEL_STACK_SIZE, PAGE_TABLE_BUDGET,
 };
 use rustos_abi::{BootInfo, MemRegion, BOOT_INFO_MAGIC, BOOT_INFO_VERSION, MEMMAP_MAX_REGIONS};
 use uefi::mem::memory_map::{MemoryMap, MemoryMapOwned, MemoryType};
 use uefi::proto::console::gop::{GraphicsOutput, PixelFormat};
-use uefi::table::cfg::ConfigTableEntry;
-use uefi::{boot::AllocateType, prelude::*, system};
+use uefi::{boot::AllocateType, prelude::*};
 
 /// Образ ядра, встроенный на этапе сборки (собирается до загрузчика).
 /// Путь относительный от `boot/uefi/src/main.rs` → `boot/uefi/payload/`.
@@ -87,6 +88,9 @@ enum BootError {
     ReservePages(uefi::Error),
     /// AllocateType::Address неожиданно вернул другой адрес.
     WrongReservationAddress,
+    /// Статическое ядро линковано вне допустимого диапазона резерва
+    /// (ниже 16 MiB или блок не помещается ниже 4 GiB).
+    WrongLinkBase,
     /// Ошибка ELF-образа ядра.
     Elf(elf::ElfError),
     /// Ошибка построения page tables.
@@ -105,6 +109,10 @@ impl core::fmt::Display for BootError {
             BootError::WrongReservationAddress => {
                 write!(f, "UEFI returned an unexpected kernel reservation address")
             }
+            BootError::WrongLinkBase => write!(
+                f,
+                "static kernel link base outside [{RESERVATION_MIN_ADDR:#x}, {RESERVATION_MAX_ADDR:#x})"
+            ),
             BootError::Elf(e) => write!(f, "kernel ELF error: {e}"),
             BootError::PageTables(e) => write!(f, "page tables error: {e}"),
         }
@@ -210,12 +218,24 @@ unsafe fn boot() -> Result<(), BootError> {
     let selection_map =
         uefi::boot::memory_map(MemoryType::LOADER_DATA).map_err(BootError::MemoryMap)?;
 
-    // 2. Резерв ядра (верх conventional-памяти ниже 4 GiB). Найденную
-    //    область обязательно регистрируем в UEFI: иначе firmware вправе
-    //    повторно выдать страницы, уже занятые ядром или page tables.
+    // 2. Резерв ядра. Найденную область обязательно регистрируем в UEFI:
+    //    иначе firmware вправе повторно выдать страницы, уже занятые ядром
+    //    или page tables.
+    //    ET_DYN (PIE) — верхний conventional-регион ниже 4 GiB;
+    //    ET_EXEC (статическое ядро) — блок начинается ровно с link base:
+    //    сегменты копируются по физическим vaddr, другой адрес означал бы
+    //    загрузку в чужую память или fault при первом обращении.
     let kernel_mem_size = elf::image_size(KERNEL_ELF).map_err(BootError::Elf)?;
+    let (is_static, link_base) = elf::load_base(KERNEL_ELF).map_err(BootError::Elf)?;
     let layout = Layout::new(kernel_mem_size);
-    let base = find_reservation(&selection_map, layout.size)?;
+    let base = if is_static {
+        if link_base < RESERVATION_MIN_ADDR || link_base + layout.size > RESERVATION_MAX_ADDR {
+            return Err(BootError::WrongLinkBase);
+        }
+        link_base
+    } else {
+        find_reservation(&selection_map, layout.size)?
+    };
     drop(selection_map);
     let reserved = uefi::boot::allocate_pages(
         AllocateType::Address(base),
@@ -247,9 +267,9 @@ unsafe fn boot() -> Result<(), BootError> {
     );
     debug_assert!(base >= RESERVATION_MIN_ADDR && base + layout.size <= RESERVATION_MAX_ADDR);
 
-    // 3. RSDP и GOP — до копирования ядра (используют pre_map и UEFI-протоколы).
-    let rsdp = find_rsdp();
-    log::info!("ACPI RSDP: {rsdp:#x}");
+    // 3. Firmware (ACPI RSDP / DTB) и GOP — до копирования ядра.
+    let (firmware_root, firmware_size) = arch::find_firmware();
+    log::info!("firmware: root={firmware_root:#x} size={firmware_size:#x}");
     let framebuffer = get_gop_framebuffer(&pre_map);
 
     // 4. Ядро (ELF64 PIE) и initramfs.
@@ -277,20 +297,22 @@ unsafe fn boot() -> Result<(), BootError> {
         INITRAMFS.len()
     );
 
-    // 5. Identity page tables (PGD в бюджетной области резерва).
-    let pgd = pagetable::build_identity_map(
+    // 5. Identity page tables (в бюджетной области резерва).
+    let page_root = pagetable::build_identity_map(
         base + layout.page_tables,
         PAGE_TABLE_BUDGET,
         &pre_map,
         base,
         layout.size,
-        rsdp,
+        firmware_root,
+        firmware_size,
         &framebuffer,
     )
     .map_err(BootError::PageTables)?;
-    log::info!("identity page tables ready: PGD={:#x}", pgd);
+    log::info!("identity page tables ready: root={page_root:#x}");
 
     // 6. BootInfo — копируем в резерв ДО exit (memmap заполним после).
+    let console = arch::boot_console();
     let bootinfo_phys = base + layout.bootinfo;
     let info = BootInfo {
         magic: BOOT_INFO_MAGIC,
@@ -300,21 +322,15 @@ unsafe fn boot() -> Result<(), BootError> {
         _pad2: 0,
         memmap: [MemRegion::ZERO; MEMMAP_MAX_REGIONS],
         framebuffer,
-        console: BootConsole {
-            kind: BOOT_CONSOLE_16550_PORT,
-            flags: 0,
-            base: 0x3f8,
-            clock_hz: 1_843_200,
-            baud: 115_200,
-        },
+        console,
         firmware: BootFirmware {
-            kind: if rsdp == 0 {
+            kind: if firmware_root == 0 {
                 BOOT_FIRMWARE_NONE
             } else {
-                BOOT_FIRMWARE_ACPI
+                arch::FIRMWARE_KIND
             },
             _reserved: 0,
-            root: rsdp,
+            root: firmware_root,
         },
         initramfs: BootInitramfs {
             phys_addr: initramfs_phys,
@@ -337,8 +353,7 @@ unsafe fn boot() -> Result<(), BootError> {
     }
     debug::put_str("[dbg] bootinfo copied; calling exit_boot_services\n");
 
-    // 7. ExitBootServices: после этого boot-протоколы (ConOut/GOP) свободны —
-    //    дальше только serial (ядро) и isa-debug-exit (диагностика).
+    // 7. ExitBootServices.
     let final_map = uefi::boot::exit_boot_services(None);
     let reservation_is_reserved = final_map.entries().any(|descriptor| {
         let start = descriptor.phys_start;
@@ -356,13 +371,9 @@ unsafe fn boot() -> Result<(), BootError> {
     }
     debug::put_str("[dbg] exit ok; memmap written\n");
 
-    // 8. Sanity: буфер финальной карты (LOADER_DATA) не должен пересекать
-    //    резерв ядра. Теоретически возможно: UEFI pool-выделитель не знает
-    //    о нашем резерве. На практике верх резерва исключает коллизию.
-    // До SetVirtualAddressMap x86-64 firmware работает в identity mapping:
-    // обычный pointer буфера уже равен физическому адресу. `virt_start` в
-    // EFI descriptors на этом этапе равен нулю и не подходит для перевода.
-    let buf_phys = final_map.buffer().as_ptr() as u64;
+    // 8. Sanity: буфер финальной карты не должен пересекать резерв ядра.
+    let buf_virt = final_map.buffer().as_ptr() as u64;
+    let buf_phys = arch::virt_to_phys(buf_virt, &final_map);
     let buf_end = buf_phys + final_map.buffer().len() as u64;
     if buf_phys < base + layout.size && buf_end > base {
         log::error!(
@@ -373,33 +384,25 @@ unsafe fn boot() -> Result<(), BootError> {
     }
 
     // 9. Передача управления ядру.
-    //    Контракт: RDI = *const BootInfo, RSP = верх boot-стека, CR3 = PGD.
-    //    cli: у ядра ещё нет IDT (этап 3). jmp: загрузчик не возвращается.
     debug::put_str("[dbg] sanity ok; jumping to kernel\n");
-    // RSP = верх стека МИНУС 8: эмуляция обычного `call` — по ABI в точке
-    // входа функции (после push return-address) RSP ≡ 8 (mod 16). Ядро
-    // компилируется под стандартное состояние: кадры строятся от него, и
-    // `movaps`/`sub $0x28`-прологи предполагают RSP ≡ 8 на входе. `_start`
-    // — `-> !` (никакого `ret`), поэтому «ложный return-address» в верхних
-    // 8 байтах не читается.
     let stack_top = base + layout.size;
-    let kernel_rsp = stack_top - 8;
-    // Intel-синтаксис (default rustc, подтверждено сборкой ядра): `mov dst, src`.
-    // `mov cr3, {pgd}` — ЗАПИСЬ pgd в CR3 (AT&T-оригинал `%cr3, {pgd}` читал CR3).
-    //
-    // `jmp {entry}` — косвенный переход ЧЕРЕЗ РЕГИСТР (FF E0).
-    // Формы `jmp [entry]` / `jmp qword ptr [entry]` = переход ЧЕРЕЗ ПАМЯТЬ
-    // (FF 20): CPU прочитал бы 8 байт КОДА по адресу entry и прыгнул бы по
-    // значению этих байт (полевая проверка: #GP с RIP = первые 8 байт .text).
-    //
-    // Регистры: asm реально модифицирует только RDI (GPR) и спец-регистры
-    // CR3/RSP; прочие GPR не трогаем → не объявляем clobber (иначе 4 входа +
-    // 12 clobber = 16 > 15 доступных GPR → «requires more registers than
-    // available»). RDI объявлен явным output.
-    // SAFETY: pgd/stack_top/boot_info — валидные identity-адреса из раскладки;
-    // память не используется (nomem), push/pop нет (nostack — только setup
-    // стека ядра), `jmp` не возвращается (unreachable_unchecked ниже).
-    unsafe { arch::jump_to_kernel(pgd, kernel_rsp, bootinfo_phys, entry) }
+    #[cfg(target_arch = "x86_64")]
+    {
+        // RSP = верх стека − 8: эмуляция `call` (RSP ≡ 8 mod 16 по SysV ABI).
+        let kernel_rsp = stack_top - 8;
+        // SAFETY: page_root/stack_top/boot_info — identity-адреса из раскладки.
+        unsafe { arch::jump_to_kernel(page_root, kernel_rsp, bootinfo_phys, entry) }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SP_EL1 = верх стека (AAPCS64: SP%16==0 на входе, без −8).
+        // Parking-векторы в scratch-области (1-KiB-выровнена).
+        let vectors = base + layout.scratch;
+        // SAFETY: vectors — в пределах резерва, 1-KiB-выровнена.
+        unsafe { pagetable::fill_parking_vectors(vectors) };
+        // SAFETY: все аргументы — валидные identity-адреса из раскладки.
+        unsafe { arch::jump_to_kernel(page_root, stack_top, bootinfo_phys, entry, vectors) }
+    }
 }
 
 /// Выбор верхнего выровненного адреса в conventional-регионе ниже 4 GiB.
@@ -431,78 +434,11 @@ fn find_reservation(map: &MemoryMapOwned, required: u64) -> Result<u64, BootErro
     best.ok_or(BootError::NoKernelRegion)
 }
 
-/// ACPI RSDP: EFI config table (ACPI 2.0 GUID, затем ACPI 1.0),
-/// fallback — legacy scan `0xE0000..0x100000` (шаг 16 байт) и EBDA.
-///
-/// Адрес в EFI config table — физический (до `SetVirtualAddressMap`
-/// все таблицы в UEFI — по физическим адресам).
-fn find_rsdp() -> u64 {
-    let mut rsdp: u64 = 0;
-    system::with_config_table(|entries: &[ConfigTableEntry]| {
-        if rsdp == 0 {
-            if let Some(e) = entries
-                .iter()
-                .find(|e| e.guid == ConfigTableEntry::ACPI2_GUID)
-            {
-                rsdp = e.address as u64;
-            }
-        }
-        if rsdp == 0 {
-            if let Some(e) = entries
-                .iter()
-                .find(|e| e.guid == ConfigTableEntry::ACPI_GUID)
-            {
-                rsdp = e.address as u64;
-            }
-        }
-    });
-    if rsdp != 0 {
-        return rsdp;
-    }
-    // Legacy fallback (OVMF всегда отдаёт config table, но для надёжности).
-    let sig = b"RSD PTR ";
-    let mut addr = 0xE0000u64;
-    while addr < 0x100_0000 {
-        // SAFETY: identity-маппинг UEFI, регион 0xE0000..0x1000000 — ROM/RAM.
-        if unsafe { has_signature(addr, sig) } {
-            return addr;
-        }
-        addr += 16;
-    }
-    let ebda = unsafe { (0x40E as *const u16).read_volatile() };
-    if (ebda as u32) > 0x40E {
-        let base = (ebda as u64) & 0xFFFF_F000;
-        let mut a = base;
-        while a < base + 1024 {
-            // SAFETY: EBDA-регион — валидная низкая память (identity-маппинг).
-            if unsafe { has_signature(a, sig) } {
-                return a;
-            }
-            a += 16;
-        }
-    }
-    0
-}
-
-/// Проверка сигнатуры по физическому адресу (identity-маппинг UEFI).
-unsafe fn has_signature(addr: u64, sig: &[u8]) -> bool {
-    let p = addr as *const u8;
-    for (i, &b) in sig.iter().enumerate() {
-        if p.add(i).read_volatile() != b {
-            return false;
-        }
-    }
-    true
-}
-
 /// GOP-framebuffer: параметры активного режима + физический адрес.
 ///
 /// Читаем до exit, пока `pre_map` валиден для virt→phys.
-/// ОVMF на QEMU маппит framebuffer 1:1, но общий случай — через карту.
-fn get_gop_framebuffer(_pre_map: &MemoryMapOwned) -> BootFramebuffer {
-    // GOP живёт не на handle нашего image, а на handle устройства
-    // платформы — ищем его через handle-базу (open по image давал
-    // UNSUPPORTED).
+/// x86: OVMF маппит framebuffer 1:1. AArch64: через UEFI карту.
+fn get_gop_framebuffer(pre_map: &MemoryMapOwned) -> BootFramebuffer {
     let gop_handle = match uefi::boot::get_handle_for_protocol::<GraphicsOutput>() {
         Ok(h) => h,
         Err(e) => {
@@ -528,8 +464,9 @@ fn get_gop_framebuffer(_pre_map: &MemoryMapOwned) -> BootFramebuffer {
     };
     let (width, height) = mode.resolution();
     let stride = mode.stride();
-    let fb_phys = gop.frame_buffer().as_mut_ptr() as u64;
-    log::info!("GOP framebuffer identity address: {fb_phys:#x}");
+    let fb_virt = gop.frame_buffer().as_mut_ptr() as u64;
+    let fb_phys = arch::virt_to_phys(fb_virt, pre_map);
+    log::info!("GOP framebuffer: virt={fb_virt:#x} phys={fb_phys:#x}");
     BootFramebuffer {
         phys_addr: fb_phys,
         width: width as u32,

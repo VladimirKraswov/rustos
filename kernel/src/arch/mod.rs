@@ -5,13 +5,14 @@
 //! backend экспортирует один и тот же небольшой контракт: ранний запуск,
 //! адресные пространства, trap frame, таймер и запуск вторичных ядер.
 //!
-//! Сейчас x86-64 backend полностью работает и проходит boot/GUI-тесты.
-//! AArch64 backend является собираемым porting target: в нём уже определены
-//! ABI контекста, системный вызов, MMU-примитивы и PSCI shutdown; подключение
-//! GIC/Generic Timer и конкретного загрузчика выполняется следующим этапом.
+//! Оба backend'а проходят настоящий boot integration: x86-64 использует
+//! APIC/Multiboot2, AArch64 — AAVMF, GICv3, Generic Timer и PSCI. AP на обеих
+//! ISA пока запускаются и безопасно паркуются; распределение user threads по
+//! нескольким CPU остаётся отдельным per-CPU scheduler milestone.
 
 #![allow(dead_code)]
 
+use core::sync::atomic::{AtomicU64, Ordering};
 use rustos_abi::BootInfo;
 
 // Эти C builtins не зависят от ISA и нужны freestanding `core` на каждом
@@ -87,6 +88,19 @@ pub use x86_64::*;
 
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 compile_error!("RustOS kernel currently supports only x86_64 and aarch64");
+
+/// Частота timer counter, сохранённая при инициализации.
+static COUNTER_HZ: AtomicU64 = AtomicU64::new(1);
+
+/// Возвращает частоту timer counter (Гц).
+pub fn counter_frequency() -> u64 {
+    COUNTER_HZ.load(Ordering::Acquire)
+}
+
+/// Сохраняет частоту timer counter при инициализации.
+pub fn set_counter_frequency(hz: u64) {
+    COUNTER_HZ.store(hz.max(1), Ordering::Release);
+}
 
 /// Единая сигнатура запуска CPU backend'а.
 pub type EarlyInitializer = fn(&BootInfo) -> Result<EarlyInit, ArchError>;

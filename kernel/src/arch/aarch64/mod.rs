@@ -6,6 +6,11 @@
 //! будут подключаться platform-драйверами. Благодаря этому ядро не станет
 //! «ядром только для одной Raspberry Pi».
 
+mod gic;
+mod smp;
+mod timer;
+mod traps;
+
 use core::arch::asm;
 
 use rustos_abi::BootInfo;
@@ -21,11 +26,9 @@ const ESR_EC_MASK: u64 = 0x3f;
 const ESR_EC_SVC64: u16 = 0x15;
 const TRAP_SYNC: u64 = 0;
 const TRAP_IRQ: u64 = 1;
+const TRAP_SPURIOUS: u64 = 2;
 
-/// Кадр, который будущий vector stub сохраняет при входе EL0 -> EL1.
-///
-/// Массив `x` сохраняет x0..x30 без предположений process manager о роли
-/// отдельных регистров. `source` отделяет synchronous exception от IRQ.
+/// Кадр, который vector stub сохраняет при входе EL0 -> EL1.
 #[repr(C)]
 #[derive(Debug)]
 pub struct TrapFrame {
@@ -45,9 +48,10 @@ impl TrapFrame {
     }
 
     pub fn kind(&self) -> TrapKind {
+        if self.source == TRAP_SPURIOUS {
+            return TrapKind::Spurious;
+        }
         if self.source == TRAP_IRQ {
-            // После подключения GIC backend уточнит ID и сможет отличать
-            // timer/spurious. До этого единственный разрешённый IRQ — timer.
             return TrapKind::Timer;
         }
         let exception_class = ((self.esr_el1 >> ESR_EC_SHIFT) & ESR_EC_MASK) as u16;
@@ -68,7 +72,6 @@ impl TrapFrame {
     }
 
     pub const fn syscall_number(&self) -> u64 {
-        // RustOS AArch64 ABI следует обычной конвенции: x8 — номер, x0..x2 — args.
         self.x[8]
     }
 
@@ -169,45 +172,106 @@ pub fn read_monotonic_counter() -> u64 {
 /// Монотонное время на architected Generic Timer, без platform MMIO.
 pub fn monotonic_milliseconds() -> u64 {
     let frequency: u64;
-    unsafe { asm!("mrs {value}, cntfrq_el0", value = out(reg) frequency, options(nomem, nostack)) };
+    unsafe {
+        asm!(
+            "mrs {value}, cntfrq_el0",
+            value = out(reg) frequency,
+            options(nomem, nostack),
+        );
+    }
     let frequency = frequency.max(1);
     let ticks = read_monotonic_counter();
     ticks / frequency * 1_000 + (ticks % frequency) * 1_000 / frequency
 }
 
+/// Настраивает VBAR_EL1 и возвращает вершину kernel stack.
 pub fn initialize_early(info: &BootInfo) -> Result<EarlyInit, ArchError> {
-    // Синхронизируем записи загрузчика перед будущей установкой VBAR_EL1.
-    unsafe { asm!("dsb sy", "isb", options(nostack, preserves_flags)) };
+    // Синхронизируем записи загрузчика перед установкой VBAR_EL1.
+    unsafe {
+        asm!("dsb sy", "isb", options(nostack, preserves_flags));
+    }
+    traps::initialize();
+    // EL0VCTEN=1: пользовательский runtime читает architected virtual
+    // counter (`cntvct_el0`) без дорогого syscall на каждом обращении к
+    // монотонным часам. Доступ к programming registers timer остаётся EL1.
+    unsafe {
+        let mut control: u64;
+        asm!(
+            "mrs {control}, cntkctl_el1",
+            control = out(reg) control,
+            options(nomem, nostack),
+        );
+        control |= 1 << 1;
+        asm!(
+            "msr cntkctl_el1, {control}",
+            "isb",
+            control = in(reg) control,
+            options(nomem, nostack),
+        );
+    }
     Ok(EarlyInit {
         kernel_stack_top: info.boot_stack.top,
-        exception_backend: "EL1/VBAR porting backend",
+        exception_backend: "EL1/VBAR",
     })
 }
 
+/// Инициализация GICv3 + Generic Timer.
 pub fn initialize_scheduler_hardware() -> Result<SchedulerHardware, ArchError> {
-    // Частота architected counter уже доступна без platform-specific адресов.
-    let counter_hz: u64;
-    unsafe {
-        asm!("mrs {value}, cntfrq_el0", value = out(reg) counter_hz, options(nomem, nostack))
-    };
-    let _ = counter_hz;
-    // Разрешать timer IRQ до обнаружения/настройки GIC нельзя.
-    Err(ArchError::InterruptController)
+    gic::initialize().map_err(|_| ArchError::InterruptController)?;
+    timer::initialize();
+    let counter_hz = timer::counter_frequency().max(1);
+    super::set_counter_frequency(counter_hz);
+    Ok(SchedulerHardware {
+        boot_cpu_id: 0,
+        counter_hz,
+        interrupt_controller: "GICv3",
+        timer: "generic-one-shot",
+    })
 }
 
-pub fn start_secondary_cpus(_info: &BootInfo, _counter_hz: u64) -> Result<SmpInfo, ArchError> {
-    // PSCI CPU_ON требует MPIDR из DT/ACPI и выбранный firmware conduit.
-    Err(ArchError::FirmwareDescription)
+/// Запускает все объявленные Device Tree CPU через PSCI и ждёт их реального
+/// подтверждения. AP пока безопасно припаркованы до per-CPU scheduler.
+pub fn start_secondary_cpus(info: &BootInfo, counter_hz: u64) -> Result<SmpInfo, ArchError> {
+    if info.firmware.kind != rustos_abi::bootinfo::BOOT_FIRMWARE_DEVICE_TREE
+        || info.firmware.root == 0
+    {
+        return Err(ArchError::FirmwareDescription);
+    }
+    let report = smp::start_application_processors(info.firmware.root, counter_hz)
+        .map_err(|_| ArchError::SecondaryCpuStartup)?;
+    Ok(SmpInfo {
+        online_cpus: report.online_cpus,
+        discovered_cpus: report.discovered_cpus,
+        discovery: "Device Tree + PSCI",
+    })
 }
 
-pub fn start_scheduler_timer(_counter_hz: u64) {}
-pub fn stop_scheduler_timer() {}
-pub fn rearm_scheduler_timer(_counter_hz: u64) {}
-pub fn end_of_interrupt() {}
+pub fn start_scheduler_timer(counter_hz: u64) {
+    timer::start(counter_hz);
+}
+
+pub fn stop_scheduler_timer() {
+    timer::stop();
+}
+
+pub fn rearm_scheduler_timer(counter_hz: u64) {
+    let period = counter_hz.div_ceil(1000).max(1);
+    timer::rearm(period);
+}
+
+pub fn end_of_interrupt() {
+    // GIC EOI уже выполнен в traps.rs перед return.
+}
 
 pub fn current_address_space_root() -> u64 {
     let value: u64;
-    unsafe { asm!("mrs {value}, ttbr0_el1", value = out(reg) value, options(nomem, nostack)) };
+    unsafe {
+        asm!(
+            "mrs {value}, ttbr0_el1",
+            value = out(reg) value,
+            options(nomem, nostack),
+        );
+    }
     value & 0x0000_ffff_ffff_f000
 }
 
@@ -229,26 +293,23 @@ pub unsafe fn switch_address_space(root: u64) {
     }
 }
 
-static mut USER_RUN_RESULT: u64 = 0;
-
 pub fn set_user_run_result(result: u64) {
-    unsafe { USER_RUN_RESULT = result };
+    traps::set_user_result(result);
 }
 
-/// Временная безопасная граница porting target: до установки VBAR/GIC вход
-/// в EL0 запрещён и CPU остаётся в low-power wait вместо выполнения с неверной
-/// таблицей исключений. Реальный `eret` stub будет единственным ASM-файлом
-/// следующего ARM milestone.
+/// Вход в user mode: ERET в EL0t.
+///
+/// # Safety
+///
+/// `entry`, `stack` и `arguments` принадлежат подготовленному процессу.
 pub unsafe fn enter_user(
-    _entry: u64,
-    _stack: u64,
-    _arguments: [u64; 3],
-    _root: u64,
-    _interrupts: bool,
+    entry: u64,
+    stack: u64,
+    arguments: [u64; 3],
+    root: u64,
+    interrupts: bool,
 ) -> u64 {
-    loop {
-        unsafe { asm!("wfi", options(nomem, nostack)) };
-    }
+    unsafe { traps::enter_user(entry, stack, arguments, root, interrupts) }
 }
 
 pub const fn initial_user_stack(top: u64) -> u64 {
@@ -257,21 +318,30 @@ pub const fn initial_user_stack(top: u64) -> u64 {
 }
 
 pub fn halt() {
-    unsafe { asm!("wfi", options(nomem, nostack)) };
+    unsafe {
+        asm!("wfi", options(nomem, nostack));
+    }
 }
 
-pub fn debug_exit(_code: u8) {}
-
-pub fn power_off() -> ! {
-    // PSCI SYSTEM_OFF, HVC conduit (QEMU `virt` и многие гипервизоры).
-    // Реальный platform layer выберет HVC/SMC по DT `method`.
+/// Завершение VM: PSCI SYSTEM_OFF через HVC conduit QEMU `virt`.
+pub fn debug_exit(_code: u8) {
+    // В эталонной QEMU-платформе PSCI method = "hvc". SMC из
+    // non-secure EL1 здесь порождает synchronous exception.
     unsafe {
         asm!(
+            "mov w0, #0x0008",
+            "movk w0, #0x8400, lsl #16",
             "hvc #0",
-            in("x0") 0x8400_0008u64,
-            options(nostack),
+            options(nomem, nostack),
         );
     }
+    loop {
+        halt();
+    }
+}
+
+pub fn power_off() -> ! {
+    debug_exit(0);
     loop {
         halt();
     }

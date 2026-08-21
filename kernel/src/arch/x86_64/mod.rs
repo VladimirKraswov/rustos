@@ -151,6 +151,7 @@ pub fn initialize_early(_info: &BootInfo) -> Result<EarlyInit, ArchError> {
 pub fn initialize_scheduler_hardware() -> Result<SchedulerHardware, ArchError> {
     let info = apic::initialize_local().map_err(|_| ArchError::InterruptController)?;
     MONOTONIC_HZ.store(info.tsc_hz.max(1), Ordering::Release);
+    super::set_counter_frequency(info.tsc_hz.max(1));
     Ok(SchedulerHardware {
         boot_cpu_id: info.id,
         counter_hz: info.tsc_hz,
