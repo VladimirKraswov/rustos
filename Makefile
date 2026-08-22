@@ -14,7 +14,7 @@ SHELL := /bin/bash
 # содержит библиотеки с unit tests и host tools; RustOS-набор — все прямые
 # freestanding packages, которые Clippy обязан проверить для обеих ISA.
 HOST_CRATES := \
-	rustos-abi rustos-microkernel rustos-video rustos-system-ui \
+	rustos-abi rustos-microkernel rustos-video rustos-compositor rustos-system-ui \
 	rustos-system-assets rustos-system-fonts rustos-rune-format rustos-runtime rustos-vfs-client rustos-surface-client \
 	rustos-package-registry rustos-package-registry-tool \
 	rustos-elf-loader rustos-rune-loader rustos-virgl rustos-mesa rustos-usb varaniafs rustos-image rustos-pack \
@@ -23,7 +23,7 @@ HOST_CRATES := \
 HOST_CRATE_ARGS := $(addprefix -p ,$(HOST_CRATES))
 
 DOC_CRATES := \
-	rustos-abi rustos-microkernel rustos-video rustos-system-ui \
+	rustos-abi rustos-microkernel rustos-video rustos-compositor rustos-system-ui \
 	rustos-system-assets rustos-system-fonts rustos-rune-format rustos-runtime rustos-vfs-client rustos-surface-client \
 	rustos-package-registry \
 	rustos-elf-loader rustos-rune-loader rustos-ruidl rustos-ruidl-compiler rustos-virgl \
@@ -31,7 +31,7 @@ DOC_CRATES := \
 DOC_CRATE_ARGS := $(addprefix -p ,$(DOC_CRATES))
 
 RUSTOS_CRATES := \
-	rustos-kernel rustos-runtime rustos-crt rustos-bootstrap-apps \
+	rustos-kernel rustos-runtime rustos-crt rustos-bootstrap-apps rustos-compositor \
 	rustos-system-fonts \
 	rustos-vfs-client rustos-vfs-dll rustos-surface-client rustos-elf-loader rustos-rune-loader \
 	rustos-package-registry rustos-virgl rustos-ui-gpu rustos-mesa

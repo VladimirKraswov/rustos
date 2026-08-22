@@ -420,6 +420,7 @@ name = "rustos-bootstrap-apps"
 version = "0.1.0"
 dependencies = [
  "rustos-abi",
+ "rustos-compositor",
  "rustos-crt",
  "rustos-elf-loader",
  "rustos-mesa",
@@ -434,6 +435,14 @@ dependencies = [
  "rustos-video",
  "rustos-virgl",
  "varaniafs",
+]
+
+[[package]]
+name = "rustos-compositor"
+version = "0.1.0"
+dependencies = [
+ "rustos-abi",
+ "rustos-video",
 ]
 
 [[package]]

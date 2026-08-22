@@ -66,6 +66,12 @@ grep -Eq '\[gpu\] swapchain=triple mailbox=latest peak-inflight=[23]' "$SERIAL_L
 grep -Fq '[gpu-compositor] layers=3 damage=scissor blend=premultiplied readback=0 cpu-raster=0' "$SERIAL_LOG"
 grep -Fq '[virgl-test] WINDOWED_CANVAS_READY source=gpu-surface readback=0 cpu-raster=no' "$SERIAL_LOG"
 grep -Fq '[gpu-canvas] WINDOWED_CANVAS_READY source=gpu-surface readback=0 instances=2' "$SERIAL_LOG"
+grep -Fq 'pacing=ring3-atomic-mailbox slots=2 stale=drop' "$SERIAL_LOG"
+PERF_FPS_X10="$({ grep -Eo '\[graphics-perf\] workload=aurora.*fps-x10=[0-9]+' "$SERIAL_LOG" || true; } | tail -n 1 | sed -E 's/.*fps-x10=([0-9]+).*/\1/')"
+if [[ -z "$PERF_FPS_X10" || "$PERF_FPS_X10" -lt 300 ]]; then
+    echo "[utm-gpu-test] Aurora throughput below 30 FPS: fps-x10=${PERF_FPS_X10:-missing}" >&2
+    exit 6
+fi
 grep -Fq '[virgl-test] MESA_SHOWCASE_READY scanout=graphics-buffer cpu-raster=no' "$SERIAL_LOG"
 grep -Eq '\[irq\] virtio-gpu completion=intid-[0-9]+ mode=interrupt fallback=timer-poll' \
     "$SERIAL_LOG"

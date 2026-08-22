@@ -85,6 +85,11 @@ retained surface: это сохраняет правильный source-over и 
 формат приложения. Финальный pass пишет прямо в scanout-compatible `GraphicsBuffer`,
 latest-frame mailbox отбрасывает устаревшие кадры. CPU renderer включается
 только при отказе GPU.
+Двухслотовый mailbox публикуется release/acquire без частичного кадра, а
+newest-selection, focus/capture metadata и display-feedback frame clock живут
+в `no_std` crate `rustos-compositor`, используемом ring-3 `compositord`.
+Kernel bootstrap adapter больше не хранит pending-frame очередь и не решает,
+какой из накопленных кадров показывать.
 Контракт описан в
 [GRAPHICS_ABI.md](GRAPHICS_ABI.md), [GPU_RENDERING.md](GPU_RENDERING.md) и
 [ADR-0001](adr/0001-modern-graphics-architecture.md). Окончательная

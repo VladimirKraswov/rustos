@@ -8,7 +8,10 @@
 #![no_std]
 #![no_main]
 
-use core::panic::PanicInfo;
+use core::{
+    panic::PanicInfo,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 use rustos_abi::{
     display::{
@@ -17,8 +20,10 @@ use rustos_abi::{
         DISPLAY_QUERY_HANDLE_COUNT, DISPLAY_QUERY_OPCODE,
     },
     gpu::{
-        demo_flag, GpuDemoRequest, GpuRenderFrame, GPU_DEMO_START_OPCODE,
-        GPU_RENDERED_FRAME_HANDLE_COUNT, GPU_RENDERED_FRAME_OPCODE, GPU_RENDER_REQUEST_OPCODE,
+        demo_flag, GpuDemoRequest, GpuRenderFrame, GpuUiFrameHeader, GpuUiMailboxSlotHeader,
+        GPU_DEMO_START_OPCODE, GPU_RENDERED_FRAME_HANDLE_COUNT, GPU_RENDERED_FRAME_OPCODE,
+        GPU_RENDER_REQUEST_OPCODE, GPU_UI_MAILBOX_FRAME_OFFSET, GPU_UI_MAILBOX_SLOTS,
+        GPU_UI_STREAM_BYTES,
     },
     graphics_buffer::{BufferUsage, GraphicsBufferDesc, MemoryDomain, PixelFormatCode},
     ipc::{flags as ipc_flags, TransferredHandle},
@@ -33,19 +38,23 @@ use rustos_abi::{
     },
     sync::{SyncTimelineCreate, SyncTimelineSignal, SyncTimelineWait, SYNC_TIMEOUT_INFINITE},
 };
+use rustos_compositor::{
+    select_newest_scene, FocusRouter, FrameClock, InputTarget, SceneCandidate,
+};
 use rustos_runtime::{
     graphics_buffer_create, graphics_buffer_get_info, graphics_buffer_map, handle_close,
-    handle_duplicate, ipc_receive, ipc_send, process_exit, sync_timeline_create,
+    handle_duplicate, ipc_receive, ipc_send, process_exit, shared_memory_map, sync_timeline_create,
     sync_timeline_signal, sync_timeline_wait, syscall, vm_unmap, Handle, Message, Rights,
     SharedMemoryMap, VmFlags,
 };
-use rustos_video::SurfaceQueue;
+use rustos_video::{Rect, SurfaceQueue};
 
 const FRAME_MAGIC: u64 = 0x5255_5354_4f53_4758;
 const GPU_MODE_FLAG: u64 = 1 << 63;
 const GPU_FRAME_ENDPOINT: Handle = Handle(4);
 const GPU_CONTROL_ENDPOINT: Handle = Handle(5);
 const SURFACE_CONTROL_ENDPOINT: Handle = Handle(6);
+const UI_MAILBOX_HANDLES: [Handle; GPU_UI_MAILBOX_SLOTS] = [Handle(7), Handle(8)];
 const MAX_CLIENT_SURFACES: usize = 16;
 
 #[derive(Clone, Copy)]
@@ -64,10 +73,11 @@ struct PreparedFrame {
 struct PresentClock {
     timeline: Handle,
     value: u64,
+    frame: FrameClock,
 }
 
 impl PresentClock {
-    fn new() -> Self {
+    fn new(refresh_millihertz: u32) -> Self {
         let value = sync_timeline_create(&SyncTimelineCreate::new(0));
         if value <= 0 {
             process_exit(187);
@@ -75,10 +85,12 @@ impl PresentClock {
         Self {
             timeline: Handle(value as u32),
             value: 0,
+            frame: FrameClock::new(1_000_000_000_000u64 / u64::from(refresh_millihertz.max(1))),
         }
     }
 
     fn advance(&mut self) -> u64 {
+        self.frame.request_frame();
         self.value = self.value.saturating_add(1);
         self.value
     }
@@ -111,6 +123,73 @@ impl ClientSurface {
     }
 }
 
+/// Отображает два immutable scene slot только на чтение. Compositor владеет
+/// политикой выбора newest frame; renderd получает те же capabilities, но не
+/// может публиковать новое состояние сцены.
+fn map_ui_mailbox() -> [*const u8; GPU_UI_MAILBOX_SLOTS] {
+    let mut slots = [core::ptr::null(); GPU_UI_MAILBOX_SLOTS];
+    for (index, handle) in UI_MAILBOX_HANDLES.into_iter().enumerate() {
+        let mapping = SharedMemoryMap {
+            version: MEMORY_ABI_VERSION,
+            reserved: 0,
+            address: 0,
+            offset: 0,
+            length: GPU_UI_STREAM_BYTES as u64,
+            flags: VmFlags::READ,
+        };
+        let address = shared_memory_map(handle, &mapping);
+        if address <= 0 {
+            process_exit(208);
+        }
+        let base = address as *const u8;
+        let metadata = unsafe { base.cast::<GpuUiMailboxSlotHeader>().read_volatile() };
+        if metadata.validate(index as u16).is_err() {
+            process_exit(208);
+        }
+        slots[index] = base;
+    }
+    slots
+}
+
+/// Возвращает newest полностью опубликованный кадр. Один acquire-load на slot
+/// достаточно для выбора: renderd повторно проверяет generation вокруг
+/// private snapshot и никогда не отправляет GPU частично записанную сцену.
+fn newest_ui_frame(
+    slots: [*const u8; GPU_UI_MAILBOX_SLOTS],
+    last_presented: u64,
+    scene_initialized: bool,
+) -> Option<(u64, u16, bool)> {
+    let mut candidates = [SceneCandidate {
+        frame_id: 0,
+        slot: 0,
+        full: false,
+    }; GPU_UI_MAILBOX_SLOTS];
+    for (index, base) in slots.into_iter().enumerate() {
+        let published = unsafe { &*base.cast::<AtomicU64>() }.load(Ordering::Acquire);
+        if published <= last_presented {
+            continue;
+        }
+        let frame = unsafe {
+            base.add(GPU_UI_MAILBOX_FRAME_OFFSET)
+                .cast::<GpuUiFrameHeader>()
+                .read_volatile()
+        };
+        if frame.validate().is_err()
+            || frame.frame_id != published
+            || unsafe { &*base.cast::<AtomicU64>() }.load(Ordering::Acquire) != published
+        {
+            continue;
+        }
+        candidates[index] = SceneCandidate {
+            frame_id: published,
+            slot: index as u16,
+            full: frame.flags == GpuUiFrameHeader::FULL_FRAME,
+        };
+    }
+    select_newest_scene(&candidates, last_presented, scene_initialized)
+        .map(|candidate| (candidate.frame_id, candidate.slot, candidate.full))
+}
+
 #[no_mangle]
 pub extern "C" fn _start(display_endpoint: u64, feedback_endpoint: u64, abi_version: u64) -> ! {
     let gpu_mode = abi_version & GPU_MODE_FLAG != 0;
@@ -120,10 +199,14 @@ pub extern "C" fn _start(display_endpoint: u64, feedback_endpoint: u64, abi_vers
     let display_endpoint = Handle(display_endpoint as u32);
     let feedback_endpoint = Handle(feedback_endpoint as u32);
     let info = query_display(display_endpoint, feedback_endpoint);
-    let mut present_clock = PresentClock::new();
+    let mut present_clock = PresentClock::new(info.refresh_millihertz);
     let mut frame_id = 1u64;
+    let ui_mailbox = gpu_mode.then(map_ui_mailbox);
+    let mut last_system_ui_frame = 0u64;
+    let mut system_ui_scene_initialized = false;
     let mut next_surface_id = 1u64;
     let mut surfaces = [ClientSurface::EMPTY; MAX_CLIENT_SURFACES];
+    let mut focus = FocusRouter::<MAX_CLIENT_SURFACES>::new();
     // Стартовый desktop остаётся обычным CPU buffer. Иначе первый GPU кадр
     // навсегда зафиксировал бы размер renderd target равным scanout и не дал
     // бы приложениям создавать компактные оконные surfaces.
@@ -146,7 +229,7 @@ pub extern "C" fn _start(display_endpoint: u64, feedback_endpoint: u64, abi_vers
         }
         match control.header.opcode {
             SURFACE_CREATE_OPCODE => {
-                handle_surface_create(&control, &mut surfaces, &mut next_surface_id);
+                handle_surface_create(&control, &mut surfaces, &mut next_surface_id, &mut focus);
                 continue;
             }
             SURFACE_COMMIT_OPCODE => {
@@ -160,7 +243,7 @@ pub extern "C" fn _start(display_endpoint: u64, feedback_endpoint: u64, abi_vers
                 continue;
             }
             SURFACE_DESTROY_OPCODE => {
-                handle_surface_destroy(&control, &mut surfaces);
+                handle_surface_destroy(&control, &mut surfaces, &mut focus);
                 continue;
             }
             GPU_DEMO_START_OPCODE if gpu_mode => {}
@@ -177,6 +260,42 @@ pub extern "C" fn _start(display_endpoint: u64, feedback_endpoint: u64, abi_vers
             Ok(request) => request,
             Err(_) => continue,
         };
+        if request.flags & demo_flag::SYSTEM_UI != 0 {
+            let Some(mailbox) = ui_mailbox else {
+                continue;
+            };
+            let Some((scene_frame, mailbox_slot, full_frame)) =
+                newest_ui_frame(mailbox, last_system_ui_frame, system_ui_scene_initialized)
+            else {
+                continue;
+            };
+            // Несколько wakeups могут лежать в bounded endpoint queue, но
+            // каждый из них смотрит на один newest mailbox. Поэтому старые
+            // mouse frames не рендерятся после уже показанного кадра.
+            if scene_frame <= last_system_ui_frame {
+                continue;
+            }
+            let prepared = prepare_gpu_frame(
+                info.width,
+                info.height,
+                scene_frame,
+                None,
+                false,
+                true,
+                Some(mailbox_slot),
+            );
+            present_frame(
+                display_endpoint,
+                feedback_endpoint,
+                info,
+                prepared,
+                scene_frame,
+                &mut present_clock,
+            );
+            last_system_ui_frame = scene_frame;
+            system_ui_scene_initialized |= full_frame;
+            continue;
+        }
         let windowed = request.flags & demo_flag::WINDOWED != 0;
         let compositor_probe = request.flags & demo_flag::COMPOSITOR_PROBE != 0;
         let render_width = if windowed { request.width } else { info.width };
@@ -197,6 +316,7 @@ pub extern "C" fn _start(display_endpoint: u64, feedback_endpoint: u64, abi_vers
                 Some(request.first_frame),
                 compositor_probe,
                 false,
+                None,
             );
             wait_prepared(frame);
             discard_frame(frame);
@@ -219,6 +339,7 @@ fn handle_surface_create(
     message: &Message,
     surfaces: &mut [ClientSurface; MAX_CLIENT_SURFACES],
     next_surface_id: &mut u64,
+    focus: &mut FocusRouter<MAX_CLIENT_SURFACES>,
 ) {
     if message.header.payload_len as usize != core::mem::size_of::<SurfaceCreateRequest>()
         || message.header.handle_count != SURFACE_CREATE_HANDLE_COUNT
@@ -243,6 +364,10 @@ fn handle_surface_create(
         if probe > 0 {
             let _ = handle_close(Handle(probe as u32));
         } else {
+            let _ = focus.remove(InputTarget {
+                owner_pid: surface.owner_pid,
+                surface: surface.id,
+            });
             *surface = ClientSurface::EMPTY;
         }
     }
@@ -272,9 +397,26 @@ fn handle_surface_create(
         generation: 1,
         last_frame_id: 0,
     };
+    let _ = focus.insert(
+        InputTarget {
+            owner_pid: message.header.sender_pid,
+            surface: id,
+        },
+        Rect::new(
+            0,
+            0,
+            request.metrics.physical_width,
+            request.metrics.physical_height,
+        ),
+        i32::try_from(id.0).unwrap_or(i32::MAX),
+    );
 }
 
-fn handle_surface_destroy(message: &Message, surfaces: &mut [ClientSurface; MAX_CLIENT_SURFACES]) {
+fn handle_surface_destroy(
+    message: &Message,
+    surfaces: &mut [ClientSurface; MAX_CLIENT_SURFACES],
+    focus: &mut FocusRouter<MAX_CLIENT_SURFACES>,
+) {
     if message.header.payload_len != 64 || message.header.handle_count != 0 {
         close_transferred_handles(message);
         return;
@@ -289,6 +431,10 @@ fn handle_surface_destroy(message: &Message, surfaces: &mut [ClientSurface; MAX_
         return;
     };
     let _ = handle_close(slot.events);
+    let _ = focus.remove(InputTarget {
+        owner_pid: slot.owner_pid,
+        surface: slot.id,
+    });
     *slot = ClientSurface::EMPTY;
 }
 
@@ -494,6 +640,7 @@ fn present_swapchain(
                 Some(scene),
                 false,
                 request.flags & demo_flag::SYSTEM_UI != 0,
+                None,
             );
             queue
                 .publish(slot, *frame_id, prepared)
@@ -544,7 +691,7 @@ fn present_frame(
     clock: &mut PresentClock,
 ) {
     let release_value = clock.advance();
-    let _ = present_frame_on_timeline(
+    let feedback = present_frame_on_timeline(
         display,
         feedback_endpoint,
         info,
@@ -552,6 +699,11 @@ fn present_frame(
         frame_id,
         clock.timeline,
         release_value,
+    );
+    clock.frame.presented(
+        feedback.sequence,
+        feedback.actual_time_ns,
+        feedback.refresh_interval_ns,
     );
     let _ = handle_close(prepared.buffer);
     let _ = handle_close(prepared.acquire);
@@ -731,9 +883,15 @@ fn prepare_gpu_frame(
     scene_frame: Option<u32>,
     compositor_probe: bool,
     system_ui: bool,
+    mailbox_slot: Option<u16>,
 ) -> PreparedFrame {
     let request = match (system_ui, compositor_probe, scene_frame) {
-        (true, false, _) => GpuRenderFrame::system_ui_request(width, height, frame_id),
+        (true, false, _) => GpuRenderFrame::system_ui_request(
+            width,
+            height,
+            frame_id,
+            mailbox_slot.unwrap_or_else(|| process_exit(203)),
+        ),
         (false, true, _) => GpuRenderFrame::compositor_probe_request(width, height, frame_id),
         (false, false, Some(scene_frame)) => {
             GpuRenderFrame::aurora_request(width, height, frame_id, scene_frame)

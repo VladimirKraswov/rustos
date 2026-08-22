@@ -8,7 +8,7 @@
 use crate::Handle;
 
 /// Версия render ABI.
-pub const GPU_ABI_VERSION: u16 = 2;
+pub const GPU_ABI_VERSION: u16 = 3;
 /// Верхняя граница одного VirGL submission.
 ///
 /// Для SystemUI важен не только объём данных, но и число переходов через
@@ -31,8 +31,79 @@ pub const GPU_DEMO_DONE_OPCODE: u16 = 0x5111;
 /// Это не публичный Canvas ABI приложения: page принадлежит системному UI
 /// renderer'у и выдаётся только доверенному `renderd`.
 pub const GPU_UI_STREAM_BYTES: usize = 1024 * 1024;
+/// Число immutable slots в atomic scene mailbox.
+///
+/// Producer никогда не изменяет опубликованный slot до публикации следующего
+/// кадра в соседний slot. `compositord` выбирает newest generation, поэтому
+/// частые pointer events не образуют FIFO из устаревших сцен.
+pub const GPU_UI_MAILBOX_SLOTS: usize = 2;
+/// Размер служебного заголовка каждого mailbox slot.
+pub const GPU_UI_MAILBOX_SLOT_HEADER_BYTES: usize = 64;
+/// Смещение [`GpuUiFrameHeader`] и массивов сцены внутри slot.
+pub const GPU_UI_MAILBOX_FRAME_OFFSET: usize = GPU_UI_MAILBOX_SLOT_HEADER_BYTES;
+/// Максимальный размер renderer-neutral scene stream внутри одного slot.
+pub const GPU_UI_FRAME_STREAM_BYTES: usize = GPU_UI_STREAM_BYTES - GPU_UI_MAILBOX_SLOT_HEADER_BYTES;
 /// Версия внутреннего SystemUI GPU stream.
 pub const GPU_UI_STREAM_VERSION: u16 = 3;
+
+/// Стабильный заголовок одного slot atomic scene mailbox.
+///
+/// Только `published_frame_id` меняется в steady state. Producer сначала
+/// атомарно записывает туда ноль, полностью обновляет stream, затем публикует
+/// монотонный frame id release-store. Consumer читает поле acquire-load до и
+/// после private snapshot и принимает кадр лишь при совпадении значений.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GpuUiMailboxSlotHeader {
+    /// Ноль означает, что slot обновляется или ещё не использовался.
+    pub published_frame_id: u64,
+    /// [`GPU_UI_STREAM_VERSION`].
+    pub version: u16,
+    /// Размер этого заголовка.
+    pub size: u16,
+    /// Индекс slot, меньший [`GPU_UI_MAILBOX_SLOTS`].
+    pub slot_index: u16,
+    /// Зарезервировано; равно нулю.
+    pub reserved_header: u16,
+    /// [`GPU_UI_MAILBOX_FRAME_OFFSET`].
+    pub frame_offset: u32,
+    /// [`GPU_UI_FRAME_STREAM_BYTES`].
+    pub frame_capacity: u32,
+    /// Зарезервировано; заполнено нулями.
+    pub reserved: [u64; 5],
+}
+
+impl GpuUiMailboxSlotHeader {
+    /// Создаёт ещё не опубликованный slot.
+    pub const fn new(slot_index: u16) -> Self {
+        Self {
+            published_frame_id: 0,
+            version: GPU_UI_STREAM_VERSION,
+            size: core::mem::size_of::<Self>() as u16,
+            slot_index,
+            reserved_header: 0,
+            frame_offset: GPU_UI_MAILBOX_FRAME_OFFSET as u32,
+            frame_capacity: GPU_UI_FRAME_STREAM_BYTES as u32,
+            reserved: [0; 5],
+        }
+    }
+
+    /// Проверяет неизменяемую геометрию mailbox до чтения scene stream.
+    pub fn validate(self, expected_slot: u16) -> Result<(), GpuAbiError> {
+        if self.version != GPU_UI_STREAM_VERSION
+            || self.size as usize != core::mem::size_of::<Self>()
+            || self.slot_index != expected_slot
+            || usize::from(self.slot_index) >= GPU_UI_MAILBOX_SLOTS
+            || self.reserved_header != 0
+            || self.frame_offset as usize != GPU_UI_MAILBOX_FRAME_OFFSET
+            || self.frame_capacity as usize != GPU_UI_FRAME_STREAM_BYTES
+            || self.reserved != [0; 5]
+        {
+            return Err(GpuAbiError::InvalidValue);
+        }
+        Ok(())
+    }
+}
 
 /// Биты [`GpuUiLayer::flags`]. Слой хранит собственную GPU surface, поэтому
 /// его положение на экране не входит в `content_hash` и может меняться без
@@ -215,7 +286,7 @@ impl GpuUiFrameHeader {
             || self.frame_id == 0
             || self.layer_count == 0
             || self.layer_count > 64
-            || bytes > GPU_UI_STREAM_BYTES
+            || bytes > GPU_UI_FRAME_STREAM_BYTES
             || !matches!(self.flags, Self::FULL_FRAME | Self::TRANSFORM_ONLY)
             || (self.flags == Self::FULL_FRAME && self.quad_count == 0)
             || (self.flags == Self::TRANSFORM_ONLY && self.quad_count != 0)
@@ -1022,7 +1093,12 @@ impl GpuRenderFrame {
     }
 
     /// Создаёт запрос штатного SystemUI frame из общей command page.
-    pub const fn system_ui_request(width: u32, height: u32, frame_id: u64) -> Self {
+    pub const fn system_ui_request(
+        width: u32,
+        height: u32,
+        frame_id: u64,
+        mailbox_slot: u16,
+    ) -> Self {
         Self {
             version: GPU_ABI_VERSION,
             size: core::mem::size_of::<Self>() as u16,
@@ -1031,7 +1107,7 @@ impl GpuRenderFrame {
             height,
             frame_id,
             fence_id: 0,
-            reserved: [0; 4],
+            reserved: [mailbox_slot as u64, 0, 0, 0],
         }
     }
 
@@ -1045,14 +1121,28 @@ impl GpuRenderFrame {
         self.reserved[1]
     }
 
+    /// Slot atomic scene mailbox для SystemUI request.
+    pub const fn ui_mailbox_slot(&self) -> Option<u16> {
+        if self.flags == frame_flag::SYSTEM_UI && self.reserved[0] < GPU_UI_MAILBOX_SLOTS as u64 {
+            Some(self.reserved[0] as u16)
+        } else {
+            None
+        }
+    }
+
     /// Проверяет общий record.
     pub fn validate(&self) -> Result<(), GpuAbiError> {
         validate_prefix(self.version, self.size, core::mem::size_of::<Self>())?;
         if self.flags & !frame_flag::KNOWN != 0
             || self.flags.count_ones() > 1
             || self.reserved[2..] != [0; 2]
-            || self.reserved[0] > u64::from(u32::MAX)
-            || (self.flags == 0 && self.reserved[0] != 0)
+            || (self.flags == frame_flag::AURORA_SHOWCASE && self.reserved[0] > u64::from(u32::MAX))
+            || (self.flags == frame_flag::SYSTEM_UI
+                && self.reserved[0] >= GPU_UI_MAILBOX_SLOTS as u64)
+            || (!matches!(
+                self.flags,
+                frame_flag::AURORA_SHOWCASE | frame_flag::SYSTEM_UI
+            ) && self.reserved[0] != 0)
             || (self.fence_id == 0 && self.reserved[1] != 0)
             || (self.fence_id != 0 && self.reserved[1] == 0)
         {
@@ -1254,6 +1344,7 @@ impl GpuDemoRequest {
 }
 
 const _: () = assert!(core::mem::size_of::<GpuUiFrameHeader>() == 64);
+const _: () = assert!(core::mem::size_of::<GpuUiMailboxSlotHeader>() == 64);
 const _: () = assert!(core::mem::size_of::<GpuUiLayer>() == 64);
 const _: () = assert!(core::mem::size_of::<GpuUiQuad>() == 32);
 
@@ -1363,6 +1454,14 @@ mod tests {
             Ok(())
         );
         assert_eq!(GpuDemoRequest::system_ui().validate(), Ok(()));
+        let ui = GpuRenderFrame::system_ui_request(1280, 800, 11, 1);
+        assert_eq!(ui.validate(), Ok(()));
+        assert_eq!(ui.ui_mailbox_slot(), Some(1));
+        assert_eq!(
+            GpuRenderFrame::system_ui_request(1280, 800, 12, 2).validate(),
+            Err(GpuAbiError::ReservedNonZero)
+        );
+        assert_eq!(GpuUiMailboxSlotHeader::new(0).validate(0), Ok(()));
     }
 
     #[test]

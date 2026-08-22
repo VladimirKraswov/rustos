@@ -9,14 +9,14 @@
 
 use rustos_abi::gpu::{
     gpu_ui_checksum, gpu_ui_content_hash, GpuUiFrameHeader, GpuUiLayer, GpuUiQuad,
-    GPU_UI_STREAM_BYTES,
+    GPU_UI_FRAME_STREAM_BYTES,
 };
 use rustos_video::{Color, Rect};
 
 const HEADER_BYTES: usize = core::mem::size_of::<GpuUiFrameHeader>();
 pub(crate) const MAX_LAYERS: usize = 32;
 pub(crate) const MAX_QUADS: usize =
-    (GPU_UI_STREAM_BYTES - HEADER_BYTES - MAX_LAYERS * core::mem::size_of::<GpuUiLayer>())
+    (GPU_UI_FRAME_STREAM_BYTES - HEADER_BYTES - MAX_LAYERS * core::mem::size_of::<GpuUiLayer>())
         / core::mem::size_of::<GpuUiQuad>();
 
 struct Recorder {

@@ -13,6 +13,7 @@ members = [
     "abi",
     "microkernel",
     "video",
+    "compositor",
     "system-ui",
     "system-assets",
     "system-fonts",

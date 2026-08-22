@@ -77,6 +77,7 @@ client facade — четыре последовательные задачи, а
 |---|---|---|
 | `system-ui/` | `cargo test -p rustos-system-ui` | `cargo test -p rustos-system-ui -p rustos-rui -p rustos-abi` |
 | `video/` | `cargo test -p rustos-video` | `cargo test -p rustos-video -p rustos-gui-check` |
+| `compositor/` | `cargo test -p rustos-compositor` | `make test-host` и `make test-arch` |
 | `microkernel/` | `cargo test -p rustos-microkernel` | `make test-host` |
 | `abi/` | `cargo test -p rustos-abi` | `make test-host` и `make test-arch` |
 | kernel/ring 3 compile | x86-64 target build | `make test-arch` |

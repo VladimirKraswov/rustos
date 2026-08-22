@@ -111,6 +111,27 @@ renderd                 compositord                   displayd          virtio-g
 перезапускает их и требует прохождения второго atomic present: stale
 capability не должна пережить restart.
 
+### Atomic scene mailbox
+
+Интерактивный SystemUI больше не держит очередь кадров и frame pacing в
+process manager ядра. Bootstrap-adapter является только producer'ом двух
+read-only для сервисов shared slots:
+
+1. release-store нуля закрывает выбранный slot от чтения;
+2. producer полностью записывает renderer-neutral layers/quads и checksum;
+3. один release-store публикует монотонный `frame_id`;
+4. `compositord` acquire-load'ом выбирает newest slot и игнорирует старые IPC
+   wakeups;
+5. `renderd` проверяет generation до и после private snapshot, поэтому
+   наполовину обновлённая сцена никогда не попадает в GPU command stream.
+
+После рестарта renderer'а compositor сначала выбирает последний полный кадр,
+даже если рядом уже лежит более новая transform-only delta. Затем retained
+cache снова допускает дешёвые transform commits. Политика выбора, focus state
+и display-feedback frame clock находятся в переносимом `rustos-compositor` и
+проверяются host unit tests; kernel хранит только shared-memory lifetime,
+capability rights и атомарный release-store.
+
 Firmware framebuffer не имеет runtime authority, которую можно безопасно
 выдать процессу. На такой машине supervisor оставляет display services
 выключенными, но продолжает `vfsd` и kernel recovery desktop; отсутствие
@@ -129,11 +150,11 @@ feedback -> destroy`; compositor связывает `SurfaceId` с неподд�
 падает, kernel отзывает его event endpoint, а compositor лениво удаляет stale
 metadata.
 
-Интерактивный desktop пока рисует kernel bootstrap compositor через тот же
-глобальный scanout broker. Это аварийный клиент, а не окончательная граница:
-следующий графический рубеж — multi-layer GPU pass для оконных surface и
-перенос desktop на `surface.dll`, после чего kernel renderer остаётся только
-для panic/recovery screen.
+Интерактивный desktop пока строит scene primitives в kernel bootstrap adapter,
+но очередь newest-frame, retained cache bootstrap и frame clock уже находятся
+в ring-3 сервисах. Окончательная граница требует перевода desktop и input
+routing на обычные `surface.dll` clients; после этого kernel renderer останется
+только для panic/recovery screen.
 
 Driver-neutral provider model, atomic-check/commit, buffer modifier contract,
 failure containment и performance gates описаны в
@@ -146,4 +167,11 @@ provider, а не частью API приложений или compositor protoc
 [graphics-abi-v7] graphics-buffer sync-timeline atomic-present supervisor-restart verified
 [surface] ring3 create/commit/direct-scanout/release/feedback/destroy verified
 [supervisor] persistent renderd/compositord/displayd services ready
+[system-ui-gpu] ... pacing=ring3-atomic-mailbox slots=2 stale=drop
+[graphics-perf] workload=aurora frames=48 elapsed-ms=... fps-x10=... readback=0
 ```
+
+UTM/ANGLE-Metal integration gate дополнительно требует не менее 30 FPS
+throughput для bounded 48-frame Aurora workload. Это защита от грубой
+регрессии transport/очередей, а не замена будущим p95/p99 input-to-present и
+длительному interactive benchmark.

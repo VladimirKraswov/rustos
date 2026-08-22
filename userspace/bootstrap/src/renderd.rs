@@ -8,15 +8,19 @@
 #![no_std]
 #![no_main]
 
-use core::panic::PanicInfo;
+use core::{
+    panic::PanicInfo,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 use rustos_abi::{
     gpu::{
         frame_flag, gpu_ui_checksum, gpu_ui_static_content_hash, virgl_format, GpuContextCreate,
         GpuDeviceInfo, GpuRenderFrame, GpuResourceCreate, GpuResourceImport, GpuSubmit,
-        GpuUiFrameHeader, GpuUiLayer, GpuUiQuad, GPU_ABI_VERSION, GPU_MAX_COMMAND_BYTES,
-        GPU_RENDERED_FRAME_HANDLE_COUNT, GPU_RENDERED_FRAME_OPCODE, GPU_RENDER_REQUEST_OPCODE,
-        GPU_UI_STREAM_BYTES,
+        GpuUiFrameHeader, GpuUiLayer, GpuUiMailboxSlotHeader, GpuUiQuad, GPU_ABI_VERSION,
+        GPU_MAX_COMMAND_BYTES, GPU_RENDERED_FRAME_HANDLE_COUNT, GPU_RENDERED_FRAME_OPCODE,
+        GPU_RENDER_REQUEST_OPCODE, GPU_UI_FRAME_STREAM_BYTES, GPU_UI_MAILBOX_FRAME_OFFSET,
+        GPU_UI_MAILBOX_SLOTS, GPU_UI_STREAM_BYTES,
     },
     graphics_buffer::{BufferUsage, GraphicsBufferDesc, MemoryDomain, PixelFormatCode},
     ipc::TransferredHandle,
@@ -31,7 +35,7 @@ use rustos_runtime::{
 use rustos_system_assets::{wallpaper, Wallpaper, WallpaperId};
 
 const CONTROL_HANDLE: Handle = Handle(4);
-const UI_STREAM_HANDLE: Handle = Handle(7);
+const UI_STREAM_HANDLES: [Handle; GPU_UI_MAILBOX_SLOTS] = [Handle(7), Handle(8)];
 const SWAPCHAIN_IMAGES: usize = 3;
 const UI_COMMAND_DWORDS: usize = GPU_MAX_COMMAND_BYTES as usize / 4;
 const UI_BATCH_QUADS: usize = 2_700;
@@ -42,7 +46,7 @@ const GLYPH_TILE_SIDE: u32 = rustos_system_fonts::GLYPH_SIDE as u32;
 const GLYPH_ATLAS_ENTRIES: usize =
     (GLYPH_ATLAS_SIDE / GLYPH_TILE_SIDE) as usize * (GLYPH_ATLAS_SIDE / GLYPH_TILE_SIDE) as usize;
 const GLYPH_BATCH: usize = 256;
-const UI_FRAME_QUADS: usize = (GPU_UI_STREAM_BYTES
+const UI_FRAME_QUADS: usize = (GPU_UI_FRAME_STREAM_BYTES
     - core::mem::size_of::<GpuUiFrameHeader>()
     - UI_FRAME_LAYERS * core::mem::size_of::<GpuUiLayer>())
     / core::mem::size_of::<GpuUiQuad>();
@@ -392,19 +396,27 @@ pub extern "C" fn _start(frame_endpoint: u64, render_capability: u64, abi_versio
     }
     let context = Handle(context_value as u32);
 
-    let ui_mapping = SharedMemoryMap {
-        version: rustos_abi::memory::MEMORY_ABI_VERSION,
-        reserved: 0,
-        address: 0,
-        offset: 0,
-        length: GPU_UI_STREAM_BYTES as u64,
-        flags: VmFlags::READ,
-    };
-    let ui_stream = shared_memory_map(UI_STREAM_HANDLE, &ui_mapping);
-    if ui_stream <= 0 {
-        process_exit(230);
+    let mut ui_streams = [core::ptr::null(); GPU_UI_MAILBOX_SLOTS];
+    for (slot, handle) in UI_STREAM_HANDLES.into_iter().enumerate() {
+        let ui_mapping = SharedMemoryMap {
+            version: rustos_abi::memory::MEMORY_ABI_VERSION,
+            reserved: 0,
+            address: 0,
+            offset: 0,
+            length: GPU_UI_STREAM_BYTES as u64,
+            flags: VmFlags::READ,
+        };
+        let address = shared_memory_map(handle, &ui_mapping);
+        if address <= 0 {
+            process_exit(230);
+        }
+        let base = address as *const u8;
+        let metadata = unsafe { base.cast::<GpuUiMailboxSlotHeader>().read_volatile() };
+        if metadata.validate(slot as u16).is_err() {
+            process_exit(230);
+        }
+        ui_streams[slot] = base;
     }
-    let ui_stream = ui_stream as *const u8;
 
     if info.max_inflight < SWAPCHAIN_IMAGES as u16 {
         process_exit(223);
@@ -561,7 +573,11 @@ pub extern "C" fn _start(frame_endpoint: u64, render_capability: u64, abi_versio
             match render_system_ui_frame(
                 context,
                 slot,
-                ui_stream,
+                ui_streams,
+                request
+                    .ui_mailbox_slot()
+                    .unwrap_or_else(|| process_exit(215)),
+                request.frame_id,
                 width,
                 height,
                 vertex_resource,
@@ -625,7 +641,9 @@ pub extern "C" fn _start(frame_endpoint: u64, render_capability: u64, abi_versio
 fn render_system_ui_frame(
     context: Handle,
     slot: &mut RenderSlot,
-    stream: *const u8,
+    streams: [*const u8; GPU_UI_MAILBOX_SLOTS],
+    mailbox_slot: u16,
+    expected_frame_id: u64,
     width: u32,
     height: u32,
     vertex_resource: u32,
@@ -636,9 +654,19 @@ fn render_system_ui_frame(
     pipeline_initialized: &mut bool,
     submissions: &mut UiSubmissionQueue,
 ) -> Result<u64, u8> {
+    let base = *streams.get(mailbox_slot as usize).ok_or(1u8)?;
+    if base.is_null() {
+        return Err(1);
+    }
+    let published = unsafe { &*base.cast::<AtomicU64>() };
+    if published.load(Ordering::Acquire) != expected_frame_id {
+        return Err(16);
+    }
+    let stream = unsafe { base.add(GPU_UI_MAILBOX_FRAME_OFFSET) };
     let header = unsafe { (stream as *const GpuUiFrameHeader).read_volatile() };
     header.validate().map_err(|_| 1)?;
-    if header.width != width
+    if header.frame_id != expected_frame_id
+        || header.width != width
         || header.height != height
         || header.layer_count as usize > UI_FRAME_LAYERS
         || header.quad_count as usize > UI_FRAME_QUADS
@@ -701,6 +729,12 @@ fn render_system_ui_frame(
     layer_snapshot[..shared_layers.len()].copy_from_slice(shared_layers);
     let snapshot = unsafe { &mut *core::ptr::addr_of_mut!(UI_FRAME_SNAPSHOT) };
     snapshot[..shared_quads.len()].copy_from_slice(shared_quads);
+    // Snapshot считается атомарным только если producer не начал повторно
+    // использовать slot во время копирования. Ноль и другая generation
+    // означают harmless mailbox replacement, а не повреждение GPU state.
+    if published.load(Ordering::Acquire) != expected_frame_id {
+        return Err(16);
+    }
     let layers = &layer_snapshot[..shared_layers.len()];
     let quads = &snapshot[..shared_quads.len()];
 
