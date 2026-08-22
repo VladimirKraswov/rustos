@@ -533,17 +533,6 @@ impl DesktopSession {
                 );
                 self.display_fallback_logged = true;
             }
-            if let Some(window) = self.tick_animated_application(arch::monotonic_milliseconds()) {
-                let old_cursor = self.cursor.rect();
-                self.cursor.restore(&mut self.framebuffer);
-                let mut damage = self.render_application_incremental(window);
-                self.cursor
-                    .draw(&mut self.framebuffer, self.mouse_x, self.mouse_y);
-                damage.add(old_cursor);
-                damage.add(self.cursor.rect());
-                self.framebuffer.present_damage(&damage);
-                continue;
-            }
             if let Some(event) = self.input.poll() {
                 let old_cursor = self.cursor.rect();
                 self.cursor.restore(&mut self.framebuffer);
@@ -595,15 +584,19 @@ impl DesktopSession {
                     .draw(&mut self.framebuffer, self.mouse_x, self.mouse_y);
                 match redraw {
                     Redraw::None => {
-                        self.framebuffer.present_rect(old_cursor);
-                        self.framebuffer.present_rect(self.cursor.rect());
+                        let mut damage = self.empty_frame_damage();
+                        damage.add(old_cursor);
+                        damage.add(self.cursor.rect());
+                        self.framebuffer.present_damage(&damage);
                     }
                     Redraw::TerminalLine => {
-                        self.framebuffer.present_rect(old_cursor);
+                        let mut damage = self.empty_frame_damage();
+                        damage.add(old_cursor);
                         if let Some(line) = terminal_line {
-                            self.framebuffer.present_rect(line);
+                            damage.add(line);
                         }
-                        self.framebuffer.present_rect(self.cursor.rect());
+                        damage.add(self.cursor.rect());
+                        self.framebuffer.present_damage(&damage);
                     }
                     Redraw::Application(_)
                     | Redraw::Ui(_)
@@ -635,22 +628,20 @@ impl DesktopSession {
                     Redraw::DragMove {
                         window,
                         previous,
-                        first,
+                        first: _,
                     } => {
+                        let mut damage = self.empty_frame_damage();
                         if drag_cached {
-                            if first {
-                                self.present_drag_rect(window_damage(previous));
-                            } else {
-                                self.present_preview(previous);
-                            }
+                            self.record_drag_rect(&mut damage, window_damage(previous));
                             if let Some(current) = self.window_rect(window) {
-                                self.present_preview(current);
+                                self.record_drag_rect(&mut damage, window_damage(current));
                             }
                         } else {
-                            self.present_drag_full();
+                            self.record_drag_full(&mut damage);
                         }
-                        self.framebuffer.present_rect(old_cursor);
-                        self.framebuffer.present_rect(self.cursor.rect());
+                        damage.add(old_cursor);
+                        damage.add(self.cursor.rect());
+                        self.framebuffer.present_damage(&damage);
                     }
                     Redraw::DragEnd {
                         window,
@@ -658,17 +649,21 @@ impl DesktopSession {
                         resized,
                         ..
                     } => {
+                        let mut damage = self.empty_frame_damage();
                         if visible {
                             if drag_cached {
                                 if let Some(current) = self.window_rect(window) {
-                                    self.present_drag_rect(window_damage(current));
+                                    self.record_drag_rect(&mut damage, window_damage(current));
                                 }
                             } else {
-                                self.present_drag_full();
+                                self.record_drag_full(&mut damage);
                             }
                         } else {
-                            self.framebuffer.present_rect(old_cursor);
-                            self.framebuffer.present_rect(self.cursor.rect());
+                            damage.add(old_cursor);
+                            damage.add(self.cursor.rect());
+                        }
+                        if !damage.is_empty() {
+                            self.framebuffer.present_damage(&damage);
                         }
                         self.log_drag_finished(window, resized);
                     }
@@ -677,6 +672,21 @@ impl DesktopSession {
                 self.dispatch_window_events();
             } else {
                 let now_ms = arch::monotonic_milliseconds();
+                // Сначала полностью обслуживаем уже опубликованный input.
+                // Медленный renderer не вправе запускать следующий animation
+                // frame раньше ожидающего mouse/key event и тем самым делать
+                // desktop неуправляемым при просадке частоты кадров.
+                if let Some(window) = self.tick_animated_application(now_ms) {
+                    let old_cursor = self.cursor.rect();
+                    self.cursor.restore(&mut self.framebuffer);
+                    let mut damage = self.render_application_incremental(window);
+                    self.cursor
+                        .draw(&mut self.framebuffer, self.mouse_x, self.mouse_y);
+                    damage.add(old_cursor);
+                    damage.add(self.cursor.rect());
+                    self.framebuffer.present_damage(&damage);
+                    continue;
+                }
                 if self.shell.update_clock(now_ms) {
                     let old_cursor = self.cursor.rect();
                     self.cursor.restore(&mut self.framebuffer);
@@ -686,17 +696,19 @@ impl DesktopSession {
                     }
                     self.cursor
                         .draw(&mut self.framebuffer, self.mouse_x, self.mouse_y);
-                    self.framebuffer.present_rect(old_cursor);
-                    self.framebuffer.present_rect(Rect::new(
+                    let mut damage = self.empty_frame_damage();
+                    damage.add(old_cursor);
+                    damage.add(Rect::new(
                         0,
                         self.framebuffer.height() as i32 - TASKBAR_HEIGHT as i32,
                         self.framebuffer.width(),
                         TASKBAR_HEIGHT,
                     ));
                     if self.shell.is_open() {
-                        self.framebuffer.present_rect(self.shell.menu_rect());
+                        damage.add(self.shell.menu_rect());
                     }
-                    self.framebuffer.present_rect(self.cursor.rect());
+                    damage.add(self.cursor.rect());
+                    self.framebuffer.present_damage(&damage);
                     continue;
                 }
                 if self.cursor.animate(now_ms) {
@@ -704,8 +716,10 @@ impl DesktopSession {
                     self.cursor.restore(&mut self.framebuffer);
                     self.cursor
                         .draw(&mut self.framebuffer, self.mouse_x, self.mouse_y);
-                    self.framebuffer.present_rect(old_cursor);
-                    self.framebuffer.present_rect(self.cursor.rect());
+                    let mut damage = self.empty_frame_damage();
+                    damage.add(old_cursor);
+                    damage.add(self.cursor.rect());
+                    self.framebuffer.present_damage(&damage);
                 } else {
                     core::hint::spin_loop();
                 }
@@ -2382,30 +2396,34 @@ impl DesktopSession {
         let _ = self.framebuffer.restore_background(window_damage(rect));
     }
 
-    fn present_preview(&mut self, rect: Rect) {
+    fn empty_frame_damage(&self) -> DamageRegion<INCREMENTAL_DAMAGE_CAPACITY> {
         let bounds = Rect::new(0, 0, self.framebuffer.width(), self.framebuffer.height());
-        let mut region = DamageRegion::<4>::new(bounds);
-        region.add(window_damage(rect));
-        self.drag_present_pixels = self
-            .drag_present_pixels
-            .saturating_add(region.covered_pixels());
-        self.framebuffer.present_damage(&region);
+        DamageRegion::new(bounds)
     }
 
-    fn present_drag_rect(&mut self, rect: Rect) {
+    fn record_drag_rect<const CAPACITY: usize>(
+        &mut self,
+        region: &mut DamageRegion<CAPACITY>,
+        rect: Rect,
+    ) {
+        region.add(rect);
         self.drag_present_pixels = self.drag_present_pixels.saturating_add(clipped_area(
             rect,
             self.framebuffer.width(),
             self.framebuffer.height(),
         ));
-        self.framebuffer.present_rect(rect);
     }
 
-    fn present_drag_full(&mut self) {
+    fn record_drag_full<const CAPACITY: usize>(&mut self, region: &mut DamageRegion<CAPACITY>) {
+        region.add(Rect::new(
+            0,
+            0,
+            self.framebuffer.width(),
+            self.framebuffer.height(),
+        ));
         self.drag_present_pixels = self.drag_present_pixels.saturating_add(
             u64::from(self.framebuffer.width()) * u64::from(self.framebuffer.height()),
         );
-        self.framebuffer.present();
     }
 
     fn log_drag_finished(&self, window: WindowId, resized: bool) {
