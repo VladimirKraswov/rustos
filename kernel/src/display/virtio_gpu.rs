@@ -15,6 +15,8 @@ use rustos_video::{
     ModeSetError, PresentStats, Rect, ScanoutCapabilities, ScanoutError, StartupModePolicy,
 };
 
+#[cfg(target_arch = "aarch64")]
+use crate::arch;
 use crate::memory::{self, FrameBlock};
 
 #[cfg(target_arch = "aarch64")]
@@ -28,6 +30,8 @@ const MAX_SCANOUTS: usize = 16;
 // остаётся bounded, но больше не отбрасывает low-resolution fallback после
 // Retina/UltraWide timings монитора.
 const MAX_MODES: usize = 48;
+#[cfg(target_arch = "aarch64")]
+const GPU_FORMAT_B8G8R8A8_UNORM: u32 = 1;
 const GPU_FORMAT_B8G8R8X8_UNORM: u32 = 2;
 const CMD_GET_DISPLAY_INFO: u32 = 0x0100;
 const CMD_RESOURCE_CREATE_2D: u32 = 0x0101;
@@ -46,6 +50,10 @@ const CMD_CTX_DETACH_RESOURCE: u32 = 0x0203;
 const CMD_RESOURCE_CREATE_3D: u32 = 0x0204;
 const CMD_TRANSFER_FROM_HOST_3D: u32 = 0x0206;
 const CMD_SUBMIT_3D: u32 = 0x0207;
+#[cfg(target_arch = "aarch64")]
+const CMD_UPDATE_CURSOR: u32 = 0x0300;
+#[cfg(target_arch = "aarch64")]
+const CMD_MOVE_CURSOR: u32 = 0x0301;
 const RESP_OK_NODATA: u32 = 0x1100;
 const RESP_OK_DISPLAY_INFO: u32 = 0x1101;
 const RESP_OK_EDID: u32 = 0x1104;
@@ -53,6 +61,10 @@ const RESP_OK_CAPSET_INFO: u32 = 0x1102;
 const FLAG_FENCE: u32 = 1;
 const RESOURCE_FLAG_Y_0_TOP: u32 = 1;
 const MAX_RENDER_RESOURCES: usize = 4;
+#[cfg(target_arch = "aarch64")]
+const CURSOR_EXTENT: u32 = 64;
+#[cfg(target_arch = "aarch64")]
+const CURSOR_BYTES: u32 = CURSOR_EXTENT * CURSOR_EXTENT * 4;
 const NO_GRAPHICS_OBJECT: u16 = u16::MAX;
 const MIN_WIDTH: u32 = 640;
 const MIN_HEIGHT: u32 = 480;
@@ -179,6 +191,28 @@ struct TransferRequest {
     rect: GpuRect,
     offset: u64,
     resource: u32,
+    padding: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+#[cfg(target_arch = "aarch64")]
+struct CursorPosition {
+    scanout: u32,
+    x: u32,
+    y: u32,
+    padding: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+#[cfg(target_arch = "aarch64")]
+struct UpdateCursorRequest {
+    header: ControlHeader,
+    position: CursorPosition,
+    resource: u32,
+    hotspot_x: u32,
+    hotspot_y: u32,
     padding: u32,
 }
 
@@ -311,6 +345,7 @@ pub struct VirtioGpu {
     transport: GpuTransport,
     scanout: u32,
     resource: Resource,
+    cursor_resource: Resource,
     next_resource: u32,
     mode: DisplayMode,
     modes: [DisplayMode; MAX_MODES],
@@ -326,6 +361,8 @@ pub struct VirtioGpu {
     capset_size: u32,
     render_context: u32,
     render_resources: [RenderResource; MAX_RENDER_RESOURCES],
+    #[cfg(target_arch = "aarch64")]
+    pending_cursor: Option<UpdateCursorRequest>,
 }
 
 impl VirtioGpu {
@@ -346,6 +383,7 @@ impl VirtioGpu {
             transport,
             scanout: 0,
             resource: placeholder,
+            cursor_resource: placeholder,
             next_resource: 1,
             mode: fallback,
             modes: [fallback; MAX_MODES],
@@ -361,6 +399,8 @@ impl VirtioGpu {
             capset_size: 0,
             render_context: 0,
             render_resources: [RenderResource::EMPTY; MAX_RENDER_RESOURCES],
+            #[cfg(target_arch = "aarch64")]
+            pending_cursor: None,
         };
         gpu.discover_capset();
         let (scanout, preferred) = gpu.display_info().unwrap_or((0, fallback));
@@ -448,8 +488,99 @@ impl VirtioGpu {
         ScanoutCapabilities {
             page_flip: false,
             vsync_event: false,
-            hardware_cursor: false,
+            hardware_cursor: self.transport.cursor_supported(),
             multiple_outputs: false,
+        }
+    }
+
+    /// Загружает ARGB sprite в отдельный 64×64 cursor resource и атомарно
+    /// связывает его с hardware cursor plane. Горячий mouse path после этого
+    /// использует только `move_cursor` и никогда не трогает scanout damage.
+    pub fn update_cursor(
+        &mut self,
+        pixels: &[u32],
+        width: u32,
+        height: u32,
+        hotspot_x: u32,
+        hotspot_y: u32,
+        pointer_x: i32,
+        pointer_y: i32,
+    ) -> Result<(), ModeSetError> {
+        #[cfg(target_arch = "aarch64")]
+        {
+            if !self.transport.cursor_supported()
+                || width == 0
+                || height == 0
+                || width > CURSOR_EXTENT
+                || height > CURSOR_EXTENT
+                || hotspot_x >= width
+                || hotspot_y >= height
+                || pixels.len()
+                    != usize::try_from(u64::from(width) * u64::from(height)).unwrap_or(usize::MAX)
+            {
+                return Err(ModeSetError::UnsupportedMode);
+            }
+            self.ensure_cursor_resource()?;
+            let destination = self.cursor_resource.backing.phys as *mut u32;
+            // SAFETY: cursor backing содержит ровно 64*64 u32; input length и
+            // обе размерности проверены выше, строки не пересекаются.
+            unsafe { ptr::write_bytes(destination, 0, (CURSOR_BYTES / 4) as usize) };
+            for row in 0..height as usize {
+                unsafe {
+                    ptr::copy_nonoverlapping(
+                        pixels.as_ptr().add(row * width as usize),
+                        destination.add(row * CURSOR_EXTENT as usize),
+                        width as usize,
+                    )
+                };
+            }
+            arch::dma_write_barrier();
+            self.transfer_resource_2d(
+                self.cursor_resource.id,
+                Rect::new(0, 0, CURSOR_EXTENT, CURSOR_EXTENT),
+                0,
+            )?;
+            let request = self.cursor_request(
+                CMD_UPDATE_CURSOR,
+                self.cursor_resource.id,
+                hotspot_x,
+                hotspot_y,
+                pointer_x,
+                pointer_y,
+            );
+            self.queue_cursor(request)
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            let _ = (
+                pixels, width, height, hotspot_x, hotspot_y, pointer_x, pointer_y,
+            );
+            Err(ModeSetError::UnsupportedMode)
+        }
+    }
+
+    /// Неблокирующее перемещение hardware plane. При заполненной cursorq
+    /// сохраняется только последняя позиция (mailbox), старые кадры не ждём.
+    pub fn move_cursor(&mut self, pointer_x: i32, pointer_y: i32) -> Result<(), ModeSetError> {
+        #[cfg(target_arch = "aarch64")]
+        {
+            if self.cursor_resource.id == 0 {
+                return Err(ModeSetError::UnsupportedMode);
+            }
+            let request = self.cursor_request(
+                CMD_MOVE_CURSOR,
+                self.cursor_resource.id,
+                0,
+                0,
+                pointer_x,
+                pointer_y,
+            );
+            self.queue_cursor(request)
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            let _ = (pointer_x, pointer_y);
+            Err(ModeSetError::UnsupportedMode)
         }
     }
 
@@ -694,9 +825,18 @@ impl VirtioGpu {
             if interrupt != self.transport.interrupt_id() {
                 return Ok(false);
             }
-            self.transport
+            let acknowledged = self
+                .transport
                 .acknowledge_interrupt()
-                .map_err(map_transport)
+                .map_err(map_transport)?;
+            if let Some(pending) = self.pending_cursor.take() {
+                match self.transport.submit_cursor(&pending) {
+                    Ok(()) => {}
+                    Err(TransportError::Busy) => self.pending_cursor = Some(pending),
+                    Err(error) => return Err(map_transport(error)),
+                }
+            }
+            Ok(acknowledged)
         }
         #[cfg(target_arch = "x86_64")]
         {
@@ -1125,6 +1265,50 @@ impl VirtioGpu {
         })
     }
 
+    #[cfg(target_arch = "aarch64")]
+    fn ensure_cursor_resource(&mut self) -> Result<(), ModeSetError> {
+        if self.cursor_resource.id != 0 {
+            return Ok(());
+        }
+        let backing = memory::allocate(u64::from(CURSOR_BYTES).div_ceil(4096), 1)
+            .map_err(|_| ModeSetError::OutOfMemory)?;
+        unsafe { ptr::write_bytes(backing.phys as *mut u8, 0, (backing.frames * 4096) as usize) };
+        let resource = self.next_resource;
+        self.next_resource = self.next_resource.wrapping_add(1).max(1);
+        let create = Create2dRequest {
+            header: self.header(CMD_RESOURCE_CREATE_2D),
+            resource,
+            format: GPU_FORMAT_B8G8R8A8_UNORM,
+            width: CURSOR_EXTENT,
+            height: CURSOR_EXTENT,
+        };
+        if self.command_nodata(&create).is_err() {
+            let _ = memory::free(backing);
+            return Err(ModeSetError::DeviceLost);
+        }
+        let attach = AttachBackingRequest {
+            header: self.header(CMD_RESOURCE_ATTACH_BACKING),
+            resource,
+            entries: 1,
+            entry: MemoryEntry {
+                address: backing.phys,
+                length: CURSOR_BYTES,
+                padding: 0,
+            },
+        };
+        if self.command_nodata(&attach).is_err() {
+            let _ = self.unref_resource(resource);
+            let _ = memory::free(backing);
+            return Err(ModeSetError::DeviceLost);
+        }
+        self.cursor_resource = Resource {
+            id: resource,
+            backing,
+            bytes: CURSOR_BYTES,
+        };
+        Ok(())
+    }
+
     fn set_scanout_resource(
         &mut self,
         resource: u32,
@@ -1250,6 +1434,71 @@ impl VirtioGpu {
         self.command_nodata(&request)
     }
 
+    #[cfg(target_arch = "aarch64")]
+    fn transfer_resource_2d(
+        &mut self,
+        resource: u32,
+        rect: Rect,
+        offset: u64,
+    ) -> Result<(), ModeSetError> {
+        let request = TransferRequest {
+            header: self.header(CMD_TRANSFER_TO_HOST_2D),
+            rect: GpuRect {
+                x: rect.x.max(0) as u32,
+                y: rect.y.max(0) as u32,
+                width: rect.width,
+                height: rect.height,
+            },
+            offset,
+            resource,
+            padding: 0,
+        };
+        self.command_nodata(&request)
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    fn cursor_request(
+        &self,
+        kind: u32,
+        resource: u32,
+        hotspot_x: u32,
+        hotspot_y: u32,
+        pointer_x: i32,
+        pointer_y: i32,
+    ) -> UpdateCursorRequest {
+        UpdateCursorRequest {
+            // Cursorq не возвращает protocol response, поэтому fenced header
+            // здесь запрещён: completion выражается только used-ring entry.
+            header: ControlHeader {
+                kind,
+                ..ControlHeader::ZERO
+            },
+            position: CursorPosition {
+                scanout: self.scanout,
+                x: pointer_x.max(0) as u32,
+                y: pointer_y.max(0) as u32,
+                padding: 0,
+            },
+            resource,
+            hotspot_x,
+            hotspot_y,
+            padding: 0,
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    fn queue_cursor(&mut self, request: UpdateCursorRequest) -> Result<(), ModeSetError> {
+        match self.transport.submit_cursor(&request) {
+            Ok(()) => Ok(()),
+            Err(TransportError::Busy) => {
+                // Настоящий mailbox: сохраняется лишь новейшая позиция/форма.
+                self.pending_cursor = Some(request);
+                Ok(())
+            }
+            Err(error) => Err(map_transport(error)),
+        }
+    }
+
     fn flush(&mut self, rect: Rect) -> Result<(), ModeSetError> {
         self.flush_resource(self.resource.id, rect)
     }
@@ -1322,6 +1571,12 @@ fn valid_virgl_stream(commands: &[u8]) -> bool {
 
 impl Drop for VirtioGpu {
     fn drop(&mut self) {
+        if self.cursor_resource.id != 0 {
+            let _ = self.detach_resource(self.cursor_resource.id);
+            let _ = self.unref_resource(self.cursor_resource.id);
+            let _ = memory::free(self.cursor_resource.backing);
+            self.cursor_resource.id = 0;
+        }
         if self.resource.id == 0 {
             return;
         }

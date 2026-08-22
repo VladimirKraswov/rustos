@@ -212,6 +212,12 @@ impl ModernTransport {
         self.virgl
     }
 
+    /// PCI cursorq будет включена вместе с MSI-X interrupt-domain. До этого
+    /// x86 compositor использует тот же корректный software fallback.
+    pub const fn cursor_supported(&self) -> bool {
+        false
+    }
+
     pub fn num_capsets(&self) -> u32 {
         if self.device_length < 16 {
             return 0;

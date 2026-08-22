@@ -378,6 +378,43 @@ pub fn handle_interrupt(interrupt: u32) -> Result<bool, DisplayBrokerError> {
         .map_err(map_mode_error)
 }
 
+/// Меняет hardware cursor sprite. Формат — premultiplied B8G8R8A8; plane
+/// принадлежит display driver и не входит в damage основного framebuffer.
+#[allow(clippy::too_many_arguments)]
+pub fn update_cursor(
+    pixels: &[u32],
+    width: u32,
+    height: u32,
+    hotspot_x: u32,
+    hotspot_y: u32,
+    pointer_x: i32,
+    pointer_y: i32,
+) -> Result<(), DisplayBrokerError> {
+    let mut guard = DEVICE.acquire()?;
+    guard
+        .get()
+        .as_mut()
+        .ok_or(DisplayBrokerError::Unavailable)?
+        .gpu
+        .update_cursor(
+            pixels, width, height, hotspot_x, hotspot_y, pointer_x, pointer_y,
+        )
+        .map_err(map_mode_error)
+}
+
+/// Неблокирующий MOVE_CURSOR. Transport хранит новейшую позицию mailbox'ом,
+/// если все cursorq slots ещё исполняются.
+pub fn move_cursor(pointer_x: i32, pointer_y: i32) -> Result<(), DisplayBrokerError> {
+    let mut guard = DEVICE.acquire()?;
+    guard
+        .get()
+        .as_mut()
+        .ok_or(DisplayBrokerError::Unavailable)?
+        .gpu
+        .move_cursor(pointer_x, pointer_y)
+        .map_err(map_mode_error)
+}
+
 /// Безопасно получает следующий completion перед уничтожением GPU context.
 /// Это не часть кадрового hot path: blocking разрешён только при
 /// завершении/падении renderd. Конкретный fence сопоставляет process manager,

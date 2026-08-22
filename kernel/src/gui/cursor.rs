@@ -4,7 +4,10 @@
 //! `rustos-system-assets`. Это важная граница: замена cursor pack не требует
 //! менять input driver или window manager.
 
-use crate::graphics::{Framebuffer, Rect};
+use crate::{
+    graphics::{Framebuffer, Rect},
+    serial,
+};
 use rustos_abi::input::PointerCursor;
 use rustos_system_assets::{
     CursorImage, CursorPack, CursorPixel, PackId, PackRegistry, ResourcePack,
@@ -17,6 +20,8 @@ const ANIMATION_INTERVAL_MS: u64 = 80;
 /// Курсор с back-save, bounded theme registry и анимацией busy spinner.
 pub struct Cursor {
     saved: [u32; CURSOR_SIDE * CURSOR_SIDE],
+    /// Raster cache для отдельной GPU cursor plane (B8G8R8A8/ARGB32).
+    hardware_pixels: [u32; CURSOR_SIDE * CURSOR_SIDE],
     pointer_x: i32,
     pointer_y: i32,
     image_x: i32,
@@ -26,6 +31,9 @@ pub struct Cursor {
     forced_kind: Option<PointerCursor>,
     frame: u8,
     last_animation_ms: u64,
+    hardware_active: bool,
+    hardware_dirty: bool,
+    hardware_logged: bool,
     packs: PackRegistry<CursorPack, 8>,
 }
 
@@ -39,6 +47,7 @@ impl Cursor {
         let _ = packs.install(HIGH_CONTRAST_CURSOR_PACK);
         Self {
             saved: [0; CURSOR_SIDE * CURSOR_SIDE],
+            hardware_pixels: [0; CURSOR_SIDE * CURSOR_SIDE],
             pointer_x: 0,
             pointer_y: 0,
             image_x: 0,
@@ -48,12 +57,18 @@ impl Cursor {
             forced_kind: None,
             frame: 0,
             last_animation_ms: 0,
+            hardware_active: false,
+            hardware_dirty: true,
+            hardware_logged: false,
             packs,
         }
     }
 
     /// Область последнего или следующего sprite, включая hotspot.
     pub fn rect(&self) -> Rect {
+        if self.hardware_active {
+            return Rect::new(0, 0, 0, 0);
+        }
         let image = self.image();
         Rect::new(
             if self.valid {
@@ -78,7 +93,7 @@ impl Cursor {
 
     /// Возвращает пиксели под старым sprite.
     pub fn restore(&mut self, framebuffer: &mut Framebuffer) {
-        if !self.valid {
+        if self.hardware_active || !self.valid {
             return;
         }
         for dy in 0..CURSOR_SIDE {
@@ -103,6 +118,7 @@ impl Cursor {
         if self.automatic_kind != kind {
             self.automatic_kind = kind;
             self.frame = 0;
+            self.hardware_dirty = true;
         }
     }
 
@@ -111,11 +127,16 @@ impl Cursor {
         self.forced_kind = kind;
         self.frame = 0;
         self.last_animation_ms = 0;
+        self.hardware_dirty = true;
     }
 
     /// Меняет cursor pack.
     pub fn select_theme(&mut self, id: PackId) -> bool {
-        self.packs.select(id).is_ok()
+        let selected = self.packs.select(id).is_ok();
+        if selected {
+            self.hardware_dirty = true;
+        }
+        selected
     }
 
     /// Имя активной темы.
@@ -145,6 +166,7 @@ impl Cursor {
         }
         self.last_animation_ms = now_ms;
         self.frame = self.frame.wrapping_add(1) % 8;
+        self.hardware_dirty = true;
         true
     }
 
@@ -156,6 +178,47 @@ impl Cursor {
         self.image_x = pointer_x - i32::from(image.hotspot_x);
         self.image_y = pointer_y - i32::from(image.hotspot_y);
         let pack = self.packs.active().unwrap_or(LIGHT_CURSOR_PACK);
+        if framebuffer.hardware_cursor_supported() {
+            let updated = if self.hardware_dirty || !self.hardware_active {
+                for dy in 0..CURSOR_SIDE {
+                    for dx in 0..CURSOR_SIDE {
+                        let (color, alpha) = match pack.pixel(image, dx as u16, dy as u16) {
+                            CursorPixel::Transparent => (pack.palette.fill, 0),
+                            CursorPixel::Shadow => (pack.palette.shadow, 115),
+                            CursorPixel::Outline => (pack.palette.outline, 255),
+                            CursorPixel::Fill => (pack.palette.fill, 255),
+                            CursorPixel::Accent => (pack.palette.accent, 255),
+                        };
+                        self.hardware_pixels[dy * CURSOR_SIDE + dx] =
+                            premultiplied_bgra(color, alpha);
+                    }
+                }
+                framebuffer.update_hardware_cursor(
+                    &self.hardware_pixels,
+                    u32::from(image.width),
+                    u32::from(image.height),
+                    image.hotspot_x.max(0) as u32,
+                    image.hotspot_y.max(0) as u32,
+                    pointer_x,
+                    pointer_y,
+                )
+            } else {
+                framebuffer.move_hardware_cursor(pointer_x, pointer_y)
+            };
+            if updated {
+                self.valid = false;
+                self.hardware_active = true;
+                self.hardware_dirty = false;
+                if !self.hardware_logged {
+                    serial::put_str(
+                        "[cursor] plane=virtio-gpu-cursorq movement=async damage=none\n",
+                    );
+                    self.hardware_logged = true;
+                }
+                return;
+            }
+        }
+        self.hardware_active = false;
         for dy in 0..CURSOR_SIDE {
             for dx in 0..CURSOR_SIDE {
                 let x = self.image_x + dx as i32;
@@ -183,4 +246,11 @@ impl Cursor {
     fn image(&self) -> CursorImage {
         CursorImage::new(self.kind(), self.frame)
     }
+}
+
+/// Virtio cursor использует ARGB32 с premultiplied alpha. На little-endian
+/// памяти это требуемый порядок B,G,R,A для B8G8R8A8_UNORM.
+fn premultiplied_bgra(color: rustos_video::Color, alpha: u8) -> u32 {
+    let scale = |channel: u8| (u16::from(channel) * u16::from(alpha) / 255) as u32;
+    (u32::from(alpha) << 24) | (scale(color.r) << 16) | (scale(color.g) << 8) | scale(color.b)
 }

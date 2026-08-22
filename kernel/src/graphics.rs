@@ -313,6 +313,34 @@ impl Framebuffer {
         }
     }
 
+    /// Hardware cursor доступен только у native driver с отдельной plane.
+    /// Firmware framebuffer никогда не выдаётся за ускоренный cursor path.
+    pub fn hardware_cursor_supported(&self) -> bool {
+        self.native_scanout && self.capabilities().hardware_cursor
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_hardware_cursor(
+        &mut self,
+        pixels: &[u32],
+        width: u32,
+        height: u32,
+        hotspot_x: u32,
+        hotspot_y: u32,
+        pointer_x: i32,
+        pointer_y: i32,
+    ) -> bool {
+        self.native_scanout
+            && scanout::update_cursor(
+                pixels, width, height, hotspot_x, hotspot_y, pointer_x, pointer_y,
+            )
+            .is_ok()
+    }
+
+    pub fn move_hardware_cursor(&mut self, pointer_x: i32, pointer_y: i32) -> bool {
+        self.native_scanout && scanout::move_cursor(pointer_x, pointer_y).is_ok()
+    }
+
     pub const fn color_mode(&self) -> ColorMode {
         match self.render_format {
             CpuPixelFormat::Rgb565 => ColorMode::HighColor16,

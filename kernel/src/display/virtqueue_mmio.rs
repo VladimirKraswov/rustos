@@ -54,11 +54,15 @@ const VIRTIO_GPU_F_EDID: u32 = 1 << 1;
 const DESC_NEXT: u16 = 1;
 const DESC_WRITE: u16 = 2;
 const CONTROL_QUEUE: u16 = 0;
+const CURSOR_QUEUE: u16 = 1;
 const MAX_QUEUE_SIZE: u16 = 64;
 const POLL_LIMIT: usize = 50_000_000;
 // Совпадает с PCI transport: три render кадра не должны занимать последний
 // slot, нужный display/control command во время их выполнения.
 const COMMAND_SLOTS: usize = 8;
+/// Cursor move/update не имеют response descriptor. Четыре request slot дают
+/// mouse producer'у опубликовать новую позицию, пока device завершает старую.
+const CURSOR_SLOTS: usize = 4;
 const QEMU_VIRT_SPI_BASE: u32 = 32 + 16;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -96,6 +100,17 @@ impl CommandSlot {
     };
 }
 
+struct CursorQueue {
+    queue: FrameBlock,
+    queue_size: u16,
+    available_offset: u64,
+    used_offset: u64,
+    dma: FrameBlock,
+    slot_count: usize,
+    busy: [bool; CURSOR_SLOTS],
+    device_used: u16,
+}
+
 /// Очередь и DMA-память принадлежат одному GPU transport до его `Drop`.
 pub struct ModernMmioTransport {
     base: u64,
@@ -110,6 +125,7 @@ pub struct ModernMmioTransport {
     device_used: u16,
     edid: bool,
     virgl: bool,
+    cursor: Option<CursorQueue>,
 }
 
 impl ModernMmioTransport {
@@ -181,6 +197,10 @@ impl ModernMmioTransport {
         write_address(base, REG_QUEUE_AVAIL_LOW, queue.phys + available_offset);
         write_address(base, REG_QUEUE_USED_LOW, queue.phys + used_offset);
         write32(base, REG_QUEUE_READY, 1);
+        // Cursor queue является независимым fast path. Отсутствие queue 1 или
+        // локальная нехватка RAM не ломают display: compositor сохранит
+        // software cursor и controlq продолжит работу.
+        let cursor = initialize_cursor_queue(base).ok();
         write32(base, REG_STATUS, negotiated | STATUS_DRIVER_OK);
 
         Ok(Self {
@@ -196,6 +216,7 @@ impl ModernMmioTransport {
             device_used: 0,
             edid: accepted_low & VIRTIO_GPU_F_EDID != 0,
             virgl: accepted_low & VIRTIO_GPU_F_VIRGL != 0,
+            cursor,
         })
     }
 
@@ -205,6 +226,10 @@ impl ModernMmioTransport {
 
     pub const fn virgl_supported(&self) -> bool {
         self.virgl
+    }
+
+    pub const fn cursor_supported(&self) -> bool {
+        self.cursor.is_some()
     }
 
     /// GIC INTID QEMU `virt`: SPI index 16+slot превращается в INTID 48+slot.
@@ -217,10 +242,75 @@ impl ModernMmioTransport {
     pub fn acknowledge_interrupt(&mut self) -> Result<bool, TransportError> {
         self.ensure_device_ready()?;
         let status = read32(self.base, REG_INTERRUPT_STATUS);
+        if status & 1 != 0 {
+            if let Some(cursor) = self.cursor.as_mut() {
+                cursor.poll_used()?;
+            }
+        }
         if status != 0 {
             write32(self.base, REG_INTERRUPT_ACK, status);
         }
         Ok(status & 1 != 0)
+    }
+
+    /// Публикует UPDATE_CURSOR/MOVE_CURSOR без ожидания device. Если четыре
+    /// старые позиции ещё in-flight, возвращает Busy: caller отбрасывает
+    /// устаревшую позицию и следующая mouse event принесёт актуальную.
+    pub fn submit_cursor<Request: Copy>(
+        &mut self,
+        request: &Request,
+    ) -> Result<(), TransportError> {
+        self.ensure_device_ready()?;
+        let request_size = mem::size_of::<Request>();
+        if request_size == 0 || request_size > 4096 {
+            return Err(TransportError::InvalidConfiguration);
+        }
+        let base = self.base;
+        let cursor = self.cursor.as_mut().ok_or(TransportError::Unsupported)?;
+        cursor.poll_used()?;
+        let index = cursor
+            .busy
+            .iter()
+            .take(cursor.slot_count)
+            .position(|busy| !*busy)
+            .ok_or(TransportError::Busy)?;
+        let request_address = cursor.dma.phys + index as u64 * 4096;
+        unsafe {
+            ptr::write_bytes(request_address as *mut u8, 0, 4096);
+            ptr::copy_nonoverlapping(
+                (request as *const Request).cast::<u8>(),
+                request_address as *mut u8,
+                request_size,
+            );
+            (cursor.queue.phys as *mut Descriptor)
+                .add(index)
+                .write_volatile(Descriptor {
+                    address: request_address,
+                    length: request_size as u32,
+                    flags: 0,
+                    next: 0,
+                });
+        }
+        let available = (cursor.queue.phys + cursor.available_offset) as *mut u8;
+        let available_index = unsafe { available.add(2).cast::<u16>().read_volatile() };
+        let ring_slot = usize::from(available_index % cursor.queue_size);
+        unsafe {
+            available
+                .add(4 + ring_slot * 2)
+                .cast::<u16>()
+                .write_volatile(index as u16);
+        }
+        arch::dma_write_barrier();
+        unsafe {
+            available
+                .add(2)
+                .cast::<u16>()
+                .write_volatile(available_index.wrapping_add(1));
+        }
+        cursor.busy[index] = true;
+        arch::dma_write_barrier();
+        write32(base, REG_QUEUE_NOTIFY, u32::from(CURSOR_QUEUE));
+        Ok(())
     }
 
     pub fn num_capsets(&self) -> u32 {
@@ -429,9 +519,83 @@ impl ModernMmioTransport {
 impl Drop for ModernMmioTransport {
     fn drop(&mut self) {
         write32(self.base, REG_STATUS, 0);
+        if let Some(cursor) = self.cursor.take() {
+            let _ = memory::free(cursor.queue);
+            let _ = memory::free(cursor.dma);
+        }
         let _ = memory::free(self.queue);
         let _ = memory::free(self.dma);
     }
+}
+
+impl CursorQueue {
+    fn poll_used(&mut self) -> Result<(), TransportError> {
+        let used = (self.queue.phys + self.used_offset) as *const u8;
+        let available = unsafe { used.add(2).cast::<u16>().read_volatile() };
+        arch::dma_read_barrier();
+        while self.device_used != available {
+            let ring_index = usize::from(self.device_used % self.queue_size);
+            let element = unsafe {
+                used.add(4 + ring_index * core::mem::size_of::<UsedElement>())
+                    .cast::<UsedElement>()
+                    .read_volatile()
+            };
+            let slot = usize::try_from(element.id).map_err(|_| TransportError::DeviceError)?;
+            if slot >= self.slot_count || !self.busy[slot] {
+                return Err(TransportError::DeviceError);
+            }
+            self.busy[slot] = false;
+            self.device_used = self.device_used.wrapping_add(1);
+        }
+        Ok(())
+    }
+}
+
+fn initialize_cursor_queue(base: u64) -> Result<CursorQueue, TransportError> {
+    write32(base, REG_QUEUE_SEL, u32::from(CURSOR_QUEUE));
+    if read32(base, REG_QUEUE_READY) != 0 {
+        return Err(TransportError::InvalidConfiguration);
+    }
+    let maximum = read32(base, REG_QUEUE_NUM_MAX).min(CURSOR_SLOTS as u32);
+    if maximum < 2 {
+        return Err(TransportError::Unsupported);
+    }
+    let queue_size = maximum as u16;
+    let descriptor_bytes = u64::from(queue_size) * 16;
+    let available_offset = descriptor_bytes;
+    let available_bytes = 6 + u64::from(queue_size) * 2;
+    let used_offset = align_up(available_offset + available_bytes, 4);
+    let used_bytes = 6 + u64::from(queue_size) * 8;
+    let queue_bytes = used_offset + used_bytes;
+    let queue =
+        memory::allocate(queue_bytes.div_ceil(4096), 1).map_err(|_| TransportError::OutOfMemory)?;
+    let slot_count = usize::from(queue_size).min(CURSOR_SLOTS);
+    let dma = match memory::allocate(slot_count as u64, 1) {
+        Ok(block) => block,
+        Err(_) => {
+            let _ = memory::free(queue);
+            return Err(TransportError::OutOfMemory);
+        }
+    };
+    unsafe {
+        ptr::write_bytes(queue.phys as *mut u8, 0, (queue.frames * 4096) as usize);
+        ptr::write_bytes(dma.phys as *mut u8, 0, slot_count * 4096);
+    }
+    write32(base, REG_QUEUE_NUM, u32::from(queue_size));
+    write_address(base, REG_QUEUE_DESC_LOW, queue.phys);
+    write_address(base, REG_QUEUE_AVAIL_LOW, queue.phys + available_offset);
+    write_address(base, REG_QUEUE_USED_LOW, queue.phys + used_offset);
+    write32(base, REG_QUEUE_READY, 1);
+    Ok(CursorQueue {
+        queue,
+        queue_size,
+        available_offset,
+        used_offset,
+        dma,
+        slot_count,
+        busy: [false; CURSOR_SLOTS],
+        device_used: 0,
+    })
 }
 
 fn find_device() -> Option<(u64, u32)> {
