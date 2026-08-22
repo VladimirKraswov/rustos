@@ -9,7 +9,7 @@
 
 #![no_std]
 
-use rustos_virgl::{encode_mesh, encode_mesh_update, EncodeError, Vertex};
+use rustos_virgl::{encode_mesh_swapchain, EncodeError, Vertex};
 
 /// Версия RustOS Mesa platform ABI.
 pub const PLATFORM_ABI_VERSION: u16 = 1;
@@ -45,6 +45,9 @@ pub struct Context {
     surface: VirglWinsysSurface,
     profile: ApiProfile,
     pipeline_initialized: bool,
+    surface_resources: [u32; 3],
+    surface_initialized: [bool; 3],
+    surface_count: usize,
 }
 
 impl Context {
@@ -63,7 +66,27 @@ impl Context {
             surface,
             profile,
             pipeline_initialized: false,
+            surface_resources: [surface.color_resource, 0, 0],
+            surface_initialized: [false; 3],
+            surface_count: 1,
         })
+    }
+
+    /// Выбирает один из трёх swapchain render target. Регистрация четвёртого
+    /// ресурса отвергается: это защищает bounded command/state model renderd.
+    pub fn bind_color_resource(&mut self, resource: u32) -> Result<(), MesaError> {
+        if resource == 0 {
+            return Err(MesaError::InvalidSurface);
+        }
+        if !self.surface_resources[..self.surface_count].contains(&resource) {
+            if self.surface_count == self.surface_resources.len() {
+                return Err(MesaError::SurfaceLimit);
+            }
+            self.surface_resources[self.surface_count] = resource;
+            self.surface_count += 1;
+        }
+        self.surface.color_resource = resource;
+        Ok(())
     }
 
     /// Кодирует кадр Aurora 3D: градиентный stage и вращающийся освещённый
@@ -83,29 +106,27 @@ impl Context {
         );
         let pulse = 0.006 * (1.0 + sin_turns(frame_index as f32 / 120.0));
         let clear = [0.010 + pulse, 0.016, 0.046 + pulse * 2.0, 1.0];
-        let result = if self.pipeline_initialized {
-            encode_mesh_update(
-                commands,
-                self.surface.width,
-                self.surface.height,
-                self.surface.color_resource,
-                self.surface.vertex_resource,
-                &vertices,
-                clear,
-            )
-        } else {
-            encode_mesh(
-                commands,
-                self.surface.width,
-                self.surface.height,
-                self.surface.color_resource,
-                self.surface.vertex_resource,
-                &vertices,
-                clear,
-            )
-        };
+        let surface_index = self.surface_resources[..self.surface_count]
+            .iter()
+            .position(|resource| *resource == self.surface.color_resource)
+            .ok_or(MesaError::InvalidSurface)?;
+        let surface_handle = [1, 8, 9][surface_index];
+        let initialize_surface = !self.surface_initialized[surface_index];
+        let result = encode_mesh_swapchain(
+            commands,
+            self.surface.width,
+            self.surface.height,
+            self.surface.color_resource,
+            self.surface.vertex_resource,
+            &vertices,
+            clear,
+            surface_handle,
+            initialize_surface,
+            !self.pipeline_initialized,
+        );
         let words = result.map_err(MesaError::Transport)?;
         self.pipeline_initialized = true;
+        self.surface_initialized[surface_index] = true;
         Ok(words)
     }
 
@@ -120,6 +141,8 @@ impl Context {
 pub enum MesaError {
     /// Некорректная surface или нулевой resource id.
     InvalidSurface,
+    /// Context уже зарегистрировал три back buffer.
+    SurfaceLimit,
     /// VirGL transport не смог сериализовать bounded stream.
     Transport(EncodeError),
 }

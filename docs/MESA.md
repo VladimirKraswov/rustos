@@ -67,7 +67,7 @@ winsys связывает драйвер с конкретной ОС и её bu
 3. дать `dlopen` RUNE/DLL adapter и Mesa-compatible TLS destructors;
 4. добавить Meson cross-file и собирать `gallium/virgl` + EGL без X11/Wayland;
 5. заменить Rust state tracker upstream `libgallium`, сохранив нынешний winsys,
-   `GraphicsBuffer`, `SyncTimeline` и capability boundary;
+`GraphicsBuffer`, `SyncTimeline` и capability boundary;
 6. затем добавить GLSL/NIR, OpenGL ES и ускорение SystemUI.
 
 Название `platform-seed` в manifest специально не выдаёт этот этап за полный
@@ -102,3 +102,10 @@ make test-utm-gpu
 рабочий вертикальный 3D-срез, но пока не полный upstream Mesa: SystemUI всё
 ещё использует CPU 2D renderer, а EGL/GLES/GLSL/NIR cross-port остаётся
 следующим самостоятельным этапом.
+
+Render path уже использует настоящий трёхбуферный swapchain: три различных
+`GraphicsBuffer`, три VirGL surface и независимые `SyncTimeline` допускают три
+GPU submission in-flight. `compositord` применяет mailbox-политику и удаляет
+устаревший готовый frame вместо накопления FIFO-задержки; reuse каждого buffer
+разрешён только после его fence. `make test-utm-gpu` требует наблюдаемый
+`peak-inflight=3`, поэтому это не декларативный флаг.

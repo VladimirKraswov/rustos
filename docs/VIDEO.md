@@ -256,7 +256,8 @@ damage и fence, а сами пиксели остаются в shared memory.
 [Linux VC4 display driver](https://docs.kernel.org/gpu/vc4.html).
 
 - frame pacing и monotonic presentation clock;
-- front/back/triple-buffer protocol с generation и fences;
+- front/back/triple-buffer protocol для всего SystemUI; Aurora/renderd уже
+  использует три разных GraphicsBuffer, независимые fences и mailbox discard;
 - SSE2/AVX2 dispatch для blend, scale и RGB/YUV conversion;
 - MSI-X/IOAPIC interrupt-domain для PCI, page flip и hardware cursor
   virtio-gpu; AArch64 MMIO controlq уже завершает fenced кадры через GICv3 SPI,

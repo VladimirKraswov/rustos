@@ -129,6 +129,8 @@ pub fn encode_mesh(
         vertex_resource,
         vertices,
         clear,
+        1,
+        true,
         true,
     )
 }
@@ -153,7 +155,42 @@ pub fn encode_mesh_update(
         vertex_resource,
         vertices,
         clear,
+        1,
         false,
+        false,
+    )
+}
+
+/// Кодирует кадр swapchain: каждый render target получает собственный
+/// VirGL surface handle, а framebuffer binding меняется без пересоздания
+/// shaders и immutable pipeline objects.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_mesh_swapchain(
+    output: &mut [u32],
+    width: u32,
+    height: u32,
+    color_resource: u32,
+    vertex_resource: u32,
+    vertices: &[Vertex],
+    clear: [f32; 4],
+    surface_handle: u32,
+    initialize_surface: bool,
+    initialize_pipeline: bool,
+) -> Result<usize, EncodeError> {
+    if !matches!(surface_handle, 1 | 8 | 9) {
+        return Err(EncodeError::InvalidExtent);
+    }
+    encode_mesh_with_pipeline(
+        output,
+        width,
+        height,
+        color_resource,
+        vertex_resource,
+        vertices,
+        clear,
+        surface_handle,
+        initialize_surface,
+        initialize_pipeline,
     )
 }
 
@@ -166,6 +203,8 @@ fn encode_mesh_with_pipeline(
     vertex_resource: u32,
     vertices: &[Vertex],
     clear: [f32; 4],
+    surface_handle: u32,
+    initialize_surface: bool,
     initialize_pipeline: bool,
 ) -> Result<usize, EncodeError> {
     if width == 0 || height == 0 || width > 16_384 || height > 16_384 {
@@ -178,12 +217,14 @@ fn encode_mesh_with_pipeline(
 
     // Surface object 1 связывает VirGL render target с capability-backed
     // resource. Уровень и диапазон layers равны нулю: это обычная 2D texture.
-    if initialize_pipeline {
+    if initialize_surface {
         encoder.command(CCMD_CREATE_OBJECT, OBJECT_SURFACE, 5)?;
-        encoder.words(&[1, color_resource, FORMAT_BGRX8888, 0, 0])?;
-        encoder.command(CCMD_SET_FRAMEBUFFER_STATE, 0, 3)?;
-        encoder.words(&[1, 0, 1])?;
+        encoder.words(&[surface_handle, color_resource, FORMAT_BGRX8888, 0, 0])?;
     }
+    // Binding входит в каждый submission: три surface могут быть in-flight,
+    // а последующий кадр выбирает свой back buffer без копии/readback.
+    encoder.command(CCMD_SET_FRAMEBUFFER_STATE, 0, 3)?;
+    encoder.words(&[1, 0, surface_handle])?;
 
     // Фон очищает host 3D renderer. Guest CPU не пишет ни одного пикселя.
     encoder.command(CCMD_CLEAR, 0, 8)?;

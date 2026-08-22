@@ -647,6 +647,7 @@ struct ProcessManager {
     gpu_context_active: bool,
     gpu_imports: [Option<u16>; MAX_GPU_IMPORTS],
     gpu_submissions: [Option<PendingGpuSubmission>; MAX_GPU_SUBMISSIONS],
+    gpu_peak_inflight: u8,
     gpu_completions: [CompletedGpuSubmission; MAX_GPU_COMPLETIONS],
     gpu_completion_cursor: usize,
     deferred_process_reap: Option<ProcessId>,
@@ -683,6 +684,7 @@ impl ProcessManager {
             gpu_context_active: false,
             gpu_imports: [None; MAX_GPU_IMPORTS],
             gpu_submissions: [const { None }; MAX_GPU_SUBMISSIONS],
+            gpu_peak_inflight: 0,
             gpu_completions: [CompletedGpuSubmission::EMPTY; MAX_GPU_COMPLETIONS],
             gpu_completion_cursor: 0,
             deferred_process_reap: None,
@@ -717,6 +719,7 @@ impl ProcessManager {
         self.gpu_context_active = false;
         self.gpu_imports = [None; MAX_GPU_IMPORTS];
         self.gpu_submissions = [const { None }; MAX_GPU_SUBMISSIONS];
+        self.gpu_peak_inflight = 0;
         self.gpu_completions = [CompletedGpuSubmission::EMPTY; MAX_GPU_COMPLETIONS];
         self.gpu_completion_cursor = 0;
         self.deferred_process_reap = None;
@@ -3342,6 +3345,12 @@ impl ProcessManager {
             timeline,
             value: request.completion_value,
         });
+        let inflight = self
+            .gpu_submissions
+            .iter()
+            .filter(|submission| submission.is_some())
+            .count();
+        self.gpu_peak_inflight = self.gpu_peak_inflight.max(inflight as u8);
         fence as i64
     }
 
@@ -5151,6 +5160,9 @@ pub(super) fn run_interactive_gpu_demo(frame_count: u32) -> Result<(), ProcessEr
     serial::put_str("[gpu-demo] AURORA_3D_READY frames=");
     serial::put_u32(frame_count);
     serial::put_str(" renderer=mesa-virgl cpu-raster=no\n");
+    serial::put_str("[gpu] swapchain=triple mailbox=latest peak-inflight=");
+    serial::put_u32(u32::from(manager.gpu_peak_inflight));
+    serial::put_str("\n");
     Ok(())
 }
 

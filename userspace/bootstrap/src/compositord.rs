@@ -40,6 +40,7 @@ const GPU_FRAME_ENDPOINT: Handle = Handle(4);
 const GPU_CONTROL_ENDPOINT: Handle = Handle(5);
 const DEMO_CONTROL_ENDPOINT: Handle = Handle(6);
 
+#[derive(Clone, Copy)]
 struct PreparedFrame {
     descriptor: GraphicsBufferDesc,
     buffer: Handle,
@@ -93,19 +94,93 @@ pub extern "C" fn _start(display_endpoint: u64, feedback_endpoint: u64, abi_vers
         } else {
             info.height
         };
-        // Каждый полноэкранный present ждёт release/vblank. Оконный запрос
-        // уже завершён acquire fence'ом renderd; его buffer остаётся у
-        // renderd, а kernel compositor скачает содержимое из host resource.
-        for scene_frame in 0..request.frame_count {
+        if windowed {
+            // Bootstrap window compositor пока забирает pixels CPU readback'ом;
+            // перед возвратом kernel обязана быть видна завершённая timeline.
             frame_id = frame_id.saturating_add(1);
-            let scene_frame = request.first_frame.saturating_add(scene_frame);
-            let frame = prepare_gpu_frame(render_width, render_height, frame_id, Some(scene_frame));
-            if windowed {
-                discard_windowed_frame(frame);
-            } else {
-                present_frame(display_endpoint, feedback_endpoint, info, frame, frame_id);
+            let frame = prepare_gpu_frame(
+                render_width,
+                render_height,
+                frame_id,
+                Some(request.first_frame),
+            );
+            wait_prepared(frame);
+            discard_frame(frame);
+        } else {
+            present_swapchain(
+                display_endpoint,
+                feedback_endpoint,
+                info,
+                request,
+                render_width,
+                render_height,
+                &mut frame_id,
+            );
+        }
+    }
+}
+
+/// Держит до трёх GPU кадров впереди displayd. Если более свежий frame уже
+/// готов, а старый опоздал к refresh boundary, stale buffer отбрасывается —
+/// это mailbox semantics, а не растущая FIFO задержка.
+fn present_swapchain(
+    display: Handle,
+    feedback: Handle,
+    info: DisplayScanoutInfo,
+    request: GpuDemoRequest,
+    width: u32,
+    height: u32,
+    frame_id: &mut u64,
+) {
+    const IMAGE_COUNT: usize = 3;
+    let mut queue: [Option<(u64, PreparedFrame)>; IMAGE_COUNT] = [None; IMAGE_COUNT];
+    let mut submitted = 0u32;
+    let mut consumed = 0u32;
+    while consumed < request.frame_count {
+        while submitted < request.frame_count {
+            let Some(slot) = queue.iter_mut().find(|slot| slot.is_none()) else {
+                break;
+            };
+            *frame_id = frame_id.saturating_add(1);
+            let scene = request.first_frame.saturating_add(submitted);
+            *slot = Some((
+                *frame_id,
+                prepare_gpu_frame(width, height, *frame_id, Some(scene)),
+            ));
+            submitted = submitted.saturating_add(1);
+        }
+
+        let oldest = queue
+            .iter()
+            .enumerate()
+            .filter_map(|(index, slot)| slot.map(|(id, _)| (index, id)))
+            .min_by_key(|(_, id)| *id)
+            .map(|(index, _)| index)
+            .unwrap_or_else(|| process_exit(206));
+        let newest_ready = queue
+            .iter()
+            .enumerate()
+            .filter_map(|(index, slot)| {
+                slot.filter(|(_, frame)| prepared_ready(*frame))
+                    .map(|(id, _)| (index, id))
+            })
+            .max_by_key(|(_, id)| *id)
+            .map(|(index, _)| index);
+        let selected = newest_ready.unwrap_or(oldest);
+        let selected_id = queue[selected].expect("selected swapchain frame").0;
+        for slot in &mut queue {
+            if slot.is_some_and(|(id, _)| id < selected_id) {
+                let (_, stale) = slot.take().expect("stale frame");
+                discard_frame(stale);
+                consumed = consumed.saturating_add(1);
             }
         }
+        let (id, prepared) = queue[selected].take().expect("selected frame");
+        present_frame(display, feedback, info, prepared, id);
+        consumed = consumed.saturating_add(1);
+    }
+    for slot in queue.into_iter().flatten() {
+        discard_frame(slot.1);
     }
 }
 
@@ -319,7 +394,26 @@ fn prepare_gpu_frame(
     }
 }
 
-fn discard_windowed_frame(prepared: PreparedFrame) {
+fn prepared_ready(prepared: PreparedFrame) -> bool {
+    sync_timeline_wait(&SyncTimelineWait::new(
+        prepared.acquire,
+        prepared.acquire_value,
+        0,
+    )) == syscall::status::OK
+}
+
+fn wait_prepared(prepared: PreparedFrame) {
+    if sync_timeline_wait(&SyncTimelineWait::new(
+        prepared.acquire,
+        prepared.acquire_value,
+        SYNC_TIMEOUT_INFINITE,
+    )) != syscall::status::OK
+    {
+        process_exit(207);
+    }
+}
+
+fn discard_frame(prepared: PreparedFrame) {
     // Полученные handles являются производными копиями. Оригинальный
     // GraphicsBuffer остаётся у renderd и будет прочитан оконным compositor'ом
     // после возврата scheduler'а в kernel desktop.

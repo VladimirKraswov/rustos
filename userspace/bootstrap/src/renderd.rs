@@ -27,6 +27,26 @@ use rustos_runtime::{
 };
 
 const CONTROL_HANDLE: Handle = Handle(4);
+const SWAPCHAIN_IMAGES: usize = 3;
+
+#[derive(Clone, Copy)]
+struct RenderSlot {
+    buffer: Handle,
+    target_resource: u32,
+    timeline: Handle,
+    completion_value: u64,
+    pending_fence: u64,
+}
+
+impl RenderSlot {
+    const EMPTY: Self = Self {
+        buffer: Handle::INVALID,
+        target_resource: 0,
+        timeline: Handle::INVALID,
+        completion_value: 0,
+        pending_fence: 0,
+    };
+}
 
 #[no_mangle]
 pub extern "C" fn _start(frame_endpoint: u64, render_capability: u64, abi_version: u64) -> ! {
@@ -57,17 +77,21 @@ pub extern "C" fn _start(frame_endpoint: u64, render_capability: u64, abi_versio
     }
     let context = Handle(context_value as u32);
 
+    if info.max_inflight < SWAPCHAIN_IMAGES as u16 {
+        process_exit(223);
+    }
     let mut width = 0;
     let mut height = 0;
-    let mut buffer = Handle::INVALID;
-    let mut target_resource = 0u32;
-    let mut vertex_resource = 0u32;
-    let timeline_value = sync_timeline_create(&SyncTimelineCreate::new(0));
-    if timeline_value <= 0 {
-        process_exit(220);
+    let mut slots = [RenderSlot::EMPTY; SWAPCHAIN_IMAGES];
+    for slot in &mut slots {
+        let timeline_value = sync_timeline_create(&SyncTimelineCreate::new(0));
+        if timeline_value <= 0 {
+            process_exit(220);
+        }
+        slot.timeline = Handle(timeline_value as u32);
     }
-    let timeline = Handle(timeline_value as u32);
-    let mut completion_value = 0u64;
+    let mut vertex_resource = 0u32;
+    let mut next_slot = 0usize;
     let mut mesa_context: Option<rustos_mesa::Context> = None;
 
     loop {
@@ -83,7 +107,7 @@ pub extern "C" fn _start(frame_endpoint: u64, render_capability: u64, abi_versio
             Ok(request) if request.fence_id == 0 => request,
             _ => process_exit(215),
         };
-        if buffer == Handle::INVALID {
+        if slots[0].buffer == Handle::INVALID {
             width = request.width;
             height = request.height;
             let usage = BufferUsage::RENDER_TARGET
@@ -100,23 +124,44 @@ pub extern "C" fn _start(frame_endpoint: u64, render_capability: u64, abi_versio
                 Ok(descriptor) => descriptor,
                 Err(_) => process_exit(216),
             };
-            let buffer_value = graphics_buffer_create(&descriptor);
-            if buffer_value <= 0 {
-                process_exit(217);
+            for slot in &mut slots {
+                let buffer_value = graphics_buffer_create(&descriptor);
+                if buffer_value <= 0 {
+                    process_exit(217);
+                }
+                slot.buffer = Handle(buffer_value as u32);
+                let imported =
+                    gpu_resource_import(context, slot.buffer, &GpuResourceImport::render_target());
+                if imported <= 0 {
+                    process_exit(218);
+                }
+                slot.target_resource = imported as u32;
             }
-            buffer = Handle(buffer_value as u32);
-            let imported =
-                gpu_resource_import(context, buffer, &GpuResourceImport::render_target());
             let created = gpu_resource_create(context, &GpuResourceCreate::vertex_buffer(4096));
-            if imported <= 0 || created <= 0 {
+            if created <= 0 {
                 process_exit(218);
             }
-            target_resource = imported as u32;
             vertex_resource = created as u32;
         } else if request.width != width || request.height != height {
             // Mode-set создаёт новый service generation через supervisor;
             // один context никогда не смешивает ресурсы разных размеров.
             process_exit(216);
+        }
+
+        let slot_index = next_slot;
+        next_slot = (next_slot + 1) % SWAPCHAIN_IMAGES;
+        let slot = &mut slots[slot_index];
+        if slot.pending_fence != 0 {
+            if sync_timeline_wait(&SyncTimelineWait::new(
+                slot.timeline,
+                slot.completion_value,
+                SYNC_TIMEOUT_INFINITE,
+            )) != syscall::status::OK
+                || gpu_completion_status(context, slot.pending_fence) != syscall::status::OK
+            {
+                process_exit(221);
+            }
+            slot.pending_fence = 0;
         }
 
         let mut commands = [0u32; 768];
@@ -127,7 +172,7 @@ pub extern "C" fn _start(frame_endpoint: u64, render_capability: u64, abi_versio
                         rustos_mesa::VirglWinsysSurface {
                             width,
                             height,
-                            color_resource: target_resource,
+                            color_resource: slot.target_resource,
                             vertex_resource,
                         },
                         rustos_mesa::ApiProfile::OpenGlCore,
@@ -137,11 +182,11 @@ pub extern "C" fn _start(frame_endpoint: u64, render_capability: u64, abi_versio
                     },
                 );
             }
-            match mesa_context
-                .as_mut()
-                .expect("Mesa context initialized")
-                .render_aurora_frame(&mut commands, request.scene_frame())
-            {
+            let mesa = mesa_context.as_mut().expect("Mesa context initialized");
+            if mesa.bind_color_resource(slot.target_resource).is_err() {
+                process_exit(219);
+            }
+            match mesa.render_aurora_frame(&mut commands, request.scene_frame()) {
                 Ok(length) => length,
                 Err(_) => process_exit(219),
             }
@@ -150,37 +195,31 @@ pub extern "C" fn _start(frame_endpoint: u64, render_capability: u64, abi_versio
                 &mut commands,
                 width,
                 height,
-                target_resource,
+                slot.target_resource,
                 vertex_resource,
             ) {
                 Ok(length) => length,
                 Err(_) => process_exit(219),
             }
         };
-        completion_value = completion_value.saturating_add(1);
+        slot.completion_value = slot.completion_value.saturating_add(1);
         let submit = GpuSubmit::new(
             commands.as_ptr() as u64,
             (command_dwords * 4) as u32,
-            timeline,
-            completion_value,
+            slot.timeline,
+            slot.completion_value,
         );
         let fence = gpu_submit(context, &submit);
-        if fence <= 0
-            || sync_timeline_wait(&SyncTimelineWait::new(
-                timeline,
-                completion_value,
-                SYNC_TIMEOUT_INFINITE,
-            )) != syscall::status::OK
-            || gpu_completion_status(context, fence as u64) != syscall::status::OK
-        {
+        if fence <= 0 {
             process_exit(221);
         }
+        slot.pending_fence = fence as u64;
 
         let mut rendered = GpuRenderFrame {
             fence_id: fence as u64,
             ..request
         };
-        rendered.reserved[1] = completion_value;
+        rendered.reserved[1] = slot.completion_value;
         let mut frame = Message::EMPTY;
         frame.header.opcode = GPU_RENDERED_FRAME_OPCODE;
         frame.header.request_id = request.frame_id;
@@ -188,12 +227,12 @@ pub extern "C" fn _start(frame_endpoint: u64, render_capability: u64, abi_versio
         frame.header.handle_count = GPU_RENDERED_FRAME_HANDLE_COUNT;
         frame.payload = rendered.encode_inline();
         frame.handles[0] = TransferredHandle {
-            handle: buffer,
+            handle: slot.buffer,
             reserved: 0,
             rights: Rights::READ.union(Rights::TRANSFER),
         };
         frame.handles[1] = TransferredHandle {
-            handle: timeline,
+            handle: slot.timeline,
             reserved: 0,
             rights: Rights::WAIT.union(Rights::TRANSFER),
         };
