@@ -16,12 +16,10 @@ rustos-abi = { path = "../abi" }
 rustos-microkernel = { path = "../microkernel" }
 rustos-rune-format = { path = "../rune-format" }
 rustos-system-assets = { path = "../system-assets" }
+rustos-system-fonts = { path = "../system-fonts" }
 rustos-system-ui = { path = "../system-ui" }
 rustos-video = { path = "../video" }
 rustos-usb = { path = "../usb" }
-embedded-graphics = { version = "=0.8.2", default-features = false }
-mplusfonts = { version = "=0.3.4" }
-u8g2-fonts = { version = "=0.8.0" }
 
 [features]
 default = []

@@ -7,17 +7,26 @@
 //! blend выполняет ring-3 `renderd`, затем готовый GraphicsBuffer напрямую
 //! проходит через compositord/displayd.
 
-use rustos_abi::gpu::{gpu_ui_checksum, GpuUiFrameHeader, GpuUiQuad, GPU_UI_STREAM_BYTES};
+use rustos_abi::gpu::{
+    gpu_ui_checksum, gpu_ui_content_hash, GpuUiFrameHeader, GpuUiLayer, GpuUiQuad,
+    GPU_UI_STREAM_BYTES,
+};
 use rustos_video::{Color, Rect};
 
 const HEADER_BYTES: usize = core::mem::size_of::<GpuUiFrameHeader>();
+pub(crate) const MAX_LAYERS: usize = 32;
 pub(crate) const MAX_QUADS: usize =
-    (GPU_UI_STREAM_BYTES - HEADER_BYTES) / core::mem::size_of::<GpuUiQuad>();
+    (GPU_UI_STREAM_BYTES - HEADER_BYTES - MAX_LAYERS * core::mem::size_of::<GpuUiLayer>())
+        / core::mem::size_of::<GpuUiQuad>();
 
 struct Recorder {
     width: u32,
     height: u32,
     frame_id: u64,
+    layers: [GpuUiLayer; MAX_LAYERS],
+    layer_len: usize,
+    current_layer: Option<usize>,
+    layer_bounds: Rect,
     quads: [GpuUiQuad; MAX_QUADS],
     len: usize,
     overflowed: bool,
@@ -29,6 +38,22 @@ impl Recorder {
             width: 0,
             height: 0,
             frame_id: 0,
+            layers: [GpuUiLayer {
+                id: 0,
+                content_hash: 0,
+                x: 0,
+                y: 0,
+                width: 0,
+                height: 0,
+                first_quad: 0,
+                quad_count: 0,
+                flags: 0,
+                reserved_header: 0,
+                reserved: [0; 2],
+            }; MAX_LAYERS],
+            layer_len: 0,
+            current_layer: None,
+            layer_bounds: Rect::new(0, 0, 0, 0),
             // Полностью нулевой массив остаётся в `.bss`, а не раздувает
             // kernel image на мегабайт и всё равно перезаписывается до чтения.
             quads: [GpuUiQuad {
@@ -56,8 +81,60 @@ pub(crate) fn begin(width: u32, height: u32) {
     recorder.width = width;
     recorder.height = height;
     recorder.frame_id = recorder.frame_id.wrapping_add(1).max(1);
+    recorder.layer_len = 0;
+    recorder.current_layer = None;
+    recorder.layer_bounds = Rect::new(0, 0, 0, 0);
     recorder.len = 0;
     recorder.overflowed = false;
+}
+
+/// Начинает независимую GPU surface. Bounds сразу обрезаются экраном, а все
+/// последующие primitives переводятся из screen-space в локальные координаты
+/// слоя. `id` обязан быть устойчивым между кадрами.
+pub(crate) fn begin_layer(id: u64, bounds: Rect, flags: u32) {
+    finish_layer();
+    let recorder = unsafe { &mut *core::ptr::addr_of_mut!(RECORDER) };
+    let screen = Rect::new(0, 0, recorder.width, recorder.height);
+    let bounds = bounds.intersection(screen);
+    if id == 0 || bounds.is_empty() || recorder.layer_len >= MAX_LAYERS {
+        recorder.overflowed = true;
+        return;
+    }
+    let index = recorder.layer_len;
+    recorder.layers[index] = GpuUiLayer {
+        id,
+        content_hash: 0,
+        x: bounds.x,
+        y: bounds.y,
+        width: bounds.width,
+        height: bounds.height,
+        first_quad: recorder.len as u32,
+        quad_count: 0,
+        flags,
+        reserved_header: 0,
+        reserved: [0; 2],
+    };
+    recorder.layer_len += 1;
+    recorder.current_layer = Some(index);
+    recorder.layer_bounds = bounds;
+}
+
+/// Завершает текущий слой и вычисляет hash только его неизменяемого
+/// содержимого. Пустой слой удаляется: это удобно для hardware cursor plane.
+pub(crate) fn finish_layer() {
+    let recorder = unsafe { &mut *core::ptr::addr_of_mut!(RECORDER) };
+    let Some(index) = recorder.current_layer.take() else {
+        return;
+    };
+    let first = recorder.layers[index].first_quad as usize;
+    let count = recorder.len.saturating_sub(first);
+    if count == 0 {
+        recorder.layer_len = recorder.layer_len.saturating_sub(1);
+        return;
+    }
+    recorder.layers[index].quad_count = count as u32;
+    recorder.layers[index].content_hash =
+        gpu_ui_content_hash(&recorder.quads[first..first + count]);
 }
 
 pub(crate) fn solid(rect: Rect, color: Color, alpha: u8) {
@@ -83,18 +160,43 @@ pub(crate) fn wallpaper(rect: Rect, id: u32) {
     );
 }
 
+/// Один Unicode glyph вместо сотен coverage spans. Renderd лениво строит
+/// общий SDF atlas, а `crop` сохраняет точный ScrollView/window clipping.
+pub(crate) fn glyph(
+    rect: Rect,
+    color: Color,
+    character: char,
+    style: u32,
+    crop_x: u16,
+    crop_y: u16,
+) {
+    quad(
+        rect,
+        [
+            premultiplied_rgba(color, u8::MAX),
+            character as u32,
+            style,
+            u32::from(crop_x) | (u32::from(crop_y) << 16),
+        ],
+        rustos_abi::gpu::ui_quad_flag::GLYPH_ATLAS,
+    );
+}
+
 fn quad(rect: Rect, colors: [u32; 4], flags: u32) {
     let recorder = unsafe { &mut *core::ptr::addr_of_mut!(RECORDER) };
-    let bounds = Rect::new(0, 0, recorder.width, recorder.height);
-    let visible = rect.intersection(bounds);
-    if visible.is_empty() {
-        return;
-    }
-    let Ok(x) = u16::try_from(visible.x) else {
+    let Some(layer_index) = recorder.current_layer else {
         recorder.overflowed = true;
         return;
     };
-    let Ok(y) = u16::try_from(visible.y) else {
+    let visible = rect.intersection(recorder.layer_bounds);
+    if visible.is_empty() {
+        return;
+    }
+    let Ok(x) = u16::try_from(visible.x.saturating_sub(recorder.layer_bounds.x)) else {
+        recorder.overflowed = true;
+        return;
+    };
+    let Ok(y) = u16::try_from(visible.y.saturating_sub(recorder.layer_bounds.y)) else {
         recorder.overflowed = true;
         return;
     };
@@ -110,7 +212,8 @@ fn quad(rect: Rect, colors: [u32; 4], flags: u32) {
     // Некоторые bitmap fonts обходят glyph по столбцам, другие по строкам.
     // Ищем соседний span не только в последней команде, но не переносим его
     // через более поздний перекрывающий primitive: painter order сохраняется.
-    let search_start = recorder.len.saturating_sub(512);
+    let search_start =
+        (recorder.layers[layer_index].first_quad as usize).max(recorder.len.saturating_sub(512));
     for index in (search_start..recorder.len).rev() {
         let candidate = recorder.quads[index];
         if candidate.colors != colors || candidate.flags != flags || flags != 0 {
@@ -176,20 +279,67 @@ fn quads_overlap(first: GpuUiQuad, second: GpuUiQuad) -> bool {
         && u32::from(second.y) < u32::from(first.y) + u32::from(first.height)
 }
 
-pub(crate) fn finish() -> Option<(GpuUiFrameHeader, &'static [GpuUiQuad])> {
+pub(crate) fn finish() -> Option<(
+    GpuUiFrameHeader,
+    &'static [GpuUiLayer],
+    &'static [GpuUiQuad],
+)> {
+    finish_layer();
     let recorder = unsafe { &*core::ptr::addr_of!(RECORDER) };
-    if recorder.overflowed || recorder.len == 0 {
+    if recorder.overflowed || recorder.layer_len == 0 || recorder.len == 0 {
         return None;
     }
+    let layers = &recorder.layers[..recorder.layer_len];
     let quads = &recorder.quads[..recorder.len];
     let mut header = GpuUiFrameHeader::new(
         recorder.width,
         recorder.height,
         recorder.frame_id,
+        recorder.layer_len as u32,
         recorder.len as u32,
     );
-    header.checksum = gpu_ui_checksum(quads);
-    Some((header, quads))
+    header.checksum = gpu_ui_checksum(layers, quads);
+    Some((header, layers, quads))
+}
+
+/// Создаёт следующий кадр, меняя только transform уже готовой surface.
+/// Содержимое и quad range остаются побитно неизменными. Если окно оказалось
+/// частично за экраном и размер clipping bounds изменился, вызывающий обязан
+/// выполнить обычный redraw.
+pub(crate) fn transform_layer(
+    id: u64,
+    bounds: Rect,
+) -> Option<(
+    GpuUiFrameHeader,
+    &'static [GpuUiLayer],
+    &'static [GpuUiQuad],
+)> {
+    let recorder = unsafe { &mut *core::ptr::addr_of_mut!(RECORDER) };
+    if recorder.overflowed || recorder.current_layer.is_some() {
+        return None;
+    }
+    let screen = Rect::new(0, 0, recorder.width, recorder.height);
+    let bounds = bounds.intersection(screen);
+    let layer = recorder.layers[..recorder.layer_len]
+        .iter_mut()
+        .find(|layer| layer.id == id)?;
+    if bounds.is_empty() || layer.width != bounds.width || layer.height != bounds.height {
+        return None;
+    }
+    layer.x = bounds.x;
+    layer.y = bounds.y;
+    recorder.frame_id = recorder.frame_id.wrapping_add(1).max(1);
+    let layers = &recorder.layers[..recorder.layer_len];
+    let quads = &recorder.quads[..recorder.len];
+    let mut header = GpuUiFrameHeader::new(
+        recorder.width,
+        recorder.height,
+        recorder.frame_id,
+        layers.len() as u32,
+        quads.len() as u32,
+    );
+    header.checksum = gpu_ui_checksum(layers, quads);
+    Some((header, layers, quads))
 }
 
 fn premultiplied_rgba(color: Color, alpha: u8) -> u32 {

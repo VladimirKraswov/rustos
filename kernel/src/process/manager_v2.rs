@@ -17,8 +17,8 @@ use rustos_abi::{
     display::{DisplayAtomicPresent, DisplayScanoutInfo, DisplayVblankWait},
     gpu::{
         GpuContextCreate, GpuDemoRequest, GpuDeviceInfo, GpuResourceCreate, GpuResourceImport,
-        GpuSubmit, GpuUiFrameHeader, GpuUiQuad, GPU_DEMO_START_OPCODE, GPU_MAX_COMMAND_BYTES,
-        GPU_UI_STREAM_BYTES,
+        GpuSubmit, GpuUiFrameHeader, GpuUiLayer, GpuUiQuad, GPU_DEMO_START_OPCODE,
+        GPU_MAX_COMMAND_BYTES, GPU_UI_STREAM_BYTES,
     },
     graphics_buffer::{BufferUsage, GraphicsBufferDesc, MemoryDomain},
     ipc::{Message, IPC_INLINE_BYTES, IPC_MAX_HANDLES},
@@ -1510,6 +1510,12 @@ impl ProcessManager {
             }
             syscall::number::GPU_RESOURCE_CREATE => {
                 let result = self.gpu_resource_create(process_index, Handle(arg0 as u32), arg1);
+                frame.set_syscall_result(result);
+                0
+            }
+            syscall::number::GPU_RESOURCE_DESTROY => {
+                let result =
+                    self.gpu_resource_destroy(process_index, Handle(arg0 as u32), arg1 as u32);
                 frame.set_syscall_result(result);
                 0
             }
@@ -3359,6 +3365,27 @@ impl ProcessManager {
         }
         scanout::create_render_resource(1, request)
             .map(i64::from)
+            .unwrap_or_else(gpu_status)
+    }
+
+    fn gpu_resource_destroy(
+        &mut self,
+        process_index: usize,
+        context_handle: Handle,
+        resource: u32,
+    ) -> i64 {
+        if resource == 0 {
+            return status::INVALID_ARGUMENT;
+        }
+        if let Err(error) = self.processes[process_index]
+            .as_ref()
+            .expect("process")
+            .resolve(context_handle, CapabilityKind::GpuContext(1), Rights::WRITE)
+        {
+            return error;
+        }
+        scanout::destroy_render_resource(1, resource)
+            .map(|()| status::OK)
             .unwrap_or_else(gpu_status)
     }
 
@@ -5451,10 +5478,10 @@ fn progress_graphics_once(
         manager.run()?;
         return Ok(());
     }
-    if manager.complete_idle_gpu_submission() || manager.complete_idle_estimated_vblank() {
-        if manager.has_runnable_threads() {
-            manager.run()?;
-        }
+    if (manager.complete_idle_gpu_submission() || manager.complete_idle_estimated_vblank())
+        && manager.has_runnable_threads()
+    {
+        manager.run()?;
     }
     Ok(())
 }
@@ -5587,6 +5614,7 @@ pub(super) fn pump_interactive_services() -> Result<(), ProcessError> {
 /// физические quads внутреннего backend'а, а не pointers или framebuffer.
 pub(super) fn present_system_ui_gpu(
     header: GpuUiFrameHeader,
+    layers: &[GpuUiLayer],
     quads: &[GpuUiQuad],
 ) -> Result<(), ProcessError> {
     const COMPOSITOR_CONTROL_ENDPOINT: u8 = 6;
@@ -5594,11 +5622,18 @@ pub(super) fn present_system_ui_gpu(
         .filter(|services| services.render.is_some() && services.ui_stream.is_some())
         .ok_or(ProcessError::UnexpectedExit)?;
     if header.validate().is_err()
+        || layers.len() != header.layer_count as usize
         || quads.len() != header.quad_count as usize
-        || quads
-            .iter()
-            .any(|quad| quad.validate(header.width, header.height).is_err())
-        || rustos_abi::gpu::gpu_ui_checksum(quads) != header.checksum
+        || layers.iter().any(|layer| {
+            layer
+                .validate(header.width, header.height, header.quad_count)
+                .is_err()
+                || quads[layer.first_quad as usize
+                    ..layer.first_quad as usize + layer.quad_count as usize]
+                    .iter()
+                    .any(|quad| quad.validate(layer.width, layer.height).is_err())
+        })
+        || rustos_abi::gpu::gpu_ui_checksum(layers, quads) != header.checksum
     {
         serial::put_str("[system-ui-gpu] reject stage=kernel-validate\n");
         return Err(ProcessError::UnexpectedExit);
@@ -5611,6 +5646,9 @@ pub(super) fn present_system_ui_gpu(
         return Err(ProcessError::UnexpectedExit);
     }
     let stream = services.ui_stream.ok_or(ProcessError::UnexpectedExit)?;
+    let layer_bytes = unsafe {
+        slice::from_raw_parts(layers.as_ptr().cast::<u8>(), core::mem::size_of_val(layers))
+    };
     let quad_bytes = unsafe {
         slice::from_raw_parts(quads.as_ptr().cast::<u8>(), core::mem::size_of_val(quads))
     };
@@ -5618,7 +5656,15 @@ pub(super) fn present_system_ui_gpu(
     // generation с наполовину записанным массивом.
     manager
         .shared
-        .write_bytes(stream, size_of::<GpuUiFrameHeader>() as u64, quad_bytes)
+        .write_bytes(stream, size_of::<GpuUiFrameHeader>() as u64, layer_bytes)
+        .map_err(|_| ProcessError::AddressSpace)?;
+    manager
+        .shared
+        .write_bytes(
+            stream,
+            (size_of::<GpuUiFrameHeader>() + core::mem::size_of_val(layers)) as u64,
+            quad_bytes,
+        )
         .map_err(|_| ProcessError::AddressSpace)?;
     let header_bytes = unsafe {
         slice::from_raw_parts(
@@ -5648,6 +5694,8 @@ pub(super) fn present_system_ui_gpu(
     if !unsafe { GPU_UI_FIRST_FRAME_LOGGED } {
         serial::put_str("[system-ui-gpu] backend=renderd raster=gpu composition=gpu scanout=zero-copy readback=0 cpu-pixels=0 quads=");
         serial::put_u32(header.quad_count);
+        serial::put_str(" layers=");
+        serial::put_u32(header.layer_count);
         serial::put_str(" pacing=async-mailbox stale=drop\n");
         unsafe { GPU_UI_FIRST_FRAME_LOGGED = true };
     }

@@ -401,6 +401,19 @@ pub fn gpu_resource_create(context: Handle, request: &GpuResourceCreate) -> i64 
     }
 }
 
+/// Освобождает context-local resource. Импортированные GraphicsBuffer
+/// освобождаются жизненным циклом capability и этим вызовом не принимаются.
+pub fn gpu_resource_destroy(context: Handle, resource: u32) -> i64 {
+    unsafe {
+        syscall3(
+            syscall::number::GPU_RESOURCE_DESTROY,
+            context.0 as u64,
+            u64::from(resource),
+            0,
+        )
+    }
+}
+
 /// Ставит VirGL command stream в очередь; положительный результат — fence id.
 pub fn gpu_submit(context: Handle, request: &GpuSubmit) -> i64 {
     unsafe {

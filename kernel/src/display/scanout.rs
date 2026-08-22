@@ -345,6 +345,17 @@ pub fn create_render_resource(
         .map_err(map_mode_error)
 }
 
+pub fn destroy_render_resource(context: u32, resource: u32) -> Result<(), DisplayBrokerError> {
+    let mut guard = DEVICE.acquire()?;
+    guard
+        .get()
+        .as_mut()
+        .ok_or(DisplayBrokerError::Unavailable)?
+        .gpu
+        .destroy_render_resource(context, resource)
+        .map_err(map_mode_error)
+}
+
 pub fn submit_render(context: u32, commands: &[u8]) -> Result<u64, DisplayBrokerError> {
     let mut guard = DEVICE.acquire()?;
     guard

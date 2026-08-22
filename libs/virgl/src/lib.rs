@@ -10,6 +10,7 @@
 
 const CCMD_CREATE_OBJECT: u8 = 1;
 const CCMD_BIND_OBJECT: u8 = 2;
+const CCMD_DESTROY_OBJECT: u8 = 3;
 const CCMD_SET_VIEWPORT_STATE: u8 = 4;
 const CCMD_SET_FRAMEBUFFER_STATE: u8 = 5;
 const CCMD_SET_VERTEX_BUFFERS: u8 = 6;
@@ -341,6 +342,7 @@ pub fn encode_mesh(
         true,
         true,
         true,
+        FORMAT_BGRX8888,
     )
 }
 
@@ -368,6 +370,7 @@ pub fn encode_mesh_update(
         false,
         false,
         true,
+        FORMAT_BGRX8888,
     )
 }
 
@@ -436,7 +439,58 @@ pub fn encode_mesh_swapchain_pass(
         initialize_surface,
         initialize_pipeline,
         clear_target,
+        FORMAT_BGRX8888,
     )
+}
+
+/// Растеризует ordered batch в premultiplied BGRA surface окна. Surface
+/// затем может многократно участвовать в composition pass с новым transform,
+/// не выполняя draw заново.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_layer_mesh_pass(
+    output: &mut [u32],
+    width: u32,
+    height: u32,
+    color_resource: u32,
+    vertex_resource: u32,
+    vertices: &[Vertex],
+    clear: [f32; 4],
+    surface_handle: u32,
+    initialize_surface: bool,
+    initialize_pipeline: bool,
+    clear_target: bool,
+) -> Result<usize, EncodeError> {
+    if surface_handle == 0 || (2..=7).contains(&surface_handle) || surface_handle > 63 {
+        return Err(EncodeError::InvalidExtent);
+    }
+    encode_mesh_with_pipeline(
+        output,
+        width,
+        height,
+        color_resource,
+        vertex_resource,
+        vertices,
+        clear,
+        surface_handle,
+        initialize_surface,
+        initialize_pipeline,
+        clear_target,
+        FORMAT_BGRA8888,
+    )
+}
+
+/// Удаляет VirGL surface object перед освобождением или заменой resource.
+pub fn encode_destroy_surface(
+    output: &mut [u32],
+    surface_handle: u32,
+) -> Result<usize, EncodeError> {
+    if surface_handle == 0 || (2..=7).contains(&surface_handle) || surface_handle > 63 {
+        return Err(EncodeError::InvalidExtent);
+    }
+    let mut encoder = Encoder::new(output);
+    encoder.command(CCMD_DESTROY_OBJECT, OBJECT_SURFACE, 1)?;
+    encoder.word(surface_handle)?;
+    Ok(encoder.finish())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -452,6 +506,7 @@ fn encode_mesh_with_pipeline(
     initialize_surface: bool,
     initialize_pipeline: bool,
     clear_target: bool,
+    color_format: u32,
 ) -> Result<usize, EncodeError> {
     if width == 0 || height == 0 || width > 16_384 || height > 16_384 {
         return Err(EncodeError::InvalidExtent);
@@ -465,7 +520,7 @@ fn encode_mesh_with_pipeline(
     // resource. Уровень и диапазон layers равны нулю: это обычная 2D texture.
     if initialize_surface {
         encoder.command(CCMD_CREATE_OBJECT, OBJECT_SURFACE, 5)?;
-        encoder.words(&[surface_handle, color_resource, FORMAT_BGRX8888, 0, 0])?;
+        encoder.words(&[surface_handle, color_resource, color_format, 0, 0])?;
     }
     // Binding входит в каждый submission: три surface могут быть in-flight,
     // а последующий кадр выбирает свой back buffer без копии/readback.

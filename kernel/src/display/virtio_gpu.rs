@@ -1035,6 +1035,33 @@ impl VirtioGpu {
         Ok(resource)
     }
 
+    /// Уничтожает только device-local resource текущего render context.
+    /// Capability-backed imports имеют отдельный жизненный цикл и здесь
+    /// намеренно отвергаются, чтобы renderer не мог оборвать чужой DMA.
+    pub fn destroy_render_resource(
+        &mut self,
+        context: u32,
+        resource: u32,
+    ) -> Result<(), ModeSetError> {
+        if context != self.render_context || resource == 0 {
+            return Err(ModeSetError::UnsupportedMode);
+        }
+        let index = self
+            .render_resources
+            .iter()
+            .position(|candidate| {
+                candidate.used
+                    && candidate.context == context
+                    && candidate.id == resource
+                    && !candidate.has_backing
+            })
+            .ok_or(ModeSetError::UnsupportedMode)?;
+        self.detach_context(context, resource)?;
+        self.unref_resource(resource)?;
+        self.render_resources[index] = RenderResource::EMPTY;
+        Ok(())
+    }
+
     pub fn submit_render(&mut self, context: u32, commands: &[u8]) -> Result<u64, ModeSetError> {
         if context != self.render_context
             || !valid_virgl_stream(commands, context, &self.render_resources)
@@ -1904,6 +1931,9 @@ fn valid_virgl_command(
             }
         }
         2 => payload == 1 && matches!(object, 1 | 2 | 3 | 5),
+        // DESTROY_OBJECT. Renderer может освобождать только surface object;
+        // immutable pipeline objects живут до уничтожения context.
+        3 => object == 8 && payload == 1,
         4 => object == 0 && payload == 7,
         5 => object == 0 && payload == 3,
         6 => {

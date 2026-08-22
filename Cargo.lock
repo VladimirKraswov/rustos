@@ -429,6 +429,7 @@ dependencies = [
  "rustos-runtime",
  "rustos-surface-client",
  "rustos-system-assets",
+ "rustos-system-fonts",
  "rustos-vfs-client",
  "rustos-video",
  "rustos-virgl",
@@ -470,16 +471,14 @@ dependencies = [
 name = "rustos-kernel"
 version = "0.1.0"
 dependencies = [
- "embedded-graphics",
- "mplusfonts",
  "rustos-abi",
  "rustos-microkernel",
  "rustos-rune-format",
  "rustos-system-assets",
+ "rustos-system-fonts",
  "rustos-system-ui",
  "rustos-usb",
  "rustos-video",
- "u8g2-fonts",
 ]
 
 [[package]]
@@ -598,6 +597,15 @@ version = "0.1.0"
 dependencies = [
  "rustos-abi",
  "rustos-video",
+]
+
+[[package]]
+name = "rustos-system-fonts"
+version = "0.1.0"
+dependencies = [
+ "embedded-graphics",
+ "mplusfonts",
+ "u8g2-fonts",
 ]
 
 [[package]]

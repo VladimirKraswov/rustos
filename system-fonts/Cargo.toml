@@ -1,0 +1,16 @@
+[package]
+name = "rustos-system-fonts"
+description = "Единый no_std raster contract системных Latin/Cyrillic шрифтов RustOS"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+embedded-graphics = { version = "=0.8.2", default-features = false }
+mplusfonts = { version = "=0.3.4" }
+u8g2-fonts = { version = "=0.8.0" }

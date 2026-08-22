@@ -11,33 +11,13 @@
 //! наклоном rasterizer'а. Размер задаётся высотой строки в пикселях, поэтому
 //! один и тот же API пригоден для DPI-настроек и приложений user space.
 
-use core::convert::Infallible;
-
-use embedded_graphics::{
-    draw_target::DrawTarget,
-    geometry::{Dimensions, OriginDimensions},
-    pixelcolor::{BinaryColor, Gray4, GrayColor},
-    prelude::{Pixel, Point, Size},
-};
-use mplusfonts::{image::Colors, mplus, BitmapFont};
-use u8g2_fonts::{
-    fonts,
-    types::{FontColor, VerticalPosition},
-    FontRenderer,
-};
-
 use crate::graphics::{Color, Framebuffer, Rect};
 
 /// Outline растеризуется host-макросом в 24 px/4-bit coverage. Это даёт
 /// достаточно subpixel-информации для качественного уменьшения до обычных
 /// UI-размеров 13–20 px, не заставляя ядро разбирать TTF.
 const SOURCE_FONT_SIZE: i32 = 24;
-/// Компактный terminal baseline: стандартный M+ line gap слишком велик для
-/// консоли, поэтому оставляем 19 px сверху и 5 px под baseline.
-const SOURCE_BASELINE: i32 = 25;
 const SOURCE_CONSOLE_ADVANCE: i32 = 10;
-const GLYPH_BITMAP_SIDE: usize = 64;
-const GLYPH_BITMAP_CAPACITY: usize = GLYPH_BITMAP_SIDE * GLYPH_BITMAP_SIDE;
 
 /// Два системных семейства. Имена намеренно стабильны: они войдут в GUI ABI.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -140,59 +120,6 @@ pub const TERMINAL_DEFAULT: FontStyle = FontStyle::console(18);
 pub const UI_SMALL: FontStyle = FontStyle::sans(13);
 pub const UI_TITLE: FontStyle = FontStyle::sans(15).bold();
 
-type SystemFont = BitmapFont<'static, Gray4, 1>;
-
-/// Макрос M+ выполняет rasterization во время host-сборки. В kernel binary
-/// попадает только компактная bitmap/charmap-таблица, а не TTF-парсер.
-fn system_font(style: FontStyle) -> SystemFont {
-    match (style.family, style.weight) {
-        (FontFamily::Console, FontWeight::Regular) => mplus!(
-            code(100),
-            500,
-            24,
-            true,
-            1,
-            4,
-            '\u{0020}'..='\u{007e}',
-            '\u{00a0}'..='\u{00ff}',
-            ["�"]
-        ),
-        (FontFamily::Console, FontWeight::Bold) => mplus!(
-            code(100),
-            700,
-            24,
-            true,
-            1,
-            4,
-            '\u{0020}'..='\u{007e}',
-            '\u{00a0}'..='\u{00ff}',
-            ["�"]
-        ),
-        (FontFamily::Sans, FontWeight::Regular) => mplus!(
-            1,
-            450,
-            24,
-            true,
-            1,
-            4,
-            '\u{0020}'..='\u{007e}',
-            '\u{00a0}'..='\u{00ff}',
-            ["�"]
-        ),
-        (FontFamily::Sans, FontWeight::Bold) => mplus!(
-            1,
-            700,
-            24,
-            true,
-            1,
-            4,
-            '\u{0020}'..='\u{007e}',
-            '\u{00a0}'..='\u{00ff}',
-            ["�"]
-        ),
-    }
-}
-
 /// Результат измерения UTF-8 текста в физических пикселях.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct TextMetrics {
@@ -263,325 +190,101 @@ fn draw_char_clipped(
     style: FontStyle,
     clip: Rect,
 ) -> i32 {
-    if is_cyrillic(character) {
-        return draw_cyrillic(fb, x, y, character, color, style, clip);
-    }
-    let font = system_font(style);
-    let mut encoded = [0u8; 4];
-    let key = character.encode_utf8(&mut encoded);
-    let mut entry = font.charmap.get(key);
-    if entry.key != key {
-        entry = font.charmap.get("�");
-    }
-    let image = entry.glyph.images.get(0);
-    let bounds = image.bounding_box();
-    let source_width = bounds.size.width as usize;
-    let source_height = bounds.size.height as usize;
-    let target_size = style.normalized_size();
-    let baseline = y + SOURCE_BASELINE * target_size / SOURCE_FONT_SIZE;
-    if source_width == 0
-        || source_height == 0
-        || source_width > GLYPH_BITMAP_SIDE
-        || source_height > GLYPH_BITMAP_SIDE
-    {
-        return character_advance(character, style);
-    }
-
-    // Один bounded coverage tile на стеке. Раньше каждый source pixel
-    // превращался в целый target rectangle; при 24→13 px несколько таких
-    // rectangle накладывались друг на друга и давали грубую «лесенку».
-    let mut bitmap = [0u8; GLYPH_BITMAP_CAPACITY];
-    for (index, gray) in image.colors().into_iter().enumerate() {
-        if index >= source_width.saturating_mul(source_height) {
-            break;
+    if fb.gpu_recording() {
+        let metrics = rustos_system_fonts::metrics(character, raster_style(style));
+        let advance = i32::from(metrics.advance);
+        if metrics.width == 0 || metrics.height == 0 {
+            return advance;
         }
-        bitmap[index] = gray.luma().saturating_mul(17);
-    }
-
-    let target_width = div_ceil(source_width as i32 * target_size, SOURCE_FONT_SIZE).max(1);
-    let target_height = div_ceil(source_height as i32 * target_size, SOURCE_FONT_SIZE).max(1);
-    let origin_x = x + bounds.top_left.x * target_size / SOURCE_FONT_SIZE;
-    // M+ хранит vertical bearing вверх от baseline.
-    let origin_y = baseline + (-bounds.top_left.y) * target_size / SOURCE_FONT_SIZE;
-    for target_y in 0..target_height {
-        let screen_y = origin_y + target_y;
-        let shear = if style.italic {
-            (style.line_height() - (screen_y - y)).clamp(0, style.line_height()) / 4
-        } else {
-            0
-        };
-        let mut target_x = 0;
-        while target_x < target_width {
-            let coverage = resampled_coverage(
-                &bitmap,
-                source_width,
-                source_height,
-                target_width as usize,
-                target_height as usize,
-                target_x as usize,
-                target_y as usize,
+        let glyph_rect = Rect::new(
+            x + i32::from(metrics.bearing_x),
+            y + i32::from(metrics.bearing_y),
+            u32::from(metrics.width),
+            u32::from(metrics.height),
+        );
+        let screen = Rect::new(0, 0, fb.width(), fb.height());
+        let visible = glyph_rect.intersection(clip).intersection(screen);
+        if !visible.is_empty() {
+            crate::gui::gpu_scene::glyph(
+                visible,
+                color,
+                character,
+                gpu_style(style),
+                visible.x.saturating_sub(glyph_rect.x) as u16,
+                visible.y.saturating_sub(glyph_rect.y) as u16,
             );
-            let mut run_end = target_x + 1;
-            while run_end < target_width
-                && resampled_coverage(
-                    &bitmap,
-                    source_width,
-                    source_height,
-                    target_width as usize,
-                    target_height as usize,
-                    run_end as usize,
-                    target_y as usize,
-                ) == coverage
+        }
+        return advance;
+    }
+    let raster = rustos_system_fonts::rasterize(character, raster_style(style));
+    let advance = i32::from(raster.advance);
+    if raster.width == 0 || raster.height == 0 {
+        return advance;
+    }
+    let glyph_rect = Rect::new(
+        x + i32::from(raster.bearing_x),
+        y + i32::from(raster.bearing_y),
+        u32::from(raster.width),
+        u32::from(raster.height),
+    );
+    let screen = Rect::new(0, 0, fb.width(), fb.height());
+    let visible = glyph_rect.intersection(clip).intersection(screen);
+    if visible.is_empty() {
+        return advance;
+    }
+    let crop_x = visible.x.saturating_sub(glyph_rect.x) as usize;
+    let crop_y = visible.y.saturating_sub(glyph_rect.y) as usize;
+    let source_width = raster.width as usize;
+    for row in 0..visible.height as usize {
+        let source_y = crop_y + row;
+        let mut column = 0usize;
+        while column < visible.width as usize {
+            let coverage = raster.pixels[source_y * source_width + crop_x + column];
+            let mut run_end = column + 1;
+            while run_end < visible.width as usize
+                && raster.pixels[source_y * source_width + crop_x + run_end] == coverage
             {
                 run_end += 1;
             }
-            let first = (origin_x + target_x + shear).max(clip.x);
-            let last = (origin_x + run_end + shear).min(clip.right());
-            if coverage != 0 && clip.contains(first, screen_y) && first < last {
-                fb.blend_span(first, screen_y, (last - first) as u32, color, coverage);
+            if coverage != 0 {
+                fb.blend_span(
+                    visible.x + column as i32,
+                    visible.y + row as i32,
+                    (run_end - column) as u32,
+                    color,
+                    coverage,
+                );
             }
-            target_x = run_end;
+            column = run_end;
         }
     }
-    character_advance(character, style)
+    advance
 }
 
 fn character_advance(character: char, style: FontStyle) -> i32 {
-    if style.family == FontFamily::Console {
-        return style.cell_width();
-    }
-    if is_cyrillic(character) {
-        let (renderer, source_size) = cyrillic_font(style);
-        if let Ok(metrics) =
-            renderer.get_rendered_dimensions(character, Point::zero(), VerticalPosition::Top)
-        {
-            return (metrics.advance.x * style.normalized_size() / source_size).max(1)
-                + i32::from(style.italic);
-        }
-    }
-    if character == ' ' || character == '\u{00a0}' {
-        return (style.normalized_size() * 4 / 9).max(1);
-    }
-
-    let font = system_font(style);
-    let mut encoded = [0u8; 4];
-    let key = character.encode_utf8(&mut encoded);
-    let mut entry = font.charmap.get(key);
-    if entry.key != key {
-        entry = font.charmap.get("�");
-    }
-    let bounds = entry.glyph.images.get(0).bounding_box();
-    let source = bounds.top_left.x.max(0) + bounds.size.width as i32 + 1;
-    let scaled = source * style.normalized_size() / SOURCE_FONT_SIZE;
-    scaled.max(style.normalized_size() / 4).max(1) + i32::from(style.italic)
+    rustos_system_fonts::advance(character, raster_style(style))
 }
 
-fn is_cyrillic(character: char) -> bool {
-    ('\u{0400}'..='\u{052f}').contains(&character)
-}
-
-fn cyrillic_font(style: FontStyle) -> (FontRenderer, i32) {
-    match (style.family, style.weight) {
-        (FontFamily::Console, FontWeight::Regular) => {
-            (FontRenderer::new::<fonts::u8g2_font_9x15_t_cyrillic>(), 15)
-        }
-        (FontFamily::Console, FontWeight::Bold) => {
-            (FontRenderer::new::<fonts::u8g2_font_6x13B_t_cyrillic>(), 13)
-        }
-        (FontFamily::Sans, FontWeight::Regular | FontWeight::Bold) => {
-            (FontRenderer::new::<fonts::u8g2_font_inr24_t_cyrillic>(), 24)
-        }
+fn raster_style(style: FontStyle) -> rustos_system_fonts::Style {
+    rustos_system_fonts::Style {
+        family: match style.family {
+            FontFamily::Console => rustos_system_fonts::Family::Console,
+            FontFamily::Sans => rustos_system_fonts::Family::Sans,
+        },
+        weight: match style.weight {
+            FontWeight::Regular => rustos_system_fonts::Weight::Regular,
+            FontWeight::Bold => rustos_system_fonts::Weight::Bold,
+        },
+        italic: style.italic,
+        size: style.size,
     }
 }
 
-/// U8g2 хранит кириллицу компактно как 1-bit bitmap. Сначала разворачиваем
-/// один глиф в bounded coverage tile, затем применяем тот же box/bilinear
-/// filter, что и к Latin. Поэтому русский набор остаётся полным, а diagonal
-/// strokes получают полутоновые края вместо nearest-neighbour ступенек.
-fn draw_cyrillic(
-    framebuffer: &mut Framebuffer,
-    x: i32,
-    y: i32,
-    character: char,
-    color: Color,
-    style: FontStyle,
-    clip: Rect,
-) -> i32 {
-    let (renderer, source_size) = cyrillic_font(style);
-    let Ok(metrics) =
-        renderer.get_rendered_dimensions(character, Point::zero(), VerticalPosition::Top)
-    else {
-        return style.cell_width();
-    };
-    let Some(bounds) = metrics.bounding_box else {
-        return character_advance(character, style);
-    };
-    let source_width = bounds.size.width as usize;
-    let source_height = bounds.size.height as usize;
-    if source_width == 0
-        || source_height == 0
-        || source_width > GLYPH_BITMAP_SIDE
-        || source_height > GLYPH_BITMAP_SIDE
-    {
-        return character_advance(character, style);
-    }
-
-    let mut bitmap = [0u8; GLYPH_BITMAP_CAPACITY];
-    let mut target = BinaryGlyphTarget {
-        bitmap: &mut bitmap,
-        width: source_width,
-        height: source_height,
-        embolden: style.family == FontFamily::Sans && style.weight == FontWeight::Bold,
-    };
-    let position = Point::new(-bounds.top_left.x, -bounds.top_left.y);
-    let _ = renderer.render(
-        character,
-        position,
-        VerticalPosition::Top,
-        FontColor::Transparent(BinaryColor::On),
-        &mut target,
-    );
-
-    let target_size = style.normalized_size();
-    let target_width = div_ceil(source_width as i32 * target_size, source_size).max(1) as usize;
-    let target_height = div_ceil(source_height as i32 * target_size, source_size).max(1) as usize;
-    let origin_x = x + bounds.top_left.x * target_size / source_size;
-    let origin_y = y + bounds.top_left.y * target_size / source_size;
-    for target_y in 0..target_height {
-        let screen_y = origin_y + target_y as i32;
-        let shear = if style.italic {
-            (style.line_height() - (screen_y - y)).clamp(0, style.line_height()) / 4
-        } else {
-            0
-        };
-        let mut target_x = 0;
-        while target_x < target_width {
-            let coverage = resampled_coverage(
-                &bitmap,
-                source_width,
-                source_height,
-                target_width,
-                target_height,
-                target_x,
-                target_y,
-            );
-            let mut run_end = target_x + 1;
-            while run_end < target_width
-                && resampled_coverage(
-                    &bitmap,
-                    source_width,
-                    source_height,
-                    target_width,
-                    target_height,
-                    run_end,
-                    target_y,
-                ) == coverage
-            {
-                run_end += 1;
-            }
-            let first = (origin_x + target_x as i32 + shear).max(clip.x);
-            let last = (origin_x + run_end as i32 + shear).min(clip.right());
-            if coverage != 0 && clip.contains(first, screen_y) && first < last {
-                framebuffer.blend_span(first, screen_y, (last - first) as u32, color, coverage);
-            }
-            target_x = run_end;
-        }
-    }
-    if style.family == FontFamily::Console {
-        style.cell_width()
-    } else {
-        (metrics.advance.x * target_size / source_size).max(1) + i32::from(style.italic)
-    }
-}
-
-struct BinaryGlyphTarget<'a> {
-    bitmap: &'a mut [u8; GLYPH_BITMAP_CAPACITY],
-    width: usize,
-    height: usize,
-    embolden: bool,
-}
-
-impl OriginDimensions for BinaryGlyphTarget<'_> {
-    fn size(&self) -> Size {
-        Size::new(self.width as u32, self.height as u32)
-    }
-}
-
-impl DrawTarget for BinaryGlyphTarget<'_> {
-    type Color = BinaryColor;
-    type Error = Infallible;
-
-    fn draw_iter<I>(&mut self, pixels: I) -> Result<(), Self::Error>
-    where
-        I: IntoIterator<Item = Pixel<Self::Color>>,
-    {
-        for Pixel(point, value) in pixels {
-            if value == BinaryColor::Off || point.x < 0 || point.y < 0 {
-                continue;
-            }
-            let x = point.x as usize;
-            let y = point.y as usize;
-            if x >= self.width || y >= self.height {
-                continue;
-            }
-            self.bitmap[y * self.width + x] = u8::MAX;
-            if self.embolden && x + 1 < self.width {
-                self.bitmap[y * self.width + x + 1] = u8::MAX;
-            }
-        }
-        Ok(())
-    }
-}
-
-fn div_ceil(value: i32, divisor: i32) -> i32 {
-    value.saturating_add(divisor - 1) / divisor
-}
-
-/// Box filter при уменьшении и bilinear filter при увеличении. Оба пути
-/// используют только fixed-point integer math и один раз смешивают target
-/// pixel с framebuffer — без накопления тёмных overlapping rectangles.
-fn resampled_coverage(
-    bitmap: &[u8; GLYPH_BITMAP_CAPACITY],
-    source_width: usize,
-    source_height: usize,
-    target_width: usize,
-    target_height: usize,
-    target_x: usize,
-    target_y: usize,
-) -> u8 {
-    if target_width < source_width || target_height < source_height {
-        let mut sum = 0u32;
-        for sample_y in 0..4usize {
-            for sample_x in 0..4usize {
-                let x = ((target_x * 4 + sample_x) * source_width)
-                    / target_width.saturating_mul(4).max(1);
-                let y = ((target_y * 4 + sample_y) * source_height)
-                    / target_height.saturating_mul(4).max(1);
-                sum = sum.saturating_add(u32::from(
-                    bitmap[y.min(source_height - 1) * source_width + x.min(source_width - 1)],
-                ));
-            }
-        }
-        return ((sum + 8) / 16) as u8;
-    }
-
-    let x_fixed = (((target_x * 2 + 1) * source_width * 256)
-        / target_width.saturating_mul(2).max(1))
-    .saturating_sub(128)
-    .min((source_width - 1) * 256);
-    let y_fixed = (((target_y * 2 + 1) * source_height * 256)
-        / target_height.saturating_mul(2).max(1))
-    .saturating_sub(128)
-    .min((source_height - 1) * 256);
-    let x0 = x_fixed / 256;
-    let y0 = y_fixed / 256;
-    let x1 = (x0 + 1).min(source_width - 1);
-    let y1 = (y0 + 1).min(source_height - 1);
-    let fx = (x_fixed % 256) as u32;
-    let fy = (y_fixed % 256) as u32;
-    let top = u32::from(bitmap[y0 * source_width + x0]) * (256 - fx)
-        + u32::from(bitmap[y0 * source_width + x1]) * fx;
-    let bottom = u32::from(bitmap[y1 * source_width + x0]) * (256 - fx)
-        + u32::from(bitmap[y1 * source_width + x1]) * fx;
-    (((top * (256 - fy) + bottom * fy) + 32_768) / 65_536) as u8
+fn gpu_style(style: FontStyle) -> u32 {
+    rustos_abi::gpu::ui_glyph_style::pack(
+        style.family == FontFamily::Sans,
+        style.weight == FontWeight::Bold,
+        style.italic,
+        style.size.clamp(10, 48),
+    )
 }

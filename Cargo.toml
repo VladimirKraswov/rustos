@@ -15,6 +15,7 @@ members = [
     "video",
     "system-ui",
     "system-assets",
+    "system-fonts",
     "runtime",
     "userspace/crt",
     "sdk/examples/hello",

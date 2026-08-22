@@ -90,7 +90,9 @@ Display list компилируется в bounded batches, а не в один 
 1. непрозрачные прямоугольники и простые границы объединяются по pipeline;
 2. rounded rectangle, border и shadow используют аналитический fragment
    shader, поэтому радиус не превращается в сотни маленьких CPU-отрезков;
-3. glyph quad ссылается на общий R8/SDF atlas и получает цвет отдельно;
+3. glyph quad ссылается на общий SDF atlas; bootstrap VirGL хранит
+   premultiplied color в ключе tile, а следующий R8 shader backend отделит
+   distance от tint без изменения wire primitive;
 4. icon/image quad ссылается на immutable RGBA atlas;
 5. clip превращается в scissor, одинаковые соседние scissor объединяются;
 6. переполнение batch завершает его целиком и начинает следующий — частично
@@ -226,20 +228,24 @@ Release-сборка на профиле UTM Apple Silicon должна держ
 - G2: обычный SystemUI компилируется в renderer-neutral GPU scene и передаётся
   постоянному ring-3 `renderd`. VirGL выполняет blending и запись geometry,
   icon/image и wallpaper pixels; CPU backend остаётся recovery fallback.
-  Текстовый adapter пока формирует bounded coverage spans из системного
-  bitmap-шрифта — постоянный glyph atlas/SDF остаётся следующей оптимизацией;
+  Единый `rustos-system-fonts` формирует одинаковые Latin/Cyrillic metrics для
+  обоих backend. GPU display list передаёт один semantic glyph primitive, а
+  `renderd` лениво строит постоянный 2048×2048 SDF atlas для family, weight,
+  italic, size и color без повторной загрузки glyph в steady state;
 - G3: общая generation-checked `SurfaceQueue`, динамические IPC endpoint'ы и
   клиентская `surface.dll` реализованы; отдельный ring-3 процесс проходит
   `create/commit/direct-scanout/release/feedback/destroy`, а stale event
-  capability после crash отзывается ядром;
-- штатный desktop использует один агрегированный GPU frame, asynchronous
-  latest-frame mailbox, stale-frame drop и zero-copy scanout. Проверочный
-  marker содержит `raster=gpu composition=gpu readback=0 cpu-pixels=0`;
-- отдельные per-window GPU queues, transform-only drag и аппаратный cursor
-  plane ещё не завершены. Поэтому полный критерий G4 выше пока выполнен не
-  целиком, хотя CPU raster штатного desktop уже отключён.
+  capability после crash отзывается ядром. Bootstrap SystemUI stream теперь
+  также содержит независимые surfaces desktop, каждого окна и popup overlay;
+- `renderd` кэширует surfaces по устойчивому `layer.id + content_hash`,
+  растеризует только изменившийся слой и одним GPU pass смешивает их в
+  triple-buffered zero-copy scanout. При drag ядро повторно не обходит UI:
+  меняются только `x/y` layer descriptor и checksum нового кадра;
+- resize/close уничтожают VirGL surface object и device-local resource только
+  после bounded fence drain. Аппаратный cursor plane остаётся независимым от
+  damage. Проверочный marker содержит
+  `raster=gpu composition=gpu readback=0 cpu-pixels=0 layers=N`.
 
-Следующая граница — разбить агрегированную сцену на независимые оконные слои,
-чтобы drag менял только transform, и вынести policy/layout из bootstrap kernel
-GUI в постоянные `windowd`/`uid`. Публичный код приложений при этом не
-меняется: после переключения kernel GUI остаётся только аварийным fallback.
+Следующая граница — перенести ownership/policy слоёв из bootstrap kernel GUI в
+постоянные `windowd`/`uid` и связать каждый ring-3 application commit с уже
+готовым внутренним layer cache. Публичный Window/SystemUI API не меняется.

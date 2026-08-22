@@ -156,9 +156,11 @@ runtime, interrupt routing, TLB shootdown и work stealing. Постоянный
 atomic present и получает presentation feedback. Подключение оконных
 surface queues начато: `surface.dll` и boot-test уже проходят полный
 `create/commit/direct-scanout/release/feedback/destroy` между независимым
-ring-3 приложением и compositord. Multi-layer GPU composition, input и сам
-desktop ещё не переключены на этот путь. Нативный `rustc` ещё не заявлен
-готовым.
+ring-3 приложением и compositord. Штатный desktop уже композируется из
+независимых GPU surfaces окон: drag меняет только transform, текст использует
+общий Latin/Cyrillic SDF atlas, аппаратный cursor не повреждает кадр. Ownership
+слоёв пока остаётся у bootstrap window session; следующий шаг — постоянные
+ring-3 `windowd`/`uid`. Нативный `rustc` ещё не заявлен готовым.
 
 Подробнее: [архитектуры CPU](docs/ARCHITECTURES.md), [архитектура системы](docs/ARCHITECTURE.md),
 [графическая подсистема](docs/GUI.md), [видеосистема](docs/VIDEO.md), [VFS](docs/VFS.md),

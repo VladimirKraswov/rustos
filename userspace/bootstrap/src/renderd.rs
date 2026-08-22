@@ -13,7 +13,7 @@ use core::panic::PanicInfo;
 use rustos_abi::{
     gpu::{
         frame_flag, gpu_ui_checksum, virgl_format, GpuContextCreate, GpuDeviceInfo, GpuRenderFrame,
-        GpuResourceCreate, GpuResourceImport, GpuSubmit, GpuUiFrameHeader, GpuUiQuad,
+        GpuResourceCreate, GpuResourceImport, GpuSubmit, GpuUiFrameHeader, GpuUiLayer, GpuUiQuad,
         GPU_ABI_VERSION, GPU_MAX_COMMAND_BYTES, GPU_RENDERED_FRAME_HANDLE_COUNT,
         GPU_RENDERED_FRAME_OPCODE, GPU_RENDER_REQUEST_OPCODE, GPU_UI_STREAM_BYTES,
     },
@@ -23,9 +23,9 @@ use rustos_abi::{
 };
 use rustos_runtime::{
     gpu_completion_status, gpu_context_create, gpu_get_info, gpu_resource_create,
-    gpu_resource_import, gpu_submit, graphics_buffer_create, ipc_receive, ipc_send, process_exit,
-    shared_memory_map, sync_timeline_create, sync_timeline_wait, syscall, Handle, Message, Rights,
-    SharedMemoryMap, VmFlags,
+    gpu_resource_destroy, gpu_resource_import, gpu_submit, graphics_buffer_create, ipc_receive,
+    ipc_send, process_exit, shared_memory_map, sync_timeline_create, sync_timeline_wait, syscall,
+    Handle, Message, Rights, SharedMemoryMap, VmFlags,
 };
 use rustos_system_assets::{wallpaper, Wallpaper, WallpaperId};
 
@@ -35,7 +35,15 @@ const SWAPCHAIN_IMAGES: usize = 3;
 const UI_COMMAND_DWORDS: usize = GPU_MAX_COMMAND_BYTES as usize / 4;
 const UI_BATCH_QUADS: usize = 2_700;
 const UI_BATCH_VERTICES: usize = UI_BATCH_QUADS * 6;
-const UI_FRAME_QUADS: usize = (GPU_UI_STREAM_BYTES - core::mem::size_of::<GpuUiFrameHeader>())
+const UI_FRAME_LAYERS: usize = 32;
+const GLYPH_ATLAS_SIDE: u32 = 2_048;
+const GLYPH_TILE_SIDE: u32 = rustos_system_fonts::GLYPH_SIDE as u32;
+const GLYPH_ATLAS_ENTRIES: usize =
+    (GLYPH_ATLAS_SIDE / GLYPH_TILE_SIDE) as usize * (GLYPH_ATLAS_SIDE / GLYPH_TILE_SIDE) as usize;
+const GLYPH_BATCH: usize = 256;
+const UI_FRAME_QUADS: usize = (GPU_UI_STREAM_BYTES
+    - core::mem::size_of::<GpuUiFrameHeader>()
+    - UI_FRAME_LAYERS * core::mem::size_of::<GpuUiLayer>())
     / core::mem::size_of::<GpuUiQuad>();
 
 // Почти мегабайт временных данных нельзя класть на растущий user stack:
@@ -46,6 +54,19 @@ static mut UI_COMMAND_SCRATCH: [u32; UI_COMMAND_DWORDS] = [0; UI_COMMAND_DWORDS]
 static mut UI_UPLOAD_COMMAND_SCRATCH: [u32; UI_COMMAND_DWORDS] = [0; UI_COMMAND_DWORDS];
 static mut UI_VERTEX_SCRATCH: [rustos_virgl::Vertex; UI_BATCH_VERTICES] =
     [rustos_virgl::Vertex::new([0.0; 4], [0.0; 4]); UI_BATCH_VERTICES];
+static mut UI_LAYER_SNAPSHOT: [GpuUiLayer; UI_FRAME_LAYERS] = [GpuUiLayer {
+    id: 0,
+    content_hash: 0,
+    x: 0,
+    y: 0,
+    width: 0,
+    height: 0,
+    first_quad: 0,
+    quad_count: 0,
+    flags: 0,
+    reserved_header: 0,
+    reserved: [0; 2],
+}; UI_FRAME_LAYERS];
 static mut UI_FRAME_SNAPSHOT: [GpuUiQuad; UI_FRAME_QUADS] = [GpuUiQuad {
     x: 0,
     y: 0,
@@ -55,6 +76,81 @@ static mut UI_FRAME_SNAPSHOT: [GpuUiQuad; UI_FRAME_QUADS] = [GpuUiQuad {
     flags: 0,
     reserved: 0,
 }; UI_FRAME_QUADS];
+static mut GLYPH_UPLOAD_PIXELS: [u8; rustos_system_fonts::GLYPH_CAPACITY * 4] =
+    [0; rustos_system_fonts::GLYPH_CAPACITY * 4];
+static mut GLYPH_COMPOSITE_SCRATCH: [rustos_virgl::CompositeLayer; GLYPH_BATCH] =
+    [rustos_virgl::CompositeLayer {
+        resource: 0,
+        format: rustos_virgl::FORMAT_BGRA8888,
+        source: rustos_virgl::BlitRect::new(0, 0, 1, 1),
+        destination: rustos_virgl::BlitRect::new(0, 0, 1, 1),
+        linear_filter: true,
+        alpha_blend: true,
+    }; GLYPH_BATCH];
+
+#[derive(Clone, Copy)]
+struct CachedUiLayer {
+    id: u64,
+    content_hash: u64,
+    resource: u32,
+    width: u32,
+    height: u32,
+    surface_handle: u32,
+    seen_frame: u64,
+    surface_initialized: bool,
+}
+
+impl CachedUiLayer {
+    const EMPTY: Self = Self {
+        id: 0,
+        content_hash: 0,
+        resource: 0,
+        width: 0,
+        height: 0,
+        surface_handle: 0,
+        seen_frame: 0,
+        surface_initialized: false,
+    };
+}
+
+#[derive(Clone, Copy)]
+struct GlyphAtlasEntry {
+    character: u32,
+    style: u32,
+    color: u32,
+    x: u16,
+    y: u16,
+    width: u16,
+    height: u16,
+}
+
+impl GlyphAtlasEntry {
+    const EMPTY: Self = Self {
+        character: 0,
+        style: 0,
+        color: 0,
+        x: 0,
+        y: 0,
+        width: 0,
+        height: 0,
+    };
+}
+
+struct GlyphAtlas {
+    resource: u32,
+    entries: [GlyphAtlasEntry; GLYPH_ATLAS_ENTRIES],
+    len: usize,
+}
+
+impl GlyphAtlas {
+    const fn new(resource: u32) -> Self {
+        Self {
+            resource,
+            entries: [GlyphAtlasEntry::EMPTY; GLYPH_ATLAS_ENTRIES],
+            len: 0,
+        }
+    }
+}
 
 #[derive(Clone, Copy)]
 struct RenderSlot {
@@ -63,7 +159,6 @@ struct RenderSlot {
     timeline: Handle,
     completion_value: u64,
     pending_fence: u64,
-    surface_initialized: bool,
 }
 
 impl RenderSlot {
@@ -73,7 +168,6 @@ impl RenderSlot {
         timeline: Handle::INVALID,
         completion_value: 0,
         pending_fence: 0,
-        surface_initialized: false,
     };
 }
 
@@ -239,8 +333,26 @@ pub extern "C" fn _start(frame_endpoint: u64, render_capability: u64, abi_versio
         *timeline = Handle(value as u32);
     }
     let mut compositor_textures = [0u32; 3];
-    let mut ui_palette_texture = 0u32;
     let mut wallpaper_textures = [0u32; 3];
+    let glyph_resource = gpu_resource_create(
+        context,
+        &GpuResourceCreate::sampled_texture(
+            GLYPH_ATLAS_SIDE,
+            GLYPH_ATLAS_SIDE,
+            virgl_format::B8G8R8A8_UNORM,
+        ),
+    );
+    if glyph_resource <= 0 {
+        process_exit(218);
+    }
+    let mut glyph_atlas = GlyphAtlas::new(glyph_resource as u32);
+    let mut ui_layers = [CachedUiLayer::EMPTY; UI_FRAME_LAYERS];
+    for (index, layer) in ui_layers.iter_mut().enumerate() {
+        // 1, 8, 9 принадлежат desktop swapchain; 16..=18 — Aurora.
+        // Независимые SystemUI surfaces занимают непересекающийся bounded
+        // диапазон object handles одного VirGL context.
+        layer.surface_handle = 24 + index as u32;
+    }
     let mut ui_pipeline_initialized = false;
     let mut mesa_context: Option<rustos_mesa::Context> = None;
 
@@ -275,7 +387,7 @@ pub extern "C" fn _start(frame_endpoint: u64, render_capability: u64, abi_versio
         let width = pool.width;
         let height = pool.height;
         let vertex_resource = pool.vertex_resource;
-        let (slot_index, slot) = pool.select();
+        let (_, slot) = pool.select();
         if slot.pending_fence != 0 {
             if sync_timeline_wait(&SyncTimelineWait::new(
                 slot.timeline,
@@ -361,26 +473,16 @@ pub extern "C" fn _start(frame_endpoint: u64, render_capability: u64, abi_versio
             }
         };
         let fence = if system_ui {
-            if ui_palette_texture == 0 {
-                let created = gpu_resource_create(
-                    context,
-                    &GpuResourceCreate::sampled_texture(16, 16, virgl_format::B8G8R8A8_UNORM),
-                );
-                if created <= 0 {
-                    process_exit(218);
-                }
-                ui_palette_texture = created as u32;
-            }
             match render_system_ui_frame(
                 context,
                 slot,
-                slot_index,
                 ui_stream,
                 width,
                 height,
                 vertex_resource,
-                ui_palette_texture,
                 &mut wallpaper_textures,
+                &mut glyph_atlas,
+                &mut ui_layers,
                 &mut ui_pipeline_initialized,
                 &mut ui_submissions,
             ) {
@@ -437,41 +539,78 @@ pub extern "C" fn _start(frame_endpoint: u64, render_capability: u64, abi_versio
 fn render_system_ui_frame(
     context: Handle,
     slot: &mut RenderSlot,
-    slot_index: usize,
     stream: *const u8,
     width: u32,
     height: u32,
     vertex_resource: u32,
-    palette_resource: u32,
     wallpaper_resources: &mut [u32; 3],
+    glyph_atlas: &mut GlyphAtlas,
+    layer_cache: &mut [CachedUiLayer; UI_FRAME_LAYERS],
     pipeline_initialized: &mut bool,
     submissions: &mut UiSubmissionQueue,
 ) -> Result<u64, u8> {
     let header = unsafe { (stream as *const GpuUiFrameHeader).read_volatile() };
     header.validate().map_err(|_| 1)?;
-    if header.width != width || header.height != height {
+    if header.width != width
+        || header.height != height
+        || header.layer_count as usize > UI_FRAME_LAYERS
+        || header.quad_count as usize > UI_FRAME_QUADS
+    {
         return Err(1);
     }
+    let shared_layers = unsafe {
+        core::slice::from_raw_parts(
+            stream
+                .add(core::mem::size_of::<GpuUiFrameHeader>())
+                .cast::<GpuUiLayer>(),
+            header.layer_count as usize,
+        )
+    };
     let shared_quads = unsafe {
         core::slice::from_raw_parts(
             stream
                 .add(core::mem::size_of::<GpuUiFrameHeader>())
+                .add(core::mem::size_of_val(shared_layers))
                 .cast::<GpuUiQuad>(),
             header.quad_count as usize,
         )
     };
-    if gpu_ui_checksum(shared_quads) != header.checksum
-        || shared_quads
-            .iter()
-            .any(|quad| quad.validate(width, height).is_err())
-    {
+    if gpu_ui_checksum(shared_layers, shared_quads) != header.checksum {
+        return Err(2);
+    }
+    let mut expected_first = 0u32;
+    for (index, layer) in shared_layers.iter().enumerate() {
+        if layer.validate(width, height, header.quad_count).is_err()
+            || layer.first_quad != expected_first
+            || shared_layers[..index]
+                .iter()
+                .any(|previous| previous.id == layer.id)
+        {
+            return Err(2);
+        }
+        let first = layer.first_quad as usize;
+        let end = first + layer.quad_count as usize;
+        let layer_quads = &shared_quads[first..end];
+        if rustos_abi::gpu::gpu_ui_content_hash(layer_quads) != layer.content_hash
+            || layer_quads
+                .iter()
+                .any(|quad| quad.validate(layer.width, layer.height).is_err())
+        {
+            return Err(2);
+        }
+        expected_first = expected_first.saturating_add(layer.quad_count);
+    }
+    if expected_first != header.quad_count {
         return Err(2);
     }
     // Kernel-side mailbox вправе заменить shared stream следующим кадром,
     // пока этот кадр ждёт GPU fence. Снимок делается до первого blocking
     // syscall, после чего renderer читает только собственную память.
+    let layer_snapshot = unsafe { &mut *core::ptr::addr_of_mut!(UI_LAYER_SNAPSHOT) };
+    layer_snapshot[..shared_layers.len()].copy_from_slice(shared_layers);
     let snapshot = unsafe { &mut *core::ptr::addr_of_mut!(UI_FRAME_SNAPSHOT) };
     snapshot[..shared_quads.len()].copy_from_slice(shared_quads);
+    let layers = &layer_snapshot[..shared_layers.len()];
     let quads = &snapshot[..shared_quads.len()];
 
     // Большие wallpaper resources загружаются только при первом появлении.
@@ -481,44 +620,209 @@ fn render_system_ui_frame(
         ensure_wallpaper_texture(context, submissions, wallpaper_resources, id).map_err(|_| 14)?;
     }
 
-    let commands = unsafe { &mut *core::ptr::addr_of_mut!(UI_COMMAND_SCRATCH) };
+    let mut composites = [rustos_virgl::CompositeLayer {
+        resource: 0,
+        format: rustos_virgl::FORMAT_BGRA8888,
+        source: rustos_virgl::BlitRect::new(0, 0, 1, 1),
+        destination: rustos_virgl::BlitRect::new(0, 0, 1, 1),
+        linear_filter: false,
+        alpha_blend: true,
+    }; UI_FRAME_LAYERS];
 
-    // Surface object нужен только mesh pipeline, но создаётся для каждого
-    // swapchain image заранее. Чёрный clear делает кадр самодостаточным даже
-    // при повреждённом/неполном background resource.
-    let surface_handle = [1, 8, 9].get(slot_index).copied().ok_or(5)?;
-    if !slot.surface_initialized {
-        let clear_quad = GpuUiQuad::solid(0, 0, width as u16, height as u16, 0xff08_0a10);
-        let mut clear_vertices = [rustos_virgl::Vertex::new([0.0; 4], [0.0; 4]); 6];
-        quad_vertices(clear_quad, width, height, &mut clear_vertices);
-        let clear_words = rustos_virgl::encode_mesh_swapchain_pass(
-            commands,
-            width,
-            height,
-            slot.target_resource,
-            vertex_resource,
-            &clear_vertices,
-            [0.03, 0.04, 0.07, 1.0],
-            surface_handle,
-            true,
-            !*pipeline_initialized,
-            true,
-        )
-        .map_err(|_| 5)?;
-        submit_ui_commands(context, submissions, commands, clear_words).map_err(|_| 6)?;
-        slot.surface_initialized = true;
-        *pipeline_initialized = true;
+    for (order, layer) in layers.iter().enumerate() {
+        let cache_index = layer_cache
+            .iter()
+            .position(|cached| cached.id == layer.id)
+            .or_else(|| layer_cache.iter().position(|cached| cached.id == 0))
+            .ok_or(3)?;
+        if layer_cache[cache_index].resource != 0
+            && (layer_cache[cache_index].width != layer.width
+                || layer_cache[cache_index].height != layer.height)
+        {
+            release_cached_layer(context, submissions, &mut layer_cache[cache_index])
+                .map_err(|_| 4)?;
+        }
+        if layer_cache[cache_index].resource == 0 {
+            let created = gpu_resource_create(
+                context,
+                &GpuResourceCreate::window_surface(layer.width, layer.height),
+            );
+            if created <= 0 {
+                return Err(5);
+            }
+            layer_cache[cache_index].id = layer.id;
+            layer_cache[cache_index].resource = created as u32;
+            layer_cache[cache_index].width = layer.width;
+            layer_cache[cache_index].height = layer.height;
+            layer_cache[cache_index].content_hash = 0;
+            layer_cache[cache_index].surface_initialized = false;
+        }
+        let first = layer.first_quad as usize;
+        let end = first + layer.quad_count as usize;
+        if layer_cache[cache_index].content_hash != layer.content_hash {
+            let mut rasterizer = UiLayerRasterizer {
+                context,
+                submissions,
+                vertex_resource,
+                wallpaper_resources,
+                glyph_atlas,
+                pipeline_initialized,
+            };
+            rasterize_ui_layer(
+                &mut rasterizer,
+                &mut layer_cache[cache_index],
+                &quads[first..end],
+            )
+            .map_err(|_| 6)?;
+            layer_cache[cache_index].content_hash = layer.content_hash;
+        }
+        layer_cache[cache_index].seen_frame = header.frame_id;
+        composites[order] = rustos_virgl::CompositeLayer {
+            resource: layer_cache[cache_index].resource,
+            format: rustos_virgl::FORMAT_BGRA8888,
+            source: rustos_virgl::BlitRect::new(0, 0, layer.width, layer.height),
+            destination: rustos_virgl::BlitRect::new(
+                layer.x as u32,
+                gpu_y(height, layer.y as u32, layer.height),
+                layer.width,
+                layer.height,
+            ),
+            linear_filter: false,
+            alpha_blend: !layer.is_opaque(),
+        };
     }
+
+    for cached in layer_cache.iter_mut() {
+        if cached.id != 0 && cached.seen_frame != header.frame_id {
+            release_cached_layer(context, submissions, cached).map_err(|_| 7)?;
+        }
+    }
+    drain_ui_submissions(context, submissions).map_err(|_| 8)?;
+
+    // Steady-state drag попадает только сюда: content_hash окна совпадает,
+    // поэтому GPU получает один composition pass с новым destination rect.
+    let commands = unsafe { &mut *core::ptr::addr_of_mut!(UI_COMMAND_SCRATCH) };
+    let composite_words = rustos_virgl::encode_composite_pass(
+        commands,
+        width,
+        height,
+        slot.target_resource,
+        rustos_virgl::FORMAT_BGRX8888,
+        rustos_virgl::BlitRect::new(0, 0, width, height),
+        &composites[..layers.len()],
+    )
+    .map_err(|_| 9)?;
+    slot.completion_value = slot.completion_value.saturating_add(1);
+    let submit = GpuSubmit::new(
+        commands.as_ptr() as u64,
+        (composite_words * 4) as u32,
+        slot.timeline,
+        slot.completion_value,
+    );
+    let fence = gpu_submit(context, &submit);
+    if fence <= 0 {
+        return Err(10);
+    }
+    Ok(fence as u64)
+}
+
+/// Ресурсы, общие для растеризации одного независимого UI-слоя.
+///
+/// Контекст явно отделён от содержимого `CachedUiLayer`: перемещение окна
+/// меняет только transform слоя и вообще не вызывает этот код.
+struct UiLayerRasterizer<'a> {
+    context: Handle,
+    submissions: &'a mut UiSubmissionQueue,
+    vertex_resource: u32,
+    wallpaper_resources: &'a mut [u32; 3],
+    glyph_atlas: &'a mut GlyphAtlas,
+    pipeline_initialized: &'a mut bool,
+}
+
+fn rasterize_ui_layer(
+    renderer: &mut UiLayerRasterizer<'_>,
+    cached: &mut CachedUiLayer,
+    quads: &[GpuUiQuad],
+) -> Result<(), ()> {
+    let commands = unsafe { &mut *core::ptr::addr_of_mut!(UI_COMMAND_SCRATCH) };
+    let clear_quad = GpuUiQuad::solid(0, 0, cached.width as u16, cached.height as u16, 0);
+    let mut clear_vertices = [rustos_virgl::Vertex::new([0.0; 4], [0.0; 4]); 6];
+    quad_vertices(clear_quad, cached.width, cached.height, &mut clear_vertices);
+    let clear_words = rustos_virgl::encode_layer_mesh_pass(
+        commands,
+        cached.width,
+        cached.height,
+        cached.resource,
+        renderer.vertex_resource,
+        &clear_vertices,
+        [0.0; 4],
+        cached.surface_handle,
+        !cached.surface_initialized,
+        !*renderer.pipeline_initialized,
+        true,
+    )
+    .map_err(|_| ())?;
+    submit_ui_commands(
+        renderer.context,
+        renderer.submissions,
+        commands,
+        clear_words,
+    )?;
+    cached.surface_initialized = true;
+    *renderer.pipeline_initialized = true;
 
     let mut cursor = 0usize;
     while cursor < quads.len() {
+        if quads[cursor].glyph_info().is_some() {
+            let glyph_layers = unsafe { &mut *core::ptr::addr_of_mut!(GLYPH_COMPOSITE_SCRATCH) };
+            let mut count = 0usize;
+            while cursor < quads.len()
+                && count < GLYPH_BATCH
+                && quads[cursor].glyph_info().is_some()
+            {
+                let quad = quads[cursor];
+                let source = ensure_glyph_atlas_entry(
+                    renderer.context,
+                    renderer.submissions,
+                    renderer.glyph_atlas,
+                    quad,
+                )?;
+                glyph_layers[count] = rustos_virgl::CompositeLayer {
+                    resource: renderer.glyph_atlas.resource,
+                    format: rustos_virgl::FORMAT_BGRA8888,
+                    source,
+                    destination: rustos_virgl::BlitRect::new(
+                        u32::from(quad.x),
+                        gpu_y(cached.height, u32::from(quad.y), u32::from(quad.height)),
+                        u32::from(quad.width),
+                        u32::from(quad.height),
+                    ),
+                    linear_filter: true,
+                    alpha_blend: true,
+                };
+                count += 1;
+                cursor += 1;
+            }
+            let words = rustos_virgl::encode_composite_pass(
+                commands,
+                cached.width,
+                cached.height,
+                cached.resource,
+                rustos_virgl::FORMAT_BGRA8888,
+                rustos_virgl::BlitRect::new(0, 0, cached.width, cached.height),
+                &glyph_layers[..count],
+            )
+            .map_err(|_| ())?;
+            submit_ui_commands(renderer.context, renderer.submissions, commands, words)?;
+            continue;
+        }
         if let Some(id) = quads[cursor].wallpaper_id() {
             let quad = quads[cursor];
-            let image = wallpaper_from_id(id).ok_or(15)?;
-            let resource = wallpaper_resources[id as usize];
+            let image = wallpaper_from_id(id).ok_or(())?;
+            let resource = renderer.wallpaper_resources[id as usize];
             let (source_x, source_y, source_width, source_height) =
                 wallpaper_cover_crop(image, u32::from(quad.width), u32::from(quad.height));
-            let layer = rustos_virgl::CompositeLayer {
+            let wallpaper_layer = rustos_virgl::CompositeLayer {
                 resource,
                 format: rustos_virgl::FORMAT_BGRA8888,
                 source: rustos_virgl::BlitRect::new(
@@ -529,7 +833,7 @@ fn render_system_ui_frame(
                 ),
                 destination: rustos_virgl::BlitRect::new(
                     u32::from(quad.x),
-                    gpu_y(height, u32::from(quad.y), u32::from(quad.height)),
+                    gpu_y(cached.height, u32::from(quad.y), u32::from(quad.height)),
                     u32::from(quad.width),
                     u32::from(quad.height),
                 ),
@@ -538,77 +842,239 @@ fn render_system_ui_frame(
             };
             let words = rustos_virgl::encode_composite_pass(
                 commands,
-                width,
-                height,
-                slot.target_resource,
-                rustos_virgl::FORMAT_BGRX8888,
-                rustos_virgl::BlitRect::new(0, 0, width, height),
-                core::slice::from_ref(&layer),
+                cached.width,
+                cached.height,
+                cached.resource,
+                rustos_virgl::FORMAT_BGRA8888,
+                rustos_virgl::BlitRect::new(0, 0, cached.width, cached.height),
+                core::slice::from_ref(&wallpaper_layer),
             )
-            .map_err(|_| 16)?;
-            submit_ui_commands(context, submissions, commands, words).map_err(|_| 17)?;
+            .map_err(|_| ())?;
+            submit_ui_commands(renderer.context, renderer.submissions, commands, words)?;
             cursor += 1;
             continue;
         }
-        // Все geometry quads одного paint-order batch используют один shader
-        // pass. Разделение на opaque BLIT и alpha mesh создавало новый fence
-        // почти при каждой смене coverage внутри glyph и сводило на нет даже
-        // большие command buffers.
         let vertices = unsafe { &mut *core::ptr::addr_of_mut!(UI_VERTEX_SCRATCH) };
         let mut count = 0usize;
         while cursor < quads.len()
             && count < UI_BATCH_QUADS
             && quads[cursor].wallpaper_id().is_none()
+            && quads[cursor].glyph_info().is_none()
         {
             quad_vertices(
                 quads[cursor],
-                width,
-                height,
+                cached.width,
+                cached.height,
                 &mut vertices[count * 6..count * 6 + 6],
             );
             count += 1;
             cursor += 1;
         }
-        let words = rustos_virgl::encode_mesh_swapchain_pass(
+        let words = rustos_virgl::encode_layer_mesh_pass(
             commands,
-            width,
-            height,
-            slot.target_resource,
-            vertex_resource,
+            cached.width,
+            cached.height,
+            cached.resource,
+            renderer.vertex_resource,
             &vertices[..count * 6],
             [0.0; 4],
-            surface_handle,
+            cached.surface_handle,
             false,
             false,
             false,
         )
-        .map_err(|_| 9)?;
-        submit_ui_commands(context, submissions, commands, words).map_err(|_| 10)?;
+        .map_err(|_| ())?;
+        submit_ui_commands(renderer.context, renderer.submissions, commands, words)?;
     }
-    drain_ui_submissions(context, submissions).map_err(|_| 11)?;
+    drain_ui_submissions(renderer.context, renderer.submissions)
+}
 
-    // Отдельный безвредный marker после drain связывает готовность всех
-    // batches с acquire timeline именно этого GraphicsBuffer.
-    let marker = rustos_virgl::encode_texture_upload(
-        commands,
-        palette_resource,
-        rustos_virgl::BlitRect::new(0, 0, 1, 1),
-        4,
-        &[0, 0, 0, 0],
-    )
-    .map_err(|_| 12)?;
-    slot.completion_value = slot.completion_value.saturating_add(1);
-    let submit = GpuSubmit::new(
-        commands.as_ptr() as u64,
-        (marker * 4) as u32,
-        slot.timeline,
-        slot.completion_value,
-    );
-    let fence = gpu_submit(context, &submit);
-    if fence <= 0 {
-        return Err(13);
+/// Возвращает source rectangle glyph в постоянном BGRA SDF atlas. Новый
+/// символ растеризуется/загружается один раз; повторные окна и кадры делят
+/// один device-local resource, не копируя bitmap в SystemUI stream.
+fn ensure_glyph_atlas_entry(
+    context: Handle,
+    submissions: &mut UiSubmissionQueue,
+    atlas: &mut GlyphAtlas,
+    quad: GpuUiQuad,
+) -> Result<rustos_virgl::BlitRect, ()> {
+    let (character, style, crop_x, crop_y) = quad.glyph_info().ok_or(())?;
+    let entry_index = atlas.entries[..atlas.len].iter().position(|entry| {
+        entry.character == character as u32 && entry.style == style && entry.color == quad.colors[0]
+    });
+    let index = if let Some(index) = entry_index {
+        index
+    } else {
+        if atlas.len >= atlas.entries.len() {
+            return Err(());
+        }
+        let raster = rustos_system_fonts::rasterize(character, decode_glyph_style(style)?);
+        if raster.width == 0
+            || raster.height == 0
+            || u32::from(raster.width) > GLYPH_TILE_SIDE
+            || u32::from(raster.height) > GLYPH_TILE_SIDE
+        {
+            return Err(());
+        }
+        let index = atlas.len;
+        let columns = GLYPH_ATLAS_SIDE / GLYPH_TILE_SIDE;
+        let tile_x = index as u32 % columns;
+        let tile_y = index as u32 / columns;
+        let entry = GlyphAtlasEntry {
+            character: character as u32,
+            style,
+            color: quad.colors[0],
+            x: (tile_x * GLYPH_TILE_SIDE) as u16,
+            y: (tile_y * GLYPH_TILE_SIDE) as u16,
+            width: raster.width,
+            height: raster.height,
+        };
+        let pixels = unsafe { &mut *core::ptr::addr_of_mut!(GLYPH_UPLOAD_PIXELS) };
+        let width = raster.width as usize;
+        let height = raster.height as usize;
+        let [red, green, blue, source_alpha] = quad.colors[0].to_le_bytes();
+        for gpu_row in 0..height {
+            let source_row = height - gpu_row - 1;
+            for x in 0..width {
+                let coverage = sdf_alpha(&raster.pixels, width, height, x, source_row);
+                let alpha = scale_channel(source_alpha, coverage);
+                let offset = (gpu_row * width + x) * 4;
+                pixels[offset..offset + 4].copy_from_slice(&[
+                    scale_channel(blue, coverage),
+                    scale_channel(green, coverage),
+                    scale_channel(red, coverage),
+                    alpha,
+                ]);
+            }
+        }
+        let byte_count = width * height * 4;
+        let commands = unsafe { &mut *core::ptr::addr_of_mut!(UI_UPLOAD_COMMAND_SCRATCH) };
+        let words = rustos_virgl::encode_texture_upload(
+            commands,
+            atlas.resource,
+            rustos_virgl::BlitRect::new(
+                u32::from(entry.x),
+                u32::from(entry.y),
+                u32::from(entry.width),
+                u32::from(entry.height),
+            ),
+            4,
+            &pixels[..byte_count],
+        )
+        .map_err(|_| ())?;
+        submit_ui_commands(context, submissions, commands, words)?;
+        atlas.entries[index] = entry;
+        atlas.len += 1;
+        index
+    };
+
+    let entry = atlas.entries[index];
+    let source_right = u32::from(crop_x)
+        .checked_add(u32::from(quad.width))
+        .ok_or(())?;
+    let source_bottom = u32::from(crop_y)
+        .checked_add(u32::from(quad.height))
+        .ok_or(())?;
+    if source_right > u32::from(entry.width) || source_bottom > u32::from(entry.height) {
+        return Err(());
     }
-    Ok(fence as u64)
+    Ok(rustos_virgl::BlitRect::new(
+        u32::from(entry.x) + u32::from(crop_x),
+        u32::from(entry.y) + u32::from(entry.height) - source_bottom,
+        u32::from(quad.width),
+        u32::from(quad.height),
+    ))
+}
+
+fn decode_glyph_style(style: u32) -> Result<rustos_system_fonts::Style, ()> {
+    use rustos_abi::gpu::ui_glyph_style;
+    if !ui_glyph_style::valid(style) {
+        return Err(());
+    }
+    Ok(rustos_system_fonts::Style {
+        family: if style & ui_glyph_style::SANS != 0 {
+            rustos_system_fonts::Family::Sans
+        } else {
+            rustos_system_fonts::Family::Console
+        },
+        weight: if style & ui_glyph_style::BOLD != 0 {
+            rustos_system_fonts::Weight::Bold
+        } else {
+            rustos_system_fonts::Weight::Regular
+        },
+        italic: style & ui_glyph_style::ITALIC != 0,
+        size: ((style & ui_glyph_style::SIZE_MASK) >> ui_glyph_style::SIZE_SHIFT) as u16,
+    })
+}
+
+/// Преобразует 8-bit coverage в короткое signed-distance поле. Полутоновые
+/// edge samples сохраняются точно, а полностью внутренние/внешние pixels
+/// получают расстояние до ближайшей границы. Такой atlas устойчив к
+/// bilinear sampling и не возвращает ступеньки span-rasterizer'а.
+fn sdf_alpha(bitmap: &[u8], width: usize, height: usize, x: usize, y: usize) -> u8 {
+    let coverage = bitmap[y * width + x];
+    if coverage != 0 && coverage != u8::MAX {
+        return coverage;
+    }
+    let inside = coverage >= 128;
+    let mut best_squared = 25usize;
+    for dy in -4i32..=4 {
+        for dx in -4i32..=4 {
+            let nx = x as i32 + dx;
+            let ny = y as i32 + dy;
+            if nx < 0 || ny < 0 || nx >= width as i32 || ny >= height as i32 {
+                if inside {
+                    best_squared = best_squared.min((dx * dx + dy * dy) as usize);
+                }
+                continue;
+            }
+            let neighbor_inside = bitmap[ny as usize * width + nx as usize] >= 128;
+            if neighbor_inside != inside {
+                best_squared = best_squared.min((dx * dx + dy * dy) as usize);
+            }
+        }
+    }
+    let distance = integer_sqrt(best_squared.min(16)) as i32;
+    let signed = if inside { distance } else { -distance };
+    (128 + signed * 42).clamp(0, 255) as u8
+}
+
+fn integer_sqrt(value: usize) -> usize {
+    let mut result = 0usize;
+    while (result + 1) * (result + 1) <= value {
+        result += 1;
+    }
+    result
+}
+
+fn scale_channel(channel: u8, alpha: u8) -> u8 {
+    ((u16::from(channel) * u16::from(alpha) + 127) / 255) as u8
+}
+
+fn release_cached_layer(
+    context: Handle,
+    submissions: &mut UiSubmissionQueue,
+    cached: &mut CachedUiLayer,
+) -> Result<(), ()> {
+    if cached.resource == 0 {
+        return Ok(());
+    }
+    if cached.surface_initialized {
+        let commands = unsafe { &mut *core::ptr::addr_of_mut!(UI_COMMAND_SCRATCH) };
+        let words = rustos_virgl::encode_destroy_surface(commands, cached.surface_handle)
+            .map_err(|_| ())?;
+        submit_ui_commands(context, submissions, commands, words)?;
+        drain_ui_submissions(context, submissions)?;
+    }
+    if gpu_resource_destroy(context, cached.resource) != syscall::status::OK {
+        return Err(());
+    }
+    let surface_handle = cached.surface_handle;
+    *cached = CachedUiLayer {
+        surface_handle,
+        ..CachedUiLayer::EMPTY
+    };
+    Ok(())
 }
 
 fn wallpaper_from_id(id: u32) -> Option<Wallpaper> {

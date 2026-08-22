@@ -32,7 +32,17 @@ pub const GPU_DEMO_DONE_OPCODE: u16 = 0x5111;
 /// renderer'у и выдаётся только доверенному `renderd`.
 pub const GPU_UI_STREAM_BYTES: usize = 1024 * 1024;
 /// Версия внутреннего SystemUI GPU stream.
-pub const GPU_UI_STREAM_VERSION: u16 = 1;
+pub const GPU_UI_STREAM_VERSION: u16 = 2;
+
+/// Биты [`GpuUiLayer::flags`]. Слой хранит собственную GPU surface, поэтому
+/// его положение на экране не входит в `content_hash` и может меняться без
+/// повторной растеризации содержимого.
+pub mod ui_layer_flag {
+    /// Слой гарантированно закрывает каждый pixel своих bounds.
+    pub const OPAQUE: u32 = 1 << 0;
+    /// Все известные биты текущей версии.
+    pub const KNOWN: u32 = OPAQUE;
+}
 
 /// Биты [`GpuUiQuad::flags`]. Это внутренние renderer-neutral primitives
 /// SystemUI, а не VirGL protocol и не публичный API приложения.
@@ -40,8 +50,40 @@ pub mod ui_quad_flag {
     /// Quad показывает одну из встроенных wallpaper textures. Стабильный
     /// идентификатор ресурса передаётся как `colors[0]`.
     pub const WALLPAPER_TEXTURE: u32 = 1 << 0;
-    /// Все известные биты версии 1.
-    pub const KNOWN: u32 = WALLPAPER_TEXTURE;
+    /// Quad ссылается на Unicode glyph в постоянном SDF atlas renderd.
+    pub const GLYPH_ATLAS: u32 = 1 << 1;
+    /// Все известные биты текущей версии.
+    pub const KNOWN: u32 = WALLPAPER_TEXTURE | GLYPH_ATLAS;
+}
+
+/// Compact encoding системного font style внутри glyph primitive.
+pub mod ui_glyph_style {
+    /// Пропорциональное семейство; отсутствие бита означает Console.
+    pub const SANS: u32 = 1 << 0;
+    /// Жирное начертание.
+    pub const BOLD: u32 = 1 << 1;
+    /// Курсив.
+    pub const ITALIC: u32 = 1 << 2;
+    /// Сдвиг размера в пикселях.
+    pub const SIZE_SHIFT: u32 = 8;
+    /// Маска размера.
+    pub const SIZE_MASK: u32 = 0xff << SIZE_SHIFT;
+    /// Все допустимые биты.
+    pub const KNOWN: u32 = SANS | BOLD | ITALIC | SIZE_MASK;
+
+    /// Упаковывает renderer-neutral style.
+    pub const fn pack(sans: bool, bold: bool, italic: bool, size: u16) -> u32 {
+        ((sans as u32) * SANS)
+            | ((bold as u32) * BOLD)
+            | ((italic as u32) * ITALIC)
+            | ((size as u32) << SIZE_SHIFT)
+    }
+
+    /// Проверяет bounded системный style.
+    pub const fn valid(style: u32) -> bool {
+        let size = (style & SIZE_MASK) >> SIZE_SHIFT;
+        style & !KNOWN == 0 && size >= 10 && size <= 48
+    }
 }
 
 /// Биты [`GpuRenderFrame::flags`].
@@ -59,7 +101,8 @@ pub mod frame_flag {
 
 /// Заголовок одного неизменяемого SystemUI frame в общей command page.
 ///
-/// Kernel публикует record только после полной записи массива [`GpuUiQuad`].
+/// Kernel публикует record только после полной записи массивов
+/// [`GpuUiLayer`] и [`GpuUiQuad`].
 /// Renderd повторно проверяет геометрию и checksum: повреждённый frame
 /// отбрасывается целиком и никогда не доходит до GPU command validator.
 #[repr(C)]
@@ -75,14 +118,18 @@ pub struct GpuUiFrameHeader {
     pub height: u32,
     /// Монотонный идентификатор кадра.
     pub frame_id: u64,
-    /// Число следующих за заголовком quad records.
+    /// Число следующих за заголовком layer records.
+    pub layer_count: u32,
+    /// Суммарное число quad records после массива слоёв.
     pub quad_count: u32,
-    /// В версии 1 весь кадр всегда полный.
+    /// В текущей версии весь кадр всегда содержит полный display list.
     pub flags: u32,
-    /// FNV-1a всех байтов массива quad.
+    /// Должно быть равно нулю.
+    pub reserved_header: u32,
+    /// FNV-1a массивов layer и quad.
     pub checksum: u64,
     /// Зарезервировано.
-    pub reserved: [u64; 3],
+    pub reserved: [u64; 2],
 }
 
 impl GpuUiFrameHeader {
@@ -90,17 +137,25 @@ impl GpuUiFrameHeader {
     pub const FULL_FRAME: u32 = 1;
 
     /// Создаёт заголовок завершённого кадра.
-    pub const fn new(width: u32, height: u32, frame_id: u64, quad_count: u32) -> Self {
+    pub const fn new(
+        width: u32,
+        height: u32,
+        frame_id: u64,
+        layer_count: u32,
+        quad_count: u32,
+    ) -> Self {
         Self {
             version: GPU_UI_STREAM_VERSION,
             size: core::mem::size_of::<Self>() as u16,
             width,
             height,
             frame_id,
+            layer_count,
             quad_count,
             flags: Self::FULL_FRAME,
+            reserved_header: 0,
             checksum: 0,
-            reserved: [0; 3],
+            reserved: [0; 2],
         }
     }
 
@@ -112,8 +167,13 @@ impl GpuUiFrameHeader {
         if self.size as usize != core::mem::size_of::<Self>() {
             return Err(GpuAbiError::UnsupportedSize);
         }
-        let bytes = (self.quad_count as usize)
-            .checked_mul(core::mem::size_of::<GpuUiQuad>())
+        let bytes = (self.layer_count as usize)
+            .checked_mul(core::mem::size_of::<GpuUiLayer>())
+            .and_then(|layers| {
+                (self.quad_count as usize)
+                    .checked_mul(core::mem::size_of::<GpuUiQuad>())
+                    .and_then(|quads| layers.checked_add(quads))
+            })
             .and_then(|bytes| bytes.checked_add(core::mem::size_of::<Self>()))
             .ok_or(GpuAbiError::InvalidValue)?;
         if self.width == 0
@@ -121,14 +181,90 @@ impl GpuUiFrameHeader {
             || self.width > 16_384
             || self.height > 16_384
             || self.frame_id == 0
+            || self.layer_count == 0
+            || self.layer_count > 64
             || self.quad_count == 0
             || bytes > GPU_UI_STREAM_BYTES
             || self.flags != Self::FULL_FRAME
-            || self.reserved != [0; 3]
+            || self.reserved_header != 0
+            || self.reserved != [0; 2]
         {
             return Err(GpuAbiError::InvalidValue);
         }
         Ok(())
+    }
+}
+
+/// Одна независимая SystemUI surface в порядке композиции снизу вверх.
+///
+/// `x/y` задают только transform поверхности относительно scanout. Все quads
+/// используют локальные координаты `0..width`, `0..height`. Поэтому при
+/// перетаскивании окна его `content_hash` и GPU texture остаются неизменными.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct GpuUiLayer {
+    /// Устойчивый идентификатор поверхности в пределах SystemUI session.
+    pub id: u64,
+    /// FNV-1a только принадлежащих слою quad records.
+    pub content_hash: u64,
+    /// Левая physical координата поверхности на scanout.
+    pub x: i32,
+    /// Верхняя physical координата поверхности на scanout.
+    pub y: i32,
+    /// Ширина surface.
+    pub width: u32,
+    /// Высота surface.
+    pub height: u32,
+    /// Индекс первого quad в общем массиве кадра.
+    pub first_quad: u32,
+    /// Число quad этого слоя.
+    pub quad_count: u32,
+    /// Комбинация [`ui_layer_flag`].
+    pub flags: u32,
+    /// Должно быть равно нулю.
+    pub reserved_header: u32,
+    /// Зарезервировано.
+    pub reserved: [u64; 2],
+}
+
+impl GpuUiLayer {
+    /// Проверяет transform, bounds и диапазон primitive records.
+    pub fn validate(
+        &self,
+        frame_width: u32,
+        frame_height: u32,
+        total_quads: u32,
+    ) -> Result<(), GpuAbiError> {
+        let x = u32::try_from(self.x).map_err(|_| GpuAbiError::InvalidValue)?;
+        let y = u32::try_from(self.y).map_err(|_| GpuAbiError::InvalidValue)?;
+        let right = x.checked_add(self.width).ok_or(GpuAbiError::InvalidValue)?;
+        let bottom = y
+            .checked_add(self.height)
+            .ok_or(GpuAbiError::InvalidValue)?;
+        let quad_end = self
+            .first_quad
+            .checked_add(self.quad_count)
+            .ok_or(GpuAbiError::InvalidValue)?;
+        if self.id == 0
+            || self.content_hash == 0
+            || self.width == 0
+            || self.height == 0
+            || right > frame_width
+            || bottom > frame_height
+            || self.quad_count == 0
+            || quad_end > total_quads
+            || self.flags & !ui_layer_flag::KNOWN != 0
+            || self.reserved_header != 0
+            || self.reserved != [0; 2]
+        {
+            return Err(GpuAbiError::InvalidValue);
+        }
+        Ok(())
+    }
+
+    /// Непрозрачный ли слой.
+    pub const fn is_opaque(&self) -> bool {
+        self.flags & ui_layer_flag::OPAQUE != 0
     }
 }
 
@@ -185,6 +321,37 @@ impl GpuUiQuad {
         }
     }
 
+    /// Создаёт ссылку на glyph atlas. `crop_x/y` описывают clipping исходного
+    /// raster tile; сам Unicode/style остаётся достаточным для ленивого
+    /// восстановления atlas после перезапуска renderd.
+    #[allow(clippy::too_many_arguments)]
+    pub const fn glyph(
+        x: u16,
+        y: u16,
+        width: u16,
+        height: u16,
+        color: u32,
+        character: char,
+        style: u32,
+        crop_x: u16,
+        crop_y: u16,
+    ) -> Self {
+        Self {
+            x,
+            y,
+            width,
+            height,
+            colors: [
+                color,
+                character as u32,
+                style,
+                crop_x as u32 | ((crop_y as u32) << 16),
+            ],
+            flags: ui_quad_flag::GLYPH_ATLAS,
+            reserved: 0,
+        }
+    }
+
     /// Проверяет bounded physical geometry.
     pub fn validate(&self, frame_width: u32, frame_height: u32) -> Result<(), GpuAbiError> {
         let right = u32::from(self.x)
@@ -198,9 +365,14 @@ impl GpuUiQuad {
             || right > frame_width
             || bottom > frame_height
             || self.flags & !ui_quad_flag::KNOWN != 0
+            || self.flags == ui_quad_flag::KNOWN
             || self.reserved != 0
             || (self.flags == ui_quad_flag::WALLPAPER_TEXTURE
                 && (self.colors[0] > 2 || self.colors[1..] != [0; 3]))
+            || (self.flags == ui_quad_flag::GLYPH_ATLAS
+                && (char::from_u32(self.colors[1]).is_none()
+                    || !ui_glyph_style::valid(self.colors[2])
+                    || self.colors[3] & 0xffc0_ffc0 != 0))
         {
             return Err(GpuAbiError::InvalidValue);
         }
@@ -223,19 +395,47 @@ impl GpuUiQuad {
             None
         }
     }
+
+    /// Возвращает `(character, style, crop_x, crop_y)` glyph primitive.
+    pub fn glyph_info(&self) -> Option<(char, u32, u16, u16)> {
+        if self.flags != ui_quad_flag::GLYPH_ATLAS {
+            return None;
+        }
+        Some((
+            char::from_u32(self.colors[1])?,
+            self.colors[2],
+            self.colors[3] as u16,
+            (self.colors[3] >> 16) as u16,
+        ))
+    }
 }
 
 /// Детерминированный checksum SystemUI command stream.
-pub fn gpu_ui_checksum(quads: &[GpuUiQuad]) -> u64 {
-    let bytes = unsafe {
-        core::slice::from_raw_parts(quads.as_ptr().cast::<u8>(), core::mem::size_of_val(quads))
-    };
+pub fn gpu_ui_content_hash(quads: &[GpuUiQuad]) -> u64 {
     let mut hash = 0xcbf2_9ce4_8422_2325u64;
-    for byte in bytes {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
+    hash_bytes(&mut hash, as_bytes(quads));
     hash
+}
+
+/// Детерминированный checksum полного SystemUI command stream.
+pub fn gpu_ui_checksum(layers: &[GpuUiLayer], quads: &[GpuUiQuad]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    hash_bytes(&mut hash, as_bytes(layers));
+    hash_bytes(&mut hash, as_bytes(quads));
+    hash
+}
+
+fn as_bytes<T>(values: &[T]) -> &[u8] {
+    unsafe {
+        core::slice::from_raw_parts(values.as_ptr().cast::<u8>(), core::mem::size_of_val(values))
+    }
+}
+
+fn hash_bytes(hash: &mut u64, bytes: &[u8]) {
+    for byte in bytes {
+        *hash ^= u64::from(*byte);
+        *hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
 }
 
 /// Биты [`GpuDeviceInfo::features`].
@@ -526,6 +726,25 @@ impl GpuResourceCreate {
         }
     }
 
+    /// Создаёт device-local поверхность окна. Один resource одновременно
+    /// служит render target для растеризации UI и sampled source для
+    /// transform-only композиции в scanout.
+    pub const fn window_surface(width: u32, height: u32) -> Self {
+        Self {
+            version: GPU_ABI_VERSION,
+            size: core::mem::size_of::<Self>() as u16,
+            flags: 0,
+            target: resource_target::TEXTURE_2D,
+            format: virgl_format::B8G8R8A8_UNORM,
+            bind: resource_bind::RENDER_TARGET | resource_bind::SAMPLER_VIEW,
+            width,
+            height,
+            depth: 1,
+            array_size: 1,
+            reserved: [0; 2],
+        }
+    }
+
     /// Проверяет ограниченный bootstrap subset.
     pub fn validate(&self) -> Result<(), GpuAbiError> {
         validate_prefix(self.version, self.size, core::mem::size_of::<Self>())?;
@@ -548,7 +767,15 @@ impl GpuResourceCreate {
             && self.bind == resource_bind::SAMPLER_VIEW
             && (1..=4096).contains(&self.width)
             && (1..=4096).contains(&self.height);
-        if (!vertex_buffer && !sampled_texture) || self.depth != 1 || self.array_size != 1 {
+        let window_surface = self.target == resource_target::TEXTURE_2D
+            && self.format == virgl_format::B8G8R8A8_UNORM
+            && self.bind == resource_bind::RENDER_TARGET | resource_bind::SAMPLER_VIEW
+            && (1..=4096).contains(&self.width)
+            && (1..=4096).contains(&self.height);
+        if (!vertex_buffer && !sampled_texture && !window_surface)
+            || self.depth != 1
+            || self.array_size != 1
+        {
             return Err(GpuAbiError::InvalidValue);
         }
         Ok(())
@@ -941,6 +1168,7 @@ impl GpuDemoRequest {
 }
 
 const _: () = assert!(core::mem::size_of::<GpuUiFrameHeader>() == 64);
+const _: () = assert!(core::mem::size_of::<GpuUiLayer>() == 64);
 const _: () = assert!(core::mem::size_of::<GpuUiQuad>() == 32);
 
 fn validate_prefix(version: u16, size: u16, expected: usize) -> Result<(), GpuAbiError> {
@@ -991,6 +1219,10 @@ mod tests {
         assert_eq!(GpuResourceImport::window_surface().validate(), Ok(()));
         assert_eq!(GpuResourceImport::sampled_texture().validate(), Ok(()));
         assert_eq!(GpuResourceCreate::vertex_buffer(96).validate(), Ok(()));
+        assert_eq!(
+            GpuResourceCreate::window_surface(800, 600).validate(),
+            Ok(())
+        );
         assert_eq!(
             GpuResourceCreate::sampled_texture(1024, 1024, virgl_format::B8G8R8A8_UNORM).validate(),
             Ok(())
@@ -1053,9 +1285,26 @@ mod tests {
             GpuUiQuad::solid(0, 0, 1280, 720, 0xff20_1810),
             GpuUiQuad::solid(100, 80, 640, 420, 0xfff8_f8f8),
         ];
-        let mut header = GpuUiFrameHeader::new(1280, 720, 7, quads.len() as u32);
-        header.checksum = gpu_ui_checksum(&quads);
+        let mut layer = GpuUiLayer {
+            id: 1,
+            content_hash: gpu_ui_content_hash(&quads),
+            x: 0,
+            y: 0,
+            width: 1280,
+            height: 720,
+            first_quad: 0,
+            quad_count: quads.len() as u32,
+            flags: ui_layer_flag::OPAQUE,
+            reserved_header: 0,
+            reserved: [0; 2],
+        };
+        let mut header = GpuUiFrameHeader::new(1280, 720, 7, 1, quads.len() as u32);
+        header.checksum = gpu_ui_checksum(core::slice::from_ref(&layer), &quads);
         assert_eq!(header.validate(), Ok(()));
+        assert_eq!(
+            layer.validate(header.width, header.height, header.quad_count),
+            Ok(())
+        );
         assert_eq!(quads[0].validate(header.width, header.height), Ok(()));
         assert_ne!(header.checksum, 0);
 
@@ -1074,5 +1323,28 @@ mod tests {
             outside.validate(header.width, header.height),
             Err(GpuAbiError::InvalidValue)
         );
+
+        // Transform не меняет hash содержимого: именно это позволяет
+        // перетаскивать cached surface без повторной растеризации.
+        let content_hash = layer.content_hash;
+        layer.x = 8;
+        layer.y = 8;
+        layer.width = 1272;
+        layer.height = 712;
+        assert_eq!(layer.content_hash, content_hash);
+
+        let glyph = GpuUiQuad::glyph(
+            20,
+            30,
+            11,
+            15,
+            0xffee_ddcc,
+            'Я',
+            ui_glyph_style::pack(true, true, false, 16),
+            0,
+            0,
+        );
+        assert_eq!(glyph.validate(1280, 720), Ok(()));
+        assert_eq!(glyph.glyph_info().map(|value| value.0), Some('Я'));
     }
 }

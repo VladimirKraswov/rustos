@@ -559,14 +559,30 @@ impl DesktopSession {
                 };
 
                 if self.framebuffer.gpu_recording() {
-                    if matches!(redraw, Redraw::None)
-                        && self.framebuffer.hardware_cursor_supported()
-                    {
-                        // Hardware cursor plane двигается независимо от frame
-                        // и не заставляет перерисовывать desktop.
-                        self.cursor
-                            .draw(&mut self.framebuffer, self.mouse_x, self.mouse_y);
-                    } else if !self.render_gpu_frame() {
+                    let rendered = match redraw {
+                        Redraw::None if self.framebuffer.hardware_cursor_supported() => {
+                            // Hardware cursor plane двигается независимо от
+                            // frame и не заставляет перерисовывать desktop.
+                            self.cursor
+                                .draw(&mut self.framebuffer, self.mouse_x, self.mouse_y);
+                            true
+                        }
+                        Redraw::DragMove { window, first, .. }
+                            if matches!(self.interaction, WindowInteraction::Move { .. }) =>
+                        {
+                            self.cursor
+                                .draw(&mut self.framebuffer, self.mouse_x, self.mouse_y);
+                            let transformed = !first && self.render_gpu_transform(window);
+                            if !transformed {
+                                self.drag_preview_visible = true;
+                                self.render_gpu_frame()
+                            } else {
+                                true
+                            }
+                        }
+                        _ => self.render_gpu_frame(),
+                    };
+                    if !rendered {
                         self.activate_cpu_recovery("render-service-failure");
                     }
                     self.dispatch_window_events();
@@ -2425,13 +2441,43 @@ impl DesktopSession {
     fn render_gpu_frame(&mut self) -> bool {
         crate::gui::gpu_scene::begin(self.framebuffer.width(), self.framebuffer.height());
         self.render_scene();
+        // Обычно draw завершится обновлением аппаратного cursor plane и слой
+        // останется пустым. Небольшая отдельная surface сохраняет корректный
+        // software fallback, не привязывая курсор к последнему окну.
+        crate::gui::gpu_scene::begin_layer(
+            3,
+            Rect::new(self.mouse_x - 64, self.mouse_y - 64, 128, 128),
+            0,
+        );
         self.cursor
             .draw(&mut self.framebuffer, self.mouse_x, self.mouse_y);
-        let Some((header, quads)) = crate::gui::gpu_scene::finish() else {
+        let Some((header, layers, quads)) = crate::gui::gpu_scene::finish() else {
             serial::put_str("[system-ui-gpu] frame rejected reason=command-capacity\n");
             return false;
         };
-        match process::present_system_ui_gpu(header, quads) {
+        self.present_gpu_stream(header, layers, quads)
+    }
+
+    fn render_gpu_transform(&mut self, window: WindowId) -> bool {
+        let Some(rect) = self.window_rect(window) else {
+            return false;
+        };
+        let Some((header, layers, quads)) = crate::gui::gpu_scene::transform_layer(
+            0x1000_0000_0000_0000 | window.0,
+            window_damage(rect),
+        ) else {
+            return false;
+        };
+        self.present_gpu_stream(header, layers, quads)
+    }
+
+    fn present_gpu_stream(
+        &self,
+        header: rustos_abi::gpu::GpuUiFrameHeader,
+        layers: &[rustos_abi::gpu::GpuUiLayer],
+        quads: &[rustos_abi::gpu::GpuUiQuad],
+    ) -> bool {
+        match process::present_system_ui_gpu(header, layers, quads) {
             Ok(()) => true,
             Err(error) => {
                 serial::put_str("[system-ui-gpu] submit failed reason=");
@@ -2454,6 +2500,34 @@ impl DesktopSession {
     }
 
     fn render_scene(&mut self) {
+        if self.framebuffer.gpu_recording() {
+            let screen = Rect::new(0, 0, self.framebuffer.width(), self.framebuffer.height());
+            crate::gui::gpu_scene::begin_layer(1, screen, rustos_abi::gpu::ui_layer_flag::OPAQUE);
+            self.render_base();
+            for index in 0..self.window_count {
+                let id = self.z_order[index];
+                if self.window_is_visible(id) {
+                    if let Some(rect) = self.window_rect(id) {
+                        crate::gui::gpu_scene::begin_layer(
+                            0x1000_0000_0000_0000 | id.0,
+                            window_damage(rect),
+                            0,
+                        );
+                        self.render_window(id);
+                    }
+                }
+            }
+            if self.shell.desktop_menu_is_open() || self.shell.is_open() {
+                crate::gui::gpu_scene::begin_layer(2, screen, 0);
+                if self.shell.desktop_menu_is_open() {
+                    self.render_desktop_menu();
+                }
+                if self.shell.is_open() {
+                    self.render_start_menu();
+                }
+            }
+            return;
+        }
         self.render_base();
         let _ = self.framebuffer.cache_background();
         for index in 0..self.window_count {

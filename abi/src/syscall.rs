@@ -128,6 +128,9 @@ pub mod number {
     /// Создать process-owned capability IPC endpoint. Результат — handle с
     /// SEND/RECEIVE/TRANSFER либо отрицательный status.
     pub const ENDPOINT_CREATE: u64 = 48;
+    /// Уничтожить context-local GPU resource после завершения использующих
+    /// его fences. `arg0=context, arg1=resource`.
+    pub const GPU_RESOURCE_DESTROY: u64 = 49;
 }
 
 /// Отрицательные результаты syscall. Не совпадают с Unix errno намеренно:

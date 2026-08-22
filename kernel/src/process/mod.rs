@@ -220,9 +220,10 @@ pub fn pump_interactive_services() -> Result<(), ProcessError> {
 /// Отправляет renderer-neutral SystemUI frame постоянному ring-3 renderd.
 pub fn present_system_ui_gpu(
     header: rustos_abi::gpu::GpuUiFrameHeader,
+    layers: &[rustos_abi::gpu::GpuUiLayer],
     quads: &[rustos_abi::gpu::GpuUiQuad],
 ) -> Result<(), ProcessError> {
-    manager::present_system_ui_gpu(header, quads)
+    manager::present_system_ui_gpu(header, layers, quads)
 }
 
 /// Доступен ли аппаратный SystemUI backend текущего service generation.
