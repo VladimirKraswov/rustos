@@ -17,6 +17,7 @@ mod pixel;
 pub mod protocol;
 mod scanout;
 mod surface_queue;
+mod surface_scene;
 mod window;
 
 pub use compositor::{composite, Layer};
@@ -31,6 +32,9 @@ pub use scanout::{
 };
 pub use surface_queue::{
     MailboxSelection, SurfaceQueue, SurfaceQueueError, SurfaceSlotState, SurfaceSlotToken,
+};
+pub use surface_scene::{
+    SurfaceId, SurfaceLayerConfig, SurfaceScene, SurfaceSceneError, VisibleSurface,
 };
 pub use window::{
     hit_test_resize, resize_from_edges, ManagedWindow, ResizeEdges, WindowError, WindowEventQueue,
