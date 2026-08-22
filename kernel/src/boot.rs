@@ -2,7 +2,7 @@
 
 use crate::{arch, block, display, gui, memory, process, serial};
 use rustos_abi::{
-    bootinfo::{FRAMEBUFFER_FORMAT_BGR, FRAMEBUFFER_FORMAT_RGB},
+    bootinfo::{FRAMEBUFFER_FORMAT_BGR, FRAMEBUFFER_FORMAT_RGB, FRAMEBUFFER_SOURCE_GRUB},
     BootInfo, MemRegion, MemRegionKind, BOOT_INFO_MAGIC, BOOT_INFO_VERSION,
 };
 use rustos_video::{CpuPixelFormat, DisplayMode};
@@ -103,8 +103,25 @@ pub fn kernel_main(info: &BootInfo) -> ! {
             serial::put_u32(mode.height);
             serial::put_str(" capability-ready\n");
         }
-        Err(_) => {
-            serial::put_str("[display-broker] native scanout unavailable; firmware fallback\n")
+        Err(error) => {
+            serial::put_str(
+                "[display-broker] native scanout unavailable; bootstrap fallback selected\n",
+            );
+            serial::put_str("[hardware] display-probe=virtio-gpu result=unavailable reason=");
+            serial::put_str(error.diagnostic_name());
+            serial::put_str(" fallback=");
+            if framebuffer.phys_addr == 0 {
+                serial::put_str("none");
+            } else if framebuffer._reserved == FRAMEBUFFER_SOURCE_GRUB {
+                serial::put_str("grub-fb");
+            } else {
+                serial::put_str("uefi-gop");
+            }
+            serial::put_str(" renderer=cpu mode=");
+            serial::put_u32(fallback.width);
+            serial::put_str("x");
+            serial::put_u32(fallback.height);
+            serial::put_str("\n");
         }
     }
 

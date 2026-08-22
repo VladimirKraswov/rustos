@@ -67,6 +67,7 @@ pub struct Framebuffer {
     render_format: CpuPixelFormat,
     source: u32,
     present_sequence: u64,
+    present_failure_logged: bool,
 }
 
 impl Framebuffer {
@@ -108,8 +109,23 @@ impl Framebuffer {
                 serial::put_str("[video] virtio-gpu modern MMIO controlq ready\n");
                 Some(mode)
             }
-            Err(_) => {
+            Err(error) => {
                 serial::put_str("[video] virtio-gpu unavailable; using firmware framebuffer\n");
+                serial::put_str("[hardware] display-probe=virtio-gpu result=unavailable reason=");
+                serial::put_str(error.diagnostic_name());
+                serial::put_str(" fallback=");
+                if !firmware_valid {
+                    serial::put_str("none");
+                } else if info._reserved == FRAMEBUFFER_SOURCE_GRUB {
+                    serial::put_str("grub-fb");
+                } else {
+                    serial::put_str("uefi-gop");
+                }
+                serial::put_str(" renderer=cpu mode=");
+                serial::put_u32(fallback.width);
+                serial::put_str("x");
+                serial::put_u32(fallback.height);
+                serial::put_str("\n");
                 None
             }
         };
@@ -174,6 +190,7 @@ impl Framebuffer {
             render_format: scanout_format,
             source: info._reserved,
             present_sequence: 0,
+            present_failure_logged: false,
         })
     }
 
@@ -891,7 +908,19 @@ impl Framebuffer {
             return;
         };
         self.present_sequence = self.present_sequence.wrapping_add(1);
-        let _ = <Self as Scanout>::present(self, source, damage, self.present_sequence);
+        if let Err(error) = <Self as Scanout>::present(self, source, damage, self.present_sequence)
+        {
+            if !self.present_failure_logged {
+                serial::put_str("[video] present failed; frame not published reason=");
+                serial::put_str(match error {
+                    ScanoutError::InvalidSurface => "invalid-surface",
+                    ScanoutError::UnsupportedFormat => "unsupported-format",
+                    ScanoutError::DeviceLost => "device-lost",
+                });
+                serial::put_str("\n");
+                self.present_failure_logged = true;
+            }
+        }
     }
 
     fn clipped(&self, rect: Rect) -> Option<(u32, u32, u32, u32)> {

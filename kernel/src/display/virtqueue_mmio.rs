@@ -44,6 +44,7 @@ const STATUS_ACKNOWLEDGE: u32 = 1;
 const STATUS_DRIVER: u32 = 2;
 const STATUS_DRIVER_OK: u32 = 4;
 const STATUS_FEATURES_OK: u32 = 8;
+const STATUS_DEVICE_NEEDS_RESET: u32 = 64;
 const STATUS_FAILED: u32 = 128;
 const VIRTIO_F_VERSION_1_HIGH: u32 = 1;
 const VIRTIO_GPU_F_VIRGL: u32 = 1 << 0;
@@ -233,6 +234,10 @@ impl ModernMmioTransport {
             }
             core::hint::spin_loop();
         }
+        // Не освобождаем descriptor после timeout: device может завершить DMA
+        // позднее. Весь transport помечается FAILED и больше не принимает
+        // команды до контролируемого reset/reprobe.
+        self.fail_device();
         Err(TransportError::Timeout)
     }
 
@@ -343,6 +348,7 @@ impl ModernMmioTransport {
     }
 
     fn poll_used(&mut self) -> Result<(), TransportError> {
+        self.ensure_device_ready()?;
         let used = (self.queue.phys + self.used_offset) as *const u8;
         let available = unsafe { used.add(2).cast::<u16>().read_volatile() };
         // `used.idx` является publication point устройства: содержимое ring и
@@ -367,6 +373,21 @@ impl ModernMmioTransport {
             self.device_used = self.device_used.wrapping_add(1);
         }
         Ok(())
+    }
+
+    fn ensure_device_ready(&self) -> Result<(), TransportError> {
+        let status = read32(self.base, REG_STATUS);
+        if status & STATUS_DRIVER_OK == 0
+            || status & (STATUS_DEVICE_NEEDS_RESET | STATUS_FAILED) != 0
+        {
+            return Err(TransportError::DeviceError);
+        }
+        Ok(())
+    }
+
+    fn fail_device(&self) {
+        let status = read32(self.base, REG_STATUS);
+        write32(self.base, REG_STATUS, status | STATUS_FAILED);
     }
 
     fn request_address(&self, index: usize) -> u64 {

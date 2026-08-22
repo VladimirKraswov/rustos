@@ -28,6 +28,26 @@ firmware linear framebuffer. В этом режиме смена разреше�
 возвращает `RequiresReboot`: уже переданный firmware framebuffer не
 имеет runtime mode-set API.
 
+Выбор выполняется автоматически и fail-closed. На AMD64 enumerator проверяет
+все функции PCI bus 0, на AArch64 — все стандартные modern virtio-mmio slots
+QEMU `virt`. Драйвер принимается только после Virtio 1.x reset, feature
+negotiation, `FEATURES_OK`, настройки controlq и ответа display protocol.
+Действительный EDID preferred timing становится рекомендованным режимом. Если
+VirGL feature и capset не подтверждены одновременно, `renderd` не получает
+GPU capability и SystemUI остаётся на CPU renderer — наличие одного
+virtio-gpu 2D устройства не выдаётся за 3D-ускорение.
+
+Boot-report фиксирует принятое решение одной машинно-проверяемой строкой:
+
+```text
+[hardware] display-driver=virtio-gpu transport=modern-mmio mode=1440x900 preferred=2880x1800 edid=valid outputs=1 renderer=virgl
+```
+
+При отсутствии устройства строка содержит причину и выбранный `uefi-gop`,
+`grub-fb` либо честный headless fallback. Timeout/`DEVICE_NEEDS_RESET`/`FAILED`
+навсегда закрывает текущую virtqueue до контролируемого reset: descriptor не
+переиспользуется, пока устройство ещё может писать в старый DMA buffer.
+
 Host display frontend не является частью scanout contract. На macOS
 `scripts/run.sh` выбирает guest mode, который целое число раз помещается в
 Cocoa backing surface, включает fullscreen и отключает zoom interpolation.
@@ -36,6 +56,13 @@ Policy `actual` сохраняет строгое окно 1:1 для pixel-leve
 обычный дробный `fit` доступен только как явный выбор. Настоящий HiDPI внутри ОС
 выполняется до rasterization через `WindowMetrics`; scanout и compositor
 по-прежнему получают physical surface и публикуют её `1:1`.
+
+Pure policy `rustos-video::select_startup_mode` сначала сохраняет native mode,
+если он укладывается в UI budget, затем ищет точную целую долю 2x…6x. Например,
+2880×1800 выбирает 1440×900, а 2048×1280 — 1024×640. Если целая доля не
+помещается, обе оси уменьшаются с сохранением пропорций; независимый clamp,
+искажавший ultra-wide картинку, запрещён host-тестами. Ручной mode-set при
+этом по-прежнему видит полный список до 4K.
 
 ## Virtio-gpu 2D и VirGL
 
@@ -103,7 +130,8 @@ Policy `actual` сохраняет строгое окно 1:1 для pixel-leve
 Все unsafe-операции остаются на границе scanout/back-buffer mapping. Raster и
 compositor получают обычные slices и тестируются на Linux/macOS как обычная
 Rust-библиотека. Сейчас есть отдельные тесты geometry, pixel conversion,
-clipped blit, alpha, damage overflow и многослойной композиции.
+startup mode policy, clipped blit, alpha, damage overflow и многослойной
+композиции.
 
 ## Горячий путь
 
@@ -120,12 +148,14 @@ byte. Packed RGB888 не используется из-за плохого вы�
 `DISPLAY COLOR TRUECOLOR`, `RGB565` и `GRAY8` переключают логический формат
 software surface; present конвертирует его в выровненный scanout.
 
-Drag в TCG работает в preview-режиме. На первом движении старое окно один раз
-удаляется из scanout, затем перемещаются только title bar и тонкий контур.
-Полное содержимое публикуется один раз на mouse-up. PS/2-пакеты с неизменными
-кнопками дополнительно объединяются, поэтому compositor не догоняет очередь
-устаревших координат. При нехватке непрерывной RAM сохраняется корректный, но
-медленный full-redraw fallback.
+Во время drag окно продолжает отрисовываться полностью. На mouse-down его
+готовый слой один раз сохраняется в отдельный bounded buffer; каждый пакет
+движения восстанавливает только старый damage из desktop cache и копирует этот
+слой в новое положение. Содержимое окна не растеризуется заново. Пакеты xHCI
+USB HID mouse (а также PS/2/virtio fallback) с неизменными кнопками
+объединяются, поэтому compositor не догоняет очередь устаревших координат. При
+нехватке непрерывной RAM сохраняется корректный, но медленный full-redraw
+fallback.
 
 ## Graphics buffers и явная синхронизация
 
@@ -242,7 +272,7 @@ alpha, damage и layer ABI уже отделены от этого ограни�
 
 ## Спецификации
 
-- [OASIS Virtio 1.2, GPU Device](https://docs.oasis-open.org/virtio/virtio/v1.2/virtio-v1.2.html#x1-3720007)
+- [OASIS Virtio 1.3, GPU Device](https://docs.oasis-open.org/virtio/virtio/v1.3/virtio-v1.3.html)
   — normative transport, control queue, 2D resources, EDID и scanout commands;
 - [QEMU virtio-gpu](https://www.qemu.org/docs/master/system/devices/virtio-gpu.html)
   — доступные QEMU backends и соотношение 2D/virgl/rutabaga.

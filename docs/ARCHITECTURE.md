@@ -29,7 +29,7 @@ GRUB 2 / Multiboot2 --> BootInfo v3 --> kernel
                                   |-- graphics-buffer/surface/sync ABI
                                   |-- async virtio-gpu/VirGL render ABI
                                   |-- damage/layer CPU compositor
-                                  |-- PS/2 input
+                                  |-- xHCI USB HID input + PS/2/virtio fallback
                                   |-- bootstrap RIFS + RAM overlay
                                   |-- UI components
                                   |-- window manager

@@ -11,8 +11,8 @@ use rustos_abi::{
     graphics_buffer::{GraphicsBufferDesc, PixelFormatCode},
 };
 use rustos_video::{
-    ConnectorInfo, ConnectorKind, CpuPixelFormat, CpuSurface, DisplayMode, ModeSetError,
-    PresentStats, Rect, ScanoutCapabilities, ScanoutError,
+    select_startup_mode, ConnectorInfo, ConnectorKind, CpuPixelFormat, CpuSurface, DisplayMode,
+    ModeSetError, PresentStats, Rect, ScanoutCapabilities, ScanoutError, StartupModePolicy,
 };
 
 use crate::memory::{self, FrameBlock};
@@ -64,8 +64,6 @@ const MAX_HEIGHT: u32 = 2160;
 /// выбирает комфортный широкий logical scanout не больше 1600×900.
 const STARTUP_MAX_WIDTH: u32 = 1600;
 const STARTUP_MAX_HEIGHT: u32 = 900;
-const INTEGER_MIN_WIDTH: u32 = 800;
-const INTEGER_MIN_HEIGHT: u32 = 540;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -317,6 +315,8 @@ pub struct VirtioGpu {
     mode: DisplayMode,
     modes: [DisplayMode; MAX_MODES],
     mode_count: usize,
+    preferred_mode: DisplayMode,
+    edid_valid: bool,
     width_mm: u16,
     height_mm: u16,
     fence: u64,
@@ -350,6 +350,8 @@ impl VirtioGpu {
             mode: fallback,
             modes: [fallback; MAX_MODES],
             mode_count: 0,
+            preferred_mode: fallback,
+            edid_valid: false,
             width_mm: 0,
             height_mm: 0,
             fence: 0,
@@ -364,7 +366,8 @@ impl VirtioGpu {
         let (scanout, preferred) = gpu.display_info().unwrap_or((0, fallback));
         gpu.scanout = scanout;
         gpu.add_mode(preferred);
-        gpu.read_edid();
+        let connector_preferred = gpu.read_edid().unwrap_or(preferred);
+        gpu.preferred_mode = connector_preferred;
         // Полезные wide modes остаются доступны даже если виртуальный EDID
         // содержит только preferred timing. Virtio-gpu 2D scanout допускает
         // любой ресурс в пределах безопасного размера драйвера.
@@ -404,10 +407,14 @@ impl VirtioGpu {
         }
         let connector_preferred = DisplayMode {
             format: CpuPixelFormat::Bgr888,
-            stride_pixels: preferred.width,
-            ..preferred
+            stride_pixels: connector_preferred.width,
+            ..connector_preferred
         };
-        let startup = startup_mode(connector_preferred, fallback);
+        let startup = select_startup_mode(
+            connector_preferred,
+            fallback,
+            StartupModePolicy::desktop(STARTUP_MAX_WIDTH, STARTUP_MAX_HEIGHT),
+        );
         // Автоматически выведенный integer-fit mode обязан быть виден через
         // DISPLAY MODES наравне с EDID и стандартными режимами.
         gpu.add_mode(startup);
@@ -431,7 +438,7 @@ impl VirtioGpu {
         ConnectorInfo {
             kind: ConnectorKind::Virtual,
             connected: true,
-            preferred_mode: self.modes[0],
+            preferred_mode: self.preferred_mode,
             width_mm: self.width_mm,
             height_mm: self.height_mm,
         }
@@ -444,6 +451,18 @@ impl VirtioGpu {
             hardware_cursor: false,
             multiple_outputs: false,
         }
+    }
+
+    pub const fn edid_valid(&self) -> bool {
+        self.edid_valid
+    }
+
+    pub fn virgl_ready(&self) -> bool {
+        self.render_info().is_some()
+    }
+
+    pub fn output_count(&self) -> u32 {
+        self.transport.num_scanouts()
     }
 
     pub fn modes(&self, output: &mut [DisplayMode]) -> usize {
@@ -947,9 +966,9 @@ impl VirtioGpu {
         Err(ModeSetError::DeviceLost)
     }
 
-    fn read_edid(&mut self) {
+    fn read_edid(&mut self) -> Option<DisplayMode> {
         if !self.transport.edid_supported() {
-            return;
+            return None;
         }
         let request = GetEdidRequest {
             header: self.header(CMD_GET_EDID),
@@ -957,26 +976,31 @@ impl VirtioGpu {
             padding: 0,
         };
         let Ok(response) = self.transport.command::<_, EdidResponse>(&request) else {
-            return;
+            return None;
         };
         if response.header.kind != RESP_OK_EDID {
-            return;
+            return None;
         }
         let size = (response.size as usize).min(response.bytes.len());
-        let Some(info) = edid::parse(&response.bytes[..size]) else {
-            return;
-        };
+        let info = edid::parse(&response.bytes[..size])?;
+        self.edid_valid = true;
         self.width_mm = info.width_mm;
         self.height_mm = info.height_mm;
+        let mut preferred = None;
         for mode in info.modes[..info.mode_count].iter().copied() {
-            self.add_mode(DisplayMode {
+            let display_mode = DisplayMode {
                 width: mode.width,
                 height: mode.height,
                 stride_pixels: mode.width,
                 format: CpuPixelFormat::Bgr888,
                 refresh_millihertz: mode.refresh_millihertz,
-            });
+            };
+            self.add_mode(display_mode);
+            if mode.preferred {
+                preferred = Some(display_mode);
+            }
         }
+        preferred
     }
 
     fn add_mode(&mut self, mode: DisplayMode) {
@@ -984,10 +1008,16 @@ impl VirtioGpu {
             || mode.height < MIN_HEIGHT
             || mode.width > MAX_WIDTH
             || mode.height > MAX_HEIGHT
-            || self.modes[..self.mode_count]
-                .iter()
-                .any(|existing| existing.width == mode.width && existing.height == mode.height)
         {
+            return;
+        }
+        if let Some(existing) = self.modes[..self.mode_count]
+            .iter_mut()
+            .find(|existing| existing.width == mode.width && existing.height == mode.height)
+        {
+            if existing.refresh_millihertz == 0 && mode.refresh_millihertz != 0 {
+                existing.refresh_millihertz = mode.refresh_millihertz;
+            }
             return;
         }
         if self.mode_count < MAX_MODES {
@@ -1237,73 +1267,6 @@ fn valid_virgl_stream(commands: &[u8]) -> bool {
         offset += (payload + 1) * 4;
     }
     offset == commands.len()
-}
-
-/// Ограничивает только начальный logical mode. Если monitor меньше лимита,
-/// сохраняется его preferred mode; ручной `DISPLAY MODE` не ограничивается.
-fn startup_mode(preferred: DisplayMode, fallback: DisplayMode) -> DisplayMode {
-    let preferred_is_usable = preferred.width >= MIN_WIDTH && preferred.height >= MIN_HEIGHT;
-    if preferred_is_usable
-        && preferred.width <= STARTUP_MAX_WIDTH
-        && preferred.height <= STARTUP_MAX_HEIGHT
-    {
-        return preferred;
-    }
-    if preferred_is_usable {
-        if let Some((width, height)) = integer_fit_dimensions(preferred.width, preferred.height) {
-            return DisplayMode {
-                width,
-                height,
-                stride_pixels: width,
-                format: CpuPixelFormat::Bgr888,
-                refresh_millihertz: preferred.refresh_millihertz.max(60_000),
-            };
-        }
-    }
-    let fallback_is_usable = fallback.width >= MIN_WIDTH
-        && fallback.height >= MIN_HEIGHT
-        && fallback.width <= STARTUP_MAX_WIDTH
-        && fallback.height <= STARTUP_MAX_HEIGHT;
-    let (width, height) = if preferred_is_usable && preferred.width >= 16 * preferred.height / 10 {
-        (STARTUP_MAX_WIDTH, STARTUP_MAX_HEIGHT)
-    } else if fallback_is_usable {
-        (fallback.width, fallback.height)
-    } else {
-        (1280, 800)
-    };
-    DisplayMode {
-        width,
-        height,
-        stride_pixels: width,
-        format: CpuPixelFormat::Bgr888,
-        refresh_millihertz: preferred.refresh_millihertz.max(60_000),
-    }
-}
-
-/// Подбирает surface, которую host увеличит на целое число.
-///
-/// Cocoa сообщает virtio-gpu fullscreen backing size ещё до старта kernel:
-/// например, 2880×1800. Прежний clamp превращал его в 1600×900 и давал
-/// дробный коэффициент 1.8. Теперь выбирается 1440×900 ×2. Если только одна
-/// ось выходит за startup budget, вторая остаётся точной ограничивающей осью,
-/// а свободное место становится letterbox без масштабирования bitmap.
-fn integer_fit_dimensions(host_width: u32, host_height: u32) -> Option<(u32, u32)> {
-    for scale in 2..=6 {
-        if !host_width.is_multiple_of(scale) || !host_height.is_multiple_of(scale) {
-            continue;
-        }
-        let desired_width = host_width / scale;
-        let desired_height = host_height / scale;
-        if desired_width > STARTUP_MAX_WIDTH && desired_height > STARTUP_MAX_HEIGHT {
-            continue;
-        }
-        let width = desired_width.min(STARTUP_MAX_WIDTH);
-        let height = desired_height.min(STARTUP_MAX_HEIGHT);
-        if width >= INTEGER_MIN_WIDTH && height >= INTEGER_MIN_HEIGHT {
-            return Some((width, height));
-        }
-    }
-    None
 }
 
 impl Drop for VirtioGpu {

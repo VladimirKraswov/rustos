@@ -45,7 +45,7 @@ endif
 .PHONY: all bootstrap build build-x86 run run-x86 boot test test-host test-arch \
         test-boot test-arm test-arm-boot test-arm-gui test-gui bootstrap-arm build-arm \
         bootstrap-mesa run-arm run-utm-gpu setup-utm-gpu run-virgl test-virgl \
-        test-utm-gpu format lint clean
+        test-utm-gpu test-display-fallback format lint clean
 
 all: build
 
@@ -103,6 +103,10 @@ test-arch:
 test-boot:
 	RUSTOS_BOOT_TEST=1 bash scripts/build.sh
 	bash scripts/test-boot.sh
+
+test-display-fallback:
+	RUSTOS_BOOT_TEST=1 bash scripts/build.sh
+	BOOT_DISPLAY_BACKEND=firmware bash scripts/test-boot.sh
 
 # Короткий alias удобен локально; полное имя явно отличает boot integration
 # от compile-only `test-arch`.

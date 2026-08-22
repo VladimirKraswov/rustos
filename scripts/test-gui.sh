@@ -225,6 +225,8 @@ grep -Fq '[supervisor] persistent displayd/compositord atomic-present services r
     "$RUN_DIR/serial.log"
 grep -Eq '\[video\] scanout=virtio-gpu mode=1280x800 format=bgr888 present=immediate page-flip=no' \
     "$RUN_DIR/serial.log"
+grep -Eq '\[hardware\] display-driver=virtio-gpu transport=modern-pci mode=1280x800 preferred=1280x800 edid=(valid|unavailable) outputs=[1-9][0-9]* renderer=cpu' \
+    "$RUN_DIR/serial.log"
 grep -Fq '[usb] hid attached port=' "$RUN_DIR/serial.log"
 grep -Fq 'mouse=xhci-usb-hid' "$RUN_DIR/serial.log"
 grep -q '\[display-metrics\] logical=1280x800 physical=1280x800 device-scale-milli=1000 framebuffer=1280x800 compositor-scale-milli=1000' \

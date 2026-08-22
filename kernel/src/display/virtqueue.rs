@@ -18,6 +18,7 @@ const STATUS_ACKNOWLEDGE: u8 = 1;
 const STATUS_DRIVER: u8 = 2;
 const STATUS_DRIVER_OK: u8 = 4;
 const STATUS_FEATURES_OK: u8 = 8;
+const STATUS_DEVICE_NEEDS_RESET: u8 = 64;
 const STATUS_FAILED: u8 = 128;
 const VIRTIO_F_VERSION_1_HIGH: u32 = 1;
 const VIRTIO_GPU_F_VIRGL: u32 = 1 << 0;
@@ -248,6 +249,12 @@ impl ModernTransport {
             }
             core::hint::spin_loop();
         }
+        // Descriptor нельзя просто вернуть в FREE: устройство ещё может
+        // завершить DMA и опубликовать stale used entry. По Virtio 1.x
+        // timeout переводит весь transport в FAILED: верхний уровень получает
+        // DeviceLost вместо повторного использования потенциально
+        // повреждённой очереди.
+        self.fail_device();
         Err(TransportError::Timeout)
     }
 
@@ -365,6 +372,7 @@ impl ModernTransport {
     }
 
     fn poll_used(&mut self) -> Result<(), TransportError> {
+        self.ensure_device_ready()?;
         let used = (self.queue.phys + self.used_offset) as *const u8;
         let available = unsafe { used.add(2).cast::<u16>().read_volatile() };
         // Сначала наблюдаем новый used.idx, затем запрещаем процессору читать
@@ -390,6 +398,21 @@ impl ModernTransport {
             self.device_used = self.device_used.wrapping_add(1);
         }
         Ok(())
+    }
+
+    fn ensure_device_ready(&self) -> Result<(), TransportError> {
+        let status = unsafe { read_u8(self.common, 20) };
+        if status & STATUS_DRIVER_OK == 0
+            || status & (STATUS_DEVICE_NEEDS_RESET | STATUS_FAILED) != 0
+        {
+            return Err(TransportError::DeviceError);
+        }
+        Ok(())
+    }
+
+    fn fail_device(&self) {
+        let status = unsafe { read_u8(self.common, 20) };
+        unsafe { write_u8(self.common, 20, status | STATUS_FAILED) };
     }
 
     fn request_address(&self, index: usize) -> u64 {

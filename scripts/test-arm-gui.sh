@@ -109,6 +109,8 @@ grep -Fq '[graphics-abi-v7] graphics-buffer sync-timeline atomic-present supervi
 grep -Fq '[supervisor] persistent displayd/compositord atomic-present services ready' \
     "$RUN_DIR/serial.log"
 grep -Fq '[video] virtio-gpu modern MMIO controlq ready' "$RUN_DIR/serial.log"
+grep -Eq '\[hardware\] display-driver=virtio-gpu transport=modern-mmio mode=1280x720 preferred=1280x720 edid=(valid|unavailable) outputs=[1-9][0-9]* renderer=cpu' \
+    "$RUN_DIR/serial.log"
 grep -Fq '[usb] hid attached port=' "$RUN_DIR/serial.log"
 grep -Fq 'mouse=xhci-usb-hid' "$RUN_DIR/serial.log"
 

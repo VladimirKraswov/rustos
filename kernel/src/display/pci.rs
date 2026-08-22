@@ -1,7 +1,7 @@
 //! Минимальное обнаружение modern virtio-pci display function.
 //!
 //! Пока PC platform использует один PCI segment и bus 0, как QEMU q35.
-//! Код не закрепляет номер slot: просматриваются все 32 функции. В будущем
+//! Код не закрепляет slot/function: просматриваются все функции bus 0. В будущем
 //! enumerator PCI bridges/IOMMU станет отдельным сервисом и передаст драйверу
 //! уже проверенные BAR capabilities.
 
@@ -32,6 +32,7 @@ pub struct VirtioPciRegions {
 struct Function {
     bus: u8,
     slot: u8,
+    function: u8,
 }
 
 impl Function {
@@ -39,6 +40,7 @@ impl Function {
         let address = 0x8000_0000u32
             | (u32::from(self.bus) << 16)
             | (u32::from(self.slot) << 11)
+            | (u32::from(self.function) << 8)
             | u32::from(offset & 0xfc);
         unsafe {
             arch::outl(0xcf8, address);
@@ -92,18 +94,39 @@ impl Function {
 
 pub fn discover_virtio_gpu() -> Option<VirtioPciRegions> {
     for slot in 0..32 {
-        let function = Function { bus: 0, slot };
-        let id = function.read_u32(0);
-        if id as u16 != VIRTIO_VENDOR || (id >> 16) as u16 != VIRTIO_GPU_MODERN {
+        let first = Function {
+            bus: 0,
+            slot,
+            function: 0,
+        };
+        if first.read_u16(0) == u16::MAX {
             continue;
         }
-        // Memory space + bus mastering; interrupts пока не используются,
-        // completion controlq читается polling'ом.
-        let command_status = function.read_u32(0x04);
-        // Верхние 16 бит PCI status содержат write-one-to-clear flags: их
-        // нельзя бездумно записывать обратно вместе с command.
-        function.write_u32(0x04, (command_status & 0xffff) | 0x0000_0006);
-        return parse_capabilities(function);
+        let function_count = if first.read_u8(0x0e) & 0x80 != 0 {
+            8
+        } else {
+            1
+        };
+        for function_index in 0..function_count {
+            let function = Function {
+                bus: 0,
+                slot,
+                function: function_index,
+            };
+            let id = function.read_u32(0);
+            if id as u16 != VIRTIO_VENDOR || (id >> 16) as u16 != VIRTIO_GPU_MODERN {
+                continue;
+            }
+            // Memory space + bus mastering; interrupts пока не используются,
+            // completion controlq читается polling'ом.
+            let command_status = function.read_u32(0x04);
+            // Верхние 16 бит PCI status содержат write-one-to-clear flags: их
+            // нельзя бездумно записывать обратно вместе с command.
+            function.write_u32(0x04, (command_status & 0xffff) | 0x0000_0006);
+            if let Some(regions) = parse_capabilities(function) {
+                return Some(regions);
+            }
+        }
     }
     None
 }

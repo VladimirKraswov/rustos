@@ -12,6 +12,7 @@ mod compositor;
 mod cpu_surface;
 mod damage;
 mod geometry;
+mod mode_policy;
 mod pixel;
 pub mod protocol;
 mod scanout;
@@ -21,6 +22,7 @@ pub use compositor::{composite, Layer};
 pub use cpu_surface::{CpuSurface, CpuSurfaceError, CpuSurfaceMut};
 pub use damage::DamageRegion;
 pub use geometry::{Point, Rect};
+pub use mode_policy::{select_startup_mode, StartupModePolicy};
 pub use pixel::{Color, CpuPixelFormat, Rgba};
 pub use scanout::{
     ColorMode, ConnectorInfo, ConnectorKind, DisplayDriver, DisplayMode, ModeSetError,

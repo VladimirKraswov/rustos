@@ -13,7 +13,7 @@
 | DLL | RUNE library resolver, imports/exports, TLS и RELRO работают | что Rust ABI стабилен или DLL равна service |
 | VFS | изолированный `vfsd`, shared-memory streaming, COW B+tree, checksums, snapshots, scrub/fsck | что исчерпывающее fault-injection тестирование равно production-аудиту |
 | SMP | AP startup и вытеснение CPU0 проверены, AP пока безопасно parked | что scheduler распределяет процессы по всем CPU |
-| Display | framebuffer/virtio scanout и инкрементальный CPU compositor | что есть аппаратный 3D/GPU command path |
+| Display | virtio 2D/firmware fallback, CPU compositor и bounded ring-3 VirGL command path | что upstream Mesa и native Intel/AMD/Apple/V3D drivers уже портированы |
 
 Перед задачей сверяй таблицу с `docs/ARCHITECTURE.md`: статус может измениться.
 

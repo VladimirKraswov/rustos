@@ -30,6 +30,7 @@ make lint        fmt + ShellCheck + Clippy -D warnings для host/обеих IS
 make test-host   ABI, SystemUI/assets, scheduler, loader/format/fs/tool tests
 make test-arch   собрать kernel/runtime/apps для AMD64 и AArch64
 make test-boot   GRUB/Multiboot2 + CPL3 RUNE/VFS/fault/reclaim test
+make test-display-fallback boot без virtio-gpu: CPU/headless/firmware fallback
 make test-arm-boot AAVMF + EL0/EL1/GICv3/PSCI/VFS test
 make test-arm-gui AAVMF + virtio GPU + xHCI USB HID + SystemUI smoke test
 make test-gui    keyboard/mouse/window framebuffer test

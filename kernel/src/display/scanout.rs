@@ -22,6 +22,7 @@ use rustos_video::{
 };
 
 use super::{virtio_gpu::RenderCompletion, VirtioGpu};
+use crate::serial;
 
 const DEFAULT_REFRESH_MILLIHERTZ: u32 = 60_000;
 
@@ -33,6 +34,29 @@ pub enum DisplayBrokerError {
     DeviceLost,
     UnsupportedMode,
     OutOfMemory,
+}
+
+impl DisplayBrokerError {
+    pub const fn diagnostic_name(self) -> &'static str {
+        match self {
+            Self::Unavailable => "unavailable",
+            Self::Busy => "busy",
+            Self::InvalidSurface => "invalid-surface",
+            Self::DeviceLost => "device-lost",
+            Self::UnsupportedMode => "unsupported-mode",
+            Self::OutOfMemory => "out-of-memory",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DisplayDeviceInfo {
+    pub transport: &'static str,
+    pub mode: DisplayMode,
+    pub preferred_mode: DisplayMode,
+    pub edid_valid: bool,
+    pub virgl_ready: bool,
+    pub outputs: u32,
 }
 
 struct Device {
@@ -114,7 +138,34 @@ pub fn initialize(fallback: DisplayMode) -> Result<DisplayMode, DisplayBrokerErr
     let gpu = VirtioGpu::initialize(fallback).map_err(map_mode_error)?;
     let selected = gpu.mode();
     DEVICE.install(gpu)?;
+    if let Ok(info) = device_info() {
+        log_hardware_report(info);
+    }
     Ok(selected)
+}
+
+fn log_hardware_report(device: DisplayDeviceInfo) {
+    serial::put_str("[hardware] display-driver=virtio-gpu transport=");
+    serial::put_str(device.transport);
+    serial::put_str(" mode=");
+    serial::put_u32(device.mode.width);
+    serial::put_str("x");
+    serial::put_u32(device.mode.height);
+    serial::put_str(" preferred=");
+    serial::put_u32(device.preferred_mode.width);
+    serial::put_str("x");
+    serial::put_u32(device.preferred_mode.height);
+    serial::put_str(" edid=");
+    serial::put_str(if device.edid_valid {
+        "valid"
+    } else {
+        "unavailable"
+    });
+    serial::put_str(" outputs=");
+    serial::put_u32(device.outputs);
+    serial::put_str(" renderer=");
+    serial::put_str(if device.virgl_ready { "virgl" } else { "cpu" });
+    serial::put_str("\n");
 }
 
 pub fn mode() -> Result<DisplayMode, DisplayBrokerError> {
@@ -133,6 +184,25 @@ pub fn connector() -> Result<ConnectorInfo, DisplayBrokerError> {
         .as_ref()
         .map(|device| device.gpu.connector())
         .ok_or(DisplayBrokerError::Unavailable)
+}
+
+pub fn device_info() -> Result<DisplayDeviceInfo, DisplayBrokerError> {
+    let mut guard = DEVICE.acquire()?;
+    let device = guard
+        .get()
+        .as_ref()
+        .ok_or(DisplayBrokerError::Unavailable)?;
+    Ok(DisplayDeviceInfo {
+        #[cfg(target_arch = "x86_64")]
+        transport: "modern-pci",
+        #[cfg(target_arch = "aarch64")]
+        transport: "modern-mmio",
+        mode: device.gpu.mode(),
+        preferred_mode: device.gpu.connector().preferred_mode,
+        edid_valid: device.gpu.edid_valid(),
+        virgl_ready: device.gpu.virgl_ready(),
+        outputs: device.gpu.output_count(),
+    })
 }
 
 pub fn capabilities() -> Result<ScanoutCapabilities, DisplayBrokerError> {
