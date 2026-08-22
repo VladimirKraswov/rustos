@@ -187,7 +187,13 @@ fn map_device_ranges(allocator: &mut TableAllocator, root: u64) -> Result<(), Pt
         map_range_device(allocator, root, A_GIC_BASE, A_GIC_SIZE)?;
         map_range_device(allocator, root, A_VIRTIO_MMIO_BASE, A_VIRTIO_MMIO_SIZE)?;
         map_range_device(allocator, root, A_PCIE_LOW_MMIO_BASE, A_PCIE_LOW_MMIO_SIZE)?;
-        map_range_device(allocator, root, A_PCIE_ECAM_BASE, A_PCIE_ECAM_SIZE)?;
+        map_range_device(allocator, root, A_PCIE_LOW_ECAM_BASE, A_PCIE_LOW_ECAM_SIZE)?;
+        map_range_device(
+            allocator,
+            root,
+            A_PCIE_HIGH_ECAM_BASE,
+            A_PCIE_HIGH_ECAM_SIZE,
+        )?;
         map_range_device(
             allocator,
             root,
@@ -470,18 +476,23 @@ const A_GIC_SIZE: u64 = 0x0100_0000;
 const A_VIRTIO_MMIO_BASE: u64 = 0x0a00_0000;
 #[cfg(target_arch = "aarch64")]
 const A_VIRTIO_MMIO_SIZE: u64 = 32 * 0x200;
-/// QEMU `virt`: совместимое с любым поддерживаемым PARange низкое ECAM-окно
-/// и PCIe MMIO aperture. Высокие окна тоже отображаются для 64-битных BAR,
-/// но конфигурационное пространство намеренно читаем через low ECAM: это
-/// работает на Cortex-A72 и не требует от bootstrap-драйвера ACPI/DT parser.
+/// QEMU `virt`: низкие и высокие PCIe ECAM/MMIO apertures. Новые QEMU/UTM
+/// по умолчанию публикуют 256-MiB ECAM над 256 GiB, тогда как компактный
+/// профиль и Cortex-A72 tests используют старое 16-MiB окно под 1 GiB.
+/// Оба отображаются как device-nGnRE; platform discovery выбирает то окно,
+/// в котором действительно найдена host bridge функция.
 #[cfg(target_arch = "aarch64")]
 const A_PCIE_LOW_MMIO_BASE: u64 = 0x1000_0000;
 #[cfg(target_arch = "aarch64")]
 const A_PCIE_LOW_MMIO_SIZE: u64 = 0x2eff_0000;
 #[cfg(target_arch = "aarch64")]
-const A_PCIE_ECAM_BASE: u64 = 0x3f00_0000;
+const A_PCIE_LOW_ECAM_BASE: u64 = 0x3f00_0000;
 #[cfg(target_arch = "aarch64")]
-const A_PCIE_ECAM_SIZE: u64 = 16 * 1024 * 1024;
+const A_PCIE_LOW_ECAM_SIZE: u64 = 16 * 1024 * 1024;
+#[cfg(target_arch = "aarch64")]
+const A_PCIE_HIGH_ECAM_BASE: u64 = 0x0040_1000_0000;
+#[cfg(target_arch = "aarch64")]
+const A_PCIE_HIGH_ECAM_SIZE: u64 = 256 * 1024 * 1024;
 #[cfg(target_arch = "aarch64")]
 const A_PCIE_HIGH_MMIO_BASE: u64 = 0x0080_0000_0000;
 #[cfg(target_arch = "aarch64")]

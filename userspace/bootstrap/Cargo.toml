@@ -120,3 +120,4 @@ rustos-virgl = { path = "../../libs/virgl" }
 rustos-mesa = { path = "../../libs/mesa" }
 rustos-video = { path = "../../video" }
 rustos-surface-client = { path = "../../libs/surface" }
+rustos-system-assets = { path = "../../system-assets" }

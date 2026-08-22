@@ -221,19 +221,25 @@ Release-сборка на профиле UTM Apple Silicon должна держ
 ## Текущее состояние реализации
 
 - G1: capability-checked sampled textures, damage scissor, premultiplied alpha,
-  bounded command validation и трёхслойный hardware probe реализованы;
-- G2: `rustos-ui-gpu::GpuRenderBackend` уже компилирует полный SystemUI
-  display list в bounded physical instances без CPU pixel loop; glyph/image
-  atlas и shader transport ещё должны быть подключены к `renderd`;
+  bounded command validation, большие разбиваемые batches и несколько
+  submissions in-flight реализованы;
+- G2: обычный SystemUI компилируется в renderer-neutral GPU scene и передаётся
+  постоянному ring-3 `renderd`. VirGL выполняет blending и запись geometry,
+  icon/image и wallpaper pixels; CPU backend остаётся recovery fallback.
+  Текстовый adapter пока формирует bounded coverage spans из системного
+  bitmap-шрифта — постоянный glyph atlas/SDF остаётся следующей оптимизацией;
 - G3: общая generation-checked `SurfaceQueue`, динамические IPC endpoint'ы и
   клиентская `surface.dll` реализованы; отдельный ring-3 процесс проходит
   `create/commit/direct-scanout/release/feedback/destroy`, а stale event
   capability после crash отзывается ядром;
-- обычный интерактивный desktop всё ещё использует kernel CPU recovery
-  renderer, поэтому критерий «полностью GPU-ускорен» пока честно не выполнен.
+- штатный desktop использует один агрегированный GPU frame, asynchronous
+  latest-frame mailbox, stale-frame drop и zero-copy scanout. Проверочный
+  marker содержит `raster=gpu composition=gpu readback=0 cpu-pixels=0`;
+- отдельные per-window GPU queues, transform-only drag и аппаратный cursor
+  plane ещё не завершены. Поэтому полный критерий G4 выше пока выполнен не
+  целиком, хотя CPU raster штатного desktop уже отключён.
 
-Следующая точка переключения — multi-layer оконная композиция без readback и
-внутренняя передача `GpuUiInstance` batches из `uid` в `renderd`. Публичный код
-приложений при этом не меняется. После переключения системных providers
-kernel GUI перестаёт стартовать в штатном сеансе и остаётся только аварийным
-fallback.
+Следующая граница — разбить агрегированную сцену на независимые оконные слои,
+чтобы drag менял только transform, и вынести policy/layout из bootstrap kernel
+GUI в постоянные `windowd`/`uid`. Публичный код приложений при этом не
+меняется: после переключения kernel GUI остаётся только аварийным fallback.

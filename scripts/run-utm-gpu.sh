@@ -3,7 +3,9 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-VM_NAME="${RUSTOS_UTM_VM_NAME:-RustOS GPU Development}"
+VM_NAME="${RUSTOS_UTM_VM_NAME:-RustOS-GPU-Development}"
+VM_DATA="${RUSTOS_UTM_VM_DATA_DIR:-$HOME/Library/Containers/com.utmapp.UTM/Data/Documents/$VM_NAME.utm/Data}"
+VM_SYSTEM="$VM_DATA/rustos-system.vfs"
 cd "$ROOT"
 
 if [[ ! -d /Applications/UTM.app ]] || ! command -v utmctl >/dev/null 2>&1; then
@@ -21,6 +23,12 @@ if VM_STATE="$(utmctl status "$VM_NAME" 2>/dev/null)" && [[ "$VM_STATE" != "stop
 fi
 
 if [[ "${RUSTOS_UTM_SKIP_BUILD:-0}" != "1" ]]; then
+    # Нативный UTM import сохраняет basename raw image внутри VM Data. Перед
+    # build возвращаем guest writes в рабочий образ, чтобы обновление RUNE и
+    # registry не стирало созданные пользователем файлы RustOS.
+    if [[ -f "$VM_SYSTEM" ]]; then
+        rsync --sparse "$VM_SYSTEM" "$ROOT/build/arm-system.vfs"
+    fi
     make build-arm
 fi
 bash scripts/setup-utm-gpu.sh

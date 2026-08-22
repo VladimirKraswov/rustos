@@ -17,7 +17,8 @@ use rustos_abi::{
     display::{DisplayAtomicPresent, DisplayScanoutInfo, DisplayVblankWait},
     gpu::{
         GpuContextCreate, GpuDemoRequest, GpuDeviceInfo, GpuResourceCreate, GpuResourceImport,
-        GpuSubmit, GPU_DEMO_START_OPCODE, GPU_MAX_COMMAND_BYTES,
+        GpuSubmit, GpuUiFrameHeader, GpuUiQuad, GPU_DEMO_START_OPCODE, GPU_MAX_COMMAND_BYTES,
+        GPU_UI_STREAM_BYTES,
     },
     graphics_buffer::{BufferUsage, GraphicsBufferDesc, MemoryDomain},
     ipc::{Message, IPC_INLINE_BYTES, IPC_MAX_HANDLES},
@@ -63,14 +64,19 @@ const MAX_ENDPOINTS: usize = 32;
 const ENDPOINT_QUEUE_CAPACITY: usize = 8;
 const ENDPOINT_SLOT: usize = 2;
 const MAX_SHARED_OBJECTS: usize = 8;
-const MAX_SHARED_PAGES: usize = 64;
+// 1 MiB достаточно для полного bounded SystemUI command frame. Обычные
+// процессы всё равно ограничены числом objects и своими capabilities.
+const MAX_SHARED_PAGES: usize = 256;
 const MAX_SYNC_TIMELINES: usize = 32;
 const MAX_SYNC_WAITS: usize = MAX_THREADS;
 // Оконный compositor импортирует несколько client surfaces одновременно.
 // Это metadata budget, а общий объём pixels ограничен GraphicsBufferPool.
 const MAX_GPU_IMPORTS: usize = 32;
 const MAX_GPU_SUBMISSIONS: usize = 3;
-const MAX_GPU_COMPLETIONS: usize = 8;
+// Клиент обычно запрашивает completion сразу после timeline wait. Небольшое
+// кольцо хранит точный результат последних fences, включая out-of-order
+// completion; старый забытый fence честно становится NOT_FOUND.
+const MAX_GPU_COMPLETIONS: usize = 64;
 /// Один mapping ограничен 1 GiB: достаточно для compiler arenas, но ошибка в
 /// user-space всё ещё не может одним syscall переполнить арифметику/metadata.
 const MAX_VM_SYSCALL_PAGES: u64 = 256 * 1024;
@@ -462,6 +468,37 @@ impl SharedMemoryPool {
                 ptr::copy_nonoverlapping(
                     (object.frames[page].phys as *const u8).add(page_offset),
                     output[copied..copied + count].as_mut_ptr(),
+                    count,
+                );
+            }
+            copied += count;
+        }
+        Ok(())
+    }
+
+    /// Kernel-side writer доверенного SystemUI stream. Метод не экспортирован
+    /// syscall ABI: обычный процесс получает доступ только через mapping и
+    /// capability rights.
+    fn write_bytes(&mut self, id: u16, offset: u64, input: &[u8]) -> Result<(), i64> {
+        let object = self.get(id)?;
+        let length = u64::try_from(input.len()).map_err(|_| status::INVALID_ARGUMENT)?;
+        if !object.maximum_flags.contains(VmFlags::WRITE)
+            || offset
+                .checked_add(length)
+                .is_none_or(|end| end > object.pages as u64 * PAGE_SIZE)
+        {
+            return Err(status::INVALID_ARGUMENT);
+        }
+        let mut copied = 0usize;
+        while copied < input.len() {
+            let absolute = offset + copied as u64;
+            let page = (absolute / PAGE_SIZE) as usize;
+            let page_offset = (absolute % PAGE_SIZE) as usize;
+            let count = (PAGE_SIZE as usize - page_offset).min(input.len() - copied);
+            unsafe {
+                ptr::copy_nonoverlapping(
+                    input[copied..copied + count].as_ptr(),
+                    (object.frames[page].phys as *mut u8).add(page_offset),
                     count,
                 );
             }
@@ -3375,13 +3412,19 @@ impl ProcessManager {
         } {
             return status::INVALID_ARGUMENT;
         }
-        let mut commands = [0u8; GPU_MAX_COMMAND_BYTES as usize];
         let command_length = request.command_bytes as usize;
-        if let Err(error) = self.copy_from_process(
-            process_index,
-            request.commands_address,
-            &mut commands[..command_length],
-        ) {
+        // Большой bounded command buffer хранится в kernel `.bss`, а не на
+        // interrupt/process stack. GPU syscall сериализован единственным
+        // ProcessManager; device получает отдельную DMA-копию до возврата.
+        let commands = unsafe {
+            slice::from_raw_parts_mut(
+                ptr::addr_of_mut!(GPU_COMMAND_SCRATCH).cast::<u8>(),
+                command_length,
+            )
+        };
+        if let Err(error) =
+            self.copy_from_process(process_index, request.commands_address, commands)
+        {
             return error;
         }
         // Timeline reference должен существовать ещё до публикации descriptor
@@ -3389,7 +3432,7 @@ impl ProcessManager {
         if self.timelines.retain(timeline).is_err() {
             return status::LIMIT_REACHED;
         }
-        let fence = match scanout::submit_render(1, &commands[..command_length]) {
+        let fence = match scanout::submit_render(1, commands) {
             Ok(fence) => fence,
             Err(error) => {
                 let _ = self.timelines.release(timeline);
@@ -3450,6 +3493,10 @@ impl ProcessManager {
     }
 
     fn record_gpu_completion(&mut self, fence: u64, result: i64) {
+        // Нельзя сворачивать успехи в `max(fence)`: virtio GPU вправе
+        // завершить несколько in-flight submissions не по порядку. Храним
+        // точную пару fence/result и никогда не называем pending fence
+        // успешным только потому, что завершился fence с большим номером.
         self.gpu_completions[self.gpu_completion_cursor] = CompletedGpuSubmission { fence, result };
         self.gpu_completion_cursor = (self.gpu_completion_cursor + 1) % MAX_GPU_COMPLETIONS;
     }
@@ -4955,10 +5002,18 @@ enum BlockingResult {
 }
 
 static mut MANAGER: ProcessManager = ProcessManager::empty();
+/// Единственный staging buffer недоверенного VirGL stream. Содержимое всегда
+/// полностью валидируется display driver'ом до публикации descriptor chain.
+static mut GPU_COMMAND_SCRATCH: [u8; GPU_MAX_COMMAND_BYTES as usize] =
+    [0; GPU_MAX_COMMAND_BYTES as usize];
 static mut ACTIVE_MANAGER: *mut ProcessManager = ptr::null_mut();
 static mut INTERACTIVE_SERVICES_READY: bool = false;
 static mut INTERACTIVE_GRAPHICS_SERVICES: Option<GraphicsServices> = None;
 static mut GRAPHICS_RESTARTS: u8 = 0;
+static mut GPU_UI_FIRST_FRAME_LOGGED: bool = false;
+/// Ноль означает пустой mailbox. Payload уже лежит в UI shared memory;
+/// frame id нужен только для request correlation и telemetry.
+static mut GPU_UI_PENDING_FRAME_ID: u64 = 0;
 static mut INTERACTIVE_SUPERVISOR: Option<ProcessId> = None;
 static mut INTERACTIVE_COMMAND_PIPE: Option<u16> = None;
 static mut SUPERVISOR_RESTARTS: u8 = 0;
@@ -5224,6 +5279,8 @@ pub(super) fn start_interactive_services() -> Result<(), ProcessError> {
     unsafe { INTERACTIVE_SERVICES_READY = true };
     unsafe { INTERACTIVE_GRAPHICS_SERVICES = graphics };
     unsafe { GRAPHICS_RESTARTS = 0 };
+    unsafe { GPU_UI_FIRST_FRAME_LOGGED = false };
+    unsafe { GPU_UI_PENDING_FRAME_ID = 0 };
     unsafe { INTERACTIVE_SUPERVISOR = Some(supervisor) };
     unsafe { INTERACTIVE_COMMAND_PIPE = Some(command_pipe) };
     unsafe { SUPERVISOR_RESTARTS = 0 };
@@ -5362,6 +5419,75 @@ const fn startup_capability(role: StartupRole, slot: usize, rights: Rights) -> S
     }
 }
 
+fn graphics_service_exited(manager: &ProcessManager, services: GraphicsServices) -> bool {
+    [
+        Some(services.display),
+        Some(services.compositor),
+        services.render,
+    ]
+    .into_iter()
+    .flatten()
+    .any(|pid| {
+        manager
+            .processes
+            .iter()
+            .flatten()
+            .find(|process| process.pid == pid)
+            .is_none_or(|process| process.exited)
+    })
+}
+
+/// Продвигает не более одной естественной точки ожидания graphics pipeline.
+/// Это принципиально не `wait until vblank`: GUI input должен получить CPU
+/// между completions, иначе даже аппаратный renderer ощущается синхронным.
+fn progress_graphics_once(
+    manager: &mut ProcessManager,
+    services: GraphicsServices,
+) -> Result<(), ProcessError> {
+    if graphics_service_exited(manager, services) {
+        return Ok(());
+    }
+    if manager.has_runnable_threads() {
+        manager.run()?;
+        return Ok(());
+    }
+    if manager.complete_idle_gpu_submission() || manager.complete_idle_estimated_vblank() {
+        if manager.has_runnable_threads() {
+            manager.run()?;
+        }
+    }
+    Ok(())
+}
+
+/// Отправляет накопленный newest SystemUI frame только когда весь предыдущий
+/// atomic present завершён. Несколько mouse reports между двумя vblank просто
+/// заменяют shared payload и не образуют очередь устаревших кадров.
+fn dispatch_pending_system_ui(
+    manager: &mut ProcessManager,
+    services: GraphicsServices,
+) -> Result<bool, ProcessError> {
+    const COMPOSITOR_CONTROL_ENDPOINT: u8 = 6;
+    let frame_id = unsafe { GPU_UI_PENDING_FRAME_ID };
+    if frame_id == 0 || !graphics_services_blocked(manager, services) {
+        return Ok(false);
+    }
+    let mut message = Message::EMPTY;
+    message.header.opcode = GPU_DEMO_START_OPCODE;
+    message.header.request_id = frame_id;
+    message.header.payload_len = 64;
+    message.payload = GpuDemoRequest::system_ui().encode_inline();
+    manager
+        .deliver_kernel_control(COMPOSITOR_CONTROL_ENDPOINT, message)
+        .map_err(|_| ProcessError::UnexpectedExit)?;
+    unsafe { GPU_UI_PENDING_FRAME_ID = 0 };
+    // renderd копирует shared stream в private snapshot до первого fence
+    // wait. После возврата run() mailbox снова можно безопасно заменить.
+    if manager.has_runnable_threads() {
+        manager.run()?;
+    }
+    Ok(true)
+}
+
 /// Короткий supervisor tick из bootstrap GUI loop. В норме все graphics
 /// threads blocked и функция ничего не планирует. После user fault пара
 /// полностью reaped/restarted; kernel desktop при этом продолжает работать.
@@ -5407,14 +5533,24 @@ pub(super) fn pump_interactive_services() -> Result<(), ProcessError> {
         // VFS и kernel recovery desktop продолжают работать без displayd.
         return Ok(());
     };
-    if graphics_services_blocked(manager, services) {
-        return Ok(());
-    }
-    if manager.has_runnable_threads() {
-        manager.run()?;
+    // Один idle tick продвигает bounded часть текущего кадра. Когда atomic
+    // present завершён, тут же запускается сохранённый newest mailbox frame.
+    for _ in 0..3 {
         if graphics_services_blocked(manager, services) {
+            let _ = dispatch_pending_system_ui(manager, services)?;
             return Ok(());
         }
+        progress_graphics_once(manager, services)?;
+    }
+    if graphics_services_blocked(manager, services) {
+        let _ = dispatch_pending_system_ui(manager, services)?;
+        return Ok(());
+    }
+    // Busy/blocked на GPU timeline или vblank является нормальным состоянием,
+    // а не поводом убивать три изолированных сервиса. Restart нужен только
+    // после фактического выхода процесса.
+    if !graphics_service_exited(manager, services) {
+        return Ok(());
     }
     let restarts = unsafe { GRAPHICS_RESTARTS };
     if restarts >= 3 {
@@ -5438,10 +5574,89 @@ pub(super) fn pump_interactive_services() -> Result<(), ProcessError> {
     }
     unsafe { INTERACTIVE_GRAPHICS_SERVICES = Some(restarted) };
     unsafe { GRAPHICS_RESTARTS = restarts + 1 };
+    unsafe { GPU_UI_PENDING_FRAME_ID = 0 };
     serial::put_str("[supervisor] display stack restarted count=");
     serial::put_u32(u32::from(restarts + 1));
     serial::put_str("\n");
     Ok(())
+}
+
+/// Публикует один полный SystemUI frame через постоянные ring-3 GPU-сервисы.
+///
+/// Application/Window API остаётся renderer-neutral: сюда попадают уже
+/// физические quads внутреннего backend'а, а не pointers или framebuffer.
+pub(super) fn present_system_ui_gpu(
+    header: GpuUiFrameHeader,
+    quads: &[GpuUiQuad],
+) -> Result<(), ProcessError> {
+    const COMPOSITOR_CONTROL_ENDPOINT: u8 = 6;
+    let services = unsafe { INTERACTIVE_GRAPHICS_SERVICES }
+        .filter(|services| services.render.is_some() && services.ui_stream.is_some())
+        .ok_or(ProcessError::UnexpectedExit)?;
+    if header.validate().is_err()
+        || quads.len() != header.quad_count as usize
+        || quads
+            .iter()
+            .any(|quad| quad.validate(header.width, header.height).is_err())
+        || rustos_abi::gpu::gpu_ui_checksum(quads) != header.checksum
+    {
+        serial::put_str("[system-ui-gpu] reject stage=kernel-validate\n");
+        return Err(ProcessError::UnexpectedExit);
+    }
+    let manager = unsafe { &mut *ptr::addr_of_mut!(MANAGER) };
+    if manager.endpoints[COMPOSITOR_CONTROL_ENDPOINT as usize].receiver != services.compositor
+        || graphics_service_exited(manager, services)
+    {
+        serial::put_str("[system-ui-gpu] reject stage=service-state-before\n");
+        return Err(ProcessError::UnexpectedExit);
+    }
+    let stream = services.ui_stream.ok_or(ProcessError::UnexpectedExit)?;
+    let quad_bytes = unsafe {
+        slice::from_raw_parts(quads.as_ptr().cast::<u8>(), core::mem::size_of_val(quads))
+    };
+    // Сначала payload, затем header: renderd никогда не увидит новый
+    // generation с наполовину записанным массивом.
+    manager
+        .shared
+        .write_bytes(stream, size_of::<GpuUiFrameHeader>() as u64, quad_bytes)
+        .map_err(|_| ProcessError::AddressSpace)?;
+    let header_bytes = unsafe {
+        slice::from_raw_parts(
+            (&header as *const GpuUiFrameHeader).cast::<u8>(),
+            size_of::<GpuUiFrameHeader>(),
+        )
+    };
+    manager
+        .shared
+        .write_bytes(stream, 0, header_bytes)
+        .map_err(|_| ProcessError::AddressSpace)?;
+
+    unsafe { GPU_UI_PENDING_FRAME_ID = header.frame_id };
+    // Один input event делает не более одного шага старого кадра. Если тот
+    // уже завершён, отправляем newest payload; иначе он останется mailbox'ом
+    // и будет подхвачен следующим input/idle tick без накопления latency.
+    if !graphics_services_blocked(manager, services) {
+        progress_graphics_once(manager, services)?;
+    }
+    if graphics_services_blocked(manager, services) {
+        let _ = dispatch_pending_system_ui(manager, services)?;
+    }
+    if graphics_service_exited(manager, services) {
+        serial::put_str("[system-ui-gpu] reject stage=service-exit\n");
+        return Err(ProcessError::UnexpectedExit);
+    }
+    if !unsafe { GPU_UI_FIRST_FRAME_LOGGED } {
+        serial::put_str("[system-ui-gpu] backend=renderd raster=gpu composition=gpu scanout=zero-copy readback=0 cpu-pixels=0 quads=");
+        serial::put_u32(header.quad_count);
+        serial::put_str(" pacing=async-mailbox stale=drop\n");
+        unsafe { GPU_UI_FIRST_FRAME_LOGGED = true };
+    }
+    Ok(())
+}
+
+pub(super) fn system_ui_gpu_available() -> bool {
+    unsafe { INTERACTIVE_GRAPHICS_SERVICES }
+        .is_some_and(|services| services.render.is_some() && services.ui_stream.is_some())
 }
 
 /// Boot-test ломает root supervisor в безопасной точке, чтобы проверить не
@@ -5471,6 +5686,19 @@ pub(super) fn run_gpu_compositor_probe(width: u32, height: u32) -> Result<(), Pr
         .filter(|services| services.render.is_some())
         .ok_or(ProcessError::UnexpectedExit)?;
     let manager = unsafe { &mut *ptr::addr_of_mut!(MANAGER) };
+    // Aurora пока использует совместимый retained-surface readback adapter.
+    // Он не вправе врезаться между renderd и atomic present рабочего стола:
+    // сначала показываем newest UI mailbox и освобождаем общий context.
+    for _ in 0..4096 {
+        if graphics_services_blocked(manager, services) {
+            if unsafe { GPU_UI_PENDING_FRAME_ID } != 0 {
+                let _ = dispatch_pending_system_ui(manager, services)?;
+                continue;
+            }
+            break;
+        }
+        progress_graphics_once(manager, services)?;
+    }
     if manager.endpoints[DEMO_CONTROL_ENDPOINT as usize].receiver != services.compositor
         || !graphics_services_blocked(manager, services)
     {
@@ -5484,7 +5712,15 @@ pub(super) fn run_gpu_compositor_probe(width: u32, height: u32) -> Result<(), Pr
     manager
         .deliver_kernel_control(DEMO_CONTROL_ENDPOINT, message)
         .map_err(|_| ProcessError::UnexpectedExit)?;
-    manager.run()?;
+    if manager.has_runnable_threads() {
+        manager.run()?;
+    }
+    for _ in 0..4096 {
+        if graphics_services_blocked(manager, services) {
+            break;
+        }
+        progress_graphics_once(manager, services)?;
+    }
     if !graphics_services_blocked(manager, services) {
         return Err(ProcessError::UnexpectedExit);
     }
@@ -5904,6 +6140,9 @@ struct GraphicsServices {
     display: ProcessId,
     compositor: ProcessId,
     render: Option<ProcessId>,
+    /// Общая command page, доступная kernel adapter'у на запись и renderd
+    /// только на чтение. Lifetime совпадает с generation renderd.
+    ui_stream: Option<u16>,
 }
 
 /// End-to-end графический data plane: exclusive scanout capability получает
@@ -5970,6 +6209,7 @@ fn spawn_graphics_services(manager: &mut ProcessManager) -> Result<GraphicsServi
     const GPU_FRAME_SLOT: usize = 4;
     const GPU_CONTROL_SLOT: usize = 5;
     const SURFACE_CONTROL_SLOT: usize = 6;
+    const GPU_UI_STREAM_SLOT: usize = 7;
     const GPU_MODE_FLAG: u64 = 1 << 63;
     let use_gpu = scanout::render_info().is_ok();
 
@@ -6039,6 +6279,7 @@ fn spawn_graphics_services(manager: &mut ProcessManager) -> Result<GraphicsServi
     )?;
     manager.endpoints[FEEDBACK_ENDPOINT as usize].receiver = compositor;
     manager.endpoints[SURFACE_CONTROL_ENDPOINT as usize].receiver = compositor;
+    let mut ui_stream = None;
     let render = if use_gpu {
         let mut render_caps = [EMPTY_CAPABILITY; MAX_CAPABILITIES];
         render_caps[DISPLAY_SLOT] = CapabilityEntry {
@@ -6052,6 +6293,16 @@ fn spawn_graphics_services(manager: &mut ProcessManager) -> Result<GraphicsServi
         render_caps[GPU_FRAME_SLOT] = CapabilityEntry {
             kind: CapabilityKind::Endpoint(GPU_CONTROL_ENDPOINT),
             rights: Rights::RECEIVE,
+        };
+        let stream_pages = GPU_UI_STREAM_BYTES.div_ceil(PAGE_SIZE as usize);
+        let stream = manager
+            .shared
+            .create(stream_pages, VmFlags::READ.union(VmFlags::WRITE))
+            .map_err(|_| ProcessError::AddressSpace)?;
+        render_caps[GPU_UI_STREAM_SLOT] = CapabilityEntry {
+            kind: CapabilityKind::SharedMemory(stream),
+            // Renderd не может изменить опубликованный frame.
+            rights: Rights::READ.union(Rights::MAP),
         };
         let render = manager.spawn_internal(
             "system/bin/renderd.rune",
@@ -6070,6 +6321,7 @@ fn spawn_graphics_services(manager: &mut ProcessManager) -> Result<GraphicsServi
         )?;
         manager.endpoints[GPU_FRAME_ENDPOINT as usize].receiver = compositor;
         manager.endpoints[GPU_CONTROL_ENDPOINT as usize].receiver = render;
+        ui_stream = Some(stream);
         Some(render)
     } else {
         None
@@ -6078,6 +6330,7 @@ fn spawn_graphics_services(manager: &mut ProcessManager) -> Result<GraphicsServi
         display,
         compositor,
         render,
+        ui_stream,
     })
 }
 

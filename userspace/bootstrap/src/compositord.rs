@@ -160,6 +160,7 @@ pub extern "C" fn _start(display_endpoint: u64, feedback_endpoint: u64, abi_vers
                 frame_id,
                 Some(request.first_frame),
                 compositor_probe,
+                false,
             );
             wait_prepared(frame);
             discard_frame(frame);
@@ -447,7 +448,14 @@ fn present_swapchain(
             };
             *frame_id = frame_id.saturating_add(1);
             let scene = request.first_frame.saturating_add(submitted);
-            let prepared = prepare_gpu_frame(width, height, *frame_id, Some(scene), false);
+            let prepared = prepare_gpu_frame(
+                width,
+                height,
+                *frame_id,
+                Some(scene),
+                false,
+                request.flags & demo_flag::SYSTEM_UI != 0,
+            );
             queue
                 .publish(slot, *frame_id, prepared)
                 .unwrap_or_else(|_| process_exit(206));
@@ -647,13 +655,16 @@ fn prepare_gpu_frame(
     frame_id: u64,
     scene_frame: Option<u32>,
     compositor_probe: bool,
+    system_ui: bool,
 ) -> PreparedFrame {
-    let request = match (compositor_probe, scene_frame) {
-        (true, _) => GpuRenderFrame::compositor_probe_request(width, height, frame_id),
-        (false, Some(scene_frame)) => {
+    let request = match (system_ui, compositor_probe, scene_frame) {
+        (true, false, _) => GpuRenderFrame::system_ui_request(width, height, frame_id),
+        (false, true, _) => GpuRenderFrame::compositor_probe_request(width, height, frame_id),
+        (false, false, Some(scene_frame)) => {
             GpuRenderFrame::aurora_request(width, height, frame_id, scene_frame)
         }
-        (false, None) => GpuRenderFrame::request(width, height, frame_id),
+        (false, false, None) => GpuRenderFrame::request(width, height, frame_id),
+        (true, true, _) => process_exit(203),
     };
     let mut message = Message::EMPTY;
     message.header.opcode = GPU_RENDER_REQUEST_OPCODE;

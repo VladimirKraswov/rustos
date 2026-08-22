@@ -8,4 +8,5 @@
 //! приложения начали бы зависеть от framebuffer и дублировать SystemUI.
 mod chrome;
 mod cursor;
+pub(crate) mod gpu_scene;
 pub mod session;

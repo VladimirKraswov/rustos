@@ -79,10 +79,13 @@ scanout и обеспечивает runtime mode-set.
 ### Ускоренный профиль Apple Silicon
 
 `make run` на Apple Silicon эквивалентен `make run-utm-gpu`. Скрипт создаёт
-VM **RustOS GPU Development** через AppleScript API UTM, использует HVF и
+VM **RustOS-GPU-Development** через AppleScript API UTM, использует HVF и
 подключает `virtio-gpu-gl-device`. UTM передаёт VirGL в virglrenderer, а затем
-в ANGLE/Metal. Образы из `build/` подключаются напрямую и не копируются в
-скрытый каталог VM.
+в ANGLE/Metal. Из-за sandbox UTM скрипт атомарно обновляет native raw drives
+внутри bundle VM из образов `build/arm/esp-arm.img` и
+`build/arm-system.vfs`. Перед следующей сборкой изменённый гостем
+системный диск синхронизируется обратно в `build/`, поэтому файлы RustOS не
+теряются между запусками.
 
 ```sh
 brew install --cask utm  # один раз

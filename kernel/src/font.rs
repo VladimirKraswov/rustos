@@ -310,7 +310,8 @@ fn draw_char_clipped(
         } else {
             0
         };
-        for target_x in 0..target_width {
+        let mut target_x = 0;
+        while target_x < target_width {
             let coverage = resampled_coverage(
                 &bitmap,
                 source_width,
@@ -320,9 +321,26 @@ fn draw_char_clipped(
                 target_x as usize,
                 target_y as usize,
             );
-            if coverage != 0 && clip.contains(origin_x + target_x + shear, screen_y) {
-                fb.blend_pixel(origin_x + target_x + shear, screen_y, color, coverage);
+            let mut run_end = target_x + 1;
+            while run_end < target_width
+                && resampled_coverage(
+                    &bitmap,
+                    source_width,
+                    source_height,
+                    target_width as usize,
+                    target_height as usize,
+                    run_end as usize,
+                    target_y as usize,
+                ) == coverage
+            {
+                run_end += 1;
             }
+            let first = (origin_x + target_x + shear).max(clip.x);
+            let last = (origin_x + run_end + shear).min(clip.right());
+            if coverage != 0 && clip.contains(first, screen_y) && first < last {
+                fb.blend_span(first, screen_y, (last - first) as u32, color, coverage);
+            }
+            target_x = run_end;
         }
     }
     character_advance(character, style)
@@ -436,7 +454,8 @@ fn draw_cyrillic(
         } else {
             0
         };
-        for target_x in 0..target_width {
+        let mut target_x = 0;
+        while target_x < target_width {
             let coverage = resampled_coverage(
                 &bitmap,
                 source_width,
@@ -446,14 +465,26 @@ fn draw_cyrillic(
                 target_x,
                 target_y,
             );
-            if coverage != 0 && clip.contains(origin_x + target_x as i32 + shear, screen_y) {
-                framebuffer.blend_pixel(
-                    origin_x + target_x as i32 + shear,
-                    screen_y,
-                    color,
-                    coverage,
-                );
+            let mut run_end = target_x + 1;
+            while run_end < target_width
+                && resampled_coverage(
+                    &bitmap,
+                    source_width,
+                    source_height,
+                    target_width,
+                    target_height,
+                    run_end,
+                    target_y,
+                ) == coverage
+            {
+                run_end += 1;
             }
+            let first = (origin_x + target_x as i32 + shear).max(clip.x);
+            let last = (origin_x + run_end as i32 + shear).min(clip.right());
+            if coverage != 0 && clip.contains(first, screen_y) && first < last {
+                framebuffer.blend_span(first, screen_y, (last - first) as u32, color, coverage);
+            }
+            target_x = run_end;
         }
     }
     if style.family == FontFamily::Console {

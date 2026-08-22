@@ -66,11 +66,11 @@ application state ─> typed updates ─> invalidation + layout
                                          │
                       ┌──────────────────┼──────────────────┐
                       ▼                  ▼                  ▼
-                 CPU backend       future GPU          headless
+                 GPU backend       CPU fallback        headless
                       │                  │                  │
-                   surface         command buffers      snapshots
+                command batches       surface           snapshots
                       │
-                 displayd/window surface
+                renderd/compositord/displayd
 ```
 
 Выбран retained component tree и renderer-neutral display list. Immediate-mode
@@ -191,7 +191,7 @@ Column, Stack, Grid, resize окна и container breakpoint. Breakpoint зав�
 `device_scale_milli`. Например, поверхность 2048×1280 при scale 1600 даёт
 layout 1280×800; кнопка шириной 120 logical units растрируется сразу в 192
 physical pixels. Compositor получает эту поверхность в её настоящем размере и
-копирует `1:1`, поэтому готовый bitmap никогда не интерполируется.
+показывает `1:1`, поэтому готовый bitmap никогда не интерполируется.
 
 `Theme::scale_milli` имеет другое назначение: это выбранное пользователем
 accessibility-увеличение компонентов. Смешивать его с DPI нельзя, иначе смена
@@ -209,7 +209,14 @@ worker над immutable snapshot.
 CPU, GPU, remote или headless target; backend без curved/shadow acceleration
 имеет корректный прямоугольный/no-op fallback.
 
-CPU backend использует целочисленную геометрию: середина rounded surface
+В штатном сеансе renderer-neutral display list записывается как bounded GPU
+scene и через shared-memory mailbox передаётся постоянному ring-3 `renderd`.
+VirGL растеризует сцену в scanout-compatible `GraphicsBuffer`; compositor не
+делает readback, а устаревшие кадры заменяются newest frame. Эта замена backend
+не видна приложению и не меняет component API.
+
+Recovery CPU backend использует целочисленную геометрию: середина rounded
+surface
 заливается быстрыми span-ами, а 4×4 coverage рассчитывается только для
 небольших corner tiles. Так curves checkbox/toggle/card не имеют ступенек и
 не требуют supersampling полной поверхности. Тень карточки — одна смещённая

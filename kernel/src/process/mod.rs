@@ -217,6 +217,19 @@ pub fn pump_interactive_services() -> Result<(), ProcessError> {
     manager::pump_interactive_services()
 }
 
+/// Отправляет renderer-neutral SystemUI frame постоянному ring-3 renderd.
+pub fn present_system_ui_gpu(
+    header: rustos_abi::gpu::GpuUiFrameHeader,
+    quads: &[rustos_abi::gpu::GpuUiQuad],
+) -> Result<(), ProcessError> {
+    manager::present_system_ui_gpu(header, quads)
+}
+
+/// Доступен ли аппаратный SystemUI backend текущего service generation.
+pub fn system_ui_gpu_available() -> bool {
+    manager::system_ui_gpu_available()
+}
+
 /// Намеренно завершает root supervisor для проверки его bounded recovery.
 #[cfg(feature = "boot-test")]
 pub fn exercise_interactive_supervisor_restart() -> Result<(), ProcessError> {

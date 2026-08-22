@@ -60,6 +60,10 @@ const POLL_LIMIT: usize = 50_000_000;
 // Совпадает с PCI transport: девять 2D present-команд и три render кадра не
 // должны занимать slots, нужные bounded display/control операциям.
 const COMMAND_SLOTS: usize = 16;
+// Совпадает с PCI transport: command ABI не должен зависеть от шины.
+const REQUEST_BYTES: usize = rustos_abi::gpu::GPU_MAX_COMMAND_BYTES as usize + 4096;
+const RESPONSE_BYTES: usize = 4096;
+const SLOT_BYTES: usize = REQUEST_BYTES + RESPONSE_BYTES;
 /// Cursor move/update не имеют response descriptor. Четыре request slot дают
 /// mouse producer'у опубликовать новую позицию, пока device завершает старую.
 const CURSOR_SLOTS: usize = 4;
@@ -180,7 +184,12 @@ impl ModernMmioTransport {
         let queue = memory::allocate(queue_bytes.div_ceil(4096), 1)
             .map_err(|_| TransportError::OutOfMemory)?;
         let slot_count = (usize::from(queue_size) / 2).min(COMMAND_SLOTS);
-        let dma = match memory::allocate((slot_count * 2) as u64, 1) {
+        let dma = match memory::allocate(
+            u64::try_from(slot_count * SLOT_BYTES)
+                .unwrap_or(u64::MAX)
+                .div_ceil(4096),
+            1,
+        ) {
             Ok(block) => block,
             Err(_) => {
                 let _ = memory::free(queue);
@@ -190,7 +199,7 @@ impl ModernMmioTransport {
         };
         unsafe {
             ptr::write_bytes(queue.phys as *mut u8, 0, (queue.frames * 4096) as usize);
-            ptr::write_bytes(dma.phys as *mut u8, 0, slot_count * 8192);
+            ptr::write_bytes(dma.phys as *mut u8, 0, slot_count * SLOT_BYTES);
         }
         write32(base, REG_QUEUE_NUM, u32::from(queue_size));
         write_address(base, REG_QUEUE_DESC_LOW, queue.phys);
@@ -327,7 +336,11 @@ impl ModernMmioTransport {
     ) -> Result<Response, TransportError> {
         let request_size = mem::size_of::<Request>();
         let response_size = mem::size_of::<Response>();
-        if request_size == 0 || request_size > 4096 || response_size == 0 || response_size > 4096 {
+        if request_size == 0
+            || request_size > REQUEST_BYTES
+            || response_size == 0
+            || response_size > RESPONSE_BYTES
+        {
             return Err(TransportError::InvalidConfiguration);
         }
         let request_bytes = unsafe {
@@ -364,7 +377,10 @@ impl ModernMmioTransport {
             .len()
             .checked_add(payload.len())
             .ok_or(TransportError::InvalidConfiguration)?;
-        if request_size == 0 || request_size > 4096 || !(24..=4096).contains(&response_size) {
+        if request_size == 0
+            || request_size > REQUEST_BYTES
+            || !(24..=RESPONSE_BYTES).contains(&response_size)
+        {
             return Err(TransportError::InvalidConfiguration);
         }
         self.poll_used()?;
@@ -375,8 +391,8 @@ impl ModernMmioTransport {
         let request_address = self.request_address(index);
         let response_address = self.response_address(index);
         unsafe {
-            ptr::write_bytes(request_address as *mut u8, 0, 4096);
-            ptr::write_bytes(response_address as *mut u8, 0, 4096);
+            ptr::write_bytes(request_address as *mut u8, 0, request_size);
+            ptr::write_bytes(response_address as *mut u8, 0, response_size);
             ptr::copy_nonoverlapping(prefix.as_ptr(), request_address as *mut u8, prefix.len());
             ptr::copy_nonoverlapping(
                 payload.as_ptr(),
@@ -504,11 +520,11 @@ impl ModernMmioTransport {
     }
 
     fn request_address(&self, index: usize) -> u64 {
-        self.dma.phys + index as u64 * 8192
+        self.dma.phys + index as u64 * SLOT_BYTES as u64
     }
 
     fn response_address(&self, index: usize) -> u64 {
-        self.request_address(index) + 4096
+        self.request_address(index) + REQUEST_BYTES as u64
     }
 
     fn release_slot(&mut self, index: usize) {

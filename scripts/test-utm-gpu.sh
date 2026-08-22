@@ -3,7 +3,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-VM_NAME="${RUSTOS_UTM_VM_NAME:-RustOS GPU Development}"
+VM_NAME="${RUSTOS_UTM_VM_NAME:-RustOS-GPU-Development}"
 RESULT_DIR="$ROOT/build/test-results/utm-gpu"
 SERIAL_LOG="$RESULT_DIR/serial.log"
 TIMEOUT_SECONDS="${RUSTOS_UTM_GPU_TIMEOUT:-240}"

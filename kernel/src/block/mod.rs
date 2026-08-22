@@ -6,7 +6,8 @@
 //! ABI переедет в `virtioblkd`, а kernel оставит IOMMU/IRQ primitives.
 
 // Конкретный транспорт выбирается на границе платформы: legacy PCI на
-// эталонном x86 QEMU и modern virtio-mmio на QEMU `virt` AArch64.
+// эталонном x86 QEMU; AArch64 принимает modern virtio-mmio (обычный QEMU)
+// и modern virtio-pci (нативные UTM drives).
 #[derive(Clone, Copy, Debug)]
 pub enum BlockError {
     Unsupported,
@@ -27,7 +28,12 @@ pub struct BlockInfo {
 mod platform;
 
 #[cfg(target_arch = "aarch64")]
-#[path = "virtio_mmio.rs"]
+mod virtio_mmio;
+#[cfg(target_arch = "aarch64")]
+mod virtio_pci;
+
+#[cfg(target_arch = "aarch64")]
+#[path = "platform_aarch64.rs"]
 mod platform;
 
 pub use platform::{flush, info, initialize, read_block, write_block};

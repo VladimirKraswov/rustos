@@ -78,7 +78,7 @@ const DISPLAY_MODE_CAPACITY: usize = 48;
 const INCREMENTAL_DAMAGE_CAPACITY: usize = 64;
 
 pub fn run(info: &BootInfo) -> ! {
-    let Some(framebuffer) = Framebuffer::from_boot(info) else {
+    let Some(mut framebuffer) = Framebuffer::from_boot(info) else {
         serial::put_str("[gui] no supported framebuffer/back buffer; system halted\n");
         loop {
             arch::halt();
@@ -124,6 +124,18 @@ pub fn run(info: &BootInfo) -> ! {
         "[font] families=console,sans scripts=latin,cyrillic styles=regular,bold,italic sizes=10..48\n",
     );
     serial::put_str("[ui] constructing independent application sessions\n");
+    // Наличие отдельной cursor plane не является условием GPU desktop.
+    // Если устройство её не даёт, тот же cursor рисуется как обычная часть
+    // GPU scene; CPU recovery нужен только при потере renderer'а.
+    let gpu_ui = process::system_ui_gpu_available();
+    framebuffer.set_gpu_recording(gpu_ui);
+    serial::put_str("[system-ui] selected-backend=");
+    serial::put_str(if gpu_ui {
+        "gpu-renderd"
+    } else {
+        "cpu-recovery"
+    });
+    serial::put_str(" app-api=renderer-neutral\n");
     let mut session = DesktopSession::new(
         framebuffer,
         info.total_usable_ram() / (1024 * 1024),
@@ -546,6 +558,21 @@ impl DesktopSession {
                     }
                 };
 
+                if self.framebuffer.gpu_recording() {
+                    if matches!(redraw, Redraw::None)
+                        && self.framebuffer.hardware_cursor_supported()
+                    {
+                        // Hardware cursor plane двигается независимо от frame
+                        // и не заставляет перерисовывать desktop.
+                        self.cursor
+                            .draw(&mut self.framebuffer, self.mouse_x, self.mouse_y);
+                    } else if !self.render_gpu_frame() {
+                        self.activate_cpu_recovery("render-service-failure");
+                    }
+                    self.dispatch_window_events();
+                    continue;
+                }
+
                 let mut terminal_line = None;
                 let mut incremental_damage = None;
                 let mut drag_cached = false;
@@ -693,6 +720,13 @@ impl DesktopSession {
                 // frame раньше ожидающего mouse/key event и тем самым делать
                 // desktop неуправляемым при просадке частоты кадров.
                 if let Some(window) = self.tick_animated_application(now_ms) {
+                    if self.framebuffer.gpu_recording() {
+                        let _ = window;
+                        if !self.render_gpu_frame() {
+                            self.activate_cpu_recovery("animation-submit-failure");
+                        }
+                        continue;
+                    }
                     let old_cursor = self.cursor.rect();
                     self.cursor.restore(&mut self.framebuffer);
                     let mut damage = self.render_application_incremental(window);
@@ -704,6 +738,12 @@ impl DesktopSession {
                     continue;
                 }
                 if self.shell.update_clock(now_ms) {
+                    if self.framebuffer.gpu_recording() {
+                        if !self.render_gpu_frame() {
+                            self.activate_cpu_recovery("clock-submit-failure");
+                        }
+                        continue;
+                    }
                     let old_cursor = self.cursor.rect();
                     self.cursor.restore(&mut self.framebuffer);
                     self.render_taskbar();
@@ -728,6 +768,15 @@ impl DesktopSession {
                     continue;
                 }
                 if self.cursor.animate(now_ms) {
+                    if self.framebuffer.gpu_recording() {
+                        if self.framebuffer.hardware_cursor_supported() {
+                            self.cursor
+                                .draw(&mut self.framebuffer, self.mouse_x, self.mouse_y);
+                        } else if !self.render_gpu_frame() {
+                            self.activate_cpu_recovery("cursor-submit-failure");
+                        }
+                        continue;
+                    }
                     let old_cursor = self.cursor.rect();
                     self.cursor.restore(&mut self.framebuffer);
                     self.cursor
@@ -2360,6 +2409,44 @@ impl DesktopSession {
     }
 
     fn render_all(&mut self) {
+        if self.framebuffer.gpu_recording() {
+            if self.render_gpu_frame() {
+                return;
+            }
+            self.activate_cpu_recovery("initial-frame-failure");
+            return;
+        }
+        self.render_scene();
+        self.cursor
+            .draw(&mut self.framebuffer, self.mouse_x, self.mouse_y);
+        self.framebuffer.present();
+    }
+
+    fn render_gpu_frame(&mut self) -> bool {
+        crate::gui::gpu_scene::begin(self.framebuffer.width(), self.framebuffer.height());
+        self.render_scene();
+        self.cursor
+            .draw(&mut self.framebuffer, self.mouse_x, self.mouse_y);
+        let Some((header, quads)) = crate::gui::gpu_scene::finish() else {
+            serial::put_str("[system-ui-gpu] frame rejected reason=command-capacity\n");
+            return false;
+        };
+        match process::present_system_ui_gpu(header, quads) {
+            Ok(()) => true,
+            Err(error) => {
+                serial::put_str("[system-ui-gpu] submit failed reason=");
+                serial::put_str(error.label());
+                serial::put_str("\n");
+                false
+            }
+        }
+    }
+
+    fn activate_cpu_recovery(&mut self, reason: &str) {
+        self.framebuffer.set_gpu_recording(false);
+        serial::put_str("[system-ui] fallback=cpu reason=");
+        serial::put_str(reason);
+        serial::put_str("\n");
         self.render_scene();
         self.cursor
             .draw(&mut self.framebuffer, self.mouse_x, self.mouse_y);

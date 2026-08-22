@@ -177,7 +177,10 @@ pub fn encode_composite_pass(
     damage: BlitRect,
     layers: &[CompositeLayer],
 ) -> Result<usize, EncodeError> {
-    const MAX_LAYERS_PER_BATCH: usize = 32;
+    // 512 BLIT records занимают ~44 KiB и укладываются в negotiated 60 KiB
+    // transport. Большой batch критичен для UI: один fence обслуживает сотни
+    // spans, а не каждые несколько букв отдельно.
+    const MAX_LAYERS_PER_BATCH: usize = 512;
     if target_resource == 0
         || target_width == 0
         || target_height == 0
@@ -337,6 +340,7 @@ pub fn encode_mesh(
         1,
         true,
         true,
+        true,
     )
 }
 
@@ -363,6 +367,7 @@ pub fn encode_mesh_update(
         1,
         false,
         false,
+        true,
     )
 }
 
@@ -382,7 +387,41 @@ pub fn encode_mesh_swapchain(
     initialize_surface: bool,
     initialize_pipeline: bool,
 ) -> Result<usize, EncodeError> {
-    if !matches!(surface_handle, 1 | 8 | 9) {
+    encode_mesh_swapchain_pass(
+        output,
+        width,
+        height,
+        color_resource,
+        vertex_resource,
+        vertices,
+        clear,
+        surface_handle,
+        initialize_surface,
+        initialize_pipeline,
+        true,
+    )
+}
+
+/// Вариант swapchain encoder для нескольких ordered batches одного кадра.
+/// Только первый batch передаёт `clear_target=true`; остальные сохраняют уже
+/// нарисованные primitives и дополняют тот же render target.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_mesh_swapchain_pass(
+    output: &mut [u32],
+    width: u32,
+    height: u32,
+    color_resource: u32,
+    vertex_resource: u32,
+    vertices: &[Vertex],
+    clear: [f32; 4],
+    surface_handle: u32,
+    initialize_surface: bool,
+    initialize_pipeline: bool,
+    clear_target: bool,
+) -> Result<usize, EncodeError> {
+    // 2..=7 заняты immutable pipeline objects. Остальные bounded handles
+    // позволяют одному context держать независимые desktop и app surfaces.
+    if surface_handle == 0 || (2..=7).contains(&surface_handle) || surface_handle > 63 {
         return Err(EncodeError::InvalidExtent);
     }
     encode_mesh_with_pipeline(
@@ -396,6 +435,7 @@ pub fn encode_mesh_swapchain(
         surface_handle,
         initialize_surface,
         initialize_pipeline,
+        clear_target,
     )
 }
 
@@ -411,11 +451,12 @@ fn encode_mesh_with_pipeline(
     surface_handle: u32,
     initialize_surface: bool,
     initialize_pipeline: bool,
+    clear_target: bool,
 ) -> Result<usize, EncodeError> {
     if width == 0 || height == 0 || width > 16_384 || height > 16_384 {
         return Err(EncodeError::InvalidExtent);
     }
-    if vertices.is_empty() || !vertices.len().is_multiple_of(3) || vertices.len() > 48 {
+    if vertices.is_empty() || !vertices.len().is_multiple_of(3) || vertices.len() > 16_320 {
         return Err(EncodeError::InvalidVertexCount);
     }
     let mut encoder = Encoder::new(output);
@@ -432,17 +473,19 @@ fn encode_mesh_with_pipeline(
     encoder.words(&[1, 0, surface_handle])?;
 
     // Фон очищает host 3D renderer. Guest CPU не пишет ни одного пикселя.
-    encoder.command(CCMD_CLEAR, 0, 8)?;
-    encoder.words(&[
-        CLEAR_COLOR0,
-        clear[0].to_bits(),
-        clear[1].to_bits(),
-        clear[2].to_bits(),
-        clear[3].to_bits(),
-        0,
-        0,
-        0,
-    ])?;
+    if clear_target {
+        encoder.command(CCMD_CLEAR, 0, 8)?;
+        encoder.words(&[
+            CLEAR_COLOR0,
+            clear[0].to_bits(),
+            clear[1].to_bits(),
+            clear[2].to_bits(),
+            clear[3].to_bits(),
+            0,
+            0,
+            0,
+        ])?;
+    }
 
     // Две RGBA32F вершины на vertex: position и interpolated color.
     if initialize_pipeline {
@@ -464,27 +507,36 @@ fn encode_mesh_with_pipeline(
 
     // Inline-write передаёт только 3D vertex input. Это не rasterization:
     // покрытие, интерполяцию и запись framebuffer выполняет VirGL renderer.
-    let vertex_bytes =
-        u32::try_from(core::mem::size_of_val(vertices)).map_err(|_| EncodeError::BufferTooSmall)?;
-    let vertex_dwords =
-        u16::try_from(vertices.len() * 8).map_err(|_| EncodeError::BufferTooSmall)?;
-    encoder.command(CCMD_RESOURCE_INLINE_WRITE, 0, 11 + vertex_dwords)?;
-    encoder.words(&[
-        vertex_resource,
-        0,
-        0,
-        vertex_bytes,
-        0,
-        0,
-        0,
-        0,
-        vertex_bytes,
-        1,
-        1,
-    ])?;
-    for vertex in vertices {
-        for component in vertex.position.into_iter().chain(vertex.color) {
-            encoder.word(component.to_bits())?;
+    // Длина одной VirGL-команды кодируется u16 dwords. Большой UI batch
+    // поэтому загружается несколькими последовательными box writes в один
+    // VBO, а DRAW_VBO остаётся единственным. Контекст гарантирует порядок:
+    // GPU не увидит частично заполненный vertex buffer.
+    const MAX_INLINE_VERTICES: usize = 8_000;
+    for (chunk_index, chunk) in vertices.chunks(MAX_INLINE_VERTICES).enumerate() {
+        let chunk_dwords =
+            u16::try_from(chunk.len() * 8).map_err(|_| EncodeError::BufferTooSmall)?;
+        let byte_offset = u32::try_from(chunk_index * MAX_INLINE_VERTICES * 32)
+            .map_err(|_| EncodeError::BufferTooSmall)?;
+        let chunk_bytes = u32::try_from(core::mem::size_of_val(chunk))
+            .map_err(|_| EncodeError::BufferTooSmall)?;
+        encoder.command(CCMD_RESOURCE_INLINE_WRITE, 0, 11 + chunk_dwords)?;
+        encoder.words(&[
+            vertex_resource,
+            0,
+            0,
+            chunk_bytes,
+            0,
+            byte_offset,
+            0,
+            0,
+            chunk_bytes,
+            1,
+            1,
+        ])?;
+        for vertex in chunk {
+            for component in vertex.position.into_iter().chain(vertex.color) {
+                encoder.word(component.to_bits())?;
+            }
         }
     }
     encoder.command(CCMD_SET_VERTEX_BUFFERS, 0, 3)?;
@@ -498,7 +550,11 @@ fn encode_mesh_with_pipeline(
 
         // Стандартные immutable pipeline states из reference virglrenderer test.
         encoder.command(CCMD_CREATE_OBJECT, OBJECT_BLEND, 11)?;
-        encoder.words(&[5, 0, 0, 0x7800_0000, 0, 0, 0, 0, 0, 0, 0])?;
+        // Premultiplied alpha: src=ONE, dst=ONE_MINUS_SRC_ALPHA для RGB и
+        // alpha, ADD, RGBA colormask. Ранее здесь был только colormask
+        // 0x7800_0000 с выключенным blend_enable — именно поэтому AA coverage
+        // шрифта превращался в чёрные контуры на GPU desktop.
+        encoder.words(&[5, 0, 0, 0x7cc2_2611, 0, 0, 0, 0, 0, 0, 0])?;
         encoder.command(CCMD_BIND_OBJECT, OBJECT_BLEND, 1)?;
         encoder.word(5)?;
 
@@ -722,7 +778,7 @@ mod tests {
             ),
             Err(EncodeError::InvalidExtent)
         );
-        let layers = [layer; 33];
+        let layers = [layer; 513];
         assert_eq!(
             encode_composite_pass(
                 &mut words,

@@ -47,6 +47,7 @@ pub struct Context {
     pipeline_initialized: bool,
     surface_resources: [u32; 3],
     surface_initialized: [bool; 3],
+    surface_handles: [u32; 3],
     surface_count: usize,
 }
 
@@ -68,8 +69,37 @@ impl Context {
             pipeline_initialized: false,
             surface_resources: [surface.color_resource, 0, 0],
             surface_initialized: [false; 3],
+            surface_handles: [1, 8, 9],
             surface_count: 1,
         })
+    }
+
+    /// Выбирает отдельное пространство surface objects и при необходимости
+    /// подхватывает immutable color pipeline, уже созданный UI renderer'ом в
+    /// том же изолированном VirGL context.
+    ///
+    /// Это не публичный OpenGL API: renderd использует метод только при смене
+    /// SystemUI frame на Aurora scene. Повторное CREATE_OBJECT с теми же
+    /// handles было бы protocol error; общая vertex-color pipeline полностью
+    /// подходит непрозрачной 3D mesh.
+    pub fn configure_shared_pipeline(
+        &mut self,
+        surface_handles: [u32; 3],
+        pipeline_initialized: bool,
+    ) -> Result<(), MesaError> {
+        if surface_handles.contains(&0)
+            || surface_handles[0] == surface_handles[1]
+            || surface_handles[0] == surface_handles[2]
+            || surface_handles[1] == surface_handles[2]
+            || surface_handles
+                .iter()
+                .any(|handle| (2..=7).contains(handle))
+        {
+            return Err(MesaError::InvalidSurface);
+        }
+        self.surface_handles = surface_handles;
+        self.pipeline_initialized = pipeline_initialized;
+        Ok(())
     }
 
     /// Выбирает один из трёх swapchain render target. Регистрация четвёртого
@@ -110,7 +140,7 @@ impl Context {
             .iter()
             .position(|resource| *resource == self.surface.color_resource)
             .ok_or(MesaError::InvalidSurface)?;
-        let surface_handle = [1, 8, 9][surface_index];
+        let surface_handle = self.surface_handles[surface_index];
         let initialize_surface = !self.surface_initialized[surface_index];
         let result = encode_mesh_swapchain(
             commands,

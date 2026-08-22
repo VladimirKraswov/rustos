@@ -1433,6 +1433,8 @@ fn take_firmware_ownership(mmio: u64, hcc1: u32) -> Result<(), UsbError> {
 
 #[derive(Clone, Copy)]
 struct PciFunction {
+    #[cfg(target_arch = "aarch64")]
+    ecam: u64,
     bus: u8,
     slot: u8,
     function: u8,
@@ -1464,28 +1466,48 @@ impl PciFunction {
 }
 
 fn discover_xhci() -> Option<u64> {
-    for slot in 0..32 {
-        for function in 0..8 {
-            let pci = PciFunction {
-                bus: 0,
-                slot,
-                function,
-            };
-            let id = pci.read_u32(0);
-            if id == u32::MAX || id as u16 == 0xffff {
-                if function == 0 {
-                    break;
+    #[cfg(target_arch = "x86_64")]
+    const ECAM_BASES: &[u64] = &[0];
+    #[cfg(target_arch = "aarch64")]
+    const ECAM_BASES: &[u64] = &[0x3f00_0000, 0x0040_1000_0000];
+
+    for &ecam in ECAM_BASES {
+        #[cfg(target_arch = "x86_64")]
+        let _ = ecam;
+        // У QEMU `virt` PCI host bridge публикуется ровно в одном из этих
+        // окон. После первого валидного PCI function нельзя пробовать второе
+        // окно вслепую: чтение отсутствующего ECAM на AArch64 вызывает
+        // synchronous external abort, а не возвращает привычное 0xffff_ffff.
+        let mut window_present = false;
+        for slot in 0..32 {
+            for function in 0..8 {
+                let pci = PciFunction {
+                    #[cfg(target_arch = "aarch64")]
+                    ecam,
+                    bus: 0,
+                    slot,
+                    function,
+                };
+                let id = pci.read_u32(0);
+                if id == u32::MAX || id as u16 == 0xffff {
+                    if function == 0 {
+                        break;
+                    }
+                    continue;
                 }
-                continue;
+                window_present = true;
+                let class = pci.read_u32(0x08);
+                if class >> 8 != 0x000c_0330 {
+                    continue;
+                }
+                let command = pci.read_u32(0x04);
+                // MMIO + bus mastering; status bits нельзя записывать обратно.
+                pci.write_u32(0x04, (command & 0xffff) | 0x0000_0006);
+                return pci.bar0();
             }
-            let class = pci.read_u32(0x08);
-            if class >> 8 != 0x000c_0330 {
-                continue;
-            }
-            let command = pci.read_u32(0x04);
-            // MMIO + bus mastering; status bits нельзя записывать обратно.
-            pci.write_u32(0x04, (command & 0xffff) | 0x0000_0006);
-            return pci.bar0();
+        }
+        if window_present {
+            break;
         }
     }
     None
@@ -1519,10 +1541,9 @@ fn pci_write(function: PciFunction, offset: u16, value: u32) {
 
 #[cfg(target_arch = "aarch64")]
 fn pci_read(function: PciFunction, offset: u16) -> u32 {
-    // QEMU `virt` публикует 16-MiB low ECAM по 0x3f00_0000. Нам пока нужен
-    // только bus 0; platformd позднее заменит константу данными из DT/ACPI.
-    const QEMU_VIRT_ECAM: u64 = 0x3f00_0000;
-    let address = QEMU_VIRT_ECAM
+    // QEMU `virt` может публиковать compact low ECAM или 256-MiB high ECAM.
+    // Конкретное окно уже выбрано bounded discovery выше.
+    let address = function.ecam
         + (u64::from(function.bus) << 20)
         + (u64::from(function.slot) << 15)
         + (u64::from(function.function) << 12)
@@ -1532,8 +1553,7 @@ fn pci_read(function: PciFunction, offset: u16) -> u32 {
 
 #[cfg(target_arch = "aarch64")]
 fn pci_write(function: PciFunction, offset: u16, value: u32) {
-    const QEMU_VIRT_ECAM: u64 = 0x3f00_0000;
-    let address = QEMU_VIRT_ECAM
+    let address = function.ecam
         + (u64::from(function.bus) << 20)
         + (u64::from(function.slot) << 15)
         + (u64::from(function.function) << 12)

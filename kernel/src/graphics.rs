@@ -1,9 +1,9 @@
-//! Software renderer поверх virtio-gpu либо GRUB/firmware framebuffer.
+//! Renderer facade поверх GPU SystemUI либо GRUB/firmware CPU framebuffer.
 //!
-//! Все примитивы рисуются CPU в обычный RAM back buffer. Virtio-gpu получает
-//! только damage через 2D transfer/flush; firmware fallback — готовые строки
-//! scanout. Благодаря этому пользователь не видит промежуточные стадии кадра,
-//! а mode-set не связан с rasterizer'ом или оконными компонентами.
+//! При доступном VirGL те же безопасные методы записывают renderer-neutral
+//! quads для ring-3 `renderd`: rasterization, blend и scanout не обходят GPU.
+//! При отсутствии/падении GPU facade переключается на обычный RAM back buffer
+//! и firmware/virtio 2D present без изменения кода приложений.
 //!
 //! В одном месте сосредоточены unsafe-доступы к framebuffer, выбор памяти,
 //! clipping и упаковка RGB/BGR — остальная GUI-подсистема работает обычным
@@ -68,6 +68,8 @@ pub struct Framebuffer {
     source: u32,
     present_sequence: u64,
     present_failure_logged: bool,
+    /// Transitional kernel adapter записывает UI-команды вместо CPU pixels.
+    gpu_recording: bool,
 }
 
 impl Framebuffer {
@@ -191,7 +193,18 @@ impl Framebuffer {
             source: info._reserved,
             present_sequence: 0,
             present_failure_logged: false,
+            gpu_recording: false,
         })
+    }
+
+    /// Переключает только системный backend; API приложений не меняется.
+    pub fn set_gpu_recording(&mut self, enabled: bool) {
+        self.gpu_recording = enabled;
+    }
+
+    /// Активен ли штатный GPU SystemUI backend.
+    pub const fn gpu_recording(&self) -> bool {
+        self.gpu_recording
     }
 
     /// Ширина кадра в пикселях (из monitor mode).
@@ -368,6 +381,10 @@ impl Framebuffer {
 
     /// Ставит один пиксель в back buffer; точки вне кадра молча отбрасываются.
     pub fn put_pixel(&mut self, x: i32, y: i32, color: Color) {
+        if self.gpu_recording {
+            crate::gui::gpu_scene::solid(Rect::new(x, y, 1, 1), color, u8::MAX);
+            return;
+        }
         if x < 0 || y < 0 || x >= self.width as i32 || y >= self.height as i32 {
             return;
         }
@@ -384,6 +401,10 @@ impl Framebuffer {
         source_height: u32,
         destination: Rect,
     ) {
+        if self.gpu_recording {
+            self.record_bgrx_mesh(source, source_width, source_height, destination);
+            return;
+        }
         if source_width == 0
             || source_height == 0
             || destination.is_empty()
@@ -453,6 +474,57 @@ impl Framebuffer {
         }
     }
 
+    /// Представляет bitmap как небольшую сетку GPU-gradient quads. Это
+    /// recovery bridge для legacy Canvas pixels (включая раннюю Aurora 3D):
+    /// CPU только читает редкие control points, но не растеризует destination.
+    fn record_bgrx_mesh(
+        &mut self,
+        source: &[u32],
+        source_width: u32,
+        source_height: u32,
+        destination: Rect,
+    ) {
+        if source_width == 0 || source_height == 0 || destination.is_empty() {
+            return;
+        }
+        const COLUMNS: u32 = 32;
+        const ROWS: u32 = 18;
+        let sample = |dx: u32, dy: u32| {
+            let sx = (u64::from(dx) * u64::from(source_width.saturating_sub(1))
+                / u64::from(destination.width.max(1))) as u32;
+            let sy = (u64::from(dy) * u64::from(source_height.saturating_sub(1))
+                / u64::from(destination.height.max(1))) as u32;
+            let raw = source
+                .get((sy * source_width + sx) as usize)
+                .copied()
+                .unwrap_or(0);
+            let rgba = CpuPixelFormat::Bgr888.unpack(raw);
+            Color::rgb(rgba.r, rgba.g, rgba.b)
+        };
+        for row in 0..ROWS {
+            let top = destination.height * row / ROWS;
+            let bottom = destination.height * (row + 1) / ROWS;
+            for column in 0..COLUMNS {
+                let left = destination.width * column / COLUMNS;
+                let right = destination.width * (column + 1) / COLUMNS;
+                crate::gui::gpu_scene::gradient(
+                    Rect::new(
+                        destination.x + left as i32,
+                        destination.y + top as i32,
+                        right.saturating_sub(left).max(1),
+                        bottom.saturating_sub(top).max(1),
+                    ),
+                    [
+                        sample(left, top),
+                        sample(right, top),
+                        sample(right, bottom),
+                        sample(left, bottom),
+                    ],
+                );
+            }
+        }
+    }
+
     /// Смешивает пиксель текста/иконки с уже нарисованным фоном.
     ///
     /// `coverage=0` не меняет framebuffer, `coverage=255` полностью заменяет
@@ -462,8 +534,20 @@ impl Framebuffer {
         if coverage == 0 || x < 0 || y < 0 || x >= self.width as i32 || y >= self.height as i32 {
             return;
         }
+        let coverage = if self.gpu_recording {
+            quantize_gpu_coverage(coverage)
+        } else {
+            coverage
+        };
+        if coverage == 0 {
+            return;
+        }
         if coverage == u8::MAX {
             self.put_pixel(x, y, foreground);
+            return;
+        }
+        if self.gpu_recording {
+            crate::gui::gpu_scene::solid(Rect::new(x, y, 1, 1), foreground, coverage);
             return;
         }
         let raw = self.read_raw(x as u32, y as u32);
@@ -472,8 +556,52 @@ impl Framebuffer {
         self.put_pixel(x, y, background.mix(foreground, coverage));
     }
 
+    /// Смешивает горизонтальный coverage-span одним семантическим primitive.
+    ///
+    /// Шрифт и векторные иконки часто состоят из десятков соседних пикселей
+    /// с одинаковой прозрачностью. Для CPU fallback результат остаётся
+    /// побитно тем же, а GPU backend получает один quad вместо серии команд
+    /// по одному пикселю. Это особенно важно для текста при перетаскивании
+    /// окна: сложность command stream зависит от числа spans, а не пикселей.
+    pub fn blend_span(&mut self, x: i32, y: i32, width: u32, foreground: Color, coverage: u8) {
+        if coverage == 0 || width == 0 || y < 0 || y >= self.height as i32 {
+            return;
+        }
+        let coverage = if self.gpu_recording {
+            quantize_gpu_coverage(coverage)
+        } else {
+            coverage
+        };
+        if coverage == 0 {
+            return;
+        }
+        let left = x.max(0);
+        let right = x
+            .saturating_add(i32::try_from(width).unwrap_or(i32::MAX))
+            .min(self.width as i32);
+        if left >= right {
+            return;
+        }
+        let visible_width = (right - left) as u32;
+        if self.gpu_recording {
+            crate::gui::gpu_scene::solid(
+                Rect::new(left, y, visible_width, 1),
+                foreground,
+                coverage,
+            );
+            return;
+        }
+        for current_x in left..right {
+            self.blend_pixel(current_x, y, foreground, coverage);
+        }
+    }
+
     /// Заливает прямоугольник цветом; выход за границы кадра обрезается.
     pub fn fill_rect(&mut self, rect: Rect, color: Color) {
+        if self.gpu_recording {
+            crate::gui::gpu_scene::solid(rect, color, u8::MAX);
+            return;
+        }
         if let Some(mut surface) = self.back_surface() {
             let _ = surface.fill(rect, color);
         }
@@ -498,6 +626,27 @@ impl Framebuffer {
         let radius = rounded_radius(rect, radius);
         if radius == 0 {
             self.fill_rect(rect.intersection(clip), color);
+            return;
+        }
+        if self.gpu_recording {
+            // GPU bridge записывает контур строками. Одинаковые middle rows
+            // recorder объединит вертикально, поэтому rounded control стоит
+            // O(radius) quads вместо O(radius²) corner pixels. Аналитический
+            // SDF shader позднее заменит и эти несколько spans без изменения
+            // публичного component API.
+            for row in 0..rect.height {
+                let inset = rounded_inset_for_height(row, rect.height, radius);
+                self.fill_rect(
+                    Rect::new(
+                        rect.x.saturating_add(inset as i32),
+                        rect.y.saturating_add(row as i32),
+                        rect.width.saturating_sub(inset.saturating_mul(2)),
+                        1,
+                    )
+                    .intersection(clip),
+                    color,
+                );
+            }
             return;
         }
 
@@ -595,6 +744,28 @@ impl Framebuffer {
                 );
                 for edge in rectangular_border(current) {
                     self.fill_rect(edge.intersection(clip), color);
+                }
+            }
+            return;
+        }
+        if self.gpu_recording {
+            for row in 0..rect.height {
+                let inset = rounded_inset_for_height(row, rect.height, radius);
+                let y = rect.y.saturating_add(row as i32);
+                let left = rect.x.saturating_add(inset as i32);
+                let right = rect.right().saturating_sub(inset as i32);
+                if row < border || row + border >= rect.height {
+                    self.fill_rect(
+                        Rect::new(left, y, (right - left).max(0) as u32, 1).intersection(clip),
+                        color,
+                    );
+                } else {
+                    self.fill_rect(Rect::new(left, y, border, 1).intersection(clip), color);
+                    self.fill_rect(
+                        Rect::new(right.saturating_sub(border as i32), y, border, 1)
+                            .intersection(clip),
+                        color,
+                    );
                 }
             }
             return;
@@ -744,8 +915,8 @@ impl Framebuffer {
         }
         let first = left.max(clip.x);
         let last = right.min(clip.right().saturating_sub(1));
-        for x in first..=last {
-            self.blend_pixel(x, y, color, coverage);
+        if first <= last {
+            self.blend_span(first, y, (last - first + 1) as u32, color, coverage);
         }
     }
 
@@ -768,6 +939,10 @@ impl Framebuffer {
 
     /// Горизонтальный градиент в `rect`: столбец за столбцом от `left` к `right`.
     pub fn horizontal_gradient(&mut self, rect: Rect, left: Color, right: Color) {
+        if self.gpu_recording {
+            crate::gui::gpu_scene::gradient(rect, [left, right, right, left]);
+            return;
+        }
         let width = rect.width.max(1);
         for offset in 0..width {
             let amount = ((offset as u64 * 255) / width as u64) as u8;
@@ -795,6 +970,10 @@ impl Framebuffer {
         let surface = Rect::new(0, 0, self.width, self.height);
         let clipped = rect.intersection(clip).intersection(surface);
         if clipped.is_empty() {
+            return;
+        }
+        if self.gpu_recording {
+            self.record_wallpaper_mesh(rect, clipped, image);
             return;
         }
         let destination_ratio_wide = u64::from(rect.width) * u64::from(image.height)
@@ -825,6 +1004,16 @@ impl Framebuffer {
                 let raw = self.pack(image.pixel_bilinear(source_x_16, source_y_16));
                 self.write_raw(screen_x as u32, screen_y as u32, raw);
             }
+        }
+    }
+
+    /// Передаёт semantic wallpaper resource, а не уже растеризованные pixels.
+    /// Ring-3 renderd держит полноразмерную GPU texture и применяет cover crop
+    /// с linear filtering. Поэтому steady-state кадр содержит один quad, а не
+    /// сотни цветных tiles и никогда не читает stale CPU framebuffer.
+    fn record_wallpaper_mesh(&mut self, rect: Rect, clip: Rect, image: Wallpaper) {
+        if !rect.intersection(clip).is_empty() {
+            crate::gui::gpu_scene::wallpaper(rect, image.id as u32);
         }
     }
 
@@ -869,6 +1058,11 @@ impl Framebuffer {
     /// Вызывается только после изменения обоев, иконок или taskbar, а не на
     /// каждом движении мыши.
     pub fn cache_background(&mut self) -> bool {
+        if self.gpu_recording {
+            // GPU-сеанс пересобирает полный retained display list; копия RAM
+            // background не нужна и только тратила бы memory bandwidth.
+            return true;
+        }
         if self.background.is_null() {
             return false;
         }
@@ -883,6 +1077,9 @@ impl Framebuffer {
     /// Это не заставляет копировать весь framebuffer при selection одного
     /// ярлыка. Caller обязан вызвать метод до отрисовки окон и cursor.
     pub fn cache_background_rect(&mut self, rect: Rect) -> bool {
+        if self.gpu_recording {
+            return true;
+        }
         if self.background.is_null() {
             return false;
         }
@@ -908,6 +1105,9 @@ impl Framebuffer {
     /// Восстанавливает прямоугольник из статического desktop-слоя в back
     /// buffer. Возвращает false, если memory pressure отключил кэш.
     pub fn restore_background(&mut self, rect: Rect) -> bool {
+        if self.gpu_recording {
+            return false;
+        }
         if self.background.is_null() {
             return false;
         }
@@ -962,6 +1162,11 @@ impl Framebuffer {
     }
 
     fn present_regions(&mut self, damage: &[Rect]) {
+        if self.gpu_recording {
+            // GPU frame публикуют только renderd/compositord/displayd. Так
+            // legacy incremental present не может перетереть новый scanout.
+            return;
+        }
         let pixels = (self.back_bytes / 4) as usize;
         // SAFETY: source читает только back, а Scanout::present пишет только
         // отдельный front. Эксклюзивный &mut self не покидает вызов.
@@ -1026,6 +1231,22 @@ fn mix_bgrx(left: u32, right: u32, fraction: u16) -> u32 {
         ((a * inverse + b * fraction + 32_768) >> 16) & 0xff
     };
     channel(0) | (channel(8) << 8) | (channel(16) << 16)
+}
+
+/// Временная 4-bit-подобная coverage palette GPU bridge.
+///
+/// До постоянного glyph atlas одинаковые соседние уровни объединяются в
+/// длинные spans. Пять уровней сохраняют сглаживание, но вместо почти
+/// уникальной alpha каждого пикселя дают renderer'у крупные batches. CPU
+/// fallback и исходные font bitmaps не меняются.
+fn quantize_gpu_coverage(coverage: u8) -> u8 {
+    match coverage {
+        0..=23 => 0,
+        24..=79 => 64,
+        80..=143 => 128,
+        144..=207 => 192,
+        _ => u8::MAX,
+    }
 }
 
 impl IconTarget for Framebuffer {

@@ -32,6 +32,12 @@ const POLL_LIMIT: usize = 50_000_000;
 // одновременно помещаться в controlq. Остаток нужен для bounded bootstrap/
 // teardown command; каждый slot владеет отдельными request/response DMA pages.
 const COMMAND_SLOTS: usize = 16;
+// SUBMIT_3D содержит небольшой transport header перед negotiated command
+// stream. Отдельная страница запаса не даёт transport-деталям уменьшить
+// публичный лимит GPU ABI.
+const REQUEST_BYTES: usize = rustos_abi::gpu::GPU_MAX_COMMAND_BYTES as usize + 4096;
+const RESPONSE_BYTES: usize = 4096;
+const SLOT_BYTES: usize = REQUEST_BYTES + RESPONSE_BYTES;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AsyncCompletion {
@@ -151,7 +157,12 @@ impl ModernTransport {
         let queue = memory::allocate(queue_bytes.div_ceil(4096), 1)
             .map_err(|_| TransportError::OutOfMemory)?;
         let slot_count = (usize::from(queue_size) / 2).min(COMMAND_SLOTS);
-        let dma = match memory::allocate((slot_count * 2) as u64, 1) {
+        let dma = match memory::allocate(
+            u64::try_from(slot_count * SLOT_BYTES)
+                .unwrap_or(u64::MAX)
+                .div_ceil(4096),
+            1,
+        ) {
             Ok(block) => block,
             Err(_) => {
                 let _ = memory::free(queue);
@@ -161,7 +172,7 @@ impl ModernTransport {
         };
         unsafe {
             ptr::write_bytes(queue.phys as *mut u8, 0, (queue.frames * 4096) as usize);
-            ptr::write_bytes(dma.phys as *mut u8, 0, slot_count * 8192);
+            ptr::write_bytes(dma.phys as *mut u8, 0, slot_count * SLOT_BYTES);
             write_u16(common, 24, queue_size);
             write_u64(common, 32, queue.phys);
             write_u64(common, 40, queue.phys + available_offset);
@@ -238,7 +249,11 @@ impl ModernTransport {
     ) -> Result<Response, TransportError> {
         let request_size = mem::size_of::<Request>();
         let response_size = mem::size_of::<Response>();
-        if request_size == 0 || request_size > 4096 || response_size == 0 || response_size > 4096 {
+        if request_size == 0
+            || request_size > REQUEST_BYTES
+            || response_size == 0
+            || response_size > RESPONSE_BYTES
+        {
             return Err(TransportError::InvalidConfiguration);
         }
         let request_bytes = unsafe {
@@ -279,7 +294,10 @@ impl ModernTransport {
             .len()
             .checked_add(payload.len())
             .ok_or(TransportError::InvalidConfiguration)?;
-        if request_size == 0 || request_size > 4096 || !(24..=4096).contains(&response_size) {
+        if request_size == 0
+            || request_size > REQUEST_BYTES
+            || !(24..=RESPONSE_BYTES).contains(&response_size)
+        {
             return Err(TransportError::InvalidConfiguration);
         }
         self.poll_used()?;
@@ -290,8 +308,8 @@ impl ModernTransport {
         let request_address = self.request_address(index);
         let response_address = self.response_address(index);
         unsafe {
-            ptr::write_bytes(request_address as *mut u8, 0, 4096);
-            ptr::write_bytes(response_address as *mut u8, 0, 4096);
+            ptr::write_bytes(request_address as *mut u8, 0, request_size);
+            ptr::write_bytes(response_address as *mut u8, 0, response_size);
             ptr::copy_nonoverlapping(prefix.as_ptr(), request_address as *mut u8, prefix.len());
             ptr::copy_nonoverlapping(
                 payload.as_ptr(),
@@ -425,11 +443,11 @@ impl ModernTransport {
     }
 
     fn request_address(&self, index: usize) -> u64 {
-        self.dma.phys + index as u64 * 8192
+        self.dma.phys + index as u64 * SLOT_BYTES as u64
     }
 
     fn response_address(&self, index: usize) -> u64 {
-        self.request_address(index) + 4096
+        self.request_address(index) + REQUEST_BYTES as u64
     }
 
     fn release_slot(&mut self, index: usize) {

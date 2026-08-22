@@ -9,8 +9,13 @@ use crate::Handle;
 
 /// Версия render ABI.
 pub const GPU_ABI_VERSION: u16 = 2;
-/// Максимальный command buffer одного submission.
-pub const GPU_MAX_COMMAND_BYTES: u32 = 3072;
+/// Верхняя граница одного VirGL submission.
+///
+/// Для SystemUI важен не только объём данных, но и число переходов через
+/// virtqueue/fence. 512 KiB позволяют передать несколько тысяч простых
+/// примитивов одним пакетом и всё ещё оставляют жёсткую, легко проверяемую
+/// границу памяти для недоверенного ring-3 renderer'а.
+pub const GPU_MAX_COMMAND_BYTES: u32 = 512 * 1024;
 /// compositord → renderd: запрос одного кадра.
 pub const GPU_RENDER_REQUEST_OPCODE: u16 = 0x5100;
 /// renderd → compositord: GraphicsBuffer + acquire timeline готовы.
@@ -21,6 +26,23 @@ pub const GPU_RENDERED_FRAME_HANDLE_COUNT: u16 = 2;
 pub const GPU_DEMO_START_OPCODE: u16 = 0x5110;
 /// compositord → future launcher: демонстрация завершила последний present.
 pub const GPU_DEMO_DONE_OPCODE: u16 = 0x5111;
+/// Размер общей command page `uid -> renderd`.
+///
+/// Это не публичный Canvas ABI приложения: page принадлежит системному UI
+/// renderer'у и выдаётся только доверенному `renderd`.
+pub const GPU_UI_STREAM_BYTES: usize = 1024 * 1024;
+/// Версия внутреннего SystemUI GPU stream.
+pub const GPU_UI_STREAM_VERSION: u16 = 1;
+
+/// Биты [`GpuUiQuad::flags`]. Это внутренние renderer-neutral primitives
+/// SystemUI, а не VirGL protocol и не публичный API приложения.
+pub mod ui_quad_flag {
+    /// Quad показывает одну из встроенных wallpaper textures. Стабильный
+    /// идентификатор ресурса передаётся как `colors[0]`.
+    pub const WALLPAPER_TEXTURE: u32 = 1 << 0;
+    /// Все известные биты версии 1.
+    pub const KNOWN: u32 = WALLPAPER_TEXTURE;
+}
 
 /// Биты [`GpuRenderFrame::flags`].
 pub mod frame_flag {
@@ -29,8 +51,191 @@ pub mod frame_flag {
     /// Renderd должен выполнить диагностический GPU compositor pass из
     /// нескольких sampled surfaces прямо в scanout-compatible target.
     pub const COMPOSITOR_PROBE: u32 = 1 << 1;
+    /// Отрисовать renderer-neutral SystemUI stream из общей command page.
+    pub const SYSTEM_UI: u32 = 1 << 2;
     /// Все известные флаги.
-    pub const KNOWN: u32 = AURORA_SHOWCASE | COMPOSITOR_PROBE;
+    pub const KNOWN: u32 = AURORA_SHOWCASE | COMPOSITOR_PROBE | SYSTEM_UI;
+}
+
+/// Заголовок одного неизменяемого SystemUI frame в общей command page.
+///
+/// Kernel публикует record только после полной записи массива [`GpuUiQuad`].
+/// Renderd повторно проверяет геометрию и checksum: повреждённый frame
+/// отбрасывается целиком и никогда не доходит до GPU command validator.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GpuUiFrameHeader {
+    /// [`GPU_UI_STREAM_VERSION`].
+    pub version: u16,
+    /// Размер заголовка.
+    pub size: u16,
+    /// Физическая ширина render target.
+    pub width: u32,
+    /// Физическая высота render target.
+    pub height: u32,
+    /// Монотонный идентификатор кадра.
+    pub frame_id: u64,
+    /// Число следующих за заголовком quad records.
+    pub quad_count: u32,
+    /// В версии 1 весь кадр всегда полный.
+    pub flags: u32,
+    /// FNV-1a всех байтов массива quad.
+    pub checksum: u64,
+    /// Зарезервировано.
+    pub reserved: [u64; 3],
+}
+
+impl GpuUiFrameHeader {
+    /// Флаг полного, самодостаточного кадра.
+    pub const FULL_FRAME: u32 = 1;
+
+    /// Создаёт заголовок завершённого кадра.
+    pub const fn new(width: u32, height: u32, frame_id: u64, quad_count: u32) -> Self {
+        Self {
+            version: GPU_UI_STREAM_VERSION,
+            size: core::mem::size_of::<Self>() as u16,
+            width,
+            height,
+            frame_id,
+            quad_count,
+            flags: Self::FULL_FRAME,
+            checksum: 0,
+            reserved: [0; 3],
+        }
+    }
+
+    /// Проверяет только metadata; каждый quad проверяется отдельно.
+    pub fn validate(&self) -> Result<(), GpuAbiError> {
+        if self.version != GPU_UI_STREAM_VERSION {
+            return Err(GpuAbiError::UnsupportedVersion);
+        }
+        if self.size as usize != core::mem::size_of::<Self>() {
+            return Err(GpuAbiError::UnsupportedSize);
+        }
+        let bytes = (self.quad_count as usize)
+            .checked_mul(core::mem::size_of::<GpuUiQuad>())
+            .and_then(|bytes| bytes.checked_add(core::mem::size_of::<Self>()))
+            .ok_or(GpuAbiError::InvalidValue)?;
+        if self.width == 0
+            || self.height == 0
+            || self.width > 16_384
+            || self.height > 16_384
+            || self.frame_id == 0
+            || self.quad_count == 0
+            || bytes > GPU_UI_STREAM_BYTES
+            || self.flags != Self::FULL_FRAME
+            || self.reserved != [0; 3]
+        {
+            return Err(GpuAbiError::InvalidValue);
+        }
+        Ok(())
+    }
+}
+
+/// Один physical quad SystemUI.
+///
+/// Четыре premultiplied RGBA8 цвета позволяют одной и той же GPU primitive
+/// представить сплошную заливку и плавный wallpaper/toolbar gradient. Текст
+/// раннего вертикального среза передаётся горизонтальными coverage spans;
+/// после подключения glyph atlas wire record останется пригоден как fallback.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct GpuUiQuad {
+    /// Левая координата.
+    pub x: u16,
+    /// Верхняя координата.
+    pub y: u16,
+    /// Ширина.
+    pub width: u16,
+    /// Высота.
+    pub height: u16,
+    /// Цвета: top-left, top-right, bottom-right, bottom-left.
+    pub colors: [u32; 4],
+    /// Комбинация [`ui_quad_flag`] текущей версии.
+    pub flags: u32,
+    /// Зарезервировано.
+    pub reserved: u32,
+}
+
+impl GpuUiQuad {
+    /// Создаёт одноцветный quad.
+    pub const fn solid(x: u16, y: u16, width: u16, height: u16, color: u32) -> Self {
+        Self {
+            x,
+            y,
+            width,
+            height,
+            colors: [color; 4],
+            flags: 0,
+            reserved: 0,
+        }
+    }
+
+    /// Создаёт ссылку на системную texture wallpaper. Сам bitmap принадлежит
+    /// `renderd` и не копируется в command stream каждого кадра.
+    pub const fn wallpaper(x: u16, y: u16, width: u16, height: u16, id: u32) -> Self {
+        Self {
+            x,
+            y,
+            width,
+            height,
+            colors: [id, 0, 0, 0],
+            flags: ui_quad_flag::WALLPAPER_TEXTURE,
+            reserved: 0,
+        }
+    }
+
+    /// Проверяет bounded physical geometry.
+    pub fn validate(&self, frame_width: u32, frame_height: u32) -> Result<(), GpuAbiError> {
+        let right = u32::from(self.x)
+            .checked_add(u32::from(self.width))
+            .ok_or(GpuAbiError::InvalidValue)?;
+        let bottom = u32::from(self.y)
+            .checked_add(u32::from(self.height))
+            .ok_or(GpuAbiError::InvalidValue)?;
+        if self.width == 0
+            || self.height == 0
+            || right > frame_width
+            || bottom > frame_height
+            || self.flags & !ui_quad_flag::KNOWN != 0
+            || self.reserved != 0
+            || (self.flags == ui_quad_flag::WALLPAPER_TEXTURE
+                && (self.colors[0] > 2 || self.colors[1..] != [0; 3]))
+        {
+            return Err(GpuAbiError::InvalidValue);
+        }
+        Ok(())
+    }
+
+    /// Возвращает true для сплошной заливки без интерполяции углов.
+    pub const fn is_solid(&self) -> bool {
+        self.flags == 0
+            && self.colors[0] == self.colors[1]
+            && self.colors[0] == self.colors[2]
+            && self.colors[0] == self.colors[3]
+    }
+
+    /// Возвращает идентификатор системной wallpaper texture.
+    pub const fn wallpaper_id(&self) -> Option<u32> {
+        if self.flags == ui_quad_flag::WALLPAPER_TEXTURE {
+            Some(self.colors[0])
+        } else {
+            None
+        }
+    }
+}
+
+/// Детерминированный checksum SystemUI command stream.
+pub fn gpu_ui_checksum(quads: &[GpuUiQuad]) -> u64 {
+    let bytes = unsafe {
+        core::slice::from_raw_parts(quads.as_ptr().cast::<u8>(), core::mem::size_of_val(quads))
+    };
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
 }
 
 /// Биты [`GpuDeviceInfo::features`].
@@ -503,6 +708,20 @@ impl GpuRenderFrame {
         }
     }
 
+    /// Создаёт запрос штатного SystemUI frame из общей command page.
+    pub const fn system_ui_request(width: u32, height: u32, frame_id: u64) -> Self {
+        Self {
+            version: GPU_ABI_VERSION,
+            size: core::mem::size_of::<Self>() as u16,
+            flags: frame_flag::SYSTEM_UI,
+            width,
+            height,
+            frame_id,
+            fence_id: 0,
+            reserved: [0; 4],
+        }
+    }
+
     /// Номер анимационного кадра либо ноль diagnostic pipeline.
     pub const fn scene_frame(&self) -> u32 {
         self.reserved[0] as u32
@@ -591,8 +810,10 @@ pub mod demo_flag {
     /// Выполнить bounded multi-surface compositor pass вместо Aurora scene.
     /// Используется аппаратным integration test и всегда требует WINDOWED.
     pub const COMPOSITOR_PROBE: u32 = 1 << 1;
+    /// Показать полный SystemUI frame из общей command page renderd.
+    pub const SYSTEM_UI: u32 = 1 << 2;
     /// Все известные биты текущего ABI.
-    pub const KNOWN: u32 = WINDOWED | COMPOSITOR_PROBE;
+    pub const KNOWN: u32 = WINDOWED | COMPOSITOR_PROBE | SYSTEM_UI;
 }
 
 impl GpuDemoRequest {
@@ -647,6 +868,23 @@ impl GpuDemoRequest {
         }
     }
 
+    /// Создаёт один полноэкранный кадр штатного desktop.
+    pub const fn system_ui() -> Self {
+        Self {
+            version: GPU_ABI_VERSION,
+            size: core::mem::size_of::<Self>() as u16,
+            flags: demo_flag::SYSTEM_UI,
+            frame_count: 1,
+            frame_interval_ms: 16,
+            width: 0,
+            height: 0,
+            first_frame: 0,
+            reserved0: 0,
+            seed: 0x5359_5354_454d_5549,
+            reserved: [0; 3],
+        }
+    }
+
     /// Проверяет bounded duration и все зарезервированные поля.
     pub fn validate(&self) -> Result<(), GpuAbiError> {
         validate_prefix(self.version, self.size, core::mem::size_of::<Self>())?;
@@ -661,7 +899,14 @@ impl GpuDemoRequest {
         }
         let windowed = self.flags & demo_flag::WINDOWED != 0;
         let compositor_probe = self.flags & demo_flag::COMPOSITOR_PROBE != 0;
+        let system_ui = self.flags & demo_flag::SYSTEM_UI != 0;
+        if compositor_probe && system_ui {
+            return Err(GpuAbiError::InvalidValue);
+        }
         if compositor_probe && (!windowed || self.frame_count != 1 || self.first_frame != 0) {
+            return Err(GpuAbiError::InvalidValue);
+        }
+        if system_ui && (windowed || self.frame_count != 1 || self.first_frame != 0) {
             return Err(GpuAbiError::InvalidValue);
         }
         if windowed {
@@ -694,6 +939,9 @@ impl GpuDemoRequest {
         Ok(value)
     }
 }
+
+const _: () = assert!(core::mem::size_of::<GpuUiFrameHeader>() == 64);
+const _: () = assert!(core::mem::size_of::<GpuUiQuad>() == 32);
 
 fn validate_prefix(version: u16, size: u16, expected: usize) -> Result<(), GpuAbiError> {
     if version != GPU_ABI_VERSION {
@@ -795,6 +1043,36 @@ mod tests {
         assert_eq!(
             GpuDemoRequest::compositor_probe(1280, 800).validate(),
             Ok(())
+        );
+        assert_eq!(GpuDemoRequest::system_ui().validate(), Ok(()));
+    }
+
+    #[test]
+    fn system_ui_stream_is_bounded_and_checksummed() {
+        let quads = [
+            GpuUiQuad::solid(0, 0, 1280, 720, 0xff20_1810),
+            GpuUiQuad::solid(100, 80, 640, 420, 0xfff8_f8f8),
+        ];
+        let mut header = GpuUiFrameHeader::new(1280, 720, 7, quads.len() as u32);
+        header.checksum = gpu_ui_checksum(&quads);
+        assert_eq!(header.validate(), Ok(()));
+        assert_eq!(quads[0].validate(header.width, header.height), Ok(()));
+        assert_ne!(header.checksum, 0);
+
+        let wallpaper = GpuUiQuad::wallpaper(0, 0, 1280, 720, 2);
+        assert_eq!(wallpaper.wallpaper_id(), Some(2));
+        assert_eq!(wallpaper.validate(header.width, header.height), Ok(()));
+        let invalid_wallpaper = GpuUiQuad::wallpaper(0, 0, 1280, 720, 3);
+        assert_eq!(
+            invalid_wallpaper.validate(header.width, header.height),
+            Err(GpuAbiError::InvalidValue)
+        );
+
+        let mut outside = quads[1];
+        outside.x = 1200;
+        assert_eq!(
+            outside.validate(header.width, header.height),
+            Err(GpuAbiError::InvalidValue)
         );
     }
 }

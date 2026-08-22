@@ -25,10 +25,10 @@ GRUB 2 / Multiboot2 --> BootInfo v3 --> kernel
                                   |-- local-APIC preemptive process manager
                                   |-- endpoint IPC + capability transfer
                                   |-- MADT + AP long-mode trampoline
-                                  |-- GRUB/virtio scanout + CPU fallback
+                                  |-- GRUB/virtio scanout + software fallback
                                   |-- graphics-buffer/surface/sync ABI
                                   |-- async virtio-gpu/VirGL render ABI
-                                  |-- damage/layer CPU compositor
+                                  |-- ring-3 GPU SystemUI + atomic compositor
                                   |-- xHCI USB HID input + PS/2/virtio fallback
                                   |-- bootstrap RIFS + RAM overlay
                                   |-- UI components
@@ -36,9 +36,11 @@ GRUB 2 / Multiboot2 --> BootInfo v3 --> kernel
                                   `-- desktop + terminal
 ```
 
-Ранний GUI-сеанс работает на CPU0 и не использует heap. Unsafe MMIO и port I/O
-сосредоточены в `graphics`, `input` и `arch`; widget/window/application logic
-написана без unsafe. Первый kernel object уже существует: process-local VFS
+Bootstrap layout/window policy пока работает на CPU0 и не использует heap, но
+штатный raster/composition выполняет ring-3 `renderd` через VirGL. Unsafe MMIO
+и port I/O сосредоточены в `graphics`, `input` и `arch`;
+widget/window/application logic написана без unsafe. Первый kernel object уже
+существует: process-local VFS
 handle разрешает ring-3 `init.rune` выполнить ограниченный `vfs_stat`. Это
 bootstrap backend initramfs, не финальный `vfsd`.
 
@@ -73,9 +75,12 @@ lifetime и блокирующий wait-many. Постоянный RUNE `display
 передаёт GPU-only buffer compositor'у; `compositord` выполняет atomic present,
 ждёт оценочный vblank и получает feedback. Клиентская `surface.dll` уже
 реализует process-owned event endpoint и полный lifecycle полноэкранной
-zero-copy surface. Интерактивный desktop пока использует CPU raster/damage
-bootstrap через тот же broker; оконная multi-layer композиция остаётся
-следующим переключением. Контракт описан в
+zero-copy surface. Интерактивный desktop публикует агрегированную
+renderer-neutral сцену в ring-3 `renderd`: VirGL растеризует её прямо в
+scanout-compatible `GraphicsBuffer`, а latest-frame mailbox отбрасывает
+устаревшие кадры. CPU renderer включается только при отказе GPU. Независимые
+per-window layers и transform-only drag остаются следующим переключением.
+Контракт описан в
 [GRAPHICS_ABI.md](GRAPHICS_ABI.md), [GPU_RENDERING.md](GPU_RENDERING.md) и
 [ADR-0001](adr/0001-modern-graphics-architecture.md). Проверяемые критерии
 перехода всего desktop на GPU и порядок удаления bootstrap readback закреплены

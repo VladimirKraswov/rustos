@@ -73,12 +73,13 @@ Host renderer дополнительно разрешает resource handles т�
 готовый кадр `displayd`. Драйвер делает `SET_SCANOUT` и `RESOURCE_FLUSH` того
 же VirGL resource: между 3D render target и экраном нет guest CPU copy.
 
-Оконный bootstrap path дополнительно использует
+Оконная Aurora 3D пока дополнительно использует совместимый retained-surface
+adapter на основе
 `VIRTIO_GPU_CMD_TRANSFER_FROM_HOST_3D`: после fence готовые GPU pixels попадают
-в attached system-memory backing и смешиваются с существующим kernel desktop.
-Это GPU readback, не CPU rasterization. Полноэкранный test path остаётся
-zero-copy; после переезда desktop compositor'а в ring 3 оконный путь тоже
-будет передавать GraphicsBuffer напрямую без readback.
+в attached system-memory backing и вставляются в desktop scene. Это GPU
+readback, не CPU rasterization. Штатный SystemUI уже идёт через отдельный
+zero-copy путь; adapter Aurora должен исчезнуть после перехода к независимым
+per-window GPU surfaces.
 
 На устройстве без VirGL Aurora использует локальный software fallback в том же
 окне. Ошибка renderer'а не переключает всю ОС, не закрывает чужие окна и не
@@ -145,8 +146,9 @@ GraphicsBuffer → compositor → scanout, но ещё не является п�
 
 Точный статус upstream-порта, закреплённая версия и C/POSIX зависимости
 описаны в [MESA.md](MESA.md). Следующий этап — Meson cross-build
-`gallium/virgl` поверх нынешнего winsys. После этого `compositord` сможет
-собирать SystemUI GPU-командами, сохраняя `GraphicsBuffer` и `SyncTimeline`.
+`gallium/virgl` поверх нынешнего winsys. SystemUI уже собирается собственным
+bounded GPU backend; upstream Mesa нужна приложениям OpenGL/OpenGL ES и не
+должна менять Window/SystemUI API.
 
 Протокол сверяется с
 [Virtio 1.2 GPU Device](https://docs.oasis-open.org/virtio/virtio/v1.2/virtio-v1.2.html#x1-3720007),
