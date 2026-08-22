@@ -23,6 +23,10 @@ pub enum TrapKind {
     Syscall,
     /// Прерывание планировщика.
     Timer,
+    /// Маскируемое прерывание platform device. Номер уже нормализован в
+    /// interrupt-controller namespace (GIC INTID либо будущий APIC vector).
+    #[allow(dead_code)] // x86 пока не создаёт variant до MSI-X/IOAPIC backend.
+    Device { interrupt: u32 },
     /// Spurious interrupt, который можно безопасно проигнорировать.
     Spurious,
     /// Обычное архитектурное исключение.

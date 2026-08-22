@@ -64,6 +64,8 @@ done
 grep -Fq '[gpu-demo] AURORA_3D_READY frames=48 renderer=mesa-virgl cpu-raster=no' "$SERIAL_LOG"
 grep -Fq '[virgl-test] WINDOWED_READBACK_READY source=host-gpu cpu-raster=no' "$SERIAL_LOG"
 grep -Fq '[virgl-test] MESA_SHOWCASE_READY scanout=graphics-buffer cpu-raster=no' "$SERIAL_LOG"
+grep -Eq '\[irq\] virtio-gpu completion=intid-[0-9]+ mode=interrupt fallback=timer-poll' \
+    "$SERIAL_LOG"
 grep -Eq '\[hardware\] display-driver=virtio-gpu transport=modern-mmio mode=[0-9]+x[0-9]+ preferred=[0-9]+x[0-9]+ edid=(valid|unavailable) outputs=[1-9][0-9]* renderer=virgl' \
     "$SERIAL_LOG"
 if [[ "$READY" != "1" ]]; then

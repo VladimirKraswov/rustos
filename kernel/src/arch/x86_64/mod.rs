@@ -176,6 +176,13 @@ pub fn initialize_scheduler_hardware() -> Result<SchedulerHardware, ArchError> {
     })
 }
 
+/// Virtio PCI пока использует bounded timer polling: MSI-X/IOAPIC routing
+/// будет подключён отдельным PCI interrupt-domain adapter. Общий caller может
+/// без cfg сохранить один порядок инициализации для обеих ISA.
+pub fn enable_device_interrupt(_interrupt: u32) -> Result<(), ArchError> {
+    Err(ArchError::InterruptController)
+}
+
 pub fn start_secondary_cpus(info: &BootInfo, counter_hz: u64) -> Result<SmpInfo, ArchError> {
     if info.firmware.kind != rustos_abi::bootinfo::BOOT_FIRMWARE_ACPI {
         return Err(ArchError::FirmwareDescription);

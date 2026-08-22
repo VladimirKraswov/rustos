@@ -34,6 +34,8 @@ const REG_QUEUE_NUM_MAX: u64 = 0x034;
 const REG_QUEUE_NUM: u64 = 0x038;
 const REG_QUEUE_READY: u64 = 0x044;
 const REG_QUEUE_NOTIFY: u64 = 0x050;
+const REG_INTERRUPT_STATUS: u64 = 0x060;
+const REG_INTERRUPT_ACK: u64 = 0x064;
 const REG_STATUS: u64 = 0x070;
 const REG_QUEUE_DESC_LOW: u64 = 0x080;
 const REG_QUEUE_AVAIL_LOW: u64 = 0x090;
@@ -57,6 +59,7 @@ const POLL_LIMIT: usize = 50_000_000;
 // Совпадает с PCI transport: три render кадра не должны занимать последний
 // slot, нужный display/control command во время их выполнения.
 const COMMAND_SLOTS: usize = 8;
+const QEMU_VIRT_SPI_BASE: u32 = 32 + 16;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AsyncCompletion {
@@ -96,6 +99,7 @@ impl CommandSlot {
 /// Очередь и DMA-память принадлежат одному GPU transport до его `Drop`.
 pub struct ModernMmioTransport {
     base: u64,
+    interrupt: u32,
     queue: FrameBlock,
     queue_size: u16,
     available_offset: u64,
@@ -112,7 +116,7 @@ impl ModernMmioTransport {
     /// Находит device id 16 среди стандартных слотов QEMU `virt` и проводит
     /// обязательный Virtio 1.x feature/status handshake.
     pub fn initialize() -> Result<Self, TransportError> {
-        let base = find_device().ok_or(TransportError::Unsupported)?;
+        let (base, slot) = find_device().ok_or(TransportError::Unsupported)?;
         write32(base, REG_STATUS, 0);
         if read32(base, REG_STATUS) != 0 {
             return Err(TransportError::InvalidConfiguration);
@@ -181,6 +185,7 @@ impl ModernMmioTransport {
 
         Ok(Self {
             base,
+            interrupt: QEMU_VIRT_SPI_BASE + slot,
             queue,
             queue_size,
             available_offset,
@@ -200,6 +205,22 @@ impl ModernMmioTransport {
 
     pub const fn virgl_supported(&self) -> bool {
         self.virgl
+    }
+
+    /// GIC INTID QEMU `virt`: SPI index 16+slot превращается в INTID 48+slot.
+    pub const fn interrupt_id(&self) -> u32 {
+        self.interrupt
+    }
+
+    /// Снимает edge-latch virtio-mmio. Used ring читает completion path;
+    /// DMA barrier остаётся сосредоточен в `poll_used`.
+    pub fn acknowledge_interrupt(&mut self) -> Result<bool, TransportError> {
+        self.ensure_device_ready()?;
+        let status = read32(self.base, REG_INTERRUPT_STATUS);
+        if status != 0 {
+            write32(self.base, REG_INTERRUPT_ACK, status);
+        }
+        Ok(status & 1 != 0)
     }
 
     pub fn num_capsets(&self) -> u32 {
@@ -413,10 +434,10 @@ impl Drop for ModernMmioTransport {
     }
 }
 
-fn find_device() -> Option<u64> {
+fn find_device() -> Option<(u64, u32)> {
     (0..MMIO_SLOTS)
-        .map(|slot| MMIO_FIRST + slot * MMIO_STRIDE)
-        .find(|base| {
+        .map(|slot| (MMIO_FIRST + slot * MMIO_STRIDE, slot as u32))
+        .find(|(base, _)| {
             read32(*base, REG_MAGIC) == MAGIC
                 && read32(*base, REG_VERSION) == VERSION_MODERN
                 && read32(*base, REG_DEVICE_ID) == DEVICE_GPU

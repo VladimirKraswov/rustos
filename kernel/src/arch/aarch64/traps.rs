@@ -256,7 +256,15 @@ rustos_irq_entry:
     // PPI 27 — architected EL1 virtual timer (`CNTV_*`).
     cmp w0, #27
     b.eq 1f
-    // Любой неожиданный/spurious INTID не считается scheduler tick.
+    // 1020..1023 — architected spurious range, EOI для него запрещён.
+    cmp w0, #1020
+    b.hs 2f
+    // source=3+INTID сохраняет номер platform interrupt прямо в TrapFrame;
+    // Rust handler не читает IAR повторно и выполняет ровно один EOI.
+    add x9, x0, #3
+    str x9, [sp, #288]
+    b 1f
+2:
     mov x9, #2
     str x9, [sp, #288]
 1:

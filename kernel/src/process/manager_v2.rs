@@ -1055,6 +1055,27 @@ impl ProcessManager {
         if kind == TrapKind::Spurious {
             return 0;
         }
+        if let TrapKind::Device { interrupt } = kind {
+            let handled = scanout::handle_interrupt(interrupt).unwrap_or(false);
+            arch::end_of_interrupt();
+            if !frame.is_from_user() {
+                return 0;
+            }
+            let Some(thread_index) = self.thread_index(self.current) else {
+                crate::boot::exit_kernel(0x7d);
+            };
+            self.threads[thread_index]
+                .as_mut()
+                .expect("current thread")
+                .context
+                .save(frame);
+            if handled {
+                self.poll_gpu_completion();
+                self.wake_display_vblank_waiters();
+                return self.schedule_next(frame);
+            }
+            return 0;
+        }
         if !frame.is_from_user() {
             serial::put_str("[trap] FATAL preemptive kernel exception");
             if let TrapKind::Exception {
@@ -4785,6 +4806,13 @@ pub(super) fn run_milestone(info: &rustos_abi::BootInfo) -> Result<(), ProcessEr
     serial::put_str(" timer=");
     serial::put_str(hardware.timer);
     serial::put_str("\n");
+    if let Ok(Some(interrupt)) = scanout::prepare_interrupt() {
+        if arch::enable_device_interrupt(interrupt).is_ok() {
+            serial::put_str("[irq] virtio-gpu completion=intid-");
+            serial::put_u32(interrupt);
+            serial::put_str(" mode=interrupt fallback=timer-poll\n");
+        }
+    }
     let smp = arch::start_secondary_cpus(info, hardware.counter_hz).map_err(|_| {
         serial::put_str("[smp] secondary CPU startup failed\n");
         ProcessError::UnexpectedExit

@@ -352,6 +352,32 @@ pub fn poll_render() -> Result<Option<RenderCompletion>, DisplayBrokerError> {
         .map_err(map_mode_error)
 }
 
+/// Готовит IRQ transport только после установки display device. `None`
+/// означает честный timer-poll fallback, а не ошибку инициализации display.
+pub fn prepare_interrupt() -> Result<Option<u32>, DisplayBrokerError> {
+    let mut guard = DEVICE.acquire()?;
+    guard
+        .get()
+        .as_mut()
+        .ok_or(DisplayBrokerError::Unavailable)?
+        .gpu
+        .prepare_interrupt()
+        .map_err(map_mode_error)
+}
+
+/// Короткий top half: подтверждает device IRQ. Fence completions и пробуждение
+/// waiters выполняет process manager после освобождения broker lock.
+pub fn handle_interrupt(interrupt: u32) -> Result<bool, DisplayBrokerError> {
+    let mut guard = DEVICE.acquire()?;
+    guard
+        .get()
+        .as_mut()
+        .ok_or(DisplayBrokerError::Unavailable)?
+        .gpu
+        .handle_interrupt(interrupt)
+        .map_err(map_mode_error)
+}
+
 /// Безопасно получает следующий completion перед уничтожением GPU context.
 /// Это не часть кадрового hot path: blocking разрешён только при
 /// завершении/падении renderd. Конкретный fence сопоставляет process manager,

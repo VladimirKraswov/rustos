@@ -666,6 +666,45 @@ impl VirtioGpu {
         })
     }
 
+    /// Возвращает platform interrupt virtio-gpu и предварительно снимает
+    /// возможный старый latch. GIC включается только после полного DRIVER_OK,
+    /// поэтому IRQ не может прийти в обработчик с полуготовым transport.
+    pub fn prepare_interrupt(&mut self) -> Result<Option<u32>, ModeSetError> {
+        #[cfg(target_arch = "aarch64")]
+        {
+            let _ = self
+                .transport
+                .acknowledge_interrupt()
+                .map_err(map_transport)?;
+            Ok(Some(self.transport.interrupt_id()))
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            // PCI MSI-X/IOAPIC adapter ещё не подключён. x86-64 продолжает
+            // bounded polling из timer bottom half без ложной IRQ-рекламы.
+            Ok(None)
+        }
+    }
+
+    /// Снимает interrupt status только у нашего transport. Used ring затем
+    /// разбирается обычным `poll_render`: IRQ остаётся коротким top half.
+    pub fn handle_interrupt(&mut self, interrupt: u32) -> Result<bool, ModeSetError> {
+        #[cfg(target_arch = "aarch64")]
+        {
+            if interrupt != self.transport.interrupt_id() {
+                return Ok(false);
+            }
+            self.transport
+                .acknowledge_interrupt()
+                .map_err(map_transport)
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            let _ = interrupt;
+            Ok(false)
+        }
+    }
+
     pub fn create_render_context(&mut self, context: u32, name: &[u8]) -> Result<(), ModeSetError> {
         if self.render_info().is_none() || context == 0 || self.render_context != 0 {
             return Err(ModeSetError::RequiresReboot);

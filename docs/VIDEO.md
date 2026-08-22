@@ -258,7 +258,9 @@ damage и fence, а сами пиксели остаются в shared memory.
 - frame pacing и monotonic presentation clock;
 - front/back/triple-buffer protocol с generation и fences;
 - SSE2/AVX2 dispatch для blend, scale и RGB/YUV conversion;
-- IRQ-driven virtqueue, page flip/fences и hardware cursor virtio-gpu;
+- MSI-X/IOAPIC interrupt-domain для PCI, page flip и hardware cursor
+  virtio-gpu; AArch64 MMIO controlq уже завершает fenced кадры через GICv3 SPI,
+  сохраняя timer-poll как bounded аварийную страховку;
 - PCI bridge enumeration, IOMMU/DMA isolation и несколько мониторов;
 - native KMS-подобные драйверы для конкретного железа;
 - перенос compositor/input/terminal из kernel bootstrap в ring 3;
@@ -266,6 +268,8 @@ damage и fence, а сами пиксели остаются в shared memory.
 
 Текущих гарантий пока недостаточно для плавного видео: CPU fallback
 синхронно ожидает transfer/flush, а Virtio GPU не даёт точный VSync event.
+Render submissions при этом уже допускают три независимых кадра in-flight;
+на ARM completion приходит аппаратным IRQ и не ждёт следующего timer tick.
 Но surfaces,
 alpha, damage и layer ABI уже отделены от этого ограничения и не потребуют
 переписывания при появлении asynchronous или native backend.

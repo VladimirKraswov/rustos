@@ -27,6 +27,7 @@ const ESR_EC_SVC64: u16 = 0x15;
 const TRAP_SYNC: u64 = 0;
 const TRAP_IRQ: u64 = 1;
 const TRAP_SPURIOUS: u64 = 2;
+const TRAP_DEVICE_BASE: u64 = 3;
 
 /// Публикует записи CPU внешнему DMA-устройству.
 ///
@@ -86,6 +87,11 @@ impl TrapFrame {
         }
         if self.source == TRAP_IRQ {
             return TrapKind::Timer;
+        }
+        if self.source >= TRAP_DEVICE_BASE {
+            return TrapKind::Device {
+                interrupt: self.source.saturating_sub(TRAP_DEVICE_BASE) as u32,
+            };
         }
         let exception_class = ((self.esr_el1 >> ESR_EC_SHIFT) & ESR_EC_MASK) as u16;
         if self.source == TRAP_SYNC && exception_class == ESR_EC_SVC64 {
@@ -283,6 +289,12 @@ pub fn initialize_scheduler_hardware() -> Result<SchedulerHardware, ArchError> {
         interrupt_controller: "GICv3",
         timer: "generic-one-shot",
     })
+}
+
+/// Включает обнаруженный platform SPI после общей настройки GIC. Device
+/// driver передаёт нормализованный INTID; CPU backend не знает MMIO устройства.
+pub fn enable_device_interrupt(interrupt: u32) -> Result<(), ArchError> {
+    gic::enable_spi(interrupt).map_err(|_| ArchError::InterruptController)
 }
 
 /// Запускает все объявленные Device Tree CPU через PSCI и ждёт их реального

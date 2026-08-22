@@ -312,6 +312,11 @@ pub extern "C" fn rustos_handle_trap(frame: &mut TrapFrame) -> u64 {
         arch::rearm_scheduler_timer(crate::arch::counter_frequency());
         return 0;
     }
+    if let TrapKind::Device { interrupt } = kind {
+        let _ = crate::display::scanout::handle_interrupt(interrupt);
+        arch::end_of_interrupt();
+        return 0;
+    }
     if !frame.is_from_user() {
         serial::put_str("[trap] FATAL kernel exception ip=0x");
         serial::put_hex(frame.instruction_pointer());
