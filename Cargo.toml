@@ -24,6 +24,7 @@ members = [
     "libs/elf-loader",
     "libs/rune-loader",
     "libs/virgl",
+    "libs/ui-gpu",
     "libs/mesa",
     "usb",
     "libs/loader-fixture",

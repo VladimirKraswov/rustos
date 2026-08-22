@@ -451,6 +451,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustos-ui-gpu"
+version = "0.1.0"
+dependencies = [
+ "rustos-system-ui",
+]
+
+[[package]]
 name = "rustos-usb"
 version = "0.1.0"
 

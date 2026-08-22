@@ -204,3 +204,19 @@ Release-сборка на профиле UTM Apple Silicon должна держ
 
 Специальный triangle/Aurora test остаётся диагностикой 3D transport, но больше
 не служит доказательством ускорения desktop.
+
+## Текущее состояние реализации
+
+- G1: capability-checked sampled textures, damage scissor, premultiplied alpha,
+  bounded command validation и трёхслойный hardware probe реализованы;
+- G2: `rustos-ui-gpu::GpuRenderBackend` уже компилирует полный SystemUI
+  display list в bounded physical instances без CPU pixel loop; glyph/image
+  atlas и shader transport ещё должны быть подключены к `renderd`;
+- G3: общая generation-checked `SurfaceQueue` реализована и используется
+  постоянным `compositord` для triple-buffer mailbox/release lifecycle;
+- обычный интерактивный desktop всё ещё использует kernel CPU recovery
+  renderer, поэтому критерий «полностью GPU-ускорен» пока честно не выполнен.
+
+Следующая точка переключения — surface IPC для обычных приложений и отправка
+`GpuUiInstance` batches в `renderd`. После миграции desktop/chrome kernel GUI
+перестаёт стартовать в штатном сеансе и остаётся только аварийным fallback.

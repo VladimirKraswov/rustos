@@ -3,7 +3,10 @@
 `rustos-system-ui` — общая `no_std`-библиотека компонентов RustOS. Она строит
 типизированное дерево UI, выполняет layout, обрабатывает мышь и клавиатуру и
 формирует display list. Один и тот же код приложения может работать через
-CPU-renderer, будущий GPU backend или headless backend тестов.
+CPU-renderer, GPU backend или headless backend тестов. Основной GPU compiler
+находится в [`libs/ui-gpu`](../libs/ui-gpu): SystemUI не зависит от
+VirGL/Vulkan и сохраняет component API при смене видеодрайвера. CPU backend
+остаётся эталоном pixel-diff тестов и аварийным recovery path.
 
 Главное правило: приложение описывает **что** находится в окне, но не рисует
 пиксели самостоятельно. Кнопка публикует `CommandId`, текст и изображения
