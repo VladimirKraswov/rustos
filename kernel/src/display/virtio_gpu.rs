@@ -550,6 +550,7 @@ impl VirtioGpu {
     /// Загружает ARGB sprite в отдельный 64×64 cursor resource и атомарно
     /// связывает его с hardware cursor plane. Горячий mouse path после этого
     /// использует только `move_cursor` и никогда не трогает scanout damage.
+    #[allow(clippy::too_many_arguments)]
     pub fn update_cursor(
         &mut self,
         pixels: &[u32],

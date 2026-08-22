@@ -22,14 +22,25 @@ use rustos_abi::{
     },
     syscall, Handle, VmFlags, PAGE_SIZE,
 };
-use rustos_rune_format::{architecture, parse_dependency, record_kind, Container, DEPENDENCY_SIZE};
-use rustos_rune_loader::{DynamicLoader, ModuleSource, RuntimeMemory, SearchPolicy};
-use rustos_runtime::{jump_to_image, process_exit, thread_set_tls, vm_map, VmMapRequest};
+use rustos_rune_format::{
+    architecture, interface_id, parse_dependency, parse_export, record_kind, Container, Dependency,
+    DEPENDENCY_SIZE, EXPORT_SIZE,
+};
+use rustos_rune_loader::{
+    CapabilityOffer, CapabilityPlan, DynamicLoader, ModuleSource, RuntimeMemory, SearchPolicy,
+};
+use rustos_runtime::{
+    handle_close, jump_to_image, process_exit, thread_set_tls, vm_map, VmMapRequest,
+};
 use rustos_vfs::VfsClient;
 
 const MAX_IMAGE_BYTES: usize = 32 * 1024 * 1024;
 const MAX_MODULES: usize = 8;
 const TARGET_STACK_BYTES: u64 = 8 * 1024 * 1024;
+const SERVICE_RIGHT_READ: u64 = 1 << 0;
+const SERVICE_RIGHT_WRITE: u64 = 1 << 1;
+const SERVICE_RIGHT_EXECUTE: u64 = 1 << 2;
+const SERVICE_RIGHT_CREATE: u64 = 1 << 7;
 
 struct VmBumpAllocator;
 
@@ -112,9 +123,17 @@ pub extern "C" fn _start(start_address: u64, abi_version: u64, _reserved: u64) -
             system_library_dir: "/system/lib",
         },
     );
-    let loaded = loader
-        .load(&target_path, &mut memory)
+    let resolution = loader
+        .prepare(&target_path)
         .unwrap_or_else(|_| process_exit(129));
+    let routes = supervisor_routes(info).unwrap_or_else(|| process_exit(137));
+    let offers: Vec<_> = routes.iter().map(|route| route.offer).collect();
+    let capability_plan = loader
+        .resolve_capabilities(&offers)
+        .unwrap_or_else(|_| process_exit(138));
+    let loaded = loader
+        .commit(resolution, &mut memory)
+        .unwrap_or_else(|_| process_exit(139));
 
     let mut tls_storage = vec![0u8; loaded.tls.storage_size as usize];
     let thread_pointer = loader
@@ -123,14 +142,18 @@ pub extern "C" fn _start(start_address: u64, abi_version: u64, _reserved: u64) -
     if loaded.tls.size != 0 && thread_set_tls(thread_pointer) != syscall::status::OK {
         process_exit(131);
     }
+    let target_capabilities =
+        target_capabilities(info, &routes, &capability_plan).unwrap_or_else(|| process_exit(140));
     let target_info = make_target_start_info(
         info,
         &arguments[1..],
+        &target_capabilities,
         &tls_storage,
         thread_pointer,
         loaded.tls,
     )
     .unwrap_or_else(|| process_exit(132));
+    close_loader_only_capabilities(info, &target_capabilities).unwrap_or_else(|| process_exit(141));
     let stack_top = allocate_target_stack().unwrap_or_else(|| process_exit(133));
 
     // С этого момента loader state намеренно не уничтожается: target вызывает
@@ -145,6 +168,132 @@ pub extern "C" fn _start(start_address: u64, abi_version: u64, _reserved: u64) -
             syscall::ABI_VERSION,
         )
     }
+}
+
+#[derive(Clone, Copy)]
+struct SupervisorRoute {
+    offer: CapabilityOffer,
+    roles: [StartupRole; 2],
+    role_count: usize,
+}
+
+fn supervisor_routes(info: &ProcessStartInfo) -> Option<Vec<SupervisorRoute>> {
+    let mut routes = Vec::new();
+    if startup_capability(info, StartupRole::EXECUTABLE_NAMESPACE).is_some() {
+        routes.push(SupervisorRoute {
+            offer: CapabilityOffer {
+                service: interface_id("org.rustos.process/1"),
+                minimum_abi: 1,
+                maximum_abi: 1,
+                rights: SERVICE_RIGHT_CREATE | SERVICE_RIGHT_EXECUTE,
+            },
+            roles: [StartupRole::EXECUTABLE_NAMESPACE, StartupRole::NONE],
+            role_count: 1,
+        });
+    }
+    if startup_capability(info, StartupRole::VFS).is_some()
+        && startup_capability(info, StartupRole::VFS_REPLY).is_some()
+    {
+        routes.push(SupervisorRoute {
+            offer: CapabilityOffer {
+                service: interface_id("org.rustos.vfs/1"),
+                minimum_abi: 1,
+                maximum_abi: 1,
+                rights: SERVICE_RIGHT_READ | SERVICE_RIGHT_WRITE,
+            },
+            roles: [StartupRole::VFS, StartupRole::VFS_REPLY],
+            role_count: 2,
+        });
+    }
+    if startup_capability(info, StartupRole::DISPLAY).is_some() {
+        routes.push(SupervisorRoute {
+            offer: CapabilityOffer {
+                service: interface_id("org.rustos.display/1"),
+                minimum_abi: 1,
+                maximum_abi: 1,
+                rights: SERVICE_RIGHT_WRITE,
+            },
+            roles: [StartupRole::DISPLAY, StartupRole::NONE],
+            role_count: 1,
+        });
+    }
+    if startup_capability(info, StartupRole::INPUT).is_some() {
+        routes.push(SupervisorRoute {
+            offer: CapabilityOffer {
+                service: interface_id("org.rustos.input/1"),
+                minimum_abi: 1,
+                maximum_abi: 1,
+                rights: SERVICE_RIGHT_READ,
+            },
+            roles: [StartupRole::INPUT, StartupRole::NONE],
+            role_count: 1,
+        });
+    }
+    Some(routes)
+}
+
+fn target_capabilities(
+    info: &ProcessStartInfo,
+    routes: &[SupervisorRoute],
+    plan: &CapabilityPlan,
+) -> Option<Vec<StartupCapability>> {
+    let mut selected = Vec::new();
+    // Stdio и lifecycle channel являются частью process bootstrap, а не
+    // доступом к системному service. Они не дают приложению новых полномочий.
+    for role in [
+        StartupRole::STDIN,
+        StartupRole::STDOUT,
+        StartupRole::STDERR,
+        StartupRole::SUPERVISOR,
+    ] {
+        if let Some(capability) = startup_capability(info, role) {
+            push_unique_capability(&mut selected, capability)?;
+        }
+    }
+    for grant in plan.grants() {
+        let route = routes.get(grant.offer_index as usize)?;
+        if route.offer.service != grant.service {
+            return None;
+        }
+        for role in route.roles.iter().take(route.role_count) {
+            let capability = startup_capability(info, *role)?;
+            push_unique_capability(&mut selected, capability)?;
+        }
+    }
+    Some(selected)
+}
+
+fn push_unique_capability(
+    selected: &mut Vec<StartupCapability>,
+    capability: StartupCapability,
+) -> Option<()> {
+    if selected
+        .iter()
+        .any(|current| current.role == capability.role)
+    {
+        return None;
+    }
+    if selected.len() == rustos_abi::process::PROCESS_SPAWN_MAX_CAPABILITIES {
+        return None;
+    }
+    selected.push(capability);
+    Some(())
+}
+
+fn close_loader_only_capabilities(
+    info: &ProcessStartInfo,
+    selected: &[StartupCapability],
+) -> Option<()> {
+    let capabilities = startup_capabilities(info)?;
+    for capability in capabilities {
+        if selected.iter().any(|kept| kept.handle == capability.handle) {
+            continue;
+        }
+        if handle_close(capability.handle) != syscall::status::OK {
+            return None;
+        }
+    }
+    Some(())
 }
 
 fn validate_start_info(address: u64, abi_version: u64) -> Option<&'static ProcessStartInfo> {
@@ -187,19 +336,34 @@ fn checked_startup_bytes(address: u64, length: usize) -> Option<&'static [u8]> {
 }
 
 fn startup_handle(info: &ProcessStartInfo, role: StartupRole) -> Option<Handle> {
+    startup_capability(info, role).map(|capability| capability.handle)
+}
+
+fn startup_capability(info: &ProcessStartInfo, role: StartupRole) -> Option<StartupCapability> {
+    startup_capabilities(info)?
+        .iter()
+        .find(|capability| capability.role == role && capability.flags == 0)
+        .copied()
+}
+
+fn startup_capabilities(info: &ProcessStartInfo) -> Option<&'static [StartupCapability]> {
     if info.capability_count > 8 {
         return None;
     }
-    let capabilities = unsafe {
+    let byte_length = info.capability_count as usize * core::mem::size_of::<StartupCapability>();
+    let bytes = checked_startup_bytes(info.capabilities_address, byte_length)?;
+    if !info
+        .capabilities_address
+        .is_multiple_of(core::mem::align_of::<StartupCapability>() as u64)
+    {
+        return None;
+    }
+    Some(unsafe {
         slice::from_raw_parts(
-            info.capabilities_address as *const StartupCapability,
+            bytes.as_ptr().cast::<StartupCapability>(),
             info.capability_count as usize,
         )
-    };
-    capabilities
-        .iter()
-        .find(|capability| capability.role == role && capability.flags == 0)
-        .map(|capability| capability.handle)
+    })
 }
 
 fn preload_graph(
@@ -219,27 +383,29 @@ fn preload_graph(
             return Err(rustos_abi::vfs::status::LIMIT_REACHED);
         }
         let dependencies =
-            dependency_names(&entries[cursor].bytes).ok_or(rustos_abi::vfs::status::IO)?;
-        for name in dependencies {
+            dependency_records(&entries[cursor].bytes).ok_or(rustos_abi::vfs::status::IO)?;
+        for (name, dependency) in dependencies {
+            if entries
+                .iter()
+                .any(|image| image_matches_dependency(&image.bytes, dependency))
+            {
+                continue;
+            }
             let candidates = [
                 format!("{application_dir}/{name}"),
                 format!("{private_dir}/{name}"),
                 format!("/system/lib/{name}"),
             ];
-            if candidates
-                .iter()
-                .any(|candidate| entries.iter().any(|image| image.path == *candidate))
-            {
-                continue;
-            }
             let mut loaded = None;
             for candidate in candidates {
                 if let Ok(bytes) = read_file(vfs, &candidate) {
-                    loaded = Some(Image {
-                        path: candidate,
-                        bytes,
-                    });
-                    break;
+                    if image_matches_dependency(&bytes, dependency) {
+                        loaded = Some(Image {
+                            path: candidate,
+                            bytes,
+                        });
+                        break;
+                    }
                 }
             }
             entries.push(loaded.ok_or(rustos_abi::vfs::status::NOT_FOUND)?);
@@ -249,7 +415,7 @@ fn preload_graph(
     Ok(Images { entries })
 }
 
-fn dependency_names(image: &[u8]) -> Option<Vec<String>> {
+fn dependency_records(image: &[u8]) -> Option<Vec<(String, Dependency)>> {
     let container = Container::parse(image).ok()?;
     let architecture = current_architecture();
     let mut names = Vec::new();
@@ -262,12 +428,44 @@ fn dependency_names(image: &[u8]) -> Option<Vec<String>> {
         }
         for raw in bytes.as_chunks::<DEPENDENCY_SIZE>().0 {
             let dependency = parse_dependency(raw)?;
-            names.push(String::from(
-                container.string(dependency.name_offset, dependency.name_length)?,
+            names.push((
+                String::from(container.string(dependency.name_offset, dependency.name_length)?),
+                dependency,
             ));
         }
     }
     Some(names)
+}
+
+fn image_matches_dependency(image: &[u8], dependency: Dependency) -> bool {
+    let Ok(container) = Container::parse(image) else {
+        return false;
+    };
+    if dependency.package != [0; 16] && container.header().package_id != dependency.package {
+        return false;
+    }
+    for table in container.entries().filter(|entry| {
+        entry.kind == record_kind::EXPORTS && entry.architecture == current_architecture()
+    }) {
+        let Some(bytes) = container.payload(table) else {
+            return false;
+        };
+        if !bytes.len().is_multiple_of(EXPORT_SIZE) {
+            return false;
+        }
+        for raw in bytes.as_chunks::<EXPORT_SIZE>().0 {
+            let Some(export) = parse_export(raw) else {
+                return false;
+            };
+            if export.interface == dependency.interface
+                && export.abi_version >= dependency.minimum_abi
+                && export.abi_version <= dependency.maximum_abi
+            {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn read_file(vfs: &mut VfsClient, path: &str) -> Result<Vec<u8>, i32> {
@@ -297,6 +495,7 @@ fn read_file(vfs: &mut VfsClient, path: &str) -> Result<Vec<u8>, i32> {
 fn make_target_start_info(
     original: &ProcessStartInfo,
     arguments: &[&[u8]],
+    capabilities: &[StartupCapability],
     tls_storage: &[u8],
     thread_pointer: u64,
     tls: rustos_rune_loader::TlsLayout,
@@ -308,8 +507,7 @@ fn make_target_start_info(
         original.environment_address,
         original.environment_length as usize,
     )?;
-    let capability_bytes =
-        original.capability_count as usize * core::mem::size_of::<StartupCapability>();
+    let capability_bytes = core::mem::size_of_val(capabilities);
     let header_size = core::mem::size_of::<ProcessStartInfo>();
     let capability_offset = align_up_usize(
         header_size
@@ -333,9 +531,9 @@ fn make_target_start_info(
     block[cursor..cursor + environment.len()].copy_from_slice(environment);
     let capabilities_address = base + capability_offset as u64;
     if capability_bytes != 0 {
-        let capabilities = checked_startup_bytes(original.capabilities_address, capability_bytes)?;
-        block[capability_offset..capability_offset + capability_bytes]
-            .copy_from_slice(capabilities);
+        let bytes =
+            unsafe { slice::from_raw_parts(capabilities.as_ptr().cast::<u8>(), capability_bytes) };
+        block[capability_offset..capability_offset + capability_bytes].copy_from_slice(bytes);
     }
     let tls_template_address = if tls.size == 0 {
         0
@@ -365,7 +563,7 @@ fn make_target_start_info(
         environment_length: environment.len() as u32,
         environment_count: original.environment_count,
         capabilities_address,
-        capability_count: original.capability_count,
+        capability_count: capabilities.len() as u32,
         reserved: 0,
         tls_template_address,
         tls_file_size: tls.size,

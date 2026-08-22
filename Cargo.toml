@@ -31,6 +31,7 @@ members = [
     "libs/loader-fixture",
     "libs/loader-root",
     "rune-format",
+    "ruidl",
     "userspace/bootstrap",
     "kernel",
     "boot/uefi",
@@ -40,6 +41,7 @@ members = [
     "tools/hmp",
     "tools/vfs-image",
     "tools/rune",
+    "tools/ruidl",
     "tools/rui",
     "tools/wallpaper-pack",
 ]

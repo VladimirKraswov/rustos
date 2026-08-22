@@ -155,7 +155,7 @@ patterns=(
     "\[std\] allocator fs threads futex process pipes stdio native SDK and VFS executable verified in ring3 RUNE"
     "\[vfsd\] open/read/write/seek/readdir/create/rename over shared memory verified"
     "\[vfsd\] restart recovered committed VaraniaFS metadata and file data"
-    "\[loader\] RUNE interfaces imports ABI TLS RELRO and cross-process shared RX verified"
+    "\[loader\] atomic package prepare/capability-policy/commit imports TLS RELRO shared-RX verified"
     "\[process-manager\] dynamic create/exit/reap reclaimed all frames"
     "\[scheduler\] priority, affinity and fault-containment policy verified"
     "\[microkernel\] RING3_MILESTONE_OK"

@@ -614,6 +614,11 @@ pub fn interface_id(canonical_name: &str) -> InterfaceId {
     InterfaceId(domain_id(b"RUNE/interface/v1\0", canonical_name.as_bytes()))
 }
 
+/// Стабильный ID package name, используемый header и optional dependency pin.
+pub fn package_id(canonical_name: &str) -> [u8; 16] {
+    sha256(canonical_name.as_bytes())[..16].try_into().unwrap()
+}
+
 /// Детерминированный symbol ID включает interface ID и каноническую C ABI
 /// signature, например `read(u64,*mut u8,u64)->i64`.
 pub fn symbol_id(interface: InterfaceId, canonical_signature: &str) -> SymbolId {
@@ -643,6 +648,18 @@ pub fn sha256_with_zeroed_range(bytes: &[u8], zeroed: Range<usize>) -> [u8; 32] 
     let mut state = Sha256::new();
     for (index, byte) in bytes.iter().copied().enumerate() {
         state.update_byte(if zeroed.contains(&index) { 0 } else { byte });
+    }
+    state.finish()
+}
+
+/// Обычный SHA-256 для content-addressed SDK/package cache.
+///
+/// Реализация общая с verifier RUNE, поэтому cache key не зависит от наличия
+/// host crypto library и совпадает при self-hosted сборке внутри RustOS.
+pub fn sha256(bytes: &[u8]) -> [u8; 32] {
+    let mut state = Sha256::new();
+    for byte in bytes {
+        state.update_byte(*byte);
     }
     state.finish()
 }
@@ -1230,6 +1247,10 @@ mod tests {
         assert_ne!(
             symbol_id(vfs, "read(u64,*mut u8,u64)->i64"),
             symbol_id(vfs, "write(u64,*const u8,u64)->i64")
+        );
+        assert_eq!(
+            package_id("org.rustos.vfs-client"),
+            sha256(b"org.rustos.vfs-client")[..16]
         );
     }
 

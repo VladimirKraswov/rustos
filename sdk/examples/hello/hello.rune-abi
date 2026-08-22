@@ -10,4 +10,5 @@ summary default "Minimal independent RustOS application"
 summary ru-RU "Минимальное независимое приложение RustOS"
 vendor "RustOS Project"
 category development.examples
+capability required org.rustos.vfs/1 1 0x3 4
 icon 64 64 100 svg any application assets/hello.svg

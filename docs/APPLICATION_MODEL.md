@@ -137,15 +137,15 @@ dependency останавливает запуск до entry point, optional de
 - errors и допустимые ABI versions;
 - capability/service requirements.
 
-Первый реализованный шаг уже встраивает проверенный исходник `RUNE-ABI 1` в
-этот record. Следующий SDK-этап заменяет ручное дублирование единым RUIDL
-generator:
+Проверенный исходник `RUNE-ABI 1` встраивается в этот record. Общий RUIDL
+parser уже используется packer'ом и SDK compiler, который генерирует raw/safe
+crates в content-addressed cache:
 
 ```text
 library.rune / installed SDK registry
                  |
                  v
-        rustos sdk resolve
+        rustos-ruidl resolve
                  |
         schema hash + target ABI
                  v
@@ -287,19 +287,21 @@ package ID, manifest, interface graph и resources совпадают. `BuildId`
 Уже реализованы fixed RUNE header/TOC, AMD64/AArch64 slices, imports/exports,
 dependency ABI ranges, relocations, TLS, RELRO, shared RX, content hash,
 ring-3 resolver, typed manifest, UTF-8 metadata, icon/resource records и
-embedded interface schema. `hello.rune` собирается с локализованным manifest и
-SVG icon.
+embedded interface schema. RUIDL compiler создаёт raw/safe crates в общем
+hash-cache, loader разделён на `prepare/capability-policy/commit`, а dependency
+может быть закреплена по PackageId. `hello.rune` собирается с локализованным
+manifest, SVG icon и required VFS route.
 
 До зрелой границы ещё обязательны:
 
-1. RUIDL parser/code generator и content-addressed SDK cache;
-2. capability requests из manifest и user-space supervisor/resolver policy;
-3. атомарный package closure с private dependencies и signatures;
-4. перенос оставшейся loader/policy логики из kernel bootstrap в ring 3;
+1. ownership/layout/error annotations для полностью safe pointer wrappers;
+2. подписи package registry и атомарная установка package set;
+3. перенос оставшейся launch orchestration из kernel bootstrap в постоянный
+   ring-3 supervisor service;
+4. fault-injection всего запуска и unload/restart lifecycle;
 5. публичные `window/system-ui/graphics` DLL и независимый ring-3 sample;
-6. fault-injection всего запуска и unload/restart lifecycle;
-7. перевод desktop/Terminal/Проводника на эту границу;
-8. переключение системных UI/graphics providers на GPU без второго публичного
+6. перевод desktop/Terminal/Проводника на эту границу;
+7. переключение системных UI/graphics providers на GPU без второго публичного
    API и без прямой зависимости приложений от renderer crates.
 
 ## Технические ориентиры

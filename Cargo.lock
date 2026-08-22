@@ -400,10 +400,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustos-ruidl"
+version = "0.1.0"
+dependencies = [
+ "rustos-rune-format",
+]
+
+[[package]]
+name = "rustos-ruidl-compiler"
+version = "0.1.0"
+dependencies = [
+ "rustos-ruidl",
+ "rustos-rune-format",
+]
+
+[[package]]
 name = "rustos-rune"
 version = "0.1.0"
 dependencies = [
  "rustos-crt",
+ "rustos-ruidl",
  "rustos-rune-format",
 ]
 

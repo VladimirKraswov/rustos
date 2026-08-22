@@ -171,8 +171,9 @@ Rust ABI не экспортируется: между версиями compiler
 - `CapabilityRequest` — 32 байта: service interface, rights, ABI, slot hint.
 
 Packer сохраняет проверенный исходник ABI-схемы в `INTERFACE_SCHEMA`. Runtime
-loader не отображает его в executable memory; SDK извлекает схему, генерирует
-Rust/C facade и кэширует результат по hash schema/target ABI.
+loader не отображает его в executable memory; `rustos-ruidl` извлекает схему,
+генерирует raw/safe Rust crates и атомарно кэширует результат по hash
+schema/target ABI. Подробности — [`RUIDL.md`](RUIDL.md).
 
 Relocation ссылается на import по индексу. Resolver выбирает provider из
 подписанного package graph, проверяет ABI и тип symbol, eagerly применяет

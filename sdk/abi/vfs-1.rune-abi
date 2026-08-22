@@ -3,6 +3,7 @@ package org.rustos.system.vfs-client
 kind library
 interface org.rustos.vfs/1
 abi 1
+capability required org.rustos.vfs/1 1 0x3 4
 export rustos_vfs_connect connect(*mut_client,u32,u32)->i32 function
 export rustos_vfs_open open(*mut_client,*const_u8,usize,u32,*mut_u64)->i32 function
 export rustos_vfs_close close(*mut_client,u64)->i32 function

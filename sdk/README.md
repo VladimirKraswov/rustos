@@ -26,8 +26,10 @@ Manifest приложения также хранит локализованны
 version, icons и resources. Рабочий пример —
 [`examples/hello/hello.rune-abi`](examples/hello/hello.rune-abi); SVG icon
 встраивается в тот же `hello.rune`. Каноническая interface schema DLL тоже
-встраивается в RUNE, а будущий `rustos sdk resolve` будет генерировать и
-кэшировать safe Rust facade без копирования «заголовков» по проектам.
+встраивается в RUNE. Реализованный `rustos-ruidl resolve` генерирует raw
+`-sys` crate и safe Rust facade в общем content-addressed cache без
+копирования «заголовков» по проектам. Формат cache, команды и safety boundary
+описаны в [`docs/RUIDL.md`](../docs/RUIDL.md).
 
 Пошаговый выбор между приложением, утилитой, service и DLL, структура малой
 задачи и checklist публикации описаны в

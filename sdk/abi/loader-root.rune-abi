@@ -4,6 +4,6 @@ package org.rustos.examples.loader-root
 kind application
 interface org.rustos.example.loader-root/1
 abi 1
-dependency fixture-1.rune org.rustos.example.answer/1 1 1
+dependency fixture-1.rune org.rustos.example.answer/1 1 1 org.rustos.examples.fixture-answer
 import fixture_answer org.rustos.example.answer/1 fixture_answer()->u64 1 1 function
 export linked_answer linked_answer()->u64 function

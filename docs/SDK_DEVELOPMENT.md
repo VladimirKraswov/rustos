@@ -107,8 +107,9 @@ export rustos_text_measure measure(*const_u8,usize,*mut_u64)->i32 function
 2. safe Rust facade: slices, typed errors, RAII handles; все `unsafe` спрятаны;
 3. consumer example, который импортирует facade, а не raw symbol.
 
-Исходная ABI-схема встраивается в DLL как `INTERFACE_SCHEMA`. Целевая команда
-`rustos sdk resolve` генерирует из неё safe Rust crate в общий cache, поэтому
+Исходная ABI-схема встраивается в DLL как `INTERFACE_SCHEMA`. Команда
+`rustos-ruidl resolve` генерирует из неё raw и safe Rust crates в общий
+content-addressed cache, поэтому
 разработчик не копирует declarations в каждый проект. Готовые Rust bindings
 могут поставляться как оптимизация, но schema остаётся единственным источником
 истины и позднее генерирует также C/Node.js bindings.

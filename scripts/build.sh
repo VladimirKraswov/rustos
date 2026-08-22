@@ -62,6 +62,15 @@ cargo run -q -p rustos-rune -- pack-manifest \
 for library in "$RUNE_LIB_DIR/"*.rune; do
     cargo run -q -p rustos-rune -- verify "$library"
 done
+# Один общий cache обслуживает все приложения workspace. Target ABI входит в
+# hash key, поэтому AMD64 и AArch64 bindings не конфликтуют и не копируются в
+# каждый project отдельно.
+RUIDL_CACHE="$ROOT/build/sdk-cache"
+mkdir -p "$RUIDL_CACHE"
+for library in fixture-1.rune vfs-1.rune; do
+    cargo run -q -p rustos-ruidl-compiler --bin rustos-ruidl -- resolve \
+        "$RUNE_LIB_DIR/$library" "$RUIDL_CACHE" x86_64-unknown-rustos >/dev/null
+done
 cargo run -q -p rustos-rune -- pack-manifest \
     "$STD_TARGET_DIR/x86_64-unknown-rustos/debug/rustos-sdk-hello" \
     "$RUNE_APP_DIR/hello.rune" sdk/examples/hello/hello.rune-abi

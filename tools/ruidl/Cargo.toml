@@ -1,0 +1,17 @@
+[package]
+name = "rustos-ruidl-compiler"
+description = "RUIDL compiler и content-addressed RustOS SDK cache"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "rustos-ruidl"
+path = "src/main.rs"
+doc = false
+
+[dependencies]
+rustos-ruidl = { path = "../../ruidl" }
+rustos-rune-format = { path = "../../rune-format" }

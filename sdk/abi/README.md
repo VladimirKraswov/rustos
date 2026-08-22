@@ -21,10 +21,17 @@ dependency math-1.rune org.example.math/1 1 2
 import add org.example.math/1 add(i64,i64)->i64 1 2 function
 ```
 
+Optional шестое поле dependency закрепляет конкретный canonical package:
+
+```text
+dependency math-1.rune org.example.math/1 1 2 org.example.math-reference
+```
+
 Из canonical interface/signature упаковщик детерминированно строит 128-битные
 ID, проверяет `.dynsym` ELF intermediate и не позволяет получить RUNE с
 необъявленным импортом. Это одновременно документация, проверка совместимости
-ABI и вход будущего генератора безопасных Rust/C wrappers.
+ABI и вход реализованного RUIDL compiler. Команда и cache layout описаны в
+[`docs/RUIDL.md`](../../docs/RUIDL.md).
 
 Для application/service тот же UTF-8 manifest может содержать package fields:
 

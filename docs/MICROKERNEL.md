@@ -183,7 +183,7 @@ PID/TID, изоляцию process fault и supervisor backoff. `make test-boot` 
 [supervisor] persistent renderd/compositord/displayd services ready
 [std] allocator fs threads futex process pipes stdio native SDK and VFS executable verified in ring3 RUNE
 [vfsd] restart recovered committed VaraniaFS metadata and file data
-[loader] RUNE interfaces imports ABI TLS RELRO and cross-process shared RX verified
+[loader] atomic package prepare/capability-policy/commit imports TLS RELRO shared-RX verified
 [process-manager] dynamic create/exit/reap reclaimed all frames
 [microkernel] RING3_MILESTONE_OK
 ```

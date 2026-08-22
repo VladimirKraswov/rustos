@@ -11,9 +11,10 @@ use core::ptr;
 
 use rustos_abi::{memory::MEMORY_ABI_VERSION, syscall, Handle, VmFlags, PAGE_SIZE};
 use rustos_rune_format::{
-    architecture, export_flags, parse_dependency, parse_export, parse_import, parse_relocation,
-    record_kind, region_flags, relocation_kind, Container, Dependency, Export, FormatError, Import,
-    InterfaceId, SymbolId, TocEntry, DEPENDENCY_SIZE, EXPORT_SIZE, IMPORT_SIZE, RELOCATION_SIZE,
+    architecture, capability_flags, export_flags, parse_capability_request, parse_dependency,
+    parse_export, parse_import, parse_relocation, record_kind, region_flags, relocation_kind,
+    CapabilityRequest, Container, Dependency, Export, FormatError, Import, InterfaceId, SymbolId,
+    TocEntry, CAPABILITY_REQUEST_SIZE, DEPENDENCY_SIZE, EXPORT_SIZE, IMPORT_SIZE, RELOCATION_SIZE,
 };
 use rustos_runtime::{
     handle_close, shared_memory_create, shared_memory_map, shared_memory_seal, vm_map, vm_protect,
@@ -26,6 +27,7 @@ const CURRENT_ARCHITECTURE: u16 = architecture::X86_64;
 const CURRENT_ARCHITECTURE: u16 = architecture::AARCH64;
 
 const MAX_MODULES: usize = 8;
+const MAX_CAPABILITY_REQUESTS: usize = 16;
 const MAX_REGIONS_PER_MODULE: usize = 12;
 const MODULE_ARENA_BASE: u64 = 0x0000_5800_0000_0000;
 const MODULE_STRIDE: u64 = 32 * 1024 * 1024;
@@ -37,6 +39,8 @@ pub enum LoadError {
     RootNotFound,
     DependencyNotFound,
     IncompatibleDependency,
+    DependencyCycle,
+    AmbiguousProvider,
     MissingImport,
     DuplicateModule,
     TooManyModules,
@@ -210,6 +214,67 @@ pub struct LoadedProgram {
     pub shared_pages: usize,
 }
 
+/// Полностью проверенный package closure до первого изменения address space.
+/// Поля доступны для диагностики, но создать валидный token может только
+/// [`DynamicLoader::prepare`].
+#[derive(Debug)]
+pub struct ResolutionPlan {
+    pub entry: u64,
+    pub modules: usize,
+    pub tls: TlsLayout,
+    seal: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CapabilityOffer {
+    pub service: InterfaceId,
+    pub minimum_abi: u16,
+    pub maximum_abi: u16,
+    /// Семантические service rights. Они не обязаны совпадать с правами
+    /// transport endpoint: policy supervisor переводит grant в handle bundle.
+    pub rights: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CapabilityGrant {
+    pub service: InterfaceId,
+    pub abi_version: u16,
+    pub slot_hint: u16,
+    pub rights: u64,
+    pub offer_index: u16,
+    pub flags: u32,
+}
+
+const EMPTY_GRANT: CapabilityGrant = CapabilityGrant {
+    service: InterfaceId([0; 16]),
+    abi_version: 0,
+    slot_hint: 0,
+    rights: 0,
+    offer_index: 0,
+    flags: 0,
+};
+
+#[derive(Clone, Copy, Debug)]
+pub struct CapabilityPlan {
+    grants: [CapabilityGrant; MAX_CAPABILITY_REQUESTS],
+    count: usize,
+}
+
+impl CapabilityPlan {
+    pub fn grants(&self) -> &[CapabilityGrant] {
+        &self.grants[..self.count]
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CapabilityError {
+    NotPrepared,
+    InvalidRecord,
+    TooManyRequests,
+    MissingRequired(InterfaceId),
+    DuplicateSlot(u16),
+}
+
 pub struct DynamicLoader<'a, S: ModuleSource> {
     source: &'a S,
     search: SearchPolicy<'a>,
@@ -242,33 +307,61 @@ impl<'a, S: ModuleSource> DynamicLoader<'a, S> {
         root_path: &str,
         memory: &mut M,
     ) -> Result<LoadedProgram, LoadError> {
+        let plan = self.prepare(root_path)?;
+        self.commit(plan, memory)
+    }
+
+    /// Строит и проверяет полный dependency closure без `vm_map`, shared
+    /// objects или других внешних изменений. Это prepare-фаза атомарного
+    /// package resolver: отсутствие DLL, cycle, import ambiguity, TLS/RELRO и
+    /// все relocation targets обнаруживаются до commit.
+    pub fn prepare(&mut self, root_path: &str) -> Result<ResolutionPlan, LoadError> {
         if self.module_count != 0 {
             return Err(LoadError::DuplicateModule);
         }
-        let root = self.source.open(root_path).ok_or(LoadError::RootNotFound)?;
-        self.add_module(root)?;
+        let result = (|| {
+            let root = self.source.open(root_path).ok_or(LoadError::RootNotFound)?;
+            self.add_module(root)?;
+            self.discover_dependencies()?;
+            self.validate_dependency_graph()?;
+            self.assign_tls()?;
+            let entry = self.validate_package_closure()?;
+            Ok(ResolutionPlan {
+                entry,
+                modules: self.module_count,
+                tls: self.tls,
+                seal: self.plan_seal(entry),
+            })
+        })();
+        if result.is_err() {
+            self.clear_plan();
+        }
+        result
+    }
+
+    /// Commit-фаза: только готовый [`ResolutionPlan`] получает право менять
+    /// address space. Любая ошибка откатывает все mappings/handles.
+    pub fn commit<M: Memory>(
+        &mut self,
+        plan: ResolutionPlan,
+        memory: &mut M,
+    ) -> Result<LoadedProgram, LoadError> {
+        if plan.modules != self.module_count
+            || plan.tls != self.tls
+            || plan.seal != self.plan_seal(plan.entry)
+        {
+            return Err(LoadError::InvalidRecord);
+        }
         let result = self
-            .discover_dependencies()
-            .and_then(|_| self.assign_tls())
-            .and_then(|_| self.map_modules(memory))
+            .map_modules(memory)
             .and_then(|_| self.relocate_modules(memory))
             .and_then(|_| self.apply_relro(memory));
         if let Err(error) = result {
             self.unload(memory);
             return Err(error);
         }
-        let root = self.modules[0].ok_or(LoadError::RootNotFound)?;
-        let slice = root.container.slice(CURRENT_ARCHITECTURE)?;
-        let entry = root
-            .base
-            .checked_add(slice.virtual_address)
-            .ok_or(LoadError::IntegerOverflow)?;
-        if !self.address_is_executable(root, entry) {
-            self.unload(memory);
-            return Err(LoadError::InvalidRecord);
-        }
         Ok(LoadedProgram {
-            entry,
+            entry: plan.entry,
             modules: self.module_count,
             tls: self.tls,
             relro_pages: self.relro_pages,
@@ -283,9 +376,97 @@ impl<'a, S: ModuleSource> DynamicLoader<'a, S> {
         minimum_abi: u16,
         maximum_abi: u16,
     ) -> Result<u64, LoadError> {
-        self.resolve_export(interface, symbol, minimum_abi, maximum_abi, 0)
+        self.resolve_export_unique(interface, symbol, minimum_abi, maximum_abi, 0)?
             .map(|definition| definition.address)
             .ok_or(LoadError::MissingImport)
+    }
+
+    /// Сопоставляет capability requests всего подготовленного closure с
+    /// supervisor policy. Метод чистый: handles создаёт только вызывающий
+    /// supervisor после успешного результата.
+    pub fn resolve_capabilities(
+        &self,
+        offers: &[CapabilityOffer],
+    ) -> Result<CapabilityPlan, CapabilityError> {
+        if self.module_count == 0 {
+            return Err(CapabilityError::NotPrepared);
+        }
+        let mut plan = CapabilityPlan {
+            grants: [EMPTY_GRANT; MAX_CAPABILITY_REQUESTS],
+            count: 0,
+        };
+        for module in self.modules.iter().take(self.module_count).flatten() {
+            for request in capability_requests(module.container)? {
+                let multiple = request.flags & capability_flags::MULTIPLE != 0;
+                let required = request.flags & capability_flags::REQUIRED != 0;
+                if !multiple {
+                    if let Some(existing) = plan.grants[..plan.count]
+                        .iter_mut()
+                        .find(|grant| grant.slot_hint == request.slot_hint)
+                    {
+                        if existing.service != request.service
+                            || existing.abi_version != request.abi_version
+                        {
+                            return Err(CapabilityError::DuplicateSlot(request.slot_hint));
+                        }
+                        let combined_rights = existing.rights | request.rights;
+                        let offer = offers
+                            .get(existing.offer_index as usize)
+                            .ok_or(CapabilityError::InvalidRecord)?;
+                        if offer.rights & combined_rights != combined_rights {
+                            if required {
+                                return Err(CapabilityError::MissingRequired(request.service));
+                            }
+                        } else {
+                            existing.rights = combined_rights;
+                            existing.flags |= request.flags;
+                        }
+                        continue;
+                    }
+                }
+                let mut matched = 0usize;
+                for (offer_index, offer) in offers.iter().enumerate() {
+                    if offer.service != request.service
+                        || request.abi_version < offer.minimum_abi
+                        || request.abi_version > offer.maximum_abi
+                        || offer.rights & request.rights != request.rights
+                    {
+                        continue;
+                    }
+                    let slot_hint = request
+                        .slot_hint
+                        .checked_add(matched as u16)
+                        .ok_or(CapabilityError::TooManyRequests)?;
+                    if plan.grants[..plan.count]
+                        .iter()
+                        .any(|grant| grant.slot_hint == slot_hint)
+                    {
+                        return Err(CapabilityError::DuplicateSlot(slot_hint));
+                    }
+                    if plan.count == MAX_CAPABILITY_REQUESTS {
+                        return Err(CapabilityError::TooManyRequests);
+                    }
+                    plan.grants[plan.count] = CapabilityGrant {
+                        service: request.service,
+                        abi_version: request.abi_version,
+                        slot_hint,
+                        rights: request.rights,
+                        offer_index: u16::try_from(offer_index)
+                            .map_err(|_| CapabilityError::TooManyRequests)?,
+                        flags: request.flags,
+                    };
+                    plan.count += 1;
+                    matched += 1;
+                    if !multiple {
+                        break;
+                    }
+                }
+                if matched == 0 && required {
+                    return Err(CapabilityError::MissingRequired(request.service));
+                }
+            }
+        }
+        Ok(plan)
     }
 
     pub fn shared_executable_region(&self, interface: InterfaceId) -> Option<SharedRegion> {
@@ -359,6 +540,11 @@ impl<'a, S: ModuleSource> DynamicLoader<'a, S> {
             }
             self.modules[module_index] = None;
         }
+        self.clear_plan();
+    }
+
+    fn clear_plan(&mut self) {
+        self.modules = [None; MAX_MODULES];
         self.module_count = 0;
         self.tls = TlsLayout {
             size: 0,
@@ -367,6 +553,20 @@ impl<'a, S: ModuleSource> DynamicLoader<'a, S> {
         };
         self.relro_pages = 0;
         self.shared_pages = 0;
+    }
+
+    fn plan_seal(&self, entry: u64) -> u64 {
+        let mut seal = entry ^ (self.module_count as u64).rotate_left(17);
+        for module in self.modules.iter().take(self.module_count).flatten() {
+            seal ^= u64::from_le_bytes(
+                module.container.header().package_id[..8]
+                    .try_into()
+                    .unwrap(),
+            )
+            .rotate_left(11);
+            seal ^= module.base.rotate_left(29);
+        }
+        seal
     }
 
     fn add_module(&mut self, image: &'a [u8]) -> Result<usize, LoadError> {
@@ -410,14 +610,7 @@ impl<'a, S: ModuleSource> DynamicLoader<'a, S> {
                     .iter()
                     .take(self.module_count)
                     .flatten()
-                    .any(|provider| {
-                        module_provides(
-                            *provider,
-                            dependency.interface,
-                            dependency.minimum_abi,
-                            dependency.maximum_abi,
-                        )
-                    })
+                    .any(|provider| module_matches_dependency(*provider, dependency))
                 {
                     continue;
                 }
@@ -426,14 +619,12 @@ impl<'a, S: ModuleSource> DynamicLoader<'a, S> {
                     .string(dependency.name_offset, dependency.name_length)
                     .ok_or(LoadError::InvalidRecord)?;
                 let image = self
-                    .find_dependency(name)
+                    .find_dependency(name, dependency)
                     .ok_or(LoadError::DependencyNotFound)?;
                 let added = self.add_module(image)?;
-                if !module_provides(
+                if !module_matches_dependency(
                     self.modules[added].ok_or(LoadError::InvalidRecord)?,
-                    dependency.interface,
-                    dependency.minimum_abi,
-                    dependency.maximum_abi,
+                    dependency,
                 ) {
                     return Err(LoadError::IncompatibleDependency);
                 }
@@ -443,7 +634,7 @@ impl<'a, S: ModuleSource> DynamicLoader<'a, S> {
         Ok(())
     }
 
-    fn find_dependency(&self, name: &str) -> Option<&'a [u8]> {
+    fn find_dependency(&self, name: &str, dependency: Dependency) -> Option<&'a [u8]> {
         if name.is_empty() || name.as_bytes().contains(&b'/') {
             return None;
         }
@@ -458,11 +649,66 @@ impl<'a, S: ModuleSource> DynamicLoader<'a, S> {
             let mut path = PathBuffer::new();
             if path.join(directory, name).is_ok() {
                 if let Some(image) = self.source.open(path.as_str()) {
-                    return Some(image);
+                    let Ok(container) = Container::parse(image) else {
+                        continue;
+                    };
+                    let module = Module {
+                        container,
+                        base: 0,
+                        tls_end_offset: 0,
+                        regions: [EMPTY_REGION; MAX_REGIONS_PER_MODULE],
+                        region_count: 0,
+                    };
+                    if module_matches_dependency(module, dependency) {
+                        return Some(image);
+                    }
                 }
             }
         }
         None
+    }
+
+    fn validate_dependency_graph(&self) -> Result<(), LoadError> {
+        let mut marks = [0u8; MAX_MODULES];
+        self.visit_dependencies(0, &mut marks)
+    }
+
+    fn visit_dependencies(
+        &self,
+        module_index: usize,
+        marks: &mut [u8; MAX_MODULES],
+    ) -> Result<(), LoadError> {
+        match marks[module_index] {
+            1 => return Err(LoadError::DependencyCycle),
+            2 => return Ok(()),
+            _ => marks[module_index] = 1,
+        }
+        let module = self.modules[module_index].ok_or(LoadError::InvalidRecord)?;
+        for dependency in dependencies(module.container)? {
+            let provider = self.unique_dependency_provider(dependency)?;
+            self.visit_dependencies(provider, marks)?;
+        }
+        marks[module_index] = 2;
+        Ok(())
+    }
+
+    fn unique_dependency_provider(&self, dependency: Dependency) -> Result<usize, LoadError> {
+        let mut found = None;
+        for (index, module) in self
+            .modules
+            .iter()
+            .take(self.module_count)
+            .enumerate()
+            .filter_map(|(index, module)| module.map(|module| (index, module)))
+        {
+            if !module_matches_dependency(module, dependency) {
+                continue;
+            }
+            if found.replace(index).is_some() {
+                return Err(LoadError::AmbiguousProvider);
+            }
+        }
+        found.ok_or(LoadError::DependencyNotFound)
     }
 
     fn assign_tls(&mut self) -> Result<(), LoadError> {
@@ -496,6 +742,71 @@ impl<'a, S: ModuleSource> DynamicLoader<'a, S> {
                 .ok_or(LoadError::InvalidTls)?,
         };
         Ok(())
+    }
+
+    fn validate_package_closure(&self) -> Result<u64, LoadError> {
+        for module in self.modules.iter().take(self.module_count).flatten() {
+            if regions(module.container).count() > MAX_REGIONS_PER_MODULE {
+                return Err(LoadError::TooManyMappings);
+            }
+            for import in imports(module.container)? {
+                if self
+                    .resolve_export_unique(
+                        import.interface,
+                        import.symbol,
+                        import.minimum_abi,
+                        import.maximum_abi,
+                        import.flags,
+                    )?
+                    .is_none()
+                    && import.flags & rustos_rune_format::import_flags::WEAK == 0
+                {
+                    return Err(LoadError::MissingImport);
+                }
+            }
+            for relocation in relocations(module.container)? {
+                if !writable_target(module.container, relocation.offset, 8) {
+                    return Err(LoadError::TextRelocation);
+                }
+                match relocation.kind {
+                    relocation_kind::RELATIVE64 => {
+                        add_signed(module.base, relocation.addend)?;
+                    }
+                    relocation_kind::IMPORT64 | relocation_kind::IMPORT_PC32 => {
+                        let import = import_at(module.container, relocation.symbol as usize)?;
+                        let definition = self.resolve_export_unique(
+                            import.interface,
+                            import.symbol,
+                            import.minimum_abi,
+                            import.maximum_abi,
+                            import.flags,
+                        )?;
+                        if definition.is_none()
+                            && import.flags & rustos_rune_format::import_flags::WEAK == 0
+                        {
+                            return Err(LoadError::MissingImport);
+                        }
+                    }
+                    relocation_kind::TLS_TPOFF64 if relocation.symbol == 0 => {
+                        let value =
+                            i128::from(relocation.addend) - i128::from(module.tls_end_offset);
+                        i64::try_from(value).map_err(|_| LoadError::InvalidTls)?;
+                    }
+                    kind => return Err(LoadError::UnsupportedRelocation(kind)),
+                }
+            }
+            validate_relro(module.container)?;
+        }
+        let root = self.modules[0].ok_or(LoadError::RootNotFound)?;
+        let slice = root.container.slice(CURRENT_ARCHITECTURE)?;
+        let entry = root
+            .base
+            .checked_add(slice.virtual_address)
+            .ok_or(LoadError::IntegerOverflow)?;
+        if !module_address_is_executable(root, entry) {
+            return Err(LoadError::InvalidRecord);
+        }
+        Ok(entry)
     }
 
     fn map_modules<M: Memory>(&mut self, memory: &mut M) -> Result<(), LoadError> {
@@ -675,13 +986,13 @@ impl<'a, S: ModuleSource> DynamicLoader<'a, S> {
                     relocation_kind::IMPORT64 | relocation_kind::IMPORT_PC32 => {
                         let import = import_at(module.container, relocation.symbol as usize)?;
                         let definition = self
-                            .resolve_export(
+                            .resolve_export_unique(
                                 import.interface,
                                 import.symbol,
                                 import.minimum_abi,
                                 import.maximum_abi,
                                 import.flags,
-                            )
+                            )?
                             .or_else(|| {
                                 (import.flags & rustos_rune_format::import_flags::WEAK != 0)
                                     .then_some(Definition { address: 0 })
@@ -718,30 +1029,35 @@ impl<'a, S: ModuleSource> DynamicLoader<'a, S> {
         Ok(())
     }
 
-    fn resolve_export(
+    fn resolve_export_unique(
         &self,
         interface: InterfaceId,
         symbol: SymbolId,
         minimum_abi: u16,
         maximum_abi: u16,
         import_flags: u32,
-    ) -> Option<Definition> {
+    ) -> Result<Option<Definition>, LoadError> {
+        let mut definition = None;
         for module in self.modules.iter().take(self.module_count) {
-            let module = module.as_ref()?;
-            for export in exports(module.container).ok()? {
+            let module = module.as_ref().ok_or(LoadError::InvalidRecord)?;
+            for export in exports(module.container)? {
                 if export.interface == interface
                     && export.symbol == symbol
                     && export.abi_version >= minimum_abi
                     && export.abi_version <= maximum_abi
                     && compatible_symbol_flags(import_flags, export.flags)
                 {
-                    return Some(Definition {
-                        address: module.base.checked_add(export.virtual_address)?,
-                    });
+                    let address = module
+                        .base
+                        .checked_add(export.virtual_address)
+                        .ok_or(LoadError::IntegerOverflow)?;
+                    if definition.replace(Definition { address }).is_some() {
+                        return Err(LoadError::AmbiguousProvider);
+                    }
                 }
             }
         }
-        None
+        Ok(definition)
     }
 
     fn apply_relro<M: Memory>(&mut self, memory: &mut M) -> Result<(), LoadError> {
@@ -774,18 +1090,6 @@ impl<'a, S: ModuleSource> DynamicLoader<'a, S> {
         }
         Ok(())
     }
-
-    fn address_is_executable(&self, module: Module<'a>, address: u64) -> bool {
-        module
-            .regions
-            .iter()
-            .take(module.region_count)
-            .any(|region| {
-                region.final_flags.contains(VmFlags::EXECUTE)
-                    && address >= region.address
-                    && address < region.address.saturating_add(region.length)
-            })
-    }
 }
 
 #[derive(Clone, Copy)]
@@ -809,6 +1113,17 @@ fn module_end(container: Container<'_>) -> Result<u64, LoadError> {
             .checked_add(region.memory_size)
             .map(|end| maximum.max(end))
             .ok_or(LoadError::IntegerOverflow)
+    })
+}
+
+fn module_address_is_executable(module: Module<'_>, address: u64) -> bool {
+    let Some(relative) = address.checked_sub(module.base) else {
+        return false;
+    };
+    regions(module.container).any(|region| {
+        region.flags & region_flags::EXECUTE != 0
+            && relative >= region.virtual_address
+            && relative < region.virtual_address.saturating_add(region.memory_size)
     })
 }
 
@@ -948,6 +1263,118 @@ fn module_provides(
                 && export.abi_version <= maximum_abi
         })
     })
+}
+
+fn module_matches_dependency(module: Module<'_>, dependency: Dependency) -> bool {
+    (dependency.package == [0; 16] || module.container.header().package_id == dependency.package)
+        && module_provides(
+            module,
+            dependency.interface,
+            dependency.minimum_abi,
+            dependency.maximum_abi,
+        )
+}
+
+fn imports(container: Container<'_>) -> Result<RecordIterator<'_, Import>, LoadError> {
+    RecordIterator::new(container, record_kind::IMPORTS, IMPORT_SIZE, parse_import)
+}
+
+fn validate_relro(container: Container<'_>) -> Result<(), LoadError> {
+    for relro in container.entries().filter(|entry| {
+        entry.kind == record_kind::RELRO && entry.architecture == CURRENT_ARCHITECTURE
+    }) {
+        if relro.memory_size == 0 {
+            continue;
+        }
+        let start = align_down(relro.virtual_address, PAGE_SIZE);
+        let end = align_up(
+            relro
+                .virtual_address
+                .checked_add(relro.memory_size)
+                .ok_or(LoadError::InvalidRelro)?,
+            PAGE_SIZE,
+        )?;
+        if !regions(container).any(|region| {
+            let region_start = align_down(region.virtual_address, PAGE_SIZE);
+            let region_end = region
+                .virtual_address
+                .checked_add(region.memory_size)
+                .and_then(|end| align_up(end, PAGE_SIZE).ok());
+            region.flags & region_flags::WRITE != 0
+                && start >= region_start
+                && region_end.is_some_and(|region_end| end <= region_end)
+        }) {
+            return Err(LoadError::InvalidRelro);
+        }
+    }
+    Ok(())
+}
+
+fn capability_requests(
+    container: Container<'_>,
+) -> Result<CapabilityIterator<'_>, CapabilityError> {
+    CapabilityIterator::new(container)
+}
+
+struct CapabilityIterator<'a> {
+    container: Container<'a>,
+    table_index: usize,
+    bytes: &'a [u8],
+    cursor: usize,
+}
+
+impl<'a> CapabilityIterator<'a> {
+    fn new(container: Container<'a>) -> Result<Self, CapabilityError> {
+        for table in container.entries().filter(|entry| {
+            entry.kind == record_kind::CAPABILITIES
+                && matches!(entry.architecture, architecture::ANY | CURRENT_ARCHITECTURE)
+        }) {
+            let bytes = container
+                .payload(table)
+                .ok_or(CapabilityError::InvalidRecord)?;
+            if !bytes.len().is_multiple_of(CAPABILITY_REQUEST_SIZE) {
+                return Err(CapabilityError::InvalidRecord);
+            }
+        }
+        Ok(Self {
+            container,
+            table_index: 0,
+            bytes: &[],
+            cursor: 0,
+        })
+    }
+
+    fn next_table(&mut self) -> Option<()> {
+        while let Some(table) = self.container.entry(self.table_index) {
+            self.table_index += 1;
+            if table.kind != record_kind::CAPABILITIES
+                || !matches!(table.architecture, architecture::ANY | CURRENT_ARCHITECTURE)
+            {
+                continue;
+            }
+            self.bytes = self.container.payload(table)?;
+            self.cursor = 0;
+            return Some(());
+        }
+        None
+    }
+}
+
+impl Iterator for CapabilityIterator<'_> {
+    type Item = CapabilityRequest;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if let Some(raw) = self
+                .bytes
+                .get(self.cursor..self.cursor + CAPABILITY_REQUEST_SIZE)
+            {
+                self.cursor += CAPABILITY_REQUEST_SIZE;
+                return parse_capability_request(raw);
+            }
+            self.next_table()?;
+        }
+    }
 }
 
 fn compatible_symbol_flags(import: u32, export: u16) -> bool {

@@ -69,8 +69,21 @@ pub extern "C" fn _start(server: u64, reply: u64, abi_version: u64) -> ! {
             system_library_dir: "/system/lib",
         },
     );
+    // Prepare не получает Memory и потому физически не может частично map'ить
+    // address space. Пустой capability policy допустим, потому что fixture
+    // является чистой in-process DLL. Только после обеих проверок выполняем
+    // единый commit.
+    let resolution = loader
+        .prepare(ROOT_PATH)
+        .unwrap_or_else(|_| process_exit(184));
+    let capability_plan = loader
+        .resolve_capabilities(&[])
+        .unwrap_or_else(|_| process_exit(188));
+    if !capability_plan.grants().is_empty() {
+        process_exit(188);
+    }
     let program = loader
-        .load(ROOT_PATH, &mut memory)
+        .commit(resolution, &mut memory)
         .unwrap_or_else(|_| process_exit(184));
     if program.modules != 2
         || program.relro_pages == 0

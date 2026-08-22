@@ -20,9 +20,11 @@ RELRO. Sealed RX/RO regions используют одни физические �
 Безопасные Rust crates являются тонкими wrappers поверх C ABI.
 
 Копировать Rust declarations в каждый проект не требуется. Каждая публичная
-DLL несёт `INTERFACE_SCHEMA`: канонический RUIDL-контракт функций, типов,
-ownership и ошибок. SDK генерирует из него safe Rust crate и кэширует по hash
-схемы/target ABI. Необязательный `SDK_BINDINGS` может ускорять offline build,
+DLL несёт `INTERFACE_SCHEMA`: сейчас это канонический RUIDL-контракт функций
+и скалярных ABI-типов; следующие расширения добавят структуры, ownership и
+наборы ошибок. `rustos-ruidl` уже генерирует из текущего контракта raw `-sys`
+и safe Rust crates и кэширует по hash схемы/target ABI. Необязательный
+`SDK_BINDINGS` может ускорять offline build,
 но остаётся производным артефактом, а не вторым источником истины.
 
 ## DLL не заменяет системный сервис
@@ -93,8 +95,9 @@ Boot-test защищает следующие свойства:
 SDK использует декларативный `RUNE-ABI 1` manifest из `sdk/abi`. Команда
 `rustos-rune pack-manifest` запрещает необъявленные undefined imports,
 проверяет exports против `.dynsym`, формирует import/export/dependency records
-и встраивает исходную схему. Следующий обязательный этап — `rustos sdk resolve`
-и генерация safe Rust/C bindings из этого же record.
+и встраивает исходную схему. `rustos-ruidl resolve` извлекает этот же record и
+атомарно публикует generated crates в общем SDK cache; подробности —
+[`RUIDL.md`](RUIDL.md).
 
 Сейчас embedded источник уже можно проверить и прочитать без ELF sections:
 

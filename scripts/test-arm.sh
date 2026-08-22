@@ -145,7 +145,7 @@ patterns=(
     "\[surface\] ring3 create/commit/direct-scanout/release/feedback/destroy verified"
     "\[std\] allocator fs threads futex process pipes stdio native SDK and VFS executable verified in ring3 RUNE"
     "\[vfsd\] restart recovered committed VaraniaFS metadata and file data"
-    "\[loader\] RUNE interfaces imports ABI TLS RELRO and cross-process shared RX verified"
+    "\[loader\] atomic package prepare/capability-policy/commit imports TLS RELRO shared-RX verified"
     "\[microkernel\] RING3_MILESTONE_OK"
     "\[boot\] kernel test done, exit code=0"
 )

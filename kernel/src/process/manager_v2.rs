@@ -4263,8 +4263,7 @@ impl ProcessManager {
         if endpoint.generation == 0 {
             return index < STATIC_ENDPOINTS;
         }
-        index >= STATIC_ENDPOINTS
-            && index < MAX_ENDPOINTS
+        (STATIC_ENDPOINTS..MAX_ENDPOINTS).contains(&index)
             && self.endpoints[index].receiver != ProcessId::KERNEL
             && self.endpoints[index].generation == endpoint.generation
     }
@@ -5127,7 +5126,7 @@ pub(super) fn run_milestone(info: &rustos_abi::BootInfo) -> Result<(), ProcessEr
         serial::put_str("[vfsd] restart recovered committed VaraniaFS metadata and file data\n");
         run_vfs_phase(manager, "system/bin/loader-test.rune", true)?;
         serial::put_str(
-            "[loader] RUNE interfaces imports ABI TLS RELRO and cross-process shared RX verified\n",
+            "[loader] atomic package prepare/capability-policy/commit imports TLS RELRO shared-RX verified\n",
         );
 
         let free_after = memory::stats()

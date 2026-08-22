@@ -17,13 +17,15 @@ HOST_CRATES := \
 	rustos-abi rustos-microkernel rustos-video rustos-system-ui \
 	rustos-system-assets rustos-rune-format rustos-runtime rustos-vfs-client rustos-surface-client \
 	rustos-elf-loader rustos-rune-loader rustos-virgl rustos-mesa rustos-usb varaniafs rustos-image rustos-pack \
-	rustos-ui-gpu rustos-gui-check rustos-hmp rustos-vfs-image rustos-rune rustos-rui rustos-wallpaper-pack
+	rustos-ui-gpu rustos-gui-check rustos-hmp rustos-vfs-image rustos-rune rustos-ruidl \
+	rustos-ruidl-compiler rustos-rui rustos-wallpaper-pack
 HOST_CRATE_ARGS := $(addprefix -p ,$(HOST_CRATES))
 
 DOC_CRATES := \
 	rustos-abi rustos-microkernel rustos-video rustos-system-ui \
 	rustos-system-assets rustos-rune-format rustos-runtime rustos-vfs-client rustos-surface-client \
-	rustos-elf-loader rustos-rune-loader rustos-virgl rustos-ui-gpu rustos-mesa rustos-usb varaniafs
+	rustos-elf-loader rustos-rune-loader rustos-ruidl rustos-ruidl-compiler rustos-virgl \
+	rustos-ui-gpu rustos-mesa rustos-usb varaniafs
 DOC_CRATE_ARGS := $(addprefix -p ,$(DOC_CRATES))
 
 RUSTOS_CRATES := \
@@ -36,14 +38,18 @@ HOST_SYSTEM := $(shell uname -s)
 HOST_MACHINE := $(shell uname -m)
 DEFAULT_BUILD_TARGET := build-x86
 DEFAULT_RUN_TARGET := run-x86
+DEFAULT_SDK_LIBRARY := build/rune-system/lib/vfs-1.rune
+DEFAULT_SDK_TARGET := x86_64-unknown-rustos
 ifeq ($(HOST_SYSTEM),Darwin)
 ifneq ($(filter arm64 aarch64,$(HOST_MACHINE)),)
 DEFAULT_BUILD_TARGET := build-arm
 DEFAULT_RUN_TARGET := run-utm-gpu
+DEFAULT_SDK_LIBRARY := build/arm-rune-system/lib/vfs-1.rune
+DEFAULT_SDK_TARGET := aarch64-unknown-rustos
 endif
 endif
 
-.PHONY: all bootstrap build build-x86 run run-x86 boot test test-host test-arch \
+.PHONY: all bootstrap build build-x86 run run-x86 boot test test-host test-arch sdk-resolve \
         test-boot test-arm test-arm-boot test-arm-gui test-gui bootstrap-arm build-arm \
         bootstrap-mesa run-arm run-utm-gpu setup-utm-gpu run-virgl test-virgl \
         test-utm-gpu test-display-fallback format lint clean
@@ -55,6 +61,11 @@ bootstrap:
 
 bootstrap-mesa:
 	bash scripts/bootstrap-mesa.sh
+
+sdk-resolve:
+	@test -f $(DEFAULT_SDK_LIBRARY) || { echo "Сначала выполните make build" >&2; exit 1; }
+	@mkdir -p build/sdk-cache
+	cargo run -q -p rustos-ruidl-compiler --bin rustos-ruidl -- resolve $(DEFAULT_SDK_LIBRARY) build/sdk-cache $(DEFAULT_SDK_TARGET)
 
 build: $(DEFAULT_BUILD_TARGET)
 
