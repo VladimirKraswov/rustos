@@ -1,5 +1,5 @@
-//! Сквозной ring-3 тест ABI v2. Один обычный пользовательский процесс
-//! проверяет VM, TLS, потоки, shared memory, spawn/wait/kill и часы.
+//! Сквозной ring-3 тест ABI. Один обычный пользовательский процесс проверяет
+//! VM, TLS, потоки, shared memory, dynamic endpoints, spawn/wait/kill и часы.
 
 #![no_std]
 #![no_main]
@@ -7,6 +7,7 @@
 use core::panic::PanicInfo;
 
 use rustos_abi::{
+    ipc::Message,
     memory::MEMORY_ABI_VERSION,
     process::{
         ProcessSpawnRequest, ProcessSpawnResult, SpawnCapability, StartupRole, ThreadCreateRequest,
@@ -15,10 +16,11 @@ use rustos_abi::{
     ExitReason, PriorityClass,
 };
 use rustos_runtime::{
-    handle_close, monotonic_time_ns, process_exit, process_kill, process_spawn, process_wait,
-    read_thread_pointer_u64, shared_memory_create, shared_memory_map, syscall, thread_create,
-    thread_exit, thread_join, thread_set_tls, vm_map, vm_protect, vm_unmap, Handle, Rights,
-    SharedMemoryCreate, SharedMemoryMap, VmFlags, VmMapRequest,
+    endpoint_create, handle_close, handle_duplicate, ipc_receive, ipc_send, monotonic_time_ns,
+    process_exit, process_kill, process_spawn, process_wait, read_thread_pointer_u64,
+    shared_memory_create, shared_memory_map, syscall, thread_create, thread_exit, thread_join,
+    thread_set_tls, vm_map, vm_protect, vm_unmap, Handle, Rights, SharedMemoryCreate,
+    SharedMemoryMap, VmFlags, VmMapRequest,
 };
 
 const PAGE_SIZE: u64 = 4096;
@@ -33,6 +35,7 @@ pub extern "C" fn _start(vfs_handle: u64, abi_version: u64) -> ! {
     if first_time <= 0 {
         process_exit(211);
     }
+    test_dynamic_endpoint();
 
     let scratch_request = VmMapRequest {
         version: MEMORY_ABI_VERSION,
@@ -176,6 +179,40 @@ pub extern "C" fn _start(vfs_handle: u64, abi_version: u64) -> ! {
         process_exit(220);
     }
     process_exit(0)
+}
+
+fn test_dynamic_endpoint() {
+    let endpoint_value = endpoint_create();
+    if endpoint_value <= 0 {
+        process_exit(225);
+    }
+    let endpoint = Handle(endpoint_value as u32);
+    let sender_value = handle_duplicate(endpoint, Rights::SEND.union(Rights::TRANSFER));
+    if sender_value <= 0
+        || handle_duplicate(endpoint, Rights::RECEIVE) != syscall::status::ACCESS_DENIED
+    {
+        process_exit(226);
+    }
+    let sender = Handle(sender_value as u32);
+    let mut outgoing = Message::EMPTY;
+    outgoing.header.opcode = 0x7e00;
+    outgoing.header.request_id = 42;
+    outgoing.header.payload_len = 8;
+    outgoing.payload[..8].copy_from_slice(&0x5255_5354_4550_0001u64.to_le_bytes());
+    if ipc_send(sender, &outgoing) != syscall::status::OK {
+        process_exit(227);
+    }
+    let mut incoming = Message::EMPTY;
+    if ipc_receive(endpoint, &mut incoming) != syscall::status::OK
+        || incoming.header.opcode != outgoing.header.opcode
+        || incoming.header.request_id != outgoing.header.request_id
+        || incoming.header.sender_pid == 0
+        || incoming.payload[..8] != outgoing.payload[..8]
+        || handle_close(sender) != syscall::status::OK
+        || handle_close(endpoint) != syscall::status::OK
+    {
+        process_exit(228);
+    }
 }
 
 fn test_thread(shared_address: u64) {

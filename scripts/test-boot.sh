@@ -150,7 +150,7 @@ patterns=(
     "\[preempt\] timer ticks=[1-9][0-9]* context-switches=[1-9][0-9]* extended-state=preserved"
     "\[isolation\] concurrent #UD terminated one process; survivor exited=22"
     "\[ipc\] queued block/wake and attenuated VFS capability verified"
-    "\[abi-v4\] spawn/wait/kill threads VM shared-memory TLS clock verified"
+    "\[abi-v8\] spawn/wait/kill threads VM shared-memory dynamic-endpoint TLS clock verified"
     "\[std-startup\] ordinary fn main argv and process-local environment verified"
     "\[std\] allocator fs threads futex process pipes stdio native SDK and VFS executable verified in ring3 RUNE"
     "\[vfsd\] open/read/write/seek/readdir/create/rename over shared memory verified"

@@ -25,12 +25,13 @@ RustOS — учебная 64-битная микроядерная операц�
 - ACPI MADT discovery и INIT–SIPI–SIPI запуск AP-ядер через 16/32/64-битный
   trampoline; AP пока безопасно parked до per-CPU TSS/IDT;
 - dynamic create/exit/reap с generation-safe PID/TID и полным reclaim;
-- process/capability ABI v7: ring-3 `spawn/wait/kill`, несколько потоков с
+- process/capability ABI v8: ring-3 `spawn/wait/kill`, несколько потоков с
   `create/join`, argv/environment, FS-base/TPIDR TLS и monotonic clock;
 - anonymous `map/unmap/protect` с W^X и shared-memory objects с раздельным
   учётом capability/mapping references;
-- bounded endpoint IPC: block/wake, kernel-supplied sender PID, FIFO queue и
-  передача только ослабленных capabilities;
+- bounded endpoint IPC: block/wake, kernel-supplied sender PID, FIFO queue,
+  process-owned динамические endpoint'ы и передача только ослабленных
+  capabilities;
 - host-tested scheduler core: CPU affinity, приоритетные классы и bounded
   driver priority;
 - wide-screen GOP/virtio-gpu scanout поверх PCI (AMD64) и MMIO (AArch64),

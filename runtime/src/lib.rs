@@ -431,6 +431,18 @@ pub fn handle_close(handle: Handle) -> i64 {
     unsafe { syscall3(syscall::number::HANDLE_CLOSE, handle.0 as u64, 0, 0) }
 }
 
+/// Создаёт производный capability с ослабленным набором прав.
+pub fn handle_duplicate(handle: Handle, rights: Rights) -> i64 {
+    unsafe {
+        syscall3(
+            syscall::number::HANDLE_DUPLICATE,
+            handle.0 as u64,
+            rights.0,
+            0,
+        )
+    }
+}
+
 /// Возвращает монотонное время в наносекундах.
 pub fn monotonic_time_ns() -> i64 {
     unsafe { syscall3(syscall::number::CLOCK_MONOTONIC, 0, 0, 0) }
@@ -539,6 +551,15 @@ pub fn ipc_receive(endpoint: Handle, message: &mut Message) -> i64 {
             0,
         )
     }
+}
+
+/// Создаёт независимый process-owned IPC endpoint.
+///
+/// Полученный capability содержит SEND/RECEIVE/TRANSFER. Для reply channel
+/// клиент передаёт сервису только производное право SEND; RECEIVE остаётся у
+/// владельца. Закрытие RECEIVE capability отзывает endpoint и все его копии.
+pub fn endpoint_create() -> i64 {
+    unsafe { syscall3(syscall::number::ENDPOINT_CREATE, 0, 0, 0) }
 }
 
 /// Низкоуровневый ABI. Номера операций и семантика аргументов общие, а

@@ -61,6 +61,8 @@ pub(super) enum CapabilityKind {
     Empty,
     VfsRoot,
     Endpoint(u8),
+    /// Динамический process-owned endpoint: high byte — generation, low byte — index.
+    DynamicEndpoint(u16),
     Process(ProcessId),
     Thread(rustos_abi::ThreadId),
     SharedMemory(u16),

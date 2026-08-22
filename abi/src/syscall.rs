@@ -8,7 +8,7 @@
 /// инструкции `svc` равно нулю.
 pub const INTERRUPT_VECTOR: u8 = 0x80;
 /// Версия syscall ABI, передаваемая вторым bootstrap-аргументом.
-pub const ABI_VERSION: u64 = 7;
+pub const ABI_VERSION: u64 = 8;
 
 /// Номера операций (`RAX`).
 pub mod number {
@@ -125,6 +125,9 @@ pub mod number {
     pub const GPU_SUBMIT: u64 = 46;
     /// Прочитать status завершённого fence. `arg0=context, arg1=fence`.
     pub const GPU_COMPLETION_STATUS: u64 = 47;
+    /// Создать process-owned capability IPC endpoint. Результат — handle с
+    /// SEND/RECEIVE/TRANSFER либо отрицательный status.
+    pub const ENDPOINT_CREATE: u64 = 48;
 }
 
 /// Отрицательные результаты syscall. Не совпадают с Unix errno намеренно:

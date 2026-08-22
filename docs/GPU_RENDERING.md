@@ -53,7 +53,7 @@ Bootstrap process ABI допускает три незавершённых submi
 
 ## GPU ABI
 
-Syscall ABI v7 добавляет:
+Syscall ABI v8 добавляет:
 
 - `gpu_get_info` — negotiated VirGL/capset и точные лимиты;
 - `gpu_context_create` — изолированный classic VirGL context;

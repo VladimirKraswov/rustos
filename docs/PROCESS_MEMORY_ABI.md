@@ -1,4 +1,4 @@
-# Процессы, потоки, память и object waits: syscall ABI v6
+# Процессы, потоки, память и object waits: syscall ABI v8
 
 Этот документ описывает первый исполняемый ABI RustOS, достаточный для
 построения `std::process`, `std::thread`, allocator и zero-copy IPC. Общие
@@ -94,9 +94,20 @@ Capability references и mapping references считаются раздельн�
 control message остаётся inline, а исходники, object-файлы и VFS-буферы можно
 передавать без копирования payload через kernel.
 
+## Динамические IPC endpoint'ы
+
+`endpoint_create` возвращает process-owned channel capability с правами
+`SEND | RECEIVE | TRANSFER`. Владелец оставляет `RECEIVE` у себя и создаёт для
+сервиса производный `SEND` handle через `handle_duplicate`. Kernel запрещает
+копирование или передачу единственного права `RECEIVE`, а при его закрытии
+отзывает endpoint вместе со всеми производными handles. В object ID входит
+generation, поэтому повторное использование kernel slot не оживляет stale
+capability. Этот механизм используется для независимых surface release и
+presentation-feedback очередей каждого GUI-клиента.
+
 ## Графические объекты и timeline waits
 
-ABI v6 содержит отдельные `GraphicsBuffer`, `SyncTimeline` и `DisplayScanout`
+ABI v8 содержит отдельные `GraphicsBuffer`, `SyncTimeline` и `DisplayScanout`
 object kinds. Первые два описывают pixel layout и межпроцессную синхронизацию;
 последний выдаётся только `displayd`, не передаётся по IPC и разрешает query,
 atomic present и блокирующее ожидание presentation boundary. Wait-many и
@@ -120,7 +131,8 @@ pointer. Полный контракт находится в [GRAPHICS_ABI.md](G
 5. внешний process kill;
 6. отдельный FS-base/TPIDR TLS потока;
 7. монотонные часы;
-8. возврат private/shared/page-table frames.
+8. создание dynamic endpoint, attenuation `SEND` и revoke владельцем;
+9. возврат private/shared/page-table frames.
 
 Отдельный upstream `std` smoke дополнительно проверяет настоящий allocator со
 slab'ами, `std::thread`, futex contention, `std::process`, capability pipes,
@@ -133,7 +145,7 @@ make test-boot
 Критерий прохождения в serial log:
 
 ```text
-[abi-v4] spawn/wait/kill threads VM shared-memory TLS clock verified
+[abi-v8] spawn/wait/kill threads VM shared-memory dynamic-endpoint TLS clock verified
 [graphics-abi-v7] graphics-buffer sync-timeline atomic-present supervisor-restart verified
 [process-manager] ABI v4 VM/shared-memory frames reclaimed
 ```

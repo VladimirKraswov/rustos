@@ -21,6 +21,14 @@ writable buffer ожидающего receiver, устанавливает syscal
 `Blocked -> Ready`. Busy polling не используется. Полная очередь возвращает
 `QUEUE_FULL` до создания производных capabilities.
 
+`endpoint_create()` создаёт process-owned reply/event channel. Владелец
+получает `SEND | RECEIVE | TRANSFER`, но передаёт сервису только производный
+`SEND` handle. Право `RECEIVE` у динамического endpoint нельзя копировать,
+передавать через IPC или наследовать при spawn: очередь всегда имеет ровно
+одного владельца. Закрытие owning handle или завершение процесса атомарно
+удаляет очередь и отзывает все её `SEND` capabilities. Generation в object ID
+защищает новый endpoint от оставшихся stale handles старого объекта.
+
 ## Передача capability
 
 Передаваемая запись содержит source handle и запрошенные права. Kernel:
@@ -58,7 +66,8 @@ sender maps RW -> seals/attenuates -> sends MAP|READ handle
 receiver maps RO -> processes bytes -> reply/release
 ```
 
-Следующие расширения IPC — user-facing endpoint factory, multi-wait,
-cancellation/timeouts, priority inheritance для synchronous call/reply и
-полное revoke tree. Текущие bootstrap endpoints для `vfsd` создаёт process
-manager; supervisor должен будет переиздавать их после restart сервиса.
+Следующие расширения IPC — multi-wait, cancellation/timeouts и priority
+inheritance для synchronous call/reply. Bootstrap endpoints постоянных
+сервисов пока создаёт process manager, а приложения уже создают независимые
+динамические reply/event channels. Supervisor должен будет переиздавать
+service capabilities после restart сервиса.

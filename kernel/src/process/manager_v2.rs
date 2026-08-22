@@ -57,7 +57,8 @@ use super::{
 
 const MAX_PROCESSES: usize = 12;
 const MAX_THREADS: usize = 24;
-const MAX_ENDPOINTS: usize = 7;
+const STATIC_ENDPOINTS: usize = 7;
+const MAX_ENDPOINTS: usize = 32;
 const ENDPOINT_QUEUE_CAPACITY: usize = 8;
 const ENDPOINT_SLOT: usize = 2;
 const MAX_SHARED_OBJECTS: usize = 8;
@@ -246,12 +247,13 @@ impl ManagedProcess {
         Ok(())
     }
 
-    fn resolve_endpoint(&self, handle: Handle, rights: Rights) -> Result<u8, i64> {
+    fn resolve_endpoint(&self, handle: Handle, rights: Rights) -> Result<EndpointKey, i64> {
         let entry = self.capability(handle, rights)?;
-        let CapabilityKind::Endpoint(endpoint) = entry.kind else {
-            return Err(status::ACCESS_DENIED);
-        };
-        Ok(endpoint)
+        match entry.kind {
+            CapabilityKind::Endpoint(endpoint) => Ok(EndpointKey::static_endpoint(endpoint)),
+            CapabilityKind::DynamicEndpoint(endpoint) => Ok(EndpointKey::dynamic(endpoint)),
+            _ => Err(status::ACCESS_DENIED),
+        }
     }
 
     fn free_capability_slot(&self) -> Option<usize> {
@@ -262,14 +264,42 @@ impl ManagedProcess {
 #[derive(Clone, Copy)]
 struct Endpoint {
     receiver: ProcessId,
+    generation: u8,
     queue: EndpointQueue<ENDPOINT_QUEUE_CAPACITY>,
 }
 
 impl Endpoint {
     const EMPTY: Self = Self {
         receiver: ProcessId::KERNEL,
+        generation: 1,
         queue: EndpointQueue::new(),
     };
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct EndpointKey {
+    index: u8,
+    generation: u8,
+}
+
+impl EndpointKey {
+    const fn static_endpoint(index: u8) -> Self {
+        Self {
+            index,
+            generation: 0,
+        }
+    }
+
+    const fn dynamic(encoded: u16) -> Self {
+        Self {
+            index: encoded as u8,
+            generation: (encoded >> 8) as u8,
+        }
+    }
+
+    const fn encoded(self) -> u16 {
+        u16::from_le_bytes([self.index, self.generation])
+    }
 }
 
 const EMPTY_FRAME: FrameBlock = FrameBlock { phys: 0, frames: 0 };
@@ -1455,6 +1485,11 @@ impl ProcessManager {
                 frame.set_syscall_result(result);
                 0
             }
+            syscall::number::ENDPOINT_CREATE => {
+                let result = self.endpoint_create(process_index);
+                frame.set_syscall_result(result);
+                0
+            }
             syscall::number::FUTEX_WAIT => {
                 match self.futex_wait(thread_index, arg0, arg1 as u32, arg2) {
                     BlockingResult::Return(result) => {
@@ -1877,6 +1912,11 @@ impl ProcessManager {
                 Err(CapabilityTransferError::EmptyRights) => return status::INVALID_ARGUMENT,
                 Err(_) => return status::ACCESS_DENIED,
             };
+            if matches!(source.kind, CapabilityKind::DynamicEndpoint(_))
+                && rights.contains(Rights::RECEIVE)
+            {
+                return status::ACCESS_DENIED;
+            }
             child_capabilities[slot] = CapabilityEntry {
                 kind: source.kind,
                 rights,
@@ -3845,6 +3885,11 @@ impl ProcessManager {
             Err(CapabilityTransferError::EmptyRights) => return status::INVALID_ARGUMENT,
             Err(_) => return status::ACCESS_DENIED,
         };
+        if matches!(source.kind, CapabilityKind::DynamicEndpoint(_))
+            && rights.contains(Rights::RECEIVE)
+        {
+            return status::ACCESS_DENIED;
+        }
         let Some(slot) = self.processes[process_index]
             .as_ref()
             .expect("process")
@@ -4213,6 +4258,81 @@ impl ProcessManager {
         }
     }
 
+    fn endpoint_is_live(&self, endpoint: EndpointKey) -> bool {
+        let index = endpoint.index as usize;
+        if endpoint.generation == 0 {
+            return index < STATIC_ENDPOINTS;
+        }
+        index >= STATIC_ENDPOINTS
+            && index < MAX_ENDPOINTS
+            && self.endpoints[index].receiver != ProcessId::KERNEL
+            && self.endpoints[index].generation == endpoint.generation
+    }
+
+    /// Создаёт reply/event channel, владельцем RECEIVE которого является
+    /// вызывающий процесс. Generation не позволяет старому SEND capability
+    /// обратиться к повторно использованному slot.
+    fn endpoint_create(&mut self, process_index: usize) -> i64 {
+        let Some(capability_slot) = self.processes[process_index]
+            .as_ref()
+            .expect("process")
+            .free_capability_slot()
+        else {
+            return status::LIMIT_REACHED;
+        };
+        let Some(index) = (STATIC_ENDPOINTS..MAX_ENDPOINTS)
+            .find(|index| self.endpoints[*index].receiver == ProcessId::KERNEL)
+        else {
+            return status::LIMIT_REACHED;
+        };
+        let receiver = self.processes[process_index].as_ref().expect("process").pid;
+        let endpoint = &mut self.endpoints[index];
+        endpoint.generation = endpoint.generation.wrapping_add(1).max(1);
+        endpoint.receiver = receiver;
+        endpoint.queue = EndpointQueue::new();
+        let key = EndpointKey {
+            index: index as u8,
+            generation: endpoint.generation,
+        };
+        self.processes[process_index]
+            .as_mut()
+            .expect("process")
+            .capabilities[capability_slot] = CapabilityEntry {
+            kind: CapabilityKind::DynamicEndpoint(key.encoded()),
+            rights: Rights::SEND.union(Rights::RECEIVE).union(Rights::TRANSFER),
+        };
+        capability_slot as i64
+    }
+
+    fn destroy_dynamic_endpoint(&mut self, endpoint: EndpointKey) {
+        if endpoint.generation == 0 || !self.endpoint_is_live(endpoint) {
+            return;
+        }
+        let index = endpoint.index as usize;
+        let receiver = self.endpoints[index].receiver;
+        while let Some(message) = self.endpoints[index].queue.pop() {
+            if let Some(receiver_index) = self.process_index(receiver) {
+                for transferred in message
+                    .handles
+                    .iter()
+                    .take(message.header.handle_count as usize)
+                {
+                    let _ = self.handle_close(receiver_index, transferred.handle);
+                }
+            }
+        }
+        let kind = CapabilityKind::DynamicEndpoint(endpoint.encoded());
+        for process in self.processes.iter_mut().flatten() {
+            for entry in &mut process.capabilities {
+                if entry.kind == kind {
+                    *entry = EMPTY_CAPABILITY;
+                }
+            }
+        }
+        self.endpoints[index].receiver = ProcessId::KERNEL;
+        self.endpoints[index].queue = EndpointQueue::new();
+    }
+
     fn ipc_receive(
         &mut self,
         thread_index: usize,
@@ -4221,7 +4341,7 @@ impl ProcessManager {
     ) -> BlockingResult {
         let pid = self.threads[thread_index].as_ref().expect("thread").pid;
         let process_index = self.process_index(pid).expect("process");
-        let endpoint_id = {
+        let endpoint = {
             let process = self.processes[process_index].as_ref().expect("process");
             if !process
                 .address_space
@@ -4235,8 +4355,8 @@ impl ProcessManager {
                 Err(error) => return BlockingResult::Return(error),
             }
         };
-        let endpoint_index = endpoint_id as usize;
-        if endpoint_index >= MAX_ENDPOINTS {
+        let endpoint_index = endpoint.index as usize;
+        if !self.endpoint_is_live(endpoint) {
             return BlockingResult::Return(status::BAD_HANDLE);
         }
         if let Some(message) = self.endpoints[endpoint_index].queue.pop() {
@@ -4260,7 +4380,7 @@ impl ProcessManager {
         }
         self.threads[thread_index].as_mut().expect("thread").pending =
             PendingOperation::Receive(PendingReceive {
-                endpoint: endpoint_id,
+                endpoint: endpoint.index,
                 user_buffer,
             });
         self.blocked_receives = self.blocked_receives.saturating_add(1);
@@ -4268,7 +4388,7 @@ impl ProcessManager {
     }
 
     fn ipc_send(&mut self, sender_index: usize, handle: Handle, user_message: u64) -> i64 {
-        let (endpoint_id, sender_pid) = {
+        let (endpoint, sender_pid) = {
             let sender = self.processes[sender_index].as_ref().expect("sender");
             if !sender
                 .address_space
@@ -4283,8 +4403,8 @@ impl ProcessManager {
             };
             (endpoint, sender.pid)
         };
-        let endpoint_index = endpoint_id as usize;
-        if endpoint_index >= MAX_ENDPOINTS {
+        let endpoint_index = endpoint.index as usize;
+        if !self.endpoint_is_live(endpoint) {
             return status::BAD_HANDLE;
         }
         let mut message = Message::EMPTY;
@@ -4315,7 +4435,7 @@ impl ProcessManager {
         let pending_thread = self.threads.iter().position(|slot| {
             slot.as_ref().is_some_and(|thread| {
                 thread.pid == receiver_pid
-                    && matches!(thread.pending, PendingOperation::Receive(pending) if pending.endpoint == endpoint_id)
+                    && matches!(thread.pending, PendingOperation::Receive(pending) if pending.endpoint == endpoint.index)
             })
         });
         if pending_thread.is_none() && self.endpoints[endpoint_index].queue.is_full() {
@@ -4443,6 +4563,11 @@ impl ProcessManager {
                         _ => status::ACCESS_DENIED,
                     }
                 })?;
+            if matches!(source.kind, CapabilityKind::DynamicEndpoint(_))
+                && rights.contains(Rights::RECEIVE)
+            {
+                return Err(status::ACCESS_DENIED);
+            }
             let receiver = self.processes[receiver_index].as_ref().expect("receiver");
             let slot = (1..MAX_CAPABILITIES)
                 .find(|slot| {
@@ -4483,7 +4608,7 @@ impl ProcessManager {
             .as_ref()
             .expect("process")
             .parent;
-        for endpoint in 0..MAX_ENDPOINTS {
+        for endpoint in 0..STATIC_ENDPOINTS {
             if self.endpoints[endpoint].receiver != pid {
                 continue;
             }
@@ -4503,6 +4628,14 @@ impl ProcessManager {
             } else {
                 ProcessId::KERNEL
             };
+        }
+        for endpoint in STATIC_ENDPOINTS..MAX_ENDPOINTS {
+            if self.endpoints[endpoint].receiver == pid {
+                self.destroy_dynamic_endpoint(EndpointKey {
+                    index: endpoint as u8,
+                    generation: self.endpoints[endpoint].generation,
+                });
+            }
         }
         for shared_index in 0..MAX_SHARED_OBJECTS {
             let object = shared_id(shared_index, self.shared.objects[shared_index].generation);
@@ -4632,6 +4765,9 @@ impl ProcessManager {
                 }
             }
             CapabilityKind::GpuContext(context) => self.release_gpu_context(context),
+            CapabilityKind::DynamicEndpoint(endpoint) if entry.rights.contains(Rights::RECEIVE) => {
+                self.destroy_dynamic_endpoint(EndpointKey::dynamic(endpoint));
+            }
             _ => {}
         }
     }
@@ -4942,7 +5078,9 @@ pub(super) fn run_milestone(info: &rustos_abi::BootInfo) -> Result<(), ProcessEr
         manager.cleanup();
         return Err(error);
     }
-    serial::put_str("[abi-v4] spawn/wait/kill threads VM shared-memory TLS clock verified\n");
+    serial::put_str(
+        "[abi-v8] spawn/wait/kill threads VM shared-memory dynamic-endpoint TLS clock verified\n",
+    );
     manager.cleanup();
 
     if run_graphics_service_phase(manager)? {
