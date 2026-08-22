@@ -7,7 +7,10 @@
 use core::ptr;
 
 use rustos_abi::{
-    gpu::{feature, GpuDeviceInfo, GpuResourceCreate, GPU_ABI_VERSION, GPU_MAX_COMMAND_BYTES},
+    gpu::{
+        feature, GpuDeviceInfo, GpuResourceCreate, GpuResourceImport, GPU_ABI_VERSION,
+        GPU_MAX_COMMAND_BYTES,
+    },
     graphics_buffer::{GraphicsBufferDesc, PixelFormatCode},
 };
 use rustos_video::{
@@ -62,7 +65,10 @@ const RESP_OK_EDID: u32 = 0x1104;
 const RESP_OK_CAPSET_INFO: u32 = 0x1102;
 const FLAG_FENCE: u32 = 1;
 const RESOURCE_FLAG_Y_0_TOP: u32 = 1;
-const MAX_RENDER_RESOURCES: usize = 4;
+// Три swapchain targets, vertex/atlas resources и независимые поверхности
+// окон должны сосуществовать в одном compositor context. Таблица хранит
+// только metadata; фактическую память по-прежнему ограничивает allocator.
+const MAX_RENDER_RESOURCES: usize = 64;
 const PRIMARY_BUFFER_COUNT: usize = 3;
 const MAX_PENDING_PRESENT_COMMANDS: usize = PRIMARY_BUFFER_COUNT * 3;
 const MAX_READY_RENDER_COMPLETIONS: usize = 8;
@@ -339,6 +345,8 @@ struct RenderResource {
     graphics_object: u16,
     width: u32,
     height: u32,
+    format: u32,
+    bind: u32,
     has_backing: bool,
 }
 
@@ -350,6 +358,8 @@ impl RenderResource {
         graphics_object: NO_GRAPHICS_OBJECT,
         width: 0,
         height: 0,
+        format: 0,
+        bind: 0,
         has_backing: false,
     };
 }
@@ -910,16 +920,23 @@ impl VirtioGpu {
         Ok(())
     }
 
-    pub fn import_render_target(
+    pub fn import_render_resource(
         &mut self,
         context: u32,
         graphics_object: u16,
         descriptor: GraphicsBufferDesc,
         backing: FrameBlock,
+        request: GpuResourceImport,
     ) -> Result<u32, ModeSetError> {
+        let format = match descriptor.format {
+            PixelFormatCode::B8G8R8A8_UNORM => 1,
+            PixelFormatCode::B8G8R8X8_UNORM => GPU_FORMAT_B8G8R8X8_UNORM,
+            PixelFormatCode::R8_UNORM => 64,
+            _ => return Err(ModeSetError::UnsupportedMode),
+        };
         if context != self.render_context
             || context == 0
-            || descriptor.format != PixelFormatCode::B8G8R8X8_UNORM
+            || request.validate().is_err()
             || backing.frames * 4096 < descriptor.byte_size
             || descriptor.byte_size > u64::from(u32::MAX)
             || self
@@ -936,9 +953,9 @@ impl VirtioGpu {
             .ok_or(ModeSetError::OutOfMemory)?;
         let resource = self.create_3d_resource(
             context,
-            2,
-            GPU_FORMAT_B8G8R8X8_UNORM,
-            (1 << 1) | (1 << 8),
+            request.target,
+            format,
+            request.bind,
             descriptor.width,
             descriptor.height,
             1,
@@ -968,6 +985,8 @@ impl VirtioGpu {
             graphics_object,
             width: descriptor.width,
             height: descriptor.height,
+            format,
+            bind: request.bind,
             has_backing: true,
         };
         Ok(resource)
@@ -1008,13 +1027,17 @@ impl VirtioGpu {
             graphics_object: NO_GRAPHICS_OBJECT,
             width: request.width,
             height: request.height,
+            format: request.format,
+            bind: request.bind,
             has_backing: false,
         };
         Ok(resource)
     }
 
     pub fn submit_render(&mut self, context: u32, commands: &[u8]) -> Result<u64, ModeSetError> {
-        if context != self.render_context || !valid_virgl_stream(commands) {
+        if context != self.render_context
+            || !valid_virgl_stream(commands, context, &self.render_resources)
+        {
             return Err(ModeSetError::UnsupportedMode);
         }
         let mut request = Submit3dRequest {
@@ -1793,10 +1816,13 @@ impl VirtioGpu {
     }
 }
 
-/// Проверяет framing VirGL stream до передачи host renderer'у. Содержимое
-/// команд остаётся задачей Mesa/renderd, но malformed length и неизвестные
-/// opcodes не могут заставить decoder выйти за command buffer.
-fn valid_virgl_stream(commands: &[u8]) -> bool {
+/// Проверяет framing и все resource references до передачи host renderer'у.
+///
+/// `renderd` остаётся недоверенным ring-3 процессом: даже имея GpuRender
+/// capability, он может ссылаться только на resources своего context. Полный
+/// semantic validator upstream Mesa IR здесь не нужен, но command length,
+/// object kind, fixed payload и DMA bounds обязаны быть проверены kernel.
+fn valid_virgl_stream(commands: &[u8], context: u32, resources: &[RenderResource]) -> bool {
     if commands.is_empty()
         || commands.len() > GPU_MAX_COMMAND_BYTES as usize
         || !commands.len().is_multiple_of(4)
@@ -1812,18 +1838,231 @@ fn valid_virgl_stream(commands: &[u8]) -> bool {
             commands[offset + 3],
         ]);
         let opcode = header as u8;
+        let object = (header >> 8) as u8;
         let payload = (header >> 16) as usize;
         if payload == 0
-            || !matches!(opcode, 1 | 2 | 4 | 5 | 6 | 7 | 8 | 9 | 31 | 52)
             || offset
                 .checked_add((payload + 1) * 4)
                 .is_none_or(|end| end > commands.len())
+            || !valid_virgl_command(
+                commands, offset, opcode, object, payload, context, resources,
+            )
         {
             return false;
         }
         offset += (payload + 1) * 4;
     }
     offset == commands.len()
+}
+
+fn valid_virgl_command(
+    commands: &[u8],
+    offset: usize,
+    opcode: u8,
+    object: u8,
+    payload: usize,
+    context: u32,
+    resources: &[RenderResource],
+) -> bool {
+    match opcode {
+        // CREATE_OBJECT. Только используемые renderer'ом типы и их точный
+        // wire-size. Shader содержит variable-length TGSI text после пяти
+        // обязательных dwords.
+        1 => {
+            let valid_size = match object {
+                1 => payload == 11, // blend
+                2 => payload == 9,  // rasterizer
+                3 => payload == 5,  // depth/stencil/alpha
+                4 => payload >= 5,  // shader + TGSI text
+                5 => payload == 9,  // vertex elements
+                6 => payload == 6,  // sampler view
+                7 => payload == 9,  // sampler state
+                8 => payload == 5,  // render surface
+                _ => false,
+            };
+            if !valid_size {
+                return false;
+            }
+            if matches!(object, 6 | 8) {
+                let Some(resource) = command_word(commands, offset, 1)
+                    .and_then(|id| render_resource(resources, context, id))
+                else {
+                    return false;
+                };
+                let Some(format) = command_word(commands, offset, 2) else {
+                    return false;
+                };
+                resource.format == format
+                    && if object == 6 {
+                        resource.bind & (1 << 3) != 0
+                    } else {
+                        resource.bind & (1 << 1) != 0
+                    }
+            } else {
+                true
+            }
+        }
+        2 => payload == 1 && matches!(object, 1 | 2 | 3 | 5),
+        4 => object == 0 && payload == 7,
+        5 => object == 0 && payload == 3,
+        6 => {
+            object == 0
+                && payload == 3
+                && command_word(commands, offset, 2)
+                    .and_then(|id| render_resource(resources, context, id))
+                    .is_some_and(|resource| resource.bind & (1 << 4) != 0)
+        }
+        7 => object == 0 && payload == 8,
+        8 => object == 0 && payload == 12,
+        9 => valid_inline_write(commands, offset, object, payload, context, resources),
+        10 => object == 0 && payload >= 3,
+        14 => object == 0 && payload >= 3 && (payload - 1).is_multiple_of(2),
+        16 => valid_blit(commands, offset, object, payload, context, resources),
+        18 => object == 0 && payload >= 3,
+        31 => object == 0 && payload == 2,
+        52 => object == 0 && payload == 6,
+        _ => false,
+    }
+}
+
+fn valid_inline_write(
+    commands: &[u8],
+    offset: usize,
+    object: u8,
+    payload: usize,
+    context: u32,
+    resources: &[RenderResource],
+) -> bool {
+    if object != 0 || payload < 12 {
+        return false;
+    }
+    let Some(resource) =
+        command_word(commands, offset, 0).and_then(|id| render_resource(resources, context, id))
+    else {
+        return false;
+    };
+    let Some(x) = command_word(commands, offset, 5) else {
+        return false;
+    };
+    let Some(y) = command_word(commands, offset, 6) else {
+        return false;
+    };
+    let Some(width) = command_word(commands, offset, 8) else {
+        return false;
+    };
+    let Some(height) = command_word(commands, offset, 9) else {
+        return false;
+    };
+    let Some(depth) = command_word(commands, offset, 10) else {
+        return false;
+    };
+    let bytes_per_pixel = match resource.format {
+        1 | 2 => 4usize,
+        64 => 1,
+        _ => return false,
+    };
+    let Some(expected_bytes) = usize::try_from(width)
+        .ok()
+        .and_then(|width| width.checked_mul(height as usize))
+        .and_then(|pixels| pixels.checked_mul(depth as usize))
+        .and_then(|pixels| pixels.checked_mul(bytes_per_pixel))
+    else {
+        return false;
+    };
+    x.checked_add(width)
+        .is_some_and(|right| right <= resource.width)
+        && y.checked_add(height)
+            .is_some_and(|bottom| bottom <= resource.height)
+        && depth == 1
+        && (payload - 11) * 4 == expected_bytes.next_multiple_of(4)
+}
+
+fn valid_blit(
+    commands: &[u8],
+    offset: usize,
+    object: u8,
+    payload: usize,
+    context: u32,
+    resources: &[RenderResource],
+) -> bool {
+    if object != 0 || payload != 21 {
+        return false;
+    }
+    let Some(destination) =
+        command_word(commands, offset, 3).and_then(|id| render_resource(resources, context, id))
+    else {
+        return false;
+    };
+    let Some(source) =
+        command_word(commands, offset, 12).and_then(|id| render_resource(resources, context, id))
+    else {
+        return false;
+    };
+    let Some(destination_format) = command_word(commands, offset, 5) else {
+        return false;
+    };
+    let Some(source_format) = command_word(commands, offset, 14) else {
+        return false;
+    };
+    let Some(destination_x) = command_word(commands, offset, 6) else {
+        return false;
+    };
+    let Some(destination_y) = command_word(commands, offset, 7) else {
+        return false;
+    };
+    let Some(destination_width) = command_word(commands, offset, 9) else {
+        return false;
+    };
+    let Some(destination_height) = command_word(commands, offset, 10) else {
+        return false;
+    };
+    let Some(source_x) = command_word(commands, offset, 15) else {
+        return false;
+    };
+    let Some(source_y) = command_word(commands, offset, 16) else {
+        return false;
+    };
+    let Some(source_width) = command_word(commands, offset, 18) else {
+        return false;
+    };
+    let Some(source_height) = command_word(commands, offset, 19) else {
+        return false;
+    };
+    destination.bind & (1 << 1) != 0
+        && source.bind & (1 << 3) != 0
+        && destination.format == destination_format
+        && source.format == source_format
+        && destination_width != 0
+        && destination_height != 0
+        && source_width != 0
+        && source_height != 0
+        && destination_x
+            .checked_add(destination_width)
+            .is_some_and(|right| right <= destination.width)
+        && destination_y
+            .checked_add(destination_height)
+            .is_some_and(|bottom| bottom <= destination.height)
+        && source_x
+            .checked_add(source_width)
+            .is_some_and(|right| right <= source.width)
+        && source_y
+            .checked_add(source_height)
+            .is_some_and(|bottom| bottom <= source.height)
+}
+
+fn render_resource(resources: &[RenderResource], context: u32, id: u32) -> Option<RenderResource> {
+    resources
+        .iter()
+        .copied()
+        .find(|resource| resource.used && resource.context == context && resource.id == id)
+}
+
+fn command_word(commands: &[u8], offset: usize, payload_index: usize) -> Option<u32> {
+    let start = offset
+        .checked_add(4)?
+        .checked_add(payload_index.checked_mul(4)?)?;
+    let bytes = commands.get(start..start.checked_add(4)?)?;
+    Some(u32::from_le_bytes(bytes.try_into().ok()?))
 }
 
 impl Drop for VirtioGpu {

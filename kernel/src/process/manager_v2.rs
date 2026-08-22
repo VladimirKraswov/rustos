@@ -64,7 +64,9 @@ const MAX_SHARED_OBJECTS: usize = 8;
 const MAX_SHARED_PAGES: usize = 64;
 const MAX_SYNC_TIMELINES: usize = 32;
 const MAX_SYNC_WAITS: usize = MAX_THREADS;
-const MAX_GPU_IMPORTS: usize = 4;
+// Оконный compositor импортирует несколько client surfaces одновременно.
+// Это metadata budget, а общий объём pixels ограничен GraphicsBufferPool.
+const MAX_GPU_IMPORTS: usize = 32;
 const MAX_GPU_SUBMISSIONS: usize = 3;
 const MAX_GPU_COMPLETIONS: usize = 8;
 /// Один mapping ограничен 1 GiB: достаточно для compiler arenas, но ошибка в
@@ -2737,6 +2739,7 @@ impl ProcessManager {
         };
         let mut rights = Rights::NONE;
         if descriptor.usage.contains(BufferUsage::CPU_READ)
+            || descriptor.usage.contains(BufferUsage::TEXTURE)
             || descriptor.usage.contains(BufferUsage::SCANOUT)
             || descriptor.usage.contains(BufferUsage::TRANSFER_SOURCE)
         {
@@ -3181,7 +3184,7 @@ impl ProcessManager {
         buffer_handle: Handle,
         request_address: u64,
     ) -> i64 {
-        let _request = match self.read_struct::<GpuResourceImport>(process_index, request_address) {
+        let request = match self.read_struct::<GpuResourceImport>(process_index, request_address) {
             Ok(request) if request.validate().is_ok() => request,
             _ => return status::INVALID_ARGUMENT,
         };
@@ -3192,10 +3195,17 @@ impl ProcessManager {
         {
             return error;
         }
+        let mut required_rights = Rights::NONE;
+        if request.bind & rustos_abi::gpu::resource_bind::RENDER_TARGET != 0 {
+            required_rights = required_rights.union(Rights::WRITE);
+        }
+        if request.bind & rustos_abi::gpu::resource_bind::SAMPLER_VIEW != 0 {
+            required_rights = required_rights.union(Rights::READ);
+        }
         let object = match self.processes[process_index]
             .as_ref()
             .expect("process")
-            .capability(buffer_handle, Rights::WRITE)
+            .capability(buffer_handle, required_rights)
         {
             Ok(CapabilityEntry {
                 kind: CapabilityKind::GraphicsBuffer(object),
@@ -3216,9 +3226,13 @@ impl ProcessManager {
             Ok(descriptor) => descriptor,
             Err(error) => return error,
         };
-        if !descriptor.usage.contains(BufferUsage::RENDER_TARGET)
-            || !descriptor.usage.contains(BufferUsage::SCANOUT)
-            || descriptor.usage.contains(BufferUsage::CPU_WRITE)
+        let wants_render = request.bind & rustos_abi::gpu::resource_bind::RENDER_TARGET != 0;
+        let wants_sample = request.bind & rustos_abi::gpu::resource_bind::SAMPLER_VIEW != 0;
+        let wants_scanout = request.bind & rustos_abi::gpu::resource_bind::DISPLAY_TARGET != 0;
+        if (wants_render && !descriptor.usage.contains(BufferUsage::RENDER_TARGET))
+            || (wants_sample && !descriptor.usage.contains(BufferUsage::TEXTURE))
+            || (wants_scanout && !descriptor.usage.contains(BufferUsage::SCANOUT))
+            || (wants_render && descriptor.usage.contains(BufferUsage::CPU_WRITE))
             || !descriptor.memory_domains.contains(MemoryDomain::SYSTEM)
             || !descriptor.memory_domains.contains(MemoryDomain::SHARED)
         {
@@ -3236,13 +3250,14 @@ impl ProcessManager {
         if self.graphics.retain_capability(object).is_err() {
             return status::LIMIT_REACHED;
         }
-        let resource = match scanout::import_render_target(1, object, descriptor, backing) {
-            Ok(resource) => resource,
-            Err(error) => {
-                self.graphics.release_capability(object);
-                return gpu_status(error);
-            }
-        };
+        let resource =
+            match scanout::import_render_resource(1, object, descriptor, backing, request) {
+                Ok(resource) => resource,
+                Err(error) => {
+                    self.graphics.release_capability(object);
+                    return gpu_status(error);
+                }
+            };
         self.gpu_imports[import_slot] = Some(object);
         resource as i64
     }

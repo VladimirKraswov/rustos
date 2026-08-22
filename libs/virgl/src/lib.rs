@@ -16,6 +16,7 @@ const CCMD_SET_VERTEX_BUFFERS: u8 = 6;
 const CCMD_CLEAR: u8 = 7;
 const CCMD_DRAW_VBO: u8 = 8;
 const CCMD_RESOURCE_INLINE_WRITE: u8 = 9;
+const CCMD_BLIT: u8 = 16;
 const CCMD_BIND_SHADER: u8 = 31;
 const CCMD_LINK_SHADER: u8 = 52;
 
@@ -29,7 +30,12 @@ const OBJECT_SURFACE: u8 = 8;
 const SHADER_VERTEX: u32 = 0;
 const SHADER_FRAGMENT: u32 = 1;
 const PRIM_TRIANGLES: u32 = 4;
-const FORMAT_BGRX8888: u32 = 2;
+/// VirGL format code для непрозрачных BGRX8888 surfaces.
+pub const FORMAT_BGRX8888: u32 = 2;
+/// VirGL format code для premultiplied BGRA8888 surfaces compositor'а.
+pub const FORMAT_BGRA8888: u32 = 1;
+/// VirGL format code одноканального glyph atlas.
+pub const FORMAT_R8_UNORM: u32 = 64;
 const FORMAT_RGBA32_FLOAT: u32 = 31;
 const CLEAR_COLOR0: u32 = 1 << 2;
 
@@ -79,6 +85,205 @@ pub enum EncodeError {
     InvalidExtent,
     /// Поток поддерживает только непустой список полных треугольников.
     InvalidVertexCount,
+    /// Список compositor layers превышает bounded batch.
+    TooManyLayers,
+    /// Texture upload не соответствует заявленной геометрии.
+    InvalidUpload,
+}
+
+/// Неотрицательный physical rectangle для GPU blit/scissor.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BlitRect {
+    /// Левая координата.
+    pub x: u32,
+    /// Верхняя координата.
+    pub y: u32,
+    /// Ширина.
+    pub width: u32,
+    /// Высота.
+    pub height: u32,
+}
+
+impl BlitRect {
+    /// Создаёт rectangle без скрытого clipping.
+    pub const fn new(x: u32, y: u32, width: u32, height: u32) -> Self {
+        Self {
+            x,
+            y,
+            width,
+            height,
+        }
+    }
+
+    fn valid_within(self, width: u32, height: u32) -> bool {
+        self.width != 0
+            && self.height != 0
+            && self
+                .x
+                .checked_add(self.width)
+                .is_some_and(|right| right <= width)
+            && self
+                .y
+                .checked_add(self.height)
+                .is_some_and(|bottom| bottom <= height)
+    }
+}
+
+/// Один уже готовый GPU surface в композиционном порядке снизу вверх.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CompositeLayer {
+    /// VirGL resource исходной поверхности.
+    pub resource: u32,
+    /// Формат resource.
+    pub format: u32,
+    /// Область source texture.
+    pub source: BlitRect,
+    /// Область scanout target.
+    pub destination: BlitRect,
+    /// Использовать bilinear sampling при масштабировании.
+    pub linear_filter: bool,
+    /// Смешивать premultiplied alpha поверх уже собранных нижних слоёв.
+    pub alpha_blend: bool,
+}
+
+impl CompositeLayer {
+    /// Обычный непрозрачный слой без масштабирования.
+    pub const fn opaque(resource: u32, format: u32, rect: BlitRect) -> Self {
+        Self {
+            resource,
+            format,
+            source: BlitRect::new(0, 0, rect.width, rect.height),
+            destination: rect,
+            linear_filter: false,
+            alpha_blend: false,
+        }
+    }
+}
+
+/// Кодирует один bounded pass GPU-композиции.
+///
+/// `damage` становится аппаратным scissor. Команда никогда не читает pixels
+/// обратно в guest: каждый source resource смешивается непосредственно в
+/// `target_resource`. Полностью закрытые слои должен заранее удалить
+/// `compositord`, потому что именно он владеет оконной политикой.
+pub fn encode_composite_pass(
+    output: &mut [u32],
+    target_width: u32,
+    target_height: u32,
+    target_resource: u32,
+    target_format: u32,
+    damage: BlitRect,
+    layers: &[CompositeLayer],
+) -> Result<usize, EncodeError> {
+    const MAX_LAYERS_PER_BATCH: usize = 32;
+    if target_resource == 0
+        || target_width == 0
+        || target_height == 0
+        || target_width > 16_384
+        || target_height > 16_384
+        || !damage.valid_within(target_width, target_height)
+    {
+        return Err(EncodeError::InvalidExtent);
+    }
+    if layers.is_empty() || layers.len() > MAX_LAYERS_PER_BATCH {
+        return Err(EncodeError::TooManyLayers);
+    }
+    let mut encoder = Encoder::new(output);
+    for layer in layers {
+        if layer.resource == 0
+            || !layer.destination.valid_within(target_width, target_height)
+            || layer.source.width == 0
+            || layer.source.height == 0
+        {
+            return Err(EncodeError::InvalidExtent);
+        }
+        let filter = u32::from(layer.linear_filter);
+        let alpha = u32::from(layer.alpha_blend);
+        encoder.command(CCMD_BLIT, 0, 21)?;
+        encoder.words(&[
+            0x0f | (filter << 8) | (1 << 10) | (alpha << 12),
+            pack_xy(damage.x, damage.y),
+            pack_xy(
+                damage.x.saturating_add(damage.width),
+                damage.y.saturating_add(damage.height),
+            ),
+            target_resource,
+            0,
+            target_format,
+            layer.destination.x,
+            layer.destination.y,
+            0,
+            layer.destination.width,
+            layer.destination.height,
+            1,
+            layer.resource,
+            0,
+            layer.format,
+            layer.source.x,
+            layer.source.y,
+            0,
+            layer.source.width,
+            layer.source.height,
+            1,
+        ])?;
+    }
+    Ok(encoder.finish())
+}
+
+/// Загружает tightly-packed часть atlas в device-side texture.
+///
+/// Большой atlas разбивается вызывающим кодом на строки/tiles, каждый из
+/// которых укладывается в `GPU_MAX_COMMAND_BYTES`. Такая схема выполняется
+/// при изменении cache и не создаёт full-frame upload в steady state.
+pub fn encode_texture_upload(
+    output: &mut [u32],
+    texture_resource: u32,
+    rect: BlitRect,
+    bytes_per_pixel: u8,
+    data: &[u8],
+) -> Result<usize, EncodeError> {
+    if texture_resource == 0 || rect.width == 0 || rect.height == 0 {
+        return Err(EncodeError::InvalidUpload);
+    }
+    let stride = rect
+        .width
+        .checked_mul(u32::from(bytes_per_pixel))
+        .filter(|_| matches!(bytes_per_pixel, 1 | 4))
+        .ok_or(EncodeError::InvalidUpload)?;
+    let expected = stride
+        .checked_mul(rect.height)
+        .and_then(|bytes| usize::try_from(bytes).ok())
+        .ok_or(EncodeError::InvalidUpload)?;
+    if data.len() != expected {
+        return Err(EncodeError::InvalidUpload);
+    }
+    let data_dwords = data.len().div_ceil(4);
+    let payload = u16::try_from(11usize.saturating_add(data_dwords))
+        .map_err(|_| EncodeError::BufferTooSmall)?;
+    let mut encoder = Encoder::new(output);
+    encoder.command(CCMD_RESOURCE_INLINE_WRITE, 0, payload)?;
+    encoder.words(&[
+        texture_resource,
+        0,
+        0,
+        stride,
+        stride.saturating_mul(rect.height),
+        rect.x,
+        rect.y,
+        0,
+        rect.width,
+        rect.height,
+        1,
+    ])?;
+    encoder.bytes(data)?;
+    Ok(encoder.finish())
+}
+
+fn pack_xy(x: u32, y: u32) -> u32 {
+    debug_assert!(x <= u16::MAX.into() && y <= u16::MAX.into());
+    (x & 0xffff) | ((y & 0xffff) << 16)
 }
 
 /// Строит один полный кадр: тёмный фон и RGB-треугольник.
@@ -462,5 +667,90 @@ mod tests {
             cursor += (header >> 16) as usize + 1;
         }
         assert_eq!(cursor, count);
+    }
+
+    #[test]
+    fn compositor_blits_layers_with_damage_and_alpha_without_readback() {
+        let layers = [
+            CompositeLayer::opaque(10, FORMAT_BGRX8888, BlitRect::new(0, 0, 1280, 800)),
+            CompositeLayer {
+                resource: 11,
+                format: FORMAT_BGRA8888,
+                source: BlitRect::new(0, 0, 640, 480),
+                destination: BlitRect::new(120, 80, 640, 480),
+                linear_filter: false,
+                alpha_blend: true,
+            },
+        ];
+        let mut words = [0u32; 128];
+        let count = encode_composite_pass(
+            &mut words,
+            1280,
+            800,
+            12,
+            FORMAT_BGRX8888,
+            BlitRect::new(100, 60, 700, 540),
+            &layers,
+        )
+        .unwrap();
+        assert_eq!(count, 44);
+        assert_eq!(words[0] as u8, CCMD_BLIT);
+        assert_ne!(words[1] & (1 << 10), 0, "damage использует scissor");
+        assert_eq!(words[22] as u8, CCMD_BLIT);
+        assert_ne!(words[23] & (1 << 12), 0, "верхний слой смешивает alpha");
+        let mut cursor = 0;
+        while cursor < count {
+            assert_eq!(words[cursor] as u8, CCMD_BLIT);
+            cursor += (words[cursor] >> 16) as usize + 1;
+        }
+        assert_eq!(cursor, count);
+    }
+
+    #[test]
+    fn compositor_rejects_partial_or_unbounded_batches() {
+        let layer = CompositeLayer::opaque(2, FORMAT_BGRX8888, BlitRect::new(0, 0, 640, 480));
+        let mut words = [0u32; 768];
+        assert_eq!(
+            encode_composite_pass(
+                &mut words,
+                640,
+                480,
+                1,
+                FORMAT_BGRX8888,
+                BlitRect::new(600, 0, 80, 10),
+                &[layer],
+            ),
+            Err(EncodeError::InvalidExtent)
+        );
+        let layers = [layer; 33];
+        assert_eq!(
+            encode_composite_pass(
+                &mut words,
+                640,
+                480,
+                1,
+                FORMAT_BGRX8888,
+                BlitRect::new(0, 0, 640, 480),
+                &layers,
+            ),
+            Err(EncodeError::TooManyLayers)
+        );
+    }
+
+    #[test]
+    fn atlas_upload_encodes_exact_patch_and_rejects_size_mismatch() {
+        let pixels = [0x80u8; 8 * 4];
+        let mut words = [0u32; 64];
+        let count =
+            encode_texture_upload(&mut words, 9, BlitRect::new(16, 24, 8, 4), 1, &pixels).unwrap();
+        assert_eq!(words[0] as u8, CCMD_RESOURCE_INLINE_WRITE);
+        assert_eq!(words[4], 8, "stride R8 atlas");
+        assert_eq!(words[6], 16);
+        assert_eq!(words[7], 24);
+        assert_eq!(count, 20);
+        assert_eq!(
+            encode_texture_upload(&mut words, 9, BlitRect::new(0, 0, 8, 4), 1, &pixels[..31],),
+            Err(EncodeError::InvalidUpload)
+        );
     }
 }

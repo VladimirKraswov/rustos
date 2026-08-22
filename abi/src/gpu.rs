@@ -8,7 +8,7 @@
 use crate::Handle;
 
 /// Версия render ABI.
-pub const GPU_ABI_VERSION: u16 = 1;
+pub const GPU_ABI_VERSION: u16 = 2;
 /// Максимальный command buffer одного submission.
 pub const GPU_MAX_COMMAND_BYTES: u32 = 3072;
 /// compositord → renderd: запрос одного кадра.
@@ -146,12 +146,14 @@ impl GpuContextCreate {
 pub mod resource_bind {
     /// Color render target.
     pub const RENDER_TARGET: u32 = 1 << 1;
+    /// Texture/sample source.
+    pub const SAMPLER_VIEW: u32 = 1 << 3;
     /// Vertex buffer.
     pub const VERTEX_BUFFER: u32 = 1 << 4;
     /// Ресурс можно показать на output.
     pub const DISPLAY_TARGET: u32 = 1 << 8;
     /// Разрешённый ABI subset.
-    pub const KNOWN: u32 = RENDER_TARGET | VERTEX_BUFFER | DISPLAY_TARGET;
+    pub const KNOWN: u32 = RENDER_TARGET | SAMPLER_VIEW | VERTEX_BUFFER | DISPLAY_TARGET;
 }
 
 /// Тип ресурса Gallium/VirGL.
@@ -164,6 +166,8 @@ pub mod resource_target {
 
 /// Форматы, необходимые bootstrap renderer'у.
 pub mod virgl_format {
+    /// BGRA8888 с настоящим alpha-каналом.
+    pub const B8G8R8A8_UNORM: u32 = 1;
     /// XRGB8888/BGR byte order.
     pub const B8G8R8X8_UNORM: u32 = 2;
     /// Одноканальный byte buffer.
@@ -201,17 +205,47 @@ impl GpuResourceImport {
         }
     }
 
+    /// Описывает поверхность окна: GPU рисует в неё, а compositor затем
+    /// читает тот же resource как texture без копирования pixels.
+    pub const fn window_surface() -> Self {
+        Self {
+            version: GPU_ABI_VERSION,
+            size: core::mem::size_of::<Self>() as u16,
+            flags: 0,
+            target: resource_target::TEXTURE_2D,
+            bind: resource_bind::RENDER_TARGET | resource_bind::SAMPLER_VIEW,
+            reserved: [0; 2],
+        }
+    }
+
+    /// Описывает read-only texture, например glyph/icon atlas или готовую
+    /// клиентскую поверхность.
+    pub const fn sampled_texture() -> Self {
+        Self {
+            version: GPU_ABI_VERSION,
+            size: core::mem::size_of::<Self>() as u16,
+            flags: 0,
+            target: resource_target::TEXTURE_2D,
+            bind: resource_bind::SAMPLER_VIEW,
+            reserved: [0; 2],
+        }
+    }
+
     /// Проверяет запрос.
     pub fn validate(&self) -> Result<(), GpuAbiError> {
         validate_prefix(self.version, self.size, core::mem::size_of::<Self>())?;
         if self.flags != 0 || self.reserved != [0; 2] {
             return Err(GpuAbiError::ReservedNonZero);
         }
+        let render_target = self.bind & resource_bind::RENDER_TARGET != 0;
+        let sampled = self.bind & resource_bind::SAMPLER_VIEW != 0;
+        let display = self.bind & resource_bind::DISPLAY_TARGET != 0;
         if self.target != resource_target::TEXTURE_2D
             || self.bind == 0
             || self.bind & !resource_bind::KNOWN != 0
-            || self.bind & resource_bind::RENDER_TARGET == 0
-            || self.bind & resource_bind::DISPLAY_TARGET == 0
+            || self.bind & resource_bind::VERTEX_BUFFER != 0
+            || (!render_target && !sampled)
+            || (display && !render_target)
         {
             return Err(GpuAbiError::InvalidValue);
         }
@@ -265,21 +299,48 @@ impl GpuResourceCreate {
         }
     }
 
+    /// Создаёт device-side texture. Содержимое загружается отдельными
+    /// bounded `RESOURCE_INLINE_WRITE`, поэтому большой atlas не требует
+    /// небезопасного process pointer или одного гигантского submission.
+    pub const fn sampled_texture(width: u32, height: u32, format: u32) -> Self {
+        Self {
+            version: GPU_ABI_VERSION,
+            size: core::mem::size_of::<Self>() as u16,
+            flags: 0,
+            target: resource_target::TEXTURE_2D,
+            format,
+            bind: resource_bind::SAMPLER_VIEW,
+            width,
+            height,
+            depth: 1,
+            array_size: 1,
+            reserved: [0; 2],
+        }
+    }
+
     /// Проверяет ограниченный bootstrap subset.
     pub fn validate(&self) -> Result<(), GpuAbiError> {
         validate_prefix(self.version, self.size, core::mem::size_of::<Self>())?;
         if self.flags != 0 || self.reserved != [0; 2] {
             return Err(GpuAbiError::ReservedNonZero);
         }
-        if self.target != resource_target::BUFFER
-            || self.format != virgl_format::R8_UNORM
-            || self.bind != resource_bind::VERTEX_BUFFER
-            || self.width == 0
-            || self.width > 1024 * 1024
-            || self.height != 1
-            || self.depth != 1
-            || self.array_size != 1
-        {
+        let vertex_buffer = self.target == resource_target::BUFFER
+            && self.format == virgl_format::R8_UNORM
+            && self.bind == resource_bind::VERTEX_BUFFER
+            && self.width != 0
+            && self.width <= 1024 * 1024
+            && self.height == 1;
+        let sampled_texture = self.target == resource_target::TEXTURE_2D
+            && matches!(
+                self.format,
+                virgl_format::B8G8R8A8_UNORM
+                    | virgl_format::B8G8R8X8_UNORM
+                    | virgl_format::R8_UNORM
+            )
+            && self.bind == resource_bind::SAMPLER_VIEW
+            && (1..=4096).contains(&self.width)
+            && (1..=4096).contains(&self.height);
+        if (!vertex_buffer && !sampled_texture) || self.depth != 1 || self.array_size != 1 {
             return Err(GpuAbiError::InvalidValue);
         }
         Ok(())
@@ -637,11 +698,24 @@ mod tests {
     #[test]
     fn resource_requests_keep_small_contract() {
         assert_eq!(GpuResourceImport::render_target().validate(), Ok(()));
+        assert_eq!(GpuResourceImport::window_surface().validate(), Ok(()));
+        assert_eq!(GpuResourceImport::sampled_texture().validate(), Ok(()));
         assert_eq!(GpuResourceCreate::vertex_buffer(96).validate(), Ok(()));
+        assert_eq!(
+            GpuResourceCreate::sampled_texture(1024, 1024, virgl_format::B8G8R8A8_UNORM).validate(),
+            Ok(())
+        );
         assert_eq!(
             GpuResourceCreate::vertex_buffer(0).validate(),
             Err(GpuAbiError::InvalidValue)
         );
+        assert_eq!(
+            GpuResourceCreate::sampled_texture(8192, 1, virgl_format::R8_UNORM).validate(),
+            Err(GpuAbiError::InvalidValue)
+        );
+        let mut invalid = GpuResourceImport::sampled_texture();
+        invalid.bind |= resource_bind::DISPLAY_TARGET;
+        assert_eq!(invalid.validate(), Err(GpuAbiError::InvalidValue));
     }
 
     #[test]

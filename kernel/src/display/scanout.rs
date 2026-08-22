@@ -12,7 +12,7 @@ use core::{
 
 use rustos_abi::{
     display::{scanout_capabilities, DisplayScanoutInfo, DISPLAY_SCANOUT_ABI_VERSION},
-    gpu::{GpuDeviceInfo, GpuResourceCreate},
+    gpu::{GpuDeviceInfo, GpuResourceCreate, GpuResourceImport},
     graphics_buffer::GraphicsBufferDesc,
     surface::OutputId,
 };
@@ -314,11 +314,12 @@ pub fn create_render_context(context: u32, name: &[u8]) -> Result<(), DisplayBro
         .map_err(map_mode_error)
 }
 
-pub fn import_render_target(
+pub fn import_render_resource(
     context: u32,
     graphics_object: u16,
     descriptor: GraphicsBufferDesc,
     backing: crate::memory::FrameBlock,
+    request: GpuResourceImport,
 ) -> Result<u32, DisplayBrokerError> {
     let mut guard = DEVICE.acquire()?;
     guard
@@ -326,7 +327,7 @@ pub fn import_render_target(
         .as_mut()
         .ok_or(DisplayBrokerError::Unavailable)?
         .gpu
-        .import_render_target(context, graphics_object, descriptor, backing)
+        .import_render_resource(context, graphics_object, descriptor, backing, request)
         .map_err(map_mode_error)
 }
 
