@@ -23,10 +23,8 @@ use rustos_abi::{
     graphics_buffer::{BufferUsage, GraphicsBufferDesc, MemoryDomain, PixelFormatCode},
     ipc::TransferredHandle,
     memory::MEMORY_ABI_VERSION,
-    surface::{SurfaceCommit, SurfaceCreateRequest, SurfaceMetrics},
-    sync::{
-        SyncPoint, SyncTimelineCreate, SyncTimelineSignal, SyncTimelineWait, SYNC_TIMEOUT_INFINITE,
-    },
+    surface::{SurfaceCommit, SurfaceCreateRequest, SurfaceId, SurfaceMetrics},
+    sync::{SyncTimelineCreate, SyncTimelineSignal, SyncTimelineWait, SYNC_TIMEOUT_INFINITE},
 };
 use rustos_runtime::{
     graphics_buffer_create, graphics_buffer_get_info, graphics_buffer_map, handle_close,
@@ -203,8 +201,7 @@ fn present_frame(
     let release = Handle(release_value as u32);
     let metrics = SurfaceMetrics::new(info.width, info.height, info.width, info.height, 1000);
     let surface = SurfaceCreateRequest::new(metrics, 3);
-    let mut commit = SurfaceCommit::full_damage(Handle(0x7fff), prepared.buffer, metrics, frame_id);
-    commit.acquire = SyncPoint::new(prepared.acquire, prepared.acquire_value);
+    let commit = SurfaceCommit::full_damage(SurfaceId(0x7fff), metrics, frame_id, 0);
     if surface.validate().is_err() || commit.validate().is_err() {
         process_exit(189);
     }

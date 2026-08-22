@@ -26,6 +26,7 @@ pub use damage::DamageRegion;
 pub use geometry::{Point, Rect};
 pub use mode_policy::{select_startup_mode, StartupModePolicy};
 pub use pixel::{Color, CpuPixelFormat, Rgba};
+pub use protocol::SurfaceId;
 pub use scanout::{
     ColorMode, ConnectorInfo, ConnectorKind, DisplayDriver, DisplayMode, ModeSetError,
     PresentStats, Scanout, ScanoutCapabilities, ScanoutError,
@@ -33,9 +34,7 @@ pub use scanout::{
 pub use surface_queue::{
     MailboxSelection, SurfaceQueue, SurfaceQueueError, SurfaceSlotState, SurfaceSlotToken,
 };
-pub use surface_scene::{
-    SurfaceId, SurfaceLayerConfig, SurfaceScene, SurfaceSceneError, VisibleSurface,
-};
+pub use surface_scene::{SurfaceLayerConfig, SurfaceScene, SurfaceSceneError, VisibleSurface};
 pub use window::{
     hit_test_resize, resize_from_edges, ManagedWindow, ResizeEdges, WindowError, WindowEventQueue,
 };

@@ -4,16 +4,53 @@
 //! policy, а compositor принимает immutable на время показа buffer commits.
 //! Пиксели лежат в graphics buffer capability и не копируются через IPC.
 
-use crate::{sync::SyncPoint, Handle};
-
 /// Первая версия surface ABI.
 pub const SURFACE_ABI_VERSION: u16 = 1;
+/// Клиент → compositord: создать surface и buffer queue.
+pub const SURFACE_CREATE_OPCODE: u16 = 0x5200;
+/// Compositord → клиент: назначенный ID и generation.
+pub const SURFACE_CREATED_OPCODE: u16 = 0x5201;
+/// Клиент → compositord: атомарно опубликовать buffer.
+pub const SURFACE_COMMIT_OPCODE: u16 = 0x5202;
+/// Клиент → compositord: закрыть surface.
+pub const SURFACE_DESTROY_OPCODE: u16 = 0x5203;
+/// Compositord → клиент: buffer снова доступен renderer'у.
+pub const SURFACE_BUFFER_RELEASED_OPCODE: u16 = 0x5204;
+/// Compositord → клиент: точный результат presentation.
+pub const SURFACE_PRESENTATION_FEEDBACK_OPCODE: u16 = 0x5205;
+/// Create переносит endpoint событий с правом SEND.
+pub const SURFACE_CREATE_HANDLE_COUNT: u16 = 1;
+/// Full-damage commit переносит GraphicsBuffer и acquire SyncTimeline.
+pub const SURFACE_COMMIT_FULL_HANDLE_COUNT: u16 = 2;
+/// Partial-damage commit дополнительно переносит read-only damage memory.
+pub const SURFACE_COMMIT_PARTIAL_HANDLE_COUNT: u16 = 3;
+/// Buffer release переносит только release SyncTimeline; исходный buffer
+/// остаётся у клиента и адресуется стабильным slot index.
+pub const SURFACE_RELEASE_HANDLE_COUNT: u16 = 1;
 /// Максимальное число damage rectangles в одном commit.
 pub const SURFACE_MAX_DAMAGE_RECTS: u16 = 256;
 /// Минимальная глубина client buffer queue.
 pub const SURFACE_MIN_QUEUE_DEPTH: u16 = 2;
 /// Максимальная глубина, принимаемая compositor'ом без отдельной квоты.
 pub const SURFACE_MAX_QUEUE_DEPTH: u16 = 8;
+
+/// Stable ID surface внутри соединения клиента с compositord.
+///
+/// ID не является kernel handle: сервер всегда связывает его с доверенным
+/// `sender_pid`, поэтому другой процесс не может обратиться к чужой surface.
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SurfaceId(pub u64);
+
+impl SurfaceId {
+    /// Нулевой ID не назначается.
+    pub const INVALID: Self = Self(0);
+
+    /// Проверяет назначенный ID.
+    pub const fn is_valid(self) -> bool {
+        self.0 != 0
+    }
+}
 
 /// Stable ID физического output внутри display session.
 #[repr(transparent)]
@@ -248,6 +285,211 @@ impl SurfaceCreateRequest {
         }
         Ok(())
     }
+
+    /// Кодирует request в начало inline IPC payload.
+    pub fn encode_inline(self) -> [u8; 64] {
+        let mut bytes = [0u8; 64];
+        put_u16(&mut bytes, 0, self.version);
+        put_u16(&mut bytes, 2, self.size);
+        put_u32(&mut bytes, 4, self.flags);
+        put_metrics(&mut bytes, 8, self.metrics);
+        put_u16(&mut bytes, 28, self.queue_depth);
+        put_u16(&mut bytes, 30, self.reserved_header);
+        put_u64(&mut bytes, 32, self.reserved_tail[0]);
+        put_u64(&mut bytes, 40, self.reserved_tail[1]);
+        bytes
+    }
+
+    /// Декодирует ровно 48 значимых байт create request.
+    pub fn decode_inline(bytes: &[u8]) -> Result<Self, SurfaceAbiError> {
+        if bytes.len() != core::mem::size_of::<Self>() {
+            return Err(SurfaceAbiError::UnsupportedSize);
+        }
+        let request = Self {
+            version: get_u16(bytes, 0),
+            size: get_u16(bytes, 2),
+            flags: get_u32(bytes, 4),
+            metrics: get_metrics(bytes, 8),
+            queue_depth: get_u16(bytes, 28),
+            reserved_header: get_u16(bytes, 30),
+            reserved_tail: [get_u64(bytes, 32), get_u64(bytes, 40)],
+        };
+        request.validate()?;
+        Ok(request)
+    }
+}
+
+/// Ответ create; всегда помещается в inline payload.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SurfaceCreated {
+    /// [`SURFACE_ABI_VERSION`].
+    pub version: u16,
+    /// Размер структуры.
+    pub size: u16,
+    /// Зарезервировано; равно нулю.
+    pub flags: u32,
+    /// Назначенный surface ID.
+    pub surface: SurfaceId,
+    /// Фактическая глубина очереди.
+    pub queue_depth: u16,
+    /// Зарезервировано; равно нулю.
+    pub reserved_header: [u16; 3],
+    /// Generation меняется после resize/recreate.
+    pub generation: u64,
+    /// Зарезервировано; заполнено нулями.
+    pub reserved: [u64; 4],
+}
+
+impl SurfaceCreated {
+    /// Формирует успешный ответ.
+    pub const fn new(surface: SurfaceId, queue_depth: u16, generation: u64) -> Self {
+        Self {
+            version: SURFACE_ABI_VERSION,
+            size: core::mem::size_of::<Self>() as u16,
+            flags: 0,
+            surface,
+            queue_depth,
+            reserved_header: [0; 3],
+            generation,
+            reserved: [0; 4],
+        }
+    }
+
+    /// Проверяет ответ до сохранения ID клиентом.
+    pub fn validate(self) -> Result<(), SurfaceAbiError> {
+        validate_header(self.version, self.size, core::mem::size_of::<Self>() as u16)?;
+        if self.flags != 0 || self.reserved_header != [0; 3] || self.reserved != [0; 4] {
+            return Err(SurfaceAbiError::ReservedNonZero);
+        }
+        if !self.surface.is_valid() || self.generation == 0 {
+            return Err(SurfaceAbiError::InvalidSurface);
+        }
+        if !(SURFACE_MIN_QUEUE_DEPTH..=SURFACE_MAX_QUEUE_DEPTH).contains(&self.queue_depth) {
+            return Err(SurfaceAbiError::InvalidQueueDepth);
+        }
+        Ok(())
+    }
+
+    /// Кодирует ответ в inline IPC payload.
+    pub fn encode_inline(self) -> [u8; 64] {
+        let mut bytes = [0u8; 64];
+        put_u16(&mut bytes, 0, self.version);
+        put_u16(&mut bytes, 2, self.size);
+        put_u32(&mut bytes, 4, self.flags);
+        put_u64(&mut bytes, 8, self.surface.0);
+        put_u16(&mut bytes, 16, self.queue_depth);
+        put_u16(&mut bytes, 18, self.reserved_header[0]);
+        put_u16(&mut bytes, 20, self.reserved_header[1]);
+        put_u16(&mut bytes, 22, self.reserved_header[2]);
+        put_u64(&mut bytes, 24, self.generation);
+        for (index, value) in self.reserved.into_iter().enumerate() {
+            put_u64(&mut bytes, 32 + index * 8, value);
+        }
+        bytes
+    }
+
+    /// Декодирует и проверяет create reply.
+    pub fn decode_inline(bytes: &[u8]) -> Result<Self, SurfaceAbiError> {
+        if bytes.len() != core::mem::size_of::<Self>() {
+            return Err(SurfaceAbiError::UnsupportedSize);
+        }
+        let created = Self {
+            version: get_u16(bytes, 0),
+            size: get_u16(bytes, 2),
+            flags: get_u32(bytes, 4),
+            surface: SurfaceId(get_u64(bytes, 8)),
+            queue_depth: get_u16(bytes, 16),
+            reserved_header: [get_u16(bytes, 18), get_u16(bytes, 20), get_u16(bytes, 22)],
+            generation: get_u64(bytes, 24),
+            reserved: [
+                get_u64(bytes, 32),
+                get_u64(bytes, 40),
+                get_u64(bytes, 48),
+                get_u64(bytes, 56),
+            ],
+        };
+        created.validate()?;
+        Ok(created)
+    }
+}
+
+/// Запрос закрытия surface. Последние buffers освобождаются после GPU fences,
+/// а не синхронно с получением этого сообщения.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SurfaceDestroyRequest {
+    /// [`SURFACE_ABI_VERSION`].
+    pub version: u16,
+    /// Размер структуры.
+    pub size: u16,
+    /// Зарезервировано; равно нулю.
+    pub flags: u32,
+    /// Закрываемая surface.
+    pub surface: SurfaceId,
+    /// Зарезервировано; заполнено нулями.
+    pub reserved: [u64; 6],
+}
+
+impl SurfaceDestroyRequest {
+    /// Формирует запрос закрытия.
+    pub const fn new(surface: SurfaceId) -> Self {
+        Self {
+            version: SURFACE_ABI_VERSION,
+            size: core::mem::size_of::<Self>() as u16,
+            flags: 0,
+            surface,
+            reserved: [0; 6],
+        }
+    }
+
+    /// Проверяет ID и зарезервированные поля.
+    pub fn validate(self) -> Result<(), SurfaceAbiError> {
+        validate_header(self.version, self.size, core::mem::size_of::<Self>() as u16)?;
+        if self.flags != 0 || self.reserved != [0; 6] {
+            return Err(SurfaceAbiError::ReservedNonZero);
+        }
+        if !self.surface.is_valid() {
+            return Err(SurfaceAbiError::InvalidSurface);
+        }
+        Ok(())
+    }
+
+    /// Кодирует request в inline payload.
+    pub fn encode_inline(self) -> [u8; 64] {
+        let mut bytes = [0u8; 64];
+        put_u16(&mut bytes, 0, self.version);
+        put_u16(&mut bytes, 2, self.size);
+        put_u32(&mut bytes, 4, self.flags);
+        put_u64(&mut bytes, 8, self.surface.0);
+        for (index, value) in self.reserved.into_iter().enumerate() {
+            put_u64(&mut bytes, 16 + index * 8, value);
+        }
+        bytes
+    }
+
+    /// Декодирует и проверяет destroy request.
+    pub fn decode_inline(bytes: &[u8]) -> Result<Self, SurfaceAbiError> {
+        if bytes.len() != core::mem::size_of::<Self>() {
+            return Err(SurfaceAbiError::UnsupportedSize);
+        }
+        let request = Self {
+            version: get_u16(bytes, 0),
+            size: get_u16(bytes, 2),
+            flags: get_u32(bytes, 4),
+            surface: SurfaceId(get_u64(bytes, 8)),
+            reserved: [
+                get_u64(bytes, 16),
+                get_u64(bytes, 24),
+                get_u64(bytes, 32),
+                get_u64(bytes, 40),
+                get_u64(bytes, 48),
+                get_u64(bytes, 56),
+            ],
+        };
+        request.validate()?;
+        Ok(request)
+    }
 }
 
 /// Флаги [`SurfaceCommit`].
@@ -270,77 +512,56 @@ pub struct SurfaceCommit {
     pub size: u16,
     /// Биты [`commit_flags`].
     pub flags: u32,
-    /// Surface capability.
-    pub surface: Handle,
-    /// Graphics buffer capability.
-    pub buffer: Handle,
-    /// Compositor ждёт эту point перед чтением buffer'а.
-    pub acquire: SyncPoint,
-    /// Read-only shared memory с массивом [`DamageRect`].
-    pub damage_memory: Handle,
-    /// Число элементов массива damage.
-    pub damage_count: u16,
-    /// Зарезервировано; отправитель заполняет нулём.
-    pub reserved_header: u16,
-    /// Смещение массива damage в shared memory.
-    pub damage_offset: u64,
+    /// ID, выданный [`SurfaceCreated`].
+    pub surface: SurfaceId,
     /// Logical/physical size и fractional device scale.
     pub metrics: SurfaceMetrics,
     /// [`SurfaceTransform`].
     pub transform: SurfaceTransform,
     /// [`PresentMode`].
     pub present_mode: PresentMode,
+    /// Число [`DamageRect`] в третьем transferred handle.
+    pub damage_count: u16,
+    /// Индекс buffer в созданной очереди.
+    pub buffer_slot: u16,
     /// Монотонный ID frame внутри surface.
     pub frame_id: u64,
     /// Желаемое время показа по монотонным часам, ns; ноль = ближайшее.
     pub target_present_time_ns: u64,
-    /// Зарезервировано; отправитель заполняет нулями.
-    pub reserved_tail: [u64; 2],
 }
 
 impl SurfaceCommit {
     /// Создаёт full-damage commit. Клиент может затем задать shared damage
     /// list и снять флаг `FULL_DAMAGE`.
     pub const fn full_damage(
-        surface: Handle,
-        buffer: Handle,
+        surface: SurfaceId,
         metrics: SurfaceMetrics,
         frame_id: u64,
+        buffer_slot: u16,
     ) -> Self {
         Self {
             version: SURFACE_ABI_VERSION,
             size: core::mem::size_of::<Self>() as u16,
             flags: commit_flags::FULL_DAMAGE,
             surface,
-            buffer,
-            acquire: SyncPoint::NONE,
-            damage_memory: Handle::INVALID,
-            damage_count: 0,
-            reserved_header: 0,
-            damage_offset: 0,
             metrics,
             transform: SurfaceTransform::NORMAL,
             present_mode: PresentMode::FIFO,
+            damage_count: 0,
+            buffer_slot,
             frame_id,
             target_present_time_ns: 0,
-            reserved_tail: [0; 2],
         }
     }
 
     /// Проверяет packet до импорта buffer и чтения damage memory.
     pub fn validate(self) -> Result<(), SurfaceAbiError> {
         validate_header(self.version, self.size, core::mem::size_of::<Self>() as u16)?;
-        if self.flags & !commit_flags::KNOWN != 0
-            || self.reserved_header != 0
-            || self.reserved_tail != [0; 2]
-        {
+        if self.flags & !commit_flags::KNOWN != 0 {
             return Err(SurfaceAbiError::ReservedNonZero);
         }
-        if !self.surface.is_valid() || !self.buffer.is_valid() {
-            return Err(SurfaceAbiError::InvalidHandle);
-        }
-        if self.acquire.validate().is_err() {
-            return Err(SurfaceAbiError::InvalidSyncPoint);
+        if !self.surface.is_valid() || self.frame_id == 0 {
+            return Err(SurfaceAbiError::InvalidSurface);
         }
         self.metrics.validate()?;
         if !self.transform.is_known() || !self.present_mode.is_known() {
@@ -350,26 +571,59 @@ impl SurfaceCommit {
             return Err(SurfaceAbiError::InvalidDamage);
         }
         let full_damage = self.flags & commit_flags::FULL_DAMAGE != 0;
-        if self.damage_count == 0 {
-            if self.damage_memory.is_valid() || self.damage_offset != 0 {
-                return Err(SurfaceAbiError::InvalidDamage);
-            }
-        } else {
-            if full_damage
-                || !self.damage_memory.is_valid()
-                || !self.damage_offset.is_multiple_of(8)
-            {
-                return Err(SurfaceAbiError::InvalidDamage);
-            }
-            if self
-                .damage_offset
-                .checked_add(self.damage_count as u64 * core::mem::size_of::<DamageRect>() as u64)
-                .is_none()
-            {
-                return Err(SurfaceAbiError::InvalidDamage);
-            }
+        if (full_damage && self.damage_count != 0) || (!full_damage && self.damage_count == 0) {
+            return Err(SurfaceAbiError::InvalidDamage);
         }
         Ok(())
+    }
+
+    /// Требуемое число transferred handles для выбранного damage mode.
+    pub const fn handle_count(self) -> u16 {
+        if self.flags & commit_flags::FULL_DAMAGE != 0 {
+            SURFACE_COMMIT_FULL_HANDLE_COUNT
+        } else {
+            SURFACE_COMMIT_PARTIAL_HANDLE_COUNT
+        }
+    }
+
+    /// Кодирует ровно 64 байта surface commit metadata. Buffer/acquire/damage
+    /// capabilities остаются в `Message::handles` и не дублируются числами.
+    pub fn encode_inline(self) -> [u8; 64] {
+        let mut bytes = [0u8; 64];
+        put_u16(&mut bytes, 0, self.version);
+        put_u16(&mut bytes, 2, self.size);
+        put_u32(&mut bytes, 4, self.flags);
+        put_u64(&mut bytes, 8, self.surface.0);
+        put_metrics(&mut bytes, 16, self.metrics);
+        put_u16(&mut bytes, 36, self.transform.0);
+        put_u16(&mut bytes, 38, self.present_mode.0);
+        put_u16(&mut bytes, 40, self.damage_count);
+        put_u16(&mut bytes, 42, self.buffer_slot);
+        put_u64(&mut bytes, 48, self.frame_id);
+        put_u64(&mut bytes, 56, self.target_present_time_ns);
+        bytes
+    }
+
+    /// Декодирует и валидирует inline commit metadata.
+    pub fn decode_inline(bytes: &[u8]) -> Result<Self, SurfaceAbiError> {
+        if bytes.len() != core::mem::size_of::<Self>() {
+            return Err(SurfaceAbiError::UnsupportedSize);
+        }
+        let commit = Self {
+            version: get_u16(bytes, 0),
+            size: get_u16(bytes, 2),
+            flags: get_u32(bytes, 4),
+            surface: SurfaceId(get_u64(bytes, 8)),
+            metrics: get_metrics(bytes, 16),
+            transform: SurfaceTransform(get_u16(bytes, 36)),
+            present_mode: PresentMode(get_u16(bytes, 38)),
+            damage_count: get_u16(bytes, 40),
+            buffer_slot: get_u16(bytes, 42),
+            frame_id: get_u64(bytes, 48),
+            target_present_time_ns: get_u64(bytes, 56),
+        };
+        commit.validate()?;
+        Ok(commit)
     }
 }
 
@@ -383,32 +637,70 @@ pub struct BufferReleased {
     pub size: u16,
     /// В первой версии равно нулю.
     pub flags: u32,
-    /// Surface capability.
-    pub surface: Handle,
-    /// Освобождённый graphics buffer capability.
-    pub buffer: Handle,
+    /// Surface ID.
+    pub surface: SurfaceId,
     /// Frame, который использовал buffer последним.
     pub frame_id: u64,
-    /// После этой point buffer можно менять; `NONE` означает уже свободен.
-    pub release: SyncPoint,
-    /// Зарезервировано; отправитель заполняет нулём.
-    pub reserved: u64,
+    /// Значение release timeline из transferred handle.
+    pub release_value: u64,
+    /// Освобождённый slot из [`SurfaceCommit::buffer_slot`].
+    pub buffer_slot: u16,
+    /// Зарезервировано; заполнено нулями.
+    pub reserved_header: [u16; 3],
+    /// Зарезервировано; отправитель заполняет нулями.
+    pub reserved: [u64; 3],
 }
 
 impl BufferReleased {
     /// Проверяет release event.
     pub fn validate(self) -> Result<(), SurfaceAbiError> {
         validate_header(self.version, self.size, core::mem::size_of::<Self>() as u16)?;
-        if self.flags != 0 || self.reserved != 0 {
+        if self.flags != 0 || self.reserved_header != [0; 3] || self.reserved != [0; 3] {
             return Err(SurfaceAbiError::ReservedNonZero);
         }
-        if !self.surface.is_valid() || !self.buffer.is_valid() {
-            return Err(SurfaceAbiError::InvalidHandle);
-        }
-        if self.release.validate().is_err() {
-            return Err(SurfaceAbiError::InvalidSyncPoint);
+        if !self.surface.is_valid() || self.frame_id == 0 {
+            return Err(SurfaceAbiError::InvalidSurface);
         }
         Ok(())
+    }
+
+    /// Кодирует release metadata; timeline capability передаётся отдельно.
+    pub fn encode_inline(self) -> [u8; 64] {
+        let mut bytes = [0u8; 64];
+        put_u16(&mut bytes, 0, self.version);
+        put_u16(&mut bytes, 2, self.size);
+        put_u32(&mut bytes, 4, self.flags);
+        put_u64(&mut bytes, 8, self.surface.0);
+        put_u64(&mut bytes, 16, self.frame_id);
+        put_u64(&mut bytes, 24, self.release_value);
+        put_u16(&mut bytes, 32, self.buffer_slot);
+        put_u16(&mut bytes, 34, self.reserved_header[0]);
+        put_u16(&mut bytes, 36, self.reserved_header[1]);
+        put_u16(&mut bytes, 38, self.reserved_header[2]);
+        for (index, value) in self.reserved.into_iter().enumerate() {
+            put_u64(&mut bytes, 40 + index * 8, value);
+        }
+        bytes
+    }
+
+    /// Декодирует release metadata.
+    pub fn decode_inline(bytes: &[u8]) -> Result<Self, SurfaceAbiError> {
+        if bytes.len() != core::mem::size_of::<Self>() {
+            return Err(SurfaceAbiError::UnsupportedSize);
+        }
+        let released = Self {
+            version: get_u16(bytes, 0),
+            size: get_u16(bytes, 2),
+            flags: get_u32(bytes, 4),
+            surface: SurfaceId(get_u64(bytes, 8)),
+            frame_id: get_u64(bytes, 16),
+            release_value: get_u64(bytes, 24),
+            buffer_slot: get_u16(bytes, 32),
+            reserved_header: [get_u16(bytes, 34), get_u16(bytes, 36), get_u16(bytes, 38)],
+            reserved: [get_u64(bytes, 40), get_u64(bytes, 48), get_u64(bytes, 56)],
+        };
+        released.validate()?;
+        Ok(released)
     }
 }
 
@@ -460,16 +752,12 @@ pub struct PresentationFeedback {
     pub status: PresentationStatus,
     /// Биты [`feedback_flags`].
     pub flags: u16,
-    /// Surface capability.
-    pub surface: Handle,
-    /// Зарезервировано; отправитель заполняет нулём.
-    pub reserved_header: u32,
+    /// Surface ID.
+    pub surface: SurfaceId,
     /// ID клиентского frame.
     pub frame_id: u64,
     /// Монотонный display sequence.
     pub sequence: u64,
-    /// Запрошенное время показа, ns.
-    pub target_time_ns: u64,
     /// Фактическое время vblank/present, ns; ноль для отброшенного frame.
     pub actual_time_ns: u64,
     /// Интервал refresh, ns; ноль если frame не показан.
@@ -487,14 +775,11 @@ impl PresentationFeedback {
         if !self.status.is_known() {
             return Err(SurfaceAbiError::UnsupportedMode);
         }
-        if self.flags & !feedback_flags::KNOWN != 0
-            || self.reserved_header != 0
-            || self.reserved_tail != 0
-        {
+        if self.flags & !feedback_flags::KNOWN != 0 || self.reserved_tail != 0 {
             return Err(SurfaceAbiError::ReservedNonZero);
         }
         if !self.surface.is_valid() {
-            return Err(SurfaceAbiError::InvalidHandle);
+            return Err(SurfaceAbiError::InvalidSurface);
         }
         if self.flags & feedback_flags::DIRECT_SCANOUT != 0
             && self.flags & feedback_flags::COMPOSITED != 0
@@ -515,6 +800,45 @@ impl PresentationFeedback {
         }
         Ok(())
     }
+
+    /// Кодирует feedback в один inline payload.
+    pub fn encode_inline(self) -> [u8; 64] {
+        let mut bytes = [0u8; 64];
+        put_u16(&mut bytes, 0, self.version);
+        put_u16(&mut bytes, 2, self.size);
+        put_u16(&mut bytes, 4, self.status.0);
+        put_u16(&mut bytes, 6, self.flags);
+        put_u64(&mut bytes, 8, self.surface.0);
+        put_u64(&mut bytes, 16, self.frame_id);
+        put_u64(&mut bytes, 24, self.sequence);
+        put_u64(&mut bytes, 32, self.actual_time_ns);
+        put_u64(&mut bytes, 40, self.refresh_interval_ns);
+        put_u64(&mut bytes, 48, self.output.0);
+        put_u64(&mut bytes, 56, self.reserved_tail);
+        bytes
+    }
+
+    /// Декодирует и проверяет feedback.
+    pub fn decode_inline(bytes: &[u8]) -> Result<Self, SurfaceAbiError> {
+        if bytes.len() != core::mem::size_of::<Self>() {
+            return Err(SurfaceAbiError::UnsupportedSize);
+        }
+        let feedback = Self {
+            version: get_u16(bytes, 0),
+            size: get_u16(bytes, 2),
+            status: PresentationStatus(get_u16(bytes, 4)),
+            flags: get_u16(bytes, 6),
+            surface: SurfaceId(get_u64(bytes, 8)),
+            frame_id: get_u64(bytes, 16),
+            sequence: get_u64(bytes, 24),
+            actual_time_ns: get_u64(bytes, 32),
+            refresh_interval_ns: get_u64(bytes, 40),
+            output: OutputId(get_u64(bytes, 48)),
+            reserved_tail: get_u64(bytes, 56),
+        };
+        feedback.validate()?;
+        Ok(feedback)
+    }
 }
 
 /// Ошибка структурной проверки surface protocol.
@@ -526,6 +850,8 @@ pub enum SurfaceAbiError {
     UnsupportedSize,
     /// Capability handle не задан.
     InvalidHandle,
+    /// Surface ID не задан или frame ID равен нулю.
+    InvalidSurface,
     /// Logical/physical size или scale недопустим.
     InvalidDimensions,
     /// Buffer queue слишком мала или превышает системный предел.
@@ -552,13 +878,58 @@ fn validate_header(version: u16, size: u16, expected_size: u16) -> Result<(), Su
     Ok(())
 }
 
+fn put_metrics(bytes: &mut [u8], offset: usize, metrics: SurfaceMetrics) {
+    put_u32(bytes, offset, metrics.logical_width);
+    put_u32(bytes, offset + 4, metrics.logical_height);
+    put_u32(bytes, offset + 8, metrics.physical_width);
+    put_u32(bytes, offset + 12, metrics.physical_height);
+    put_u32(bytes, offset + 16, metrics.scale_milli);
+}
+
+fn get_metrics(bytes: &[u8], offset: usize) -> SurfaceMetrics {
+    SurfaceMetrics {
+        logical_width: get_u32(bytes, offset),
+        logical_height: get_u32(bytes, offset + 4),
+        physical_width: get_u32(bytes, offset + 8),
+        physical_height: get_u32(bytes, offset + 12),
+        scale_milli: get_u32(bytes, offset + 16),
+    }
+}
+
+fn put_u16(bytes: &mut [u8], offset: usize, value: u16) {
+    bytes[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+}
+
+fn put_u32(bytes: &mut [u8], offset: usize, value: u32) {
+    bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+}
+
+fn put_u64(bytes: &mut [u8], offset: usize, value: u64) {
+    bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+}
+
+fn get_u16(bytes: &[u8], offset: usize) -> u16 {
+    u16::from_le_bytes(bytes[offset..offset + 2].try_into().unwrap_or([0; 2]))
+}
+
+fn get_u32(bytes: &[u8], offset: usize) -> u32 {
+    u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap_or([0; 4]))
+}
+
+fn get_u64(bytes: &[u8], offset: usize) -> u64 {
+    u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap_or([0; 8]))
+}
+
 const _: () = assert!(core::mem::size_of::<OutputId>() == 8);
+const _: () = assert!(core::mem::size_of::<SurfaceId>() == 8);
 const _: () = assert!(core::mem::size_of::<DamageRect>() == 16);
 const _: () = assert!(core::mem::size_of::<SurfaceMetrics>() == 20);
 const _: () = assert!(core::mem::size_of::<SurfaceCreateRequest>() == 48);
-const _: () = assert!(core::mem::size_of::<SurfaceCommit>() == 104);
-const _: () = assert!(core::mem::size_of::<BufferReleased>() == 48);
-const _: () = assert!(core::mem::size_of::<PresentationFeedback>() == 72);
+const _: () = assert!(core::mem::size_of::<SurfaceCreated>() == 64);
+const _: () = assert!(core::mem::size_of::<SurfaceDestroyRequest>() == 64);
+const _: () = assert!(core::mem::size_of::<SurfaceCommit>() == 64);
+const _: () = assert!(core::mem::size_of::<BufferReleased>() == 64);
+const _: () = assert!(core::mem::size_of::<PresentationFeedback>() == 64);
 const _: () = assert!(core::mem::align_of::<SurfaceCommit>() == 8);
 
 #[cfg(test)]
@@ -570,6 +941,15 @@ mod tests {
         let request =
             SurfaceCreateRequest::new(SurfaceMetrics::new(1280, 800, 2048, 1280, 1600), 3);
         assert_eq!(request.validate(), Ok(()));
+        assert_eq!(
+            SurfaceCreateRequest::decode_inline(&request.encode_inline()[..48]),
+            Ok(request)
+        );
+        let created = SurfaceCreated::new(SurfaceId(42), 3, 1);
+        assert_eq!(
+            SurfaceCreated::decode_inline(&created.encode_inline()),
+            Ok(created)
+        );
     }
 
     #[test]
@@ -582,27 +962,31 @@ mod tests {
     #[test]
     fn full_damage_commit_needs_no_damage_memory() {
         let commit = SurfaceCommit::full_damage(
-            Handle(2),
-            Handle(3),
+            SurfaceId(2),
             SurfaceMetrics::new(800, 600, 1600, 1200, 2000),
             7,
+            0,
         );
         assert_eq!(commit.validate(), Ok(()));
+        assert_eq!(commit.handle_count(), SURFACE_COMMIT_FULL_HANDLE_COUNT);
+        assert_eq!(
+            SurfaceCommit::decode_inline(&commit.encode_inline()),
+            Ok(commit)
+        );
     }
 
     #[test]
     fn partial_damage_requires_bounded_shared_array() {
         let mut commit = SurfaceCommit::full_damage(
-            Handle(2),
-            Handle(3),
+            SurfaceId(2),
             SurfaceMetrics::new(800, 600, 800, 600, 1000),
             8,
+            2,
         );
         commit.flags = commit_flags::REQUEST_FEEDBACK;
-        commit.damage_memory = Handle(4);
         commit.damage_count = 3;
-        commit.damage_offset = 16;
         assert_eq!(commit.validate(), Ok(()));
+        assert_eq!(commit.handle_count(), SURFACE_COMMIT_PARTIAL_HANDLE_COUNT);
         commit.damage_count = SURFACE_MAX_DAMAGE_RECTS + 1;
         assert_eq!(commit.validate(), Err(SurfaceAbiError::InvalidDamage));
     }
@@ -630,11 +1014,9 @@ mod tests {
             size: core::mem::size_of::<PresentationFeedback>() as u16,
             status: PresentationStatus::PRESENTED,
             flags: feedback_flags::COMPOSITED,
-            surface: Handle(7),
-            reserved_header: 0,
+            surface: SurfaceId(7),
             frame_id: 4,
             sequence: 10,
-            target_time_ns: 90,
             actual_time_ns: 100,
             refresh_interval_ns: 16,
             output: OutputId(1),
@@ -650,5 +1032,33 @@ mod tests {
         assert_eq!(dropped.validate(), Ok(()));
         dropped.flags = feedback_flags::DIRECT_SCANOUT;
         assert_eq!(dropped.validate(), Err(SurfaceAbiError::InvalidFeedback));
+        assert_eq!(
+            PresentationFeedback::decode_inline(&presented.encode_inline()),
+            Ok(presented)
+        );
+    }
+
+    #[test]
+    fn destroy_and_release_are_pointer_free_inline_records() {
+        let destroy = SurfaceDestroyRequest::new(SurfaceId(9));
+        assert_eq!(
+            SurfaceDestroyRequest::decode_inline(&destroy.encode_inline()),
+            Ok(destroy)
+        );
+        let released = BufferReleased {
+            version: SURFACE_ABI_VERSION,
+            size: core::mem::size_of::<BufferReleased>() as u16,
+            flags: 0,
+            surface: SurfaceId(9),
+            frame_id: 8,
+            release_value: 11,
+            buffer_slot: 2,
+            reserved_header: [0; 3],
+            reserved: [0; 3],
+        };
+        assert_eq!(
+            BufferReleased::decode_inline(&released.encode_inline()),
+            Ok(released)
+        );
     }
 }

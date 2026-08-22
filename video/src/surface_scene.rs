@@ -5,22 +5,7 @@
 //! transform-only move и bounded damage. GPU backend затем преобразует
 //! [`VisibleSurface`] в texture layers без чтения pixels обратно на CPU.
 
-use crate::{DamageRegion, Point, Rect};
-
-/// Стабильный ID surface внутри одной compositor session.
-#[repr(transparent)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct SurfaceId(pub u64);
-
-impl SurfaceId {
-    /// Нулевой ID никогда не принадлежит клиенту.
-    pub const INVALID: Self = Self(0);
-
-    /// Проверяет, что ID назначен compositor'ом.
-    pub const fn is_valid(self) -> bool {
-        self.0 != 0
-    }
-}
+use crate::{protocol::SurfaceId, DamageRegion, Point, Rect};
 
 /// Начальная политика слоя. Buffer публикуется отдельно через `commit`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
