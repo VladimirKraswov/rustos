@@ -396,6 +396,38 @@ impl Framebuffer {
         let Some((x0, y0, x1, y1)) = self.clipped(destination) else {
             return;
         };
+        if destination.width == source_width && destination.height == source_height {
+            let count = (x1 - x0) as usize;
+            for y in y0..y1 {
+                let source_y = (y as i32 - destination.y) as usize;
+                let source_x = (x0 as i32 - destination.x) as usize;
+                let source_offset = source_y * source_width as usize + source_x;
+                let destination_offset = y as usize * self.width as usize + x0 as usize;
+                if self.render_format == CpuPixelFormat::Bgr888 {
+                    // SAFETY: clipped гарантирует полный destination span в
+                    // backbuffer, а размеры source проверены выше. Массивы
+                    // принадлежат разным retained surfaces и не пересекаются.
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(
+                            source.as_ptr().add(source_offset),
+                            self.back.add(destination_offset),
+                            count,
+                        )
+                    };
+                } else {
+                    for column in 0..count {
+                        let rgba = CpuPixelFormat::Bgr888.unpack(source[source_offset + column]);
+                        // SAFETY: destination_offset + count проверен clipped.
+                        unsafe {
+                            self.back
+                                .add(destination_offset + column)
+                                .write(self.render_format.pack(rgba))
+                        };
+                    }
+                }
+            }
+            return;
+        }
         let max_source_x = source_width.saturating_sub(1);
         let max_source_y = source_height.saturating_sub(1);
         for y in y0..y1 {
@@ -919,6 +951,14 @@ impl Framebuffer {
     /// в видимой памяти.
     pub fn present_rect(&mut self, rect: Rect) {
         self.present_regions(core::slice::from_ref(&rect));
+    }
+
+    /// Публикует сохранённый newest mailbox frame после того, как GUI уже
+    /// проверил input. Firmware framebuffer не имеет асинхронной очереди.
+    pub fn service_scanout(&mut self) {
+        if self.native_scanout {
+            let _ = scanout::service_present();
+        }
     }
 
     fn present_regions(&mut self, damage: &[Rect]) {

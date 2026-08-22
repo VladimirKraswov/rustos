@@ -3355,9 +3355,6 @@ impl ProcessManager {
     }
 
     fn poll_gpu_completion(&mut self) {
-        if self.gpu_submissions.iter().all(Option::is_none) {
-            return;
-        }
         for _ in 0..MAX_GPU_SUBMISSIONS {
             let completion = match scanout::poll_render() {
                 Ok(Some(completion)) => completion,

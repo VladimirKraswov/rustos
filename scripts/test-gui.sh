@@ -223,7 +223,11 @@ grep -Fq '[graphics-abi-v7] graphics-buffer sync-timeline atomic-present supervi
     "$RUN_DIR/serial.log"
 grep -Fq '[supervisor] persistent displayd/compositord atomic-present services ready' \
     "$RUN_DIR/serial.log"
-grep -Eq '\[video\] scanout=virtio-gpu mode=1280x800 format=bgr888 present=immediate page-flip=no' \
+grep -Eq '\[video\] scanout=virtio-gpu mode=1280x800 format=bgr888 present=async-mailbox page-flip=yes' \
+    "$RUN_DIR/serial.log"
+grep -Fq '[video] 2d-present=async buffers=3 damage=coalesced mailbox=latest completion=deferred' \
+    "$RUN_DIR/serial.log"
+grep -Fq '[gui] scheduling=input-first services=idle-quantum animation=last' \
     "$RUN_DIR/serial.log"
 grep -Eq '\[hardware\] display-driver=virtio-gpu transport=modern-pci mode=1280x800 preferred=1280x800 edid=(valid|unavailable) outputs=[1-9][0-9]* renderer=cpu' \
     "$RUN_DIR/serial.log"
@@ -557,8 +561,8 @@ sleep "${GUI_CLICK_SECONDS:-0.5}"
 printf 'mouse_button 0\n' | hmp
 wait_for_serial '[wm] window minimized id=0x03'
 # Marker пишется при принятии window command. Даём медленному TCG закончить
-# полный wallpaper redraw и доставить virtio-gpu FLUSH в display frontend до
-# HMP screendump; 0.3 s на загруженном Apple Silicon хосте было погранично.
+# полный wallpaper redraw и опубликовать async mailbox frame до HMP screendump;
+# 0.3 s на загруженном Apple Silicon хосте было погранично.
 sleep "${GUI_FULL_REDRAW_SETTLE_SECONDS:-1.0}"
 printf 'screendump %s/minimized.ppm\n' "$RUN_DIR" \
     | hmp

@@ -15,9 +15,11 @@ use rustos_video::{
     ModeSetError, PresentStats, Rect, ScanoutCapabilities, ScanoutError, StartupModePolicy,
 };
 
-#[cfg(target_arch = "aarch64")]
-use crate::arch;
-use crate::memory::{self, FrameBlock};
+use crate::{
+    arch,
+    memory::{self, FrameBlock},
+    serial,
+};
 
 #[cfg(target_arch = "aarch64")]
 use super::virtqueue_mmio::ModernMmioTransport as GpuTransport;
@@ -61,6 +63,9 @@ const RESP_OK_CAPSET_INFO: u32 = 0x1102;
 const FLAG_FENCE: u32 = 1;
 const RESOURCE_FLAG_Y_0_TOP: u32 = 1;
 const MAX_RENDER_RESOURCES: usize = 4;
+const PRIMARY_BUFFER_COUNT: usize = 3;
+const MAX_PENDING_PRESENT_COMMANDS: usize = PRIMARY_BUFFER_COUNT * 3;
+const MAX_READY_RENDER_COMPLETIONS: usize = 8;
 #[cfg(target_arch = "aarch64")]
 const CURSOR_EXTENT: u32 = 64;
 #[cfg(target_arch = "aarch64")]
@@ -309,7 +314,21 @@ struct GpuBox {
 struct Resource {
     id: u32,
     backing: FrameBlock,
-    bytes: u32,
+}
+
+#[derive(Clone, Copy)]
+struct PendingPresentCommand {
+    fence: u64,
+    slot: u8,
+    final_command: bool,
+}
+
+impl PendingPresentCommand {
+    const EMPTY: Self = Self {
+        fence: 0,
+        slot: 0,
+        final_command: false,
+    };
 }
 
 #[derive(Clone, Copy)]
@@ -344,7 +363,20 @@ pub(crate) struct RenderCompletion {
 pub struct VirtioGpu {
     transport: GpuTransport,
     scanout: u32,
-    resource: Resource,
+    primary: [Resource; PRIMARY_BUFFER_COUNT],
+    primary_busy: [bool; PRIMARY_BUFFER_COUNT],
+    primary_damage: [Rect; PRIMARY_BUFFER_COUNT],
+    primary_next: usize,
+    pending_present: bool,
+    source_pixels: *const u32,
+    source_format: CpuPixelFormat,
+    pending_present_commands: [PendingPresentCommand; MAX_PENDING_PRESENT_COMMANDS],
+    ready_render: [Option<RenderCompletion>; MAX_READY_RENDER_COMPLETIONS],
+    ready_render_read: usize,
+    ready_render_write: usize,
+    async_device_failed: bool,
+    async_present_logged: bool,
+    #[cfg(target_arch = "aarch64")]
     cursor_resource: Resource,
     next_resource: u32,
     mode: DisplayMode,
@@ -377,12 +409,24 @@ impl VirtioGpu {
         let placeholder = Resource {
             id: 0,
             backing: FrameBlock { phys: 0, frames: 0 },
-            bytes: 0,
         };
         let mut gpu = Self {
             transport,
             scanout: 0,
-            resource: placeholder,
+            primary: [placeholder; PRIMARY_BUFFER_COUNT],
+            primary_busy: [false; PRIMARY_BUFFER_COUNT],
+            primary_damage: [Rect::EMPTY; PRIMARY_BUFFER_COUNT],
+            primary_next: 0,
+            pending_present: false,
+            source_pixels: ptr::null(),
+            source_format: CpuPixelFormat::Bgr888,
+            pending_present_commands: [PendingPresentCommand::EMPTY; MAX_PENDING_PRESENT_COMMANDS],
+            ready_render: [None; MAX_READY_RENDER_COMPLETIONS],
+            ready_render_read: 0,
+            ready_render_write: 0,
+            async_device_failed: false,
+            async_present_logged: false,
+            #[cfg(target_arch = "aarch64")]
             cursor_resource: placeholder,
             next_resource: 1,
             mode: fallback,
@@ -458,15 +502,15 @@ impl VirtioGpu {
         // Автоматически выведенный integer-fit mode обязан быть виден через
         // DISPLAY MODES наравне с EDID и стандартными режимами.
         gpu.add_mode(startup);
-        let resource = gpu.allocate_resource(startup)?;
-        if let Err(error) = gpu.set_scanout_resource(resource.id, startup) {
-            let _ = gpu.detach_resource(resource.id);
-            let _ = gpu.unref_resource(resource.id);
-            let _ = memory::free(resource.backing);
+        let primary = gpu.allocate_primary_resources(startup)?;
+        if let Err(error) = gpu.set_scanout_resource(primary[0].id, startup) {
+            gpu.release_primary_resources(primary);
             return Err(error);
         }
-        gpu.resource = resource;
+        gpu.primary = primary;
         gpu.mode = startup;
+        let full = Rect::new(0, 0, startup.width, startup.height);
+        gpu.primary_damage = [full; PRIMARY_BUFFER_COUNT];
         Ok(gpu)
     }
 
@@ -486,7 +530,7 @@ impl VirtioGpu {
 
     pub const fn capabilities(&self) -> ScanoutCapabilities {
         ScanoutCapabilities {
-            page_flip: false,
+            page_flip: true,
             vsync_event: false,
             hardware_cursor: self.transport.cursor_supported(),
             multiple_outputs: false,
@@ -618,24 +662,26 @@ impl VirtioGpu {
             format: CpuPixelFormat::Bgr888,
             ..requested
         };
-        let replacement = self.allocate_resource(requested)?;
-        if let Err(error) = self.set_scanout_resource(replacement.id, requested) {
-            let _ = self.detach_resource(replacement.id);
-            let _ = self.unref_resource(replacement.id);
-            let _ = memory::free(replacement.backing);
+        self.drain_primary_presents()?;
+        let replacement = self.allocate_primary_resources(requested)?;
+        if let Err(error) = self.set_scanout_resource(replacement[0].id, requested) {
+            self.release_primary_resources(replacement);
             return Err(error);
         }
 
-        let previous = self.resource;
-        self.resource = replacement;
+        let previous = self.primary;
+        self.primary = replacement;
+        self.primary_busy = [false; PRIMARY_BUFFER_COUNT];
+        let full = Rect::new(0, 0, requested.width, requested.height);
+        self.primary_damage = [full; PRIMARY_BUFFER_COUNT];
+        self.primary_next = 0;
+        self.pending_present = false;
+        self.source_pixels = ptr::null();
         self.mode = requested;
         // SET_SCANOUT уже отвязал старый resource. Освобождаем DMA backing
         // только после подтверждённого DETACH; при ошибке безопаснее оставить
         // bounded leak, чем дать device доступ к повторно выданным кадрам.
-        if self.detach_resource(previous.id).is_ok() {
-            let _ = self.unref_resource(previous.id);
-            let _ = memory::free(previous.backing);
-        }
+        self.release_primary_resources(previous);
         Ok(requested)
     }
 
@@ -648,10 +694,12 @@ impl VirtioGpu {
         if source.width() != self.mode.width || source.height() != self.mode.height {
             return Err(ScanoutError::InvalidSurface);
         }
-        self.ensure_primary_scanout()
-            .map_err(|_| ScanoutError::DeviceLost)?;
+        let source_pixels = source
+            .contiguous_pixels()
+            .ok_or(ScanoutError::InvalidSurface)?;
+        self.source_pixels = source_pixels.as_ptr();
+        self.source_format = source.format();
         let bounds = Rect::new(0, 0, self.mode.width, self.mode.height);
-        let target = self.resource.backing.phys as *mut u32;
         let mut rectangles = 0u32;
         let mut pixels = 0u64;
         let mut commit = Rect::EMPTY;
@@ -659,21 +707,6 @@ impl VirtioGpu {
             let rect = requested.intersection(bounds);
             if rect.is_empty() {
                 continue;
-            }
-            for y in rect.y as u32..rect.bottom() as u32 {
-                let row = source
-                    .row(y, rect.x as u32, rect.width)
-                    .ok_or(ScanoutError::InvalidSurface)?;
-                let destination =
-                    unsafe { target.add(y as usize * self.mode.width as usize + rect.x as usize) };
-                if source.format() == CpuPixelFormat::Bgr888 {
-                    unsafe { ptr::copy_nonoverlapping(row.as_ptr(), destination, row.len()) };
-                } else {
-                    for (offset, raw) in row.iter().copied().enumerate() {
-                        let converted = CpuPixelFormat::Bgr888.pack(source.format().unpack(raw));
-                        unsafe { destination.add(offset).write(converted) };
-                    }
-                }
             }
             commit = if commit.is_empty() {
                 rect
@@ -684,14 +717,17 @@ impl VirtioGpu {
             pixels = pixels.saturating_add(rect.area());
         }
         if !commit.is_empty() {
-            // Guest backing сохраняет предыдущий корректный кадр между
-            // present'ами. Поэтому промежутки внутри bounding rectangle уже
-            // содержат верные pixels, даже если caller прислал несколько
-            // непересекающихся damage-областей. Один transfer + один flush
-            // превращают событие compositor'а в единый device commit вместо
-            // двух синхронных round-trip на каждый прямоугольник.
-            self.transfer(commit)
-                .and_then(|_| self.flush(commit))
+            for pending in &mut self.primary_damage {
+                *pending = if pending.is_empty() {
+                    commit
+                } else {
+                    pending.union(commit)
+                };
+            }
+            self.pending_present = true;
+            self.drain_async_completions()
+                .map_err(|_| ScanoutError::DeviceLost)?;
+            self.queue_latest_primary()
                 .map_err(|_| ScanoutError::DeviceLost)?;
         }
         Ok(PresentStats {
@@ -728,7 +764,11 @@ impl VirtioGpu {
         {
             return Err(ScanoutError::InvalidSurface);
         }
-        self.ensure_primary_scanout()
+        // Нельзя писать primary[0], пока устройство ещё читает его в одном
+        // из асинхронных GUI present. Этот редкий ring-3 displayd путь может
+        // ждать, но никогда не пересекает DMA с CPU copy.
+        self.drain_primary_presents()
+            .and_then(|_| self.ensure_primary_scanout())
             .map_err(|_| ScanoutError::DeviceLost)?;
         let plane = descriptor.planes[0];
         let row_bytes = usize::try_from(descriptor.width)
@@ -738,7 +778,7 @@ impl VirtioGpu {
         let stride = plane.stride_bytes as usize;
         let plane_offset =
             usize::try_from(plane.offset).map_err(|_| ScanoutError::InvalidSurface)?;
-        let target = self.resource.backing.phys as *mut u8;
+        let target = self.primary[0].backing.phys as *mut u8;
         for y in 0..descriptor.height as usize {
             let mut source_offset = plane_offset
                 .checked_add(y.checked_mul(stride).ok_or(ScanoutError::InvalidSurface)?)
@@ -767,9 +807,13 @@ impl VirtioGpu {
             }
         }
         let full = Rect::new(0, 0, self.mode.width, self.mode.height);
-        self.transfer(full)
-            .and_then(|_| self.flush(full))
+        self.transfer_resource_2d(self.primary[0].id, full, 0)
+            .and_then(|_| self.flush_resource(self.primary[0].id, full))
             .map_err(|_| ScanoutError::DeviceLost)?;
+        // Следующий kernel GUI commit может оказаться частичным. Остальные
+        // два resources содержат более старый desktop, поэтому перед их
+        // повторным scanout они обязаны получить целиком актуальный backbuffer.
+        self.primary_damage = [full; PRIMARY_BUFFER_COUNT];
         Ok(PresentStats {
             sequence,
             rectangles: 1,
@@ -818,7 +862,8 @@ impl VirtioGpu {
     }
 
     /// Снимает interrupt status только у нашего transport. Used ring затем
-    /// разбирается обычным `poll_render`: IRQ остаётся коротким top half.
+    /// разбирается обычным `poll_render`: IRQ остаётся коротким top half и
+    /// никогда не копирует следующий 2D frame.
     pub fn handle_interrupt(&mut self, interrupt: u32) -> Result<bool, ModeSetError> {
         #[cfg(target_arch = "aarch64")]
         {
@@ -992,15 +1037,74 @@ impl VirtioGpu {
     }
 
     pub fn poll_render(&mut self) -> Result<Option<RenderCompletion>, ModeSetError> {
-        self.transport
-            .poll_completion()
-            .map(|completion| {
-                completion.map(|completion| RenderCompletion {
-                    fence_id: completion.fence_id,
-                    succeeded: completion.response_kind == RESP_OK_NODATA,
-                })
-            })
-            .map_err(map_transport)
+        self.drain_async_completions()?;
+        let completion = self.ready_render[self.ready_render_read].take();
+        if completion.is_some() {
+            self.ready_render_read = (self.ready_render_read + 1) % MAX_READY_RENDER_COMPLETIONS;
+        }
+        Ok(completion)
+    }
+
+    /// Обслуживает отложенный mailbox present вне IRQ/timer context.
+    /// GUI вызывает этот метод только после проверки очереди ввода: даже
+    /// полноэкранная копия в свободный DMA resource не задерживает мышь.
+    pub fn service_present(&mut self) -> Result<(), ModeSetError> {
+        self.drain_async_completions()?;
+        self.queue_latest_primary()
+    }
+
+    /// Разбирает общую controlq: present fences остаются внутри display
+    /// driver, render fences публикуются process manager'у. Благодаря этому
+    /// IRQ освобождает 2D buffers даже когда ring-3 GPU submission отсутствует.
+    fn drain_async_completions(&mut self) -> Result<(), ModeSetError> {
+        while let Some(completion) = self.transport.poll_completion().map_err(map_transport)? {
+            if let Some(index) = self
+                .pending_present_commands
+                .iter()
+                .position(|pending| pending.fence == completion.fence_id)
+            {
+                let pending = self.pending_present_commands[index];
+                self.pending_present_commands[index] = PendingPresentCommand::EMPTY;
+                if completion.response_kind != RESP_OK_NODATA {
+                    self.async_device_failed = true;
+                }
+                if pending.final_command {
+                    self.primary_busy[usize::from(pending.slot)] = false;
+                }
+                continue;
+            }
+            if self.ready_render[self.ready_render_write].is_some() {
+                self.async_device_failed = true;
+                return Err(ModeSetError::DeviceLost);
+            }
+            self.ready_render[self.ready_render_write] = Some(RenderCompletion {
+                fence_id: completion.fence_id,
+                succeeded: completion.response_kind == RESP_OK_NODATA,
+            });
+            self.ready_render_write = (self.ready_render_write + 1) % MAX_READY_RENDER_COMPLETIONS;
+        }
+        if self.async_device_failed {
+            return Err(ModeSetError::DeviceLost);
+        }
+        Ok(())
+    }
+
+    fn drain_primary_presents(&mut self) -> Result<(), ModeSetError> {
+        for _ in 0..50_000_000 {
+            self.drain_async_completions()?;
+            self.queue_latest_primary()?;
+            if !self.pending_present
+                && self.primary_busy.iter().all(|busy| !*busy)
+                && self
+                    .pending_present_commands
+                    .iter()
+                    .all(|pending| pending.fence == 0)
+            {
+                return Ok(());
+            }
+            core::hint::spin_loop();
+        }
+        Err(ModeSetError::DeviceLost)
     }
 
     /// Дожидается следующего completion только при аварийном teardown процесса.
@@ -1033,6 +1137,8 @@ impl VirtioGpu {
         if resource.width != self.mode.width || resource.height != self.mode.height {
             return Err(ScanoutError::InvalidSurface);
         }
+        self.drain_primary_presents()
+            .map_err(|_| ScanoutError::DeviceLost)?;
         if self.active_scanout_resource != resource.id {
             self.set_scanout_resource(resource.id, self.mode)
                 .map_err(|_| ScanoutError::DeviceLost)?;
@@ -1042,6 +1148,10 @@ impl VirtioGpu {
             Rect::new(0, 0, self.mode.width, self.mode.height),
         )
         .map_err(|_| ScanoutError::DeviceLost)?;
+        // Возврат к CPU desktop должен начинаться с полного содержимого, а
+        // не с небольшого damage поверх последнего старого primary resource.
+        let full = Rect::new(0, 0, self.mode.width, self.mode.height);
+        self.primary_damage = [full; PRIMARY_BUFFER_COUNT];
         Ok(Some(PresentStats {
             sequence,
             rectangles: 1,
@@ -1261,8 +1371,177 @@ impl VirtioGpu {
         Ok(Resource {
             id: resource,
             backing,
-            bytes,
         })
+    }
+
+    fn allocate_primary_resources(
+        &mut self,
+        mode: DisplayMode,
+    ) -> Result<[Resource; PRIMARY_BUFFER_COUNT], ModeSetError> {
+        let empty = Resource {
+            id: 0,
+            backing: FrameBlock { phys: 0, frames: 0 },
+        };
+        let mut resources = [empty; PRIMARY_BUFFER_COUNT];
+        for index in 0..PRIMARY_BUFFER_COUNT {
+            match self.allocate_resource(mode) {
+                Ok(resource) => resources[index] = resource,
+                Err(error) => {
+                    self.release_primary_resources(resources);
+                    return Err(error);
+                }
+            }
+        }
+        Ok(resources)
+    }
+
+    fn release_primary_resources(&mut self, resources: [Resource; PRIMARY_BUFFER_COUNT]) {
+        for resource in resources {
+            if resource.id == 0 {
+                continue;
+            }
+            if self.detach_resource(resource.id).is_ok() {
+                let _ = self.unref_resource(resource.id);
+                let _ = memory::free(resource.backing);
+            }
+        }
+    }
+
+    fn queue_latest_primary(&mut self) -> Result<(), ModeSetError> {
+        if self.async_device_failed {
+            return Err(ModeSetError::DeviceLost);
+        }
+        if !self.pending_present {
+            return Ok(());
+        }
+        let Some(slot) = (0..PRIMARY_BUFFER_COUNT)
+            .map(|offset| (self.primary_next + offset) % PRIMARY_BUFFER_COUNT)
+            .find(|slot| !self.primary_busy[*slot])
+        else {
+            // Все три кадра заняты: mailbox уже содержит newest sequence и
+            // будет отправлен из completion bottom half.
+            return Ok(());
+        };
+        let damage = self.primary_damage[slot];
+        if damage.is_empty() || self.source_pixels.is_null() {
+            self.pending_present = false;
+            return Ok(());
+        }
+        self.copy_primary_damage(slot, damage)?;
+        let resource = self.primary[slot].id;
+        let offset = (u64::from(damage.y as u32) * u64::from(self.mode.width)
+            + u64::from(damage.x as u32))
+            * 4;
+        let transfer = TransferRequest {
+            header: self.header(CMD_TRANSFER_TO_HOST_2D),
+            rect: GpuRect {
+                x: damage.x as u32,
+                y: damage.y as u32,
+                width: damage.width,
+                height: damage.height,
+            },
+            offset,
+            resource,
+            padding: 0,
+        };
+        self.submit_present_command(&transfer, transfer.header.fence_id, slot, false)?;
+        let scanout = SetScanoutRequest {
+            header: self.header(CMD_SET_SCANOUT),
+            rect: GpuRect {
+                x: 0,
+                y: 0,
+                width: self.mode.width,
+                height: self.mode.height,
+            },
+            scanout: self.scanout,
+            resource,
+        };
+        self.submit_present_command(&scanout, scanout.header.fence_id, slot, false)?;
+        let flush = FlushRequest {
+            header: self.header(CMD_RESOURCE_FLUSH),
+            rect: GpuRect {
+                x: damage.x as u32,
+                y: damage.y as u32,
+                width: damage.width,
+                height: damage.height,
+            },
+            resource,
+            padding: 0,
+        };
+        self.submit_present_command(&flush, flush.header.fence_id, slot, true)?;
+        self.primary_busy[slot] = true;
+        self.primary_damage[slot] = Rect::EMPTY;
+        self.primary_next = (slot + 1) % PRIMARY_BUFFER_COUNT;
+        self.active_scanout_resource = resource;
+        self.pending_present = false;
+        if !self.async_present_logged {
+            serial::put_str(
+                "[video] 2d-present=async buffers=3 damage=coalesced mailbox=latest completion=deferred\n",
+            );
+            self.async_present_logged = true;
+        }
+        Ok(())
+    }
+
+    fn copy_primary_damage(&mut self, slot: usize, damage: Rect) -> Result<(), ModeSetError> {
+        let target = self.primary[slot].backing.phys as *mut u32;
+        for y in damage.y as u32..damage.bottom() as u32 {
+            let offset = y as usize * self.mode.width as usize + damage.x as usize;
+            let source = unsafe { self.source_pixels.add(offset) };
+            let destination = unsafe { target.add(offset) };
+            if self.source_format == CpuPixelFormat::Bgr888 {
+                unsafe { ptr::copy_nonoverlapping(source, destination, damage.width as usize) };
+            } else {
+                for column in 0..damage.width as usize {
+                    let raw = unsafe { source.add(column).read() };
+                    let converted = CpuPixelFormat::Bgr888.pack(self.source_format.unpack(raw));
+                    unsafe { destination.add(column).write(converted) };
+                }
+            }
+        }
+        arch::dma_write_barrier();
+        Ok(())
+    }
+
+    fn submit_present_command<Request: Copy>(
+        &mut self,
+        request: &Request,
+        fence: u64,
+        slot: usize,
+        final_command: bool,
+    ) -> Result<(), ModeSetError> {
+        let Some(record_index) = self
+            .pending_present_commands
+            .iter()
+            .position(|record| record.fence == 0)
+        else {
+            self.async_device_failed = true;
+            return Err(ModeSetError::DeviceLost);
+        };
+        // Регистрируем fence до публикации descriptor. Быстрое устройство
+        // вправе завершить команду сразу после queue notify; IRQ тогда уже
+        // найдёт владельца completion и не примет его за render fence.
+        self.pending_present_commands[record_index] = PendingPresentCommand {
+            fence,
+            slot: slot as u8,
+            final_command,
+        };
+        let bytes = unsafe {
+            core::slice::from_raw_parts(
+                (request as *const Request).cast::<u8>(),
+                core::mem::size_of::<Request>(),
+            )
+        };
+        if self
+            .transport
+            .submit_bytes(bytes, &[], core::mem::size_of::<ControlHeader>())
+            .is_err()
+        {
+            self.pending_present_commands[record_index] = PendingPresentCommand::EMPTY;
+            self.async_device_failed = true;
+            return Err(ModeSetError::DeviceLost);
+        }
+        Ok(())
     }
 
     #[cfg(target_arch = "aarch64")]
@@ -1304,7 +1583,6 @@ impl VirtioGpu {
         self.cursor_resource = Resource {
             id: resource,
             backing,
-            bytes: CURSOR_BYTES,
         };
         Ok(())
     }
@@ -1331,8 +1609,8 @@ impl VirtioGpu {
     }
 
     fn ensure_primary_scanout(&mut self) -> Result<(), ModeSetError> {
-        if self.active_scanout_resource != self.resource.id {
-            self.set_scanout_resource(self.resource.id, self.mode)?;
+        if self.active_scanout_resource != self.primary[0].id {
+            self.set_scanout_resource(self.primary[0].id, self.mode)?;
         }
         Ok(())
     }
@@ -1413,28 +1691,6 @@ impl VirtioGpu {
         self.command_nodata(&request)
     }
 
-    fn transfer(&mut self, rect: Rect) -> Result<(), ModeSetError> {
-        let offset =
-            (u64::from(rect.y as u32) * u64::from(self.mode.width) + u64::from(rect.x as u32)) * 4;
-        if offset >= u64::from(self.resource.bytes) {
-            return Err(ModeSetError::DeviceLost);
-        }
-        let request = TransferRequest {
-            header: self.header(CMD_TRANSFER_TO_HOST_2D),
-            rect: GpuRect {
-                x: rect.x as u32,
-                y: rect.y as u32,
-                width: rect.width,
-                height: rect.height,
-            },
-            offset,
-            resource: self.resource.id,
-            padding: 0,
-        };
-        self.command_nodata(&request)
-    }
-
-    #[cfg(target_arch = "aarch64")]
     fn transfer_resource_2d(
         &mut self,
         resource: u32,
@@ -1499,10 +1755,6 @@ impl VirtioGpu {
         }
     }
 
-    fn flush(&mut self, rect: Rect) -> Result<(), ModeSetError> {
-        self.flush_resource(self.resource.id, rect)
-    }
-
     fn flush_resource(&mut self, resource: u32, rect: Rect) -> Result<(), ModeSetError> {
         let request = FlushRequest {
             header: self.header(CMD_RESOURCE_FLUSH),
@@ -1527,6 +1779,11 @@ impl VirtioGpu {
 
     fn header(&mut self, kind: u32) -> ControlHeader {
         self.fence = self.fence.wrapping_add(1);
+        if self.fence == 0 {
+            // Нулевой fence зарезервирован как EMPTY sentinel во внутренних
+            // bounded tables. Даже после u64 wrap он не публикуется device.
+            self.fence = 1;
+        }
         ControlHeader {
             kind,
             flags: FLAG_FENCE,
@@ -1571,13 +1828,15 @@ fn valid_virgl_stream(commands: &[u8]) -> bool {
 
 impl Drop for VirtioGpu {
     fn drop(&mut self) {
-        if self.cursor_resource.id != 0 {
-            let _ = self.detach_resource(self.cursor_resource.id);
-            let _ = self.unref_resource(self.cursor_resource.id);
-            let _ = memory::free(self.cursor_resource.backing);
-            self.cursor_resource.id = 0;
+        // cursorq не имеет response descriptor. До device reset нельзя
+        // доказать, что hardware plane перестал читать backing, поэтому
+        // аварийный Drop предпочитает bounded leak возможному DMA UAF.
+        // Нормальный system-lifetime driver сюда не попадает.
+        if self.primary.iter().all(|resource| resource.id == 0) {
+            return;
         }
-        if self.resource.id == 0 {
+        if self.drain_primary_presents().is_err() {
+            // Device всё ещё может владеть одним из DMA buffers.
             return;
         }
         let disable = SetScanoutRequest {
@@ -1586,12 +1845,14 @@ impl Drop for VirtioGpu {
             scanout: self.scanout,
             resource: 0,
         };
-        let _ = self.command_nodata(&disable);
-        if self.detach_resource(self.resource.id).is_ok() {
-            let _ = self.unref_resource(self.resource.id);
-            let _ = memory::free(self.resource.backing);
+        if self.command_nodata(&disable).is_err() {
+            return;
         }
-        self.resource.id = 0;
+        let primary = self.primary;
+        self.release_primary_resources(primary);
+        for resource in &mut self.primary {
+            resource.id = 0;
+        }
     }
 }
 

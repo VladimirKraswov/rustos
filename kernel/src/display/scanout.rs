@@ -252,6 +252,20 @@ pub fn present(
         .map_err(map_scanout_error)
 }
 
+/// Продвигает только newest CPU-rendered mailbox frame. В отличие от IRQ
+/// completion path, здесь разрешена bounded копия damage в свободный DMA
+/// resource: caller гарантирует, что ожидающий input уже обработан.
+pub fn service_present() -> Result<(), DisplayBrokerError> {
+    let mut guard = DEVICE.acquire()?;
+    guard
+        .get()
+        .as_mut()
+        .ok_or(DisplayBrokerError::Unavailable)?
+        .gpu
+        .service_present()
+        .map_err(map_mode_error)
+}
+
 /// Прямой full-frame commit capability-backed buffer'а.
 pub fn present_graphics<PhysicalPage>(
     graphics_object: u16,

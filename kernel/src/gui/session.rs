@@ -111,7 +111,13 @@ pub fn run(info: &BootInfo) -> ! {
         CpuPixelFormat::Rgb565 => "rgb565",
         CpuPixelFormat::Grayscale8 => "gray8",
     });
-    serial::put_str(" present=immediate page-flip=");
+    serial::put_str(" present=");
+    serial::put_str(if capabilities.page_flip {
+        "async-mailbox"
+    } else {
+        "immediate"
+    });
+    serial::put_str(" page-flip=");
     serial::put_str(if capabilities.page_flip { "yes" } else { "no" });
     serial::put_str("\n");
     serial::put_str(
@@ -128,6 +134,7 @@ pub fn run(info: &BootInfo) -> ! {
     serial::put_str("[ui] window server ready capacity=");
     serial::put_u32(MAX_WINDOWS as u32);
     serial::put_str("\n");
+    serial::put_str("[gui] scheduling=input-first services=idle-quantum animation=last\n");
     session.render_all();
     serial::put_str("[gui] GUI_READY desktop=1 terminal=1 multiwindow=1 start=system-ui clock=");
     serial::put_str(session.shell.clock_source());
@@ -527,12 +534,6 @@ impl DesktopSession {
 
     fn event_loop(&mut self) -> ! {
         loop {
-            if process::pump_interactive_services().is_err() && !self.display_fallback_logged {
-                serial::put_str(
-                    "[supervisor] display stack unavailable; kernel desktop fallback active\n",
-                );
-                self.display_fallback_logged = true;
-            }
             if let Some(event) = self.input.poll() {
                 let old_cursor = self.cursor.rect();
                 self.cursor.restore(&mut self.framebuffer);
@@ -671,6 +672,21 @@ impl DesktopSession {
                 }
                 self.dispatch_window_events();
             } else {
+                // Driver/services получают bounded квант только после input.
+                // При непрерывном потоке событий очередь дренируется по одному
+                // report и всё равно регулярно становится пустой, не создавая
+                // ни starvation сервисов, ни дополнительной input latency.
+                if process::pump_interactive_services().is_err() && !self.display_fallback_logged {
+                    serial::put_str(
+                        "[supervisor] display stack unavailable; kernel desktop fallback active\n",
+                    );
+                    self.display_fallback_logged = true;
+                }
+                // Completion может освободить один из трёх scanout buffers,
+                // пока входных событий нет. Продвигаем newest mailbox frame
+                // здесь, а не из IRQ: input всегда имеет приоритет над копией
+                // кадра и следующей анимацией.
+                self.framebuffer.service_scanout();
                 let now_ms = arch::monotonic_milliseconds();
                 // Сначала полностью обслуживаем уже опубликованный input.
                 // Медленный renderer не вправе запускать следующий animation
@@ -1928,15 +1944,13 @@ impl DesktopSession {
         // Сохраняем просторную geometry прежнего desktop: терминал на
         // 1280x800 получает 1040x640. Cascade меняет только позицию новых
         // экземпляров, а не неожиданно уменьшает рабочую область приложения.
-        let preferred_width = if kind == ApplicationKind::DesktopSettings {
-            760
-        } else {
-            1040
-        };
-        let preferred_height = if kind == ApplicationKind::DesktopSettings {
-            620
-        } else {
-            650
+        let (preferred_width, preferred_height) = match kind {
+            ApplicationKind::DesktopSettings => (760, 620),
+            // После chrome/header/padding остаётся ровно 800x450: готовый
+            // GPU target копируется линейно, без bilinear resample каждого
+            // пикселя. При ручном resize качественная фильтрация сохраняется.
+            ApplicationKind::GpuDemo => (832, 564),
+            _ => (1040, 650),
         };
         let width = fit_window_extent(
             self.framebuffer.width(),

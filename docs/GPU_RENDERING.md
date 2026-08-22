@@ -31,7 +31,8 @@ guest CPU передаёт только вершины и команды. Очи
 
 PCI и MMIO transports используют одинаковую split Virtqueue:
 
-- четыре независимых DMA command slot;
+- шестнадцать независимых DMA command slots: до девяти команд трёх 2D
+  presents, три render submissions и резерв для control/teardown;
 - отдельная request/response page для каждого slot;
 - generation token запрещает принять старое завершение за новую команду;
 - `submit_bytes` копирует bounded stream в kernel-owned DMA page и сразу
@@ -42,10 +43,11 @@ PCI и MMIO transports используют одинаковую split Virtqueue
   отдельного kernel idle thread: если все процессы ждут именно последний GPU
   fence, kernel выполняет bounded idle-drain и сразу будит timeline waiter.
 
-Bootstrap process ABI допускает один незавершённый submit на единственный
-контекст. Это осознанно более узкая граница, чем transport: сначала нужен
-простой проверяемый lifetime, затем будут добавлены несколько очередей и
-submission records для Mesa. При аварийном завершении `renderd` kernel
+Bootstrap process ABI допускает три незавершённых submit на единственный
+контекст. Каждый swapchain buffer использует собственную timeline, поэтому
+повторное использование начинается только после его fence, но кадры могут
+исполняться параллельно. Несколько contexts/engine queues остаются следующим
+расширением Mesa winsys. При аварийном завершении `renderd` kernel
 осушает очередь до fence и только после этого освобождает capability-backed
 кадры — устройство не продолжает DMA в возвращённую память.
 

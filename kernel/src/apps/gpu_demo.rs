@@ -14,7 +14,8 @@ use crate::{
 pub const SURFACE_WIDTH: u32 = 800;
 pub const SURFACE_HEIGHT: u32 = 450;
 const SURFACE_PIXELS: usize = SURFACE_WIDTH as usize * SURFACE_HEIGHT as usize;
-const FRAME_INTERVAL_MS: u64 = 33;
+const GPU_FRAME_INTERVAL_MS: u64 = 16;
+const SOFTWARE_FRAME_INTERVAL_MS: u64 = 33;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RendererBackend {
@@ -52,7 +53,7 @@ impl GpuDemo {
                 .write_bytes(0, SURFACE_PIXELS);
             core::ptr::addr_of_mut!((*destination).frame).write(0);
             core::ptr::addr_of_mut!((*destination).last_frame_ms)
-                .write(now_ms.saturating_sub(FRAME_INTERVAL_MS));
+                .write(now_ms.saturating_sub(GPU_FRAME_INTERVAL_MS));
             core::ptr::addr_of_mut!((*destination).fps_epoch_ms).write(now_ms);
             core::ptr::addr_of_mut!((*destination).fps_frames).write(0);
             core::ptr::addr_of_mut!((*destination).fps).write(0);
@@ -62,11 +63,16 @@ impl GpuDemo {
         }
     }
 
-    /// Создаёт не более одного кадра за 33 ms. GPU проверяется повторно раз в
-    /// несколько секунд, поэтому hot-plug/restart renderd не требует закрывать
-    /// приложение.
+    /// GPU получает 60 Hz pacing hint, а тяжёлый CPU fallback ограничивается
+    /// 30 Hz. Оба пути запускаются только после input polling оконного сервера,
+    /// поэтому renderer не может вытеснить уже ожидающее событие мыши.
     pub fn tick(&mut self, now_ms: u64) -> bool {
-        if now_ms.saturating_sub(self.last_frame_ms) < FRAME_INTERVAL_MS {
+        let frame_interval_ms = if self.backend == RendererBackend::Software {
+            SOFTWARE_FRAME_INTERVAL_MS
+        } else {
+            GPU_FRAME_INTERVAL_MS
+        };
+        if now_ms.saturating_sub(self.last_frame_ms) < frame_interval_ms {
             return false;
         }
         self.last_frame_ms = now_ms;
@@ -93,7 +99,13 @@ impl GpuDemo {
                 RendererBackend::Virgl => "virgl-host-gpu",
                 RendererBackend::Software | RendererBackend::Probing => "cpu-fallback",
             });
-            serial::put_str(" surface=800x450 windowed=yes\n");
+            serial::put_str(" surface=800x450 windowed=yes pacing=");
+            serial::put_str(if self.backend == RendererBackend::Virgl {
+                "60hz"
+            } else {
+                "30hz"
+            });
+            serial::put_str(" preferred-blit=linear-1:1\n");
             self.backend_logged = true;
         }
         self.frame = self.frame.wrapping_add(1);

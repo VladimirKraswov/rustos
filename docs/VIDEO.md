@@ -71,7 +71,7 @@ Pure policy `rustos-video::select_startup_mode` сначала сохраняе�
 - `display/pci.rs` находит PCI function `1af4:1050`, BAR и vendor
   capabilities common/notify/ISR/device;
 - `display/virtqueue.rs` выполняет Virtio 1.x feature negotiation и
-  обслуживает bounded split control queue с четырьмя независимыми DMA slots;
+  обслуживает bounded split control queue с шестнадцатью независимыми DMA slots;
   bootstrap-команды имеют bounded polling, 3D submit завершается асинхронно
   через fence/timeline;
 - `display/virtqueue_mmio.rs` предоставляет тому же GPU protocol modern MMIO
@@ -83,8 +83,13 @@ Pure policy `rustos-video::select_startup_mode` сначала сохраняе�
   `TRANSFER_TO_HOST_2D`, `RESOURCE_FLUSH`, `DETACH_BACKING`, `UNREF`, а также
   classic VirGL contexts, 3D resources и fenced `SUBMIT_3D`.
 
-При present драйвер копирует из software surface только damage rectangles,
-после чего отправляет transfer + flush для тех же областей.
+При present драйвер объединяет damage в один commit, накапливает пропущенные
+области отдельно для каждого из трёх 2D resources и неблокирующе отправляет
+`TRANSFER → SET_SCANOUT → FLUSH`. Если все кадры заняты, хранится только
+последний mailbox frame; completion приходит через GIC IRQ на ARM или bounded
+timer poll на PCI. GUI thread больше не ждёт transfer/flush round-trip.
+IRQ/timer completion только освобождает slot; копия следующего mailbox frame
+выполняется GUI-циклом после проверки input, а не внутри interrupt context.
 Гостевой backing сейчас физически непрерывен: это упрощает учебный DMA
 путь, хотя protocol уже допускает scatter/gather entries.
 
@@ -256,24 +261,22 @@ damage и fence, а сами пиксели остаются в shared memory.
 [Linux VC4 display driver](https://docs.kernel.org/gpu/vc4.html).
 
 - frame pacing и monotonic presentation clock;
-- front/back/triple-buffer protocol для всего SystemUI; Aurora/renderd уже
-  использует три разных GraphicsBuffer, независимые fences и mailbox discard;
+- перенос client-окон SystemUI из kernel retained objects в отдельные
+  capability-backed GraphicsBuffer; сам 2D scanout и Aurora/renderd уже
+  используют triple buffering, fences и mailbox discard;
 - SSE2/AVX2 dispatch для blend, scale и RGB/YUV conversion;
-- MSI-X/IOAPIC interrupt-domain для PCI, page flip и hardware cursor
-  virtio-gpu; AArch64 MMIO controlq уже завершает fenced кадры через GICv3 SPI,
-  сохраняя timer-poll как bounded аварийную страховку;
+- MSI-X/IOAPIC interrupt-domain и PCI cursorq; AArch64 MMIO уже завершает
+  fenced кадры через GICv3 SPI и перемещает cursor отдельной hardware plane,
+  сохраняя timer-poll/software cursor как честные fallback;
 - PCI bridge enumeration, IOMMU/DMA isolation и несколько мониторов;
 - native KMS-подобные драйверы для конкретного железа;
 - перенос compositor/input/terminal из kernel bootstrap в ring 3;
 - Mesa Gallium VirGL winsys, затем native V3D backend для Raspberry Pi 4.
 
-Текущих гарантий пока недостаточно для плавного видео: CPU fallback
-синхронно ожидает transfer/flush, а Virtio GPU не даёт точный VSync event.
-Render submissions при этом уже допускают три независимых кадра in-flight;
-на ARM completion приходит аппаратным IRQ и не ждёт следующего timer tick.
-Но surfaces,
-alpha, damage и layer ABI уже отделены от этого ограничения и не потребуют
-переписывания при появлении asynchronous или native backend.
+Virtio GPU всё ещё не даёт точный VSync event, поэтому displayd использует
+монотонный estimated-vblank. Это следующий timing-барьер, но не блокировка
+renderer'а: 2D present и три render submissions уже выполняются in-flight, а
+surfaces, alpha, damage и layer ABI отделены от конкретного backend.
 
 ## Спецификации
 

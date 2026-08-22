@@ -57,9 +57,9 @@ const CONTROL_QUEUE: u16 = 0;
 const CURSOR_QUEUE: u16 = 1;
 const MAX_QUEUE_SIZE: u16 = 64;
 const POLL_LIMIT: usize = 50_000_000;
-// Совпадает с PCI transport: три render кадра не должны занимать последний
-// slot, нужный display/control command во время их выполнения.
-const COMMAND_SLOTS: usize = 8;
+// Совпадает с PCI transport: девять 2D present-команд и три render кадра не
+// должны занимать slots, нужные bounded display/control операциям.
+const COMMAND_SLOTS: usize = 16;
 /// Cursor move/update не имеют response descriptor. Четыре request slot дают
 /// mouse producer'у опубликовать новую позицию, пока device завершает старую.
 const CURSOR_SLOTS: usize = 4;
