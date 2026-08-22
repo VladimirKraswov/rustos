@@ -156,6 +156,7 @@ surface queues, input и desktop к этим ring-3 сервисам ещё вп
 [графическая подсистема](docs/GUI.md), [видеосистема](docs/VIDEO.md), [VFS](docs/VFS.md),
 [ADR современной графической архитектуры](docs/adr/0001-modern-graphics-architecture.md),
 [graphics objects ABI](docs/GRAPHICS_ABI.md), [GPU rendering](docs/GPU_RENDERING.md),
+[план полного GPU-ускорения](docs/GPU_ACCELERATION.md),
 [Mesa и Aurora 3D](docs/MESA.md),
 [USB и HID](docs/USB.md),
 [микроядро](docs/MICROKERNEL.md), [DLL](docs/DYNAMIC_LIBRARIES.md),

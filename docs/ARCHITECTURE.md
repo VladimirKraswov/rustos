@@ -74,7 +74,9 @@ lifetime и блокирующий wait-many. Постоянный RUNE `display
 ждёт оценочный vblank и получает feedback. Интерактивный desktop пока
 использует CPU raster/damage bootstrap через тот же broker. Контракт описан в
 [GRAPHICS_ABI.md](GRAPHICS_ABI.md), [GPU_RENDERING.md](GPU_RENDERING.md) и
-[ADR-0001](adr/0001-modern-graphics-architecture.md).
+[ADR-0001](adr/0001-modern-graphics-architecture.md). Проверяемые критерии
+перехода всего desktop на GPU и порядок удаления bootstrap readback закреплены
+в [GPU_ACCELERATION.md](GPU_ACCELERATION.md).
 
 MADT перечисляет CPU, BSP последовательно выполняет INIT–SIPI–SIPI. AP
 проходит 16 -> 32 -> 64 bit trampoline, получает отдельный stack, включает
