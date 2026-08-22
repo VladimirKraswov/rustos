@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# ARM GUI integration: AAVMF → EL0 milestones → virtio GPU/input → SystemUI.
+# ARM GUI integration: AAVMF → EL0 milestones → virtio GPU + xHCI HID → SystemUI.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -72,8 +72,9 @@ qemu-system-aarch64 \
     -drive if=none,id=systemdisk,format=raw,file="$SYSTEM_DISK" \
     -device virtio-blk-device,drive=systemdisk \
     -device virtio-gpu-device,xres=1280,yres=720 \
-    -device virtio-keyboard-device \
-    -device virtio-mouse-device \
+    -device qemu-xhci,id=xhci \
+    -device usb-kbd,bus=xhci.0 \
+    -device usb-mouse,bus=xhci.0 \
     -global virtio-mmio.force-legacy=false \
     -drive if=virtio,format=raw,readonly=on,file=build/arm/esp-arm.img \
     -serial file:"$RUN_DIR/serial.log" \
@@ -108,10 +109,11 @@ grep -Fq '[graphics-abi-v7] graphics-buffer sync-timeline atomic-present supervi
 grep -Fq '[supervisor] persistent displayd/compositord atomic-present services ready' \
     "$RUN_DIR/serial.log"
 grep -Fq '[video] virtio-gpu modern MMIO controlq ready' "$RUN_DIR/serial.log"
-grep -Fq 'mouse=virtio-input-mmio' "$RUN_DIR/serial.log"
+grep -Fq '[usb] hid attached port=' "$RUN_DIR/serial.log"
+grep -Fq 'mouse=xhci-usb-hid' "$RUN_DIR/serial.log"
 
 # HMP только генерирует аппаратные события; до terminal они проходят через
-# virtio event queue, Linux-keycode decoder и общий SystemUI focus routing.
+# xHCI transfer ring, HID Boot decoder и общий SystemUI focus routing.
 printf 'sendkey h 20\nsendkey e 20\nsendkey l 20\nsendkey p 20\n' \
     | "$HMP_TOOL" "$RUN_DIR/monitor.sock" 120 >/dev/null
 sleep 0.2
@@ -123,7 +125,7 @@ done
 grep -Fq '[terminal] command: help' "$RUN_DIR/serial.log"
 
 # Курсор начинает в центре 1280×720. Перемещаем его к Start и проверяем
-# button down/up через независимый virtio-mouse device.
+# button down/up через независимое USB HID mouse устройство.
 printf 'mouse_move -578 337\n' | "$HMP_TOOL" "$RUN_DIR/monitor.sock" 100 >/dev/null
 sleep 0.3
 printf 'mouse_button 1\nmouse_button 0\n' \

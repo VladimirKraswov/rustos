@@ -315,6 +315,10 @@ pub extern "C" fn rustos_handle_trap(frame: &mut TrapFrame) -> u64 {
     if !frame.is_from_user() {
         serial::put_str("[trap] FATAL kernel exception ip=0x");
         serial::put_hex(frame.instruction_pointer());
+        serial::put_str(" syndrome=0x");
+        serial::put_hex(frame.exception_syndrome());
+        serial::put_str(" address=0x");
+        serial::put_hex(frame.fault_address());
         serial::put_str("\n");
         crate::boot::exit_kernel(0x70);
     }

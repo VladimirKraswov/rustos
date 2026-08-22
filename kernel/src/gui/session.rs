@@ -25,7 +25,7 @@ use crate::{
         chrome::{Button, Label, Panel, Theme, Widget},
         cursor::Cursor,
     },
-    input::{self, Event, Key, MouseEvent, PlatformInput},
+    input::{Event, Key, MouseEvent, PlatformInput},
     memory::{self, FrameBlock},
     process, serial,
 };
@@ -132,7 +132,7 @@ pub fn run(info: &BootInfo) -> ! {
     serial::put_str("[gui] GUI_READY desktop=1 terminal=1 multiwindow=1 start=system-ui clock=");
     serial::put_str(session.shell.clock_source());
     serial::put_str(" mouse=");
-    serial::put_str(input::backend_name());
+    serial::put_str(session.input.backend_name());
     serial::put_str("\n");
     session.event_loop()
 }

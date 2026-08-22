@@ -31,7 +31,7 @@ make test-host   ABI, SystemUI/assets, scheduler, loader/format/fs/tool tests
 make test-arch   собрать kernel/runtime/apps для AMD64 и AArch64
 make test-boot   GRUB/Multiboot2 + CPL3 RUNE/VFS/fault/reclaim test
 make test-arm-boot AAVMF + EL0/EL1/GICv3/PSCI/VFS test
-make test-arm-gui AAVMF + virtio GPU/input + SystemUI smoke test
+make test-arm-gui AAVMF + virtio GPU + xHCI USB HID + SystemUI smoke test
 make test-gui    keyboard/mouse/window framebuffer test
 make test-virgl  ring-3 Mesa/VirGL Aurora 3D -> GraphicsBuffer -> scanout test
 make test-utm-gpu Apple Silicon E2E: RustOS VirGL -> UTM ANGLE -> Metal
@@ -63,7 +63,8 @@ SHA-256 check, zeroed 64 MiB NVRAM template).
 - `build/arm-firmware/edk2-aarch64-{code,vars-template}.fd`.
 
 `make run-arm` (`scripts/run-arm.sh`) запускает QEMU `virt` с двумя pflash
-(code + runtime NVRAM), modern virtio-mmio VaraniaFS, GPU, keyboard/mouse и
+(code + runtime NVRAM), modern virtio-mmio VaraniaFS/GPU, PCI xHCI,
+USB keyboard/mouse и
 ESP; serial остаётся в терминале. `acpi=off` обязателен: AAVMF публикует FDT,
 из которого kernel получает CPU/PSCI. GOP у этой конфигурации `BltOnly`,
 поэтому после handoff собственный modern virtio-mmio GPU driver создаёт
@@ -104,7 +105,8 @@ context switch, `discovered=2 online=2` после настоящего PSCI `CP
 
 GUI-тест общается с QEMU monitor через workspace tool `rustos-hmp`, поэтому
 не зависит от несовместимых вариантов `nc` на macOS и Linux.
-`make test-arm-gui` дополнительно требует настоящие keyboard/mouse events,
+`make test-arm-gui` дополнительно требует перечисление xHCI HID и настоящие
+USB keyboard/mouse events,
 команду terminal, открытие Start и валидный PPM screendump; артефакты лежат в
 `build/test-results/arm-gui/`.
 

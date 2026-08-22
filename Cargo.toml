@@ -25,6 +25,7 @@ members = [
     "libs/rune-loader",
     "libs/virgl",
     "libs/mesa",
+    "usb",
     "libs/loader-fixture",
     "libs/loader-root",
     "rune-format",

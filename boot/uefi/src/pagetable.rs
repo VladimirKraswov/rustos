@@ -134,7 +134,6 @@ pub unsafe fn build_identity_map(
             map_range(&mut allocator, root, descriptor.phys_start, size)?;
         }
     }
-
     // Явные зависимости ядра. Повторное отображение с тем же адресом
     // разрешено и делает код устойчивым к классификации firmware.
     map_range(&mut allocator, root, reservation_base, reservation_size)?;
@@ -175,13 +174,26 @@ fn map_device_ranges(allocator: &mut TableAllocator, root: u64) -> Result<(), Pt
     #[cfg(target_arch = "x86_64")]
     {
         const LOCAL_APIC_MMIO: u64 = 0xfee0_0000;
-        map_range(allocator, root, LOCAL_APIC_MMIO, PAGE_4K)
+        // QEMU q35 размещает 64-bit BAR компактно в начале этого окна. UEFI
+        // обычно публикует его как MMIO descriptor, а явное отображение
+        // сохраняет воспроизводимый xHCI boot и на урезанных OVMF builds.
+        const Q35_HIGH_MMIO: u64 = 0x00c0_0000_0000;
+        map_range_device(allocator, root, LOCAL_APIC_MMIO, PAGE_4K)?;
+        map_range_device(allocator, root, Q35_HIGH_MMIO, PAGE_2M)
     }
     #[cfg(target_arch = "aarch64")]
     {
         map_range_device(allocator, root, A_PL011_BASE, PAGE_4K)?;
         map_range_device(allocator, root, A_GIC_BASE, A_GIC_SIZE)?;
-        map_range_device(allocator, root, A_VIRTIO_MMIO_BASE, A_VIRTIO_MMIO_SIZE)
+        map_range_device(allocator, root, A_VIRTIO_MMIO_BASE, A_VIRTIO_MMIO_SIZE)?;
+        map_range_device(allocator, root, A_PCIE_LOW_MMIO_BASE, A_PCIE_LOW_MMIO_SIZE)?;
+        map_range_device(allocator, root, A_PCIE_ECAM_BASE, A_PCIE_ECAM_SIZE)?;
+        map_range_device(
+            allocator,
+            root,
+            A_PCIE_HIGH_MMIO_BASE,
+            A_PCIE_HIGH_MMIO_SIZE,
+        )
     }
 }
 
@@ -240,6 +252,11 @@ const TABLE_FLAGS: u64 = PRESENT | WRITABLE;
 /// Флаги для записей-листьев (самых страниц).
 #[cfg(target_arch = "x86_64")]
 const LEAF_FLAGS: u64 = PRESENT | WRITABLE;
+/// PWT+PCD при стандартном IA32_PAT выбирают UC. MMIO нельзя случайно
+/// превратить в write-back RAM: posted writes и device-owned status должны
+/// наблюдаться в порядке, заданном controller specification.
+#[cfg(target_arch = "x86_64")]
+const DEVICE_LEAF_FLAGS: u64 = LEAF_FLAGS | (1 << 3) | (1 << 4);
 
 /// Индексы четырёх уровней page table для канонического адреса.
 #[cfg(target_arch = "x86_64")]
@@ -319,6 +336,85 @@ fn map_4k(allocator: &mut TableAllocator, pml4: u64, address: u64) -> Result<(),
     }
 }
 
+#[cfg(target_arch = "x86_64")]
+fn map_range_device(
+    allocator: &mut TableAllocator,
+    pml4: u64,
+    start: u64,
+    size: u64,
+) -> Result<(), PtError> {
+    if size == 0 {
+        return Ok(());
+    }
+    let end = start.checked_add(size).ok_or(PtError::AddressOverflow)?;
+    let mut address = align_down(start, PAGE_4K);
+    while address < end && !address.is_multiple_of(PAGE_2M) {
+        map_4k_device(allocator, pml4, address)?;
+        address += PAGE_4K;
+    }
+    while address.checked_add(PAGE_2M).is_some_and(|next| next <= end) {
+        map_2m_device(allocator, pml4, address)?;
+        address += PAGE_2M;
+    }
+    while address < end {
+        map_4k_device(allocator, pml4, address)?;
+        address += PAGE_4K;
+    }
+    Ok(())
+}
+
+#[cfg(target_arch = "x86_64")]
+fn map_2m_device(allocator: &mut TableAllocator, pml4: u64, address: u64) -> Result<(), PtError> {
+    let idx = indices(address);
+    unsafe {
+        let pdpt = ensure_table(allocator, pml4, idx.pml4)?;
+        let pd = ensure_table(allocator, pdpt, idx.pdpt)?;
+        let slot = entry_ptr(pd, idx.pd);
+        let old = slot.read();
+        let value = address | DEVICE_LEAF_FLAGS | PAGE_SIZE;
+        if old == 0 || old == value {
+            slot.write(value);
+            Ok(())
+        } else if old & PRESENT != 0 && old & PAGE_SIZE == 0 {
+            for offset in (0..PAGE_2M).step_by(PAGE_4K as usize) {
+                map_4k_device(allocator, pml4, address + offset)?;
+            }
+            Ok(())
+        } else {
+            Err(PtError::ConflictingMapping)
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn map_4k_device(allocator: &mut TableAllocator, pml4: u64, address: u64) -> Result<(), PtError> {
+    let idx = indices(address);
+    unsafe {
+        let pdpt = ensure_table(allocator, pml4, idx.pml4)?;
+        let pd = ensure_table(allocator, pdpt, idx.pdpt)?;
+        let pd_slot = entry_ptr(pd, idx.pd);
+        let pd_value = pd_slot.read();
+        if pd_value & PRESENT != 0 && pd_value & PAGE_SIZE != 0 {
+            let expected = align_down(address, PAGE_2M) | DEVICE_LEAF_FLAGS | PAGE_SIZE;
+            return if pd_value == expected {
+                Ok(())
+            } else {
+                Err(PtError::ConflictingMapping)
+            };
+        }
+        let pt = ensure_table(allocator, pd, idx.pd)?;
+        let slot = entry_ptr(pt, idx.pt);
+        let old = slot.read();
+        let value = address | DEVICE_LEAF_FLAGS;
+        if old == 0 || old == value {
+            slot.write(value);
+            Ok(())
+        } else {
+            Err(PtError::ConflictingMapping)
+        }
+    }
+}
+
 /// Возвращает таблицу следующего уровня, создавая её при необходимости.
 ///
 /// # Safety
@@ -374,6 +470,22 @@ const A_GIC_SIZE: u64 = 0x0100_0000;
 const A_VIRTIO_MMIO_BASE: u64 = 0x0a00_0000;
 #[cfg(target_arch = "aarch64")]
 const A_VIRTIO_MMIO_SIZE: u64 = 32 * 0x200;
+/// QEMU `virt`: совместимое с любым поддерживаемым PARange низкое ECAM-окно
+/// и PCIe MMIO aperture. Высокие окна тоже отображаются для 64-битных BAR,
+/// но конфигурационное пространство намеренно читаем через low ECAM: это
+/// работает на Cortex-A72 и не требует от bootstrap-драйвера ACPI/DT parser.
+#[cfg(target_arch = "aarch64")]
+const A_PCIE_LOW_MMIO_BASE: u64 = 0x1000_0000;
+#[cfg(target_arch = "aarch64")]
+const A_PCIE_LOW_MMIO_SIZE: u64 = 0x2eff_0000;
+#[cfg(target_arch = "aarch64")]
+const A_PCIE_ECAM_BASE: u64 = 0x3f00_0000;
+#[cfg(target_arch = "aarch64")]
+const A_PCIE_ECAM_SIZE: u64 = 16 * 1024 * 1024;
+#[cfg(target_arch = "aarch64")]
+const A_PCIE_HIGH_MMIO_BASE: u64 = 0x0080_0000_0000;
+#[cfg(target_arch = "aarch64")]
+const A_PCIE_HIGH_MMIO_SIZE: u64 = 64 * 1024 * 1024;
 /// Маска физического адреса в PTE (биты 51..12).
 #[cfg(target_arch = "aarch64")]
 const A_ADDRESS_MASK: u64 = 0x000f_ffff_ffff_f000;

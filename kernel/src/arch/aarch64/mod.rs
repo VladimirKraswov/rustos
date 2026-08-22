@@ -104,6 +104,14 @@ impl TrapFrame {
         self.elr_el1
     }
 
+    pub const fn exception_syndrome(&self) -> u64 {
+        self.esr_el1
+    }
+
+    pub const fn fault_address(&self) -> u64 {
+        self.far_el1
+    }
+
     pub const fn syscall_number(&self) -> u64 {
         self.x[8]
     }

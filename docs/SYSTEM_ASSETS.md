@@ -10,7 +10,8 @@ service выбирает активный пакет. Поэтому смена 
 Реализованы:
 
 - стабильные `PointerCursor`, `MouseSettings` и `MouseCapabilities` в ABI;
-- PS/2 sample rate 10/20/40/60/80/100/200 Гц и resolution level 0..3;
+- xHCI USB HID mouse/keyboard на AMD64 и AArch64; PS/2 умеет аппаратные
+  sample rate 10/20/40/60/80/100/200 Гц и resolution level 0..3;
 - software sensitivity 25..400%, acceleration 0..300% и fixed-point остаток;
 - debounce одиночного клика, интервал двойного клика и drag threshold;
 - автоматические Arrow, Text, Link, Grab, Grabbing, Busy, Crosshair,
@@ -26,7 +27,7 @@ service выбирает активный пакет. Поэтому смена 
 ## Границы системы
 
 ```text
-PS/2, future USB HID, virtio-input
+xHCI USB HID, PS/2 fallback, virtio-input fallback
               │ raw reports
               ▼
           input service ── MouseSettings ── settings UI / terminal
@@ -40,9 +41,9 @@ PS/2, future USB HID, virtio-input
 VFS path ── icon_for_path ── IconKind ── active IconPack ── CPU/GPU target
 ```
 
-PS/2 — только текущий transport driver, а не часть UI API. На ARM или PC с
-USB меняется нижний блок, `MouseSettings`, cursor service и приложения остаются
-прежними. Если устройство не умеет менять hardware rate/resolution, драйвер
+Все перечисленные устройства — transport drivers, а не часть UI API. При
+переключении USB/PS2/virtio `MouseSettings`, cursor service и приложения
+остаются прежними. Если устройство не умеет менять hardware rate/resolution, драйвер
 возвращает это в `MouseCapabilities`, а software speed/click settings всё равно
 работают.
 

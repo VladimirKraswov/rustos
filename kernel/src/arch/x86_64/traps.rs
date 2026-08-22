@@ -79,6 +79,18 @@ impl TrapFrame {
         self.rip
     }
 
+    pub const fn exception_syndrome(&self) -> u64 {
+        self.error_code
+    }
+
+    pub fn fault_address(&self) -> u64 {
+        if self.vector == 14 {
+            super::read_cr2()
+        } else {
+            self.rip
+        }
+    }
+
     pub const fn syscall_number(&self) -> u64 {
         self.rax
     }

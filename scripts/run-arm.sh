@@ -60,6 +60,9 @@ exec qemu-system-aarch64 \
     -drive if=none,id=systemdisk,format=raw,file=build/arm-system.vfs \
     -device virtio-blk-device,drive=systemdisk \
     -device virtio-gpu-device \
+    -device qemu-xhci,id=xhci \
+    -device usb-kbd,bus=xhci.0 \
+    -device usb-mouse,bus=xhci.0 \
     -device virtio-keyboard-device \
     -device virtio-mouse-device \
     -global virtio-mmio.force-legacy=false \

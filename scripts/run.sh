@@ -113,6 +113,9 @@ exec qemu-system-x86_64 \
     -machine q35 -cpu max -smp 2 -m 512 \
     -accel "$ACCEL" \
     -device virtio-vga,edid=on,xres="$WIDTH",yres="$HEIGHT" \
+    -device qemu-xhci,id=xhci \
+    -device usb-kbd,bus=xhci.0 \
+    -device usb-mouse,bus=xhci.0 \
     -drive if=pflash,format=raw,readonly=on,file=build/ovmf/OVMF_CODE.fd \
     -drive if=pflash,format=raw,file=build/ovmf/OVMF_VARS_RUNTIME.fd \
     -drive if=none,id=systemdisk,format=raw,file=build/system.vfs \

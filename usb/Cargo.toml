@@ -1,0 +1,8 @@
+[package]
+name = "rustos-usb"
+description = "Переносимый no_std USB descriptor и HID Boot Protocol слой RustOS"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true

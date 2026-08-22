@@ -145,13 +145,19 @@ unsafe fn jump_from_el1(
             // Attr0 = normal WB/WA, Attr1 = device-nGnRE.
             "mov x9, #0x04ff",
             "msr mair_el1, x9",
-            // 0x4_0080_3510: 4 KiB, 48-bit lower VA, WB/WA
-            // inner-shareable, TTBR1 walks disabled, 44-bit PA. Firmware
-            // использовала T0SZ=20 (44-bit VA), но native RUNE load base
-            // 0x4000_0000_0000 требует полные 48 бит.
+            // 4 KiB, 48-bit lower VA, WB/WA inner-shareable, TTBR1 walks
+            // disabled. IPS нельзя фиксировать в 44 bit: Cortex-A72 сообщает
+            // 40-bit PARange и трактует более широкий output address как
+            // Address Size Fault. Кодировка PARange совпадает с TCR.IPS;
+            // 52-bit пока ограничиваем 48-битным форматом наших PTE.
             "mov x9, #0x3510",
             "movk x9, #0x0080, lsl #16",
-            "movk x9, #0x0004, lsl #32",
+            "mrs x10, id_aa64mmfr0_el1",
+            "and x10, x10, #7",
+            "mov x11, #5",
+            "cmp x10, x11",
+            "csel x10, x10, x11, ls",
+            "bfi x9, x10, #32, #3",
             "msr tcr_el1, x9",
             "mov x9, #0x3c5",
             "msr spsr_el1, x9",
@@ -173,6 +179,8 @@ unsafe fn jump_from_el1(
             boot_info = in(reg) boot_info,
             out("x0") _,
             out("x9") _,
+            out("x10") _,
+            out("x11") _,
             options(nostack, nomem),
         );
     }
@@ -210,10 +218,16 @@ unsafe fn jump_from_el2(
             "isb",
             "mov x9, #0x04ff",
             "msr mair_el1, x9",
-            // Та же 48-bit translation regime, что и для EL1 entry.
+            // Та же 48-bit VA / hardware-sized PA translation regime, что и
+            // для EL1 entry.
             "mov x9, #0x3510",
             "movk x9, #0x0080, lsl #16",
-            "movk x9, #0x0004, lsl #32",
+            "mrs x10, id_aa64mmfr0_el1",
+            "and x10, x10, #7",
+            "mov x11, #5",
+            "cmp x10, x11",
+            "csel x10, x10, x11, ls",
+            "bfi x9, x10, #32, #3",
             "msr tcr_el1, x9",
             "mov x9, #0x3c5",
             "msr spsr_el2, x9",
@@ -233,6 +247,8 @@ unsafe fn jump_from_el2(
             boot_info = in(reg) boot_info,
             out("x0") _,
             out("x9") _,
+            out("x10") _,
+            out("x11") _,
             options(nostack, nomem),
         );
     }

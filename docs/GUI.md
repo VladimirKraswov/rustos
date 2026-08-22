@@ -10,7 +10,7 @@ layout/event/display-list pipeline и UI Gallery описаны в
 - `graphics.rs` — clipping, RGB/BGR packing, RAM back buffer и scanout present;
 - `rustos-video` — безопасные CPU surfaces, blit/alpha, damage и layers;
 - `font.rs` — системные Console/Sans bitmap fonts, UTF-8 и типографический API;
-- `input.rs` — PS/2 keyboard/mouse и нормализованные события;
+- `input/` — xHCI USB HID, PS/2/virtio fallback и нормализованные события;
 - `rustos-system-assets` — cursor/icon packs и CPU-friendly обои;
 - `gui/components.rs` — theme и базовые widgets;
 - `gui/session.rs` — compositor, desktop, taskbar, registry окон и lifecycle
@@ -92,7 +92,7 @@ Compositor сначала формирует кадр в back buffer из обы
 содержимое, controls и тень, но дорогое приложение не растеризуется заново.
 Resize меняет layout, поэтому честно рисует новый полный client frame.
 
-PS/2 service объединяет накопившиеся движения с неизменным состоянием кнопок.
+Input service объединяет накопившиеся движения с неизменным состоянием кнопок.
 Переходы mouse-down/up сохраняются отдельно, но вместо очереди устаревших
 промежуточных кадров compositor сразу рисует последнюю позицию. Обычное
 движение курсора публикует две маленькие dirty-области, а ввод символа — только
@@ -212,7 +212,7 @@ versioned client API без дублирования большого renderer-�
 ## Ограничения текущего этапа
 
 - software compositor остаётся синхронным и пока не привязан к VSync;
-- PS/2 работает polling-режимом;
+- xHCI bootstrap transport пока работает bounded polling-режимом;
 - UTF-8 Latin/Cyrillic работает, но пока нет shaping, bidi и сложных scripts;
 - terminal, Проводник и UI Gallery уже имеют независимые экземпляры, geometry, focus,
   Z-order и lifecycle, но их event handlers пока исполняются последовательно

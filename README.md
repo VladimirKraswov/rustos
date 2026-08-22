@@ -44,7 +44,8 @@ RustOS — учебная 64-битная микроядерная операц�
 - асинхронная Virtio GPU command queue, Mesa/Gallium platform layer,
   изолированный ring-3 `renderd` и системное приложение **Aurora 3D** с
   shader/lighting scene без guest CPU rasterization или копирования пикселей;
-- PS/2 input на PC и virtio-input keyboard/mouse на ARM VM;
+- xHCI USB HID keyboard/mouse на AMD64 и AArch64 с hot-plug и независимыми
+  PS/2/virtio-input fallback backend'ами;
 - desktop, taskbar, Start menu и icons;
 - window manager: drag, minimize, maximize, restore и close;
 - цветной terminal с командами `help`, `clear`, `about`, `mem`, `gui`,
@@ -82,7 +83,7 @@ ARM (AArch64, QEMU `virt` + UEFI):
 make build-arm      # kernel/RUNE/initramfs/VaraniaFS/AAVMF/ESP
 make run-arm        # интерактивный QEMU virt; serial в терминале
 make test-arm-boot  # headless EL0/EL1/GICv3/PSCI integration test
-make test-arm-gui   # virtio GPU + keyboard + mouse + SystemUI
+make test-arm-gui   # virtio GPU + xHCI USB keyboard/mouse + SystemUI
 ```
 
 Firmware для ARM (AAVMF) уже закоммичен в `firmware/aarch64/`; сетевая
@@ -124,8 +125,8 @@ make test-utm-gpu # Apple Silicon: VirGL -> UTM ANGLE -> Metal
 4. AArch64 boot-test проходит AAVMF, GICv3 preemption, PSCI SMP, EL0 fault
    containment и завершается через `PSCI SYSTEM_OFF`.
 5. ARM GUI smoke выполняет ввод `help`, клик Start и screendump через настоящие
-   virtio GPU/keyboard/mouse event queues.
-6. AMD64 GUI-тест через настоящий PS/2 выполняет запись/чтение файлов и работу с
+   virtio GPU и xHCI USB HID event/transfer rings.
+6. AMD64 GUI-тест через настоящий xHCI USB HID выполняет запись/чтение файлов и работу с
    каталогами, перетаскивает и сворачивает terminal, получает QEMU
    screendump и проверяет геометрию и пиксели.
 
@@ -156,6 +157,7 @@ surface queues, input и desktop к этим ring-3 сервисам ещё вп
 [ADR современной графической архитектуры](docs/adr/0001-modern-graphics-architecture.md),
 [graphics objects ABI](docs/GRAPHICS_ABI.md), [GPU rendering](docs/GPU_RENDERING.md),
 [Mesa и Aurora 3D](docs/MESA.md),
+[USB и HID](docs/USB.md),
 [микроядро](docs/MICROKERNEL.md), [DLL](docs/DYNAMIC_LIBRARIES.md),
 [IPC](docs/IPC.md), [процессы и память ABI](docs/PROCESS_MEMORY_ABI.md),
 [self-hosting Rust](docs/SELF_HOSTING.md),

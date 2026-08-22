@@ -32,8 +32,8 @@ hmp() {
     "$HMP_TOOL" "$RUN_DIR/monitor.sock" "${1:-0}" >/dev/null
 }
 
-# Ввод ASCII-команды через настоящий виртуальный PS/2 controller. HMP здесь
-# только нажимает клавиши; guest всё равно проходит тот же scancode parser,
+# Ввод ASCII-команды через настоящий виртуальный xHCI USB HID controller. HMP
+# только нажимает клавиши; guest всё равно проходит тот же HID report parser,
 # terminal и VFS command path, что и пользователь.
 send_command() {
     local value="$1"
@@ -57,31 +57,31 @@ send_command() {
         commands="${commands}sendkey ${key} 20\n"
     done
     # Один persistent HMP connection, prompt после каждой команды и короткая
-    # пауза после отпускания клавиши не переполняют виртуальный 8042. Guest
+    # пауза после отпускания клавиши не переполняют interrupt transfer ring. Guest
     # обновляет только dirty-строку ввода, поэтому полный software-render
     # больше не задерживает чтение следующего scancode.
     # 240 ms учитывает самый медленный macOS/Apple-Silicon TCG: HMP prompt
     # подтверждает принятие команды monitor'ом, но не окончание отложенной
-    # make/break-пары PS/2 внутри гостя. Меньшая пауза изредка теряла соседние
-    # буквы сразу после перепрограммирования PS/2 sample rate.
+    # HID press/release отчёта внутри гостя. Меньшая пауза изредка теряла
+    # соседние буквы во время тяжёлого software-render кадра.
     printf '%b' "$commands" | hmp "${GUI_KEY_PACKET_MS:-400}"
     # Enter отправляем отдельно: QEMU возвращает monitor prompt раньше, чем
-    # release последней буквы гарантированно покинет PS/2 output buffer.
+    # release последней буквы гарантированно завершит interrupt transfer.
     sleep 0.2
     printf 'sendkey ret 20\n' | hmp 100
 }
 
 # Две пары down/up идут через одно HMP-соединение. Если создавать четыре
 # отдельных host-процесса, загруженный CI runner может потратить на connect и
-# prompt больше guest double-click interval, хотя сами PS/2 события корректны.
+# prompt больше guest double-click interval, хотя сами USB события корректны.
 # 60 ms между состояниями кнопки оставляет устройству несколько polling ticks
 # и при этом удерживает down-to-down заметно ниже стандартных 450 ms.
 double_click_mouse() {
     printf 'mouse_button 1\nmouse_button 0\nmouse_button 1\nmouse_button 0\n' | hmp 60
 }
 
-# Большие relative jumps QEMU раскладывает на несколько PS/2 packets. Если
-# сразу поставить mouse-down, он может обогнать хвост движения в 8042 queue.
+# Большие relative jumps QEMU раскладывает на несколько HID reports. Если
+# сразу поставить mouse-down, он может обогнать хвост transfer queue.
 # Дробим автоматические перемещения так же, как это делает физическая мышь.
 move_mouse() {
     local dx="$1"
@@ -91,7 +91,7 @@ move_mouse() {
     local abs_y=${dy#-}
     local required_x=$(((abs_x + 95) / 96))
     local required_y=$(((abs_y + 95) / 96))
-    # Один PS/2 packet кодирует signed delta. Не полагаемся на то, что QEMU
+    # Один Boot Mouse report кодирует signed delta. Не полагаемся на то, что QEMU
     # сам одинаково раздробит скачок >127 во всех версиях/режимах мыши.
     ((steps < required_x)) && steps=$required_x
     ((steps < required_y)) && steps=$required_y
@@ -112,19 +112,19 @@ move_mouse() {
         sent_x=$((sent_x + part_x))
         sent_y=$((sent_y + part_y))
         # Hover может инициировать incremental repaint. На Apple Silicon TCG
-        # следующий трёхбайтовый PS/2 packet нельзя посылать, пока guest ещё
-        # обслуживает предыдущий: у старого 8042 всего один output byte.
+        # следующий HID report не посылаем, пока guest ещё обслуживает
+        # предыдущий и публикует damage.
         sleep "${GUI_MOUSE_PACKET_SECONDS:-0.25}"
     done
     # `mouse_move` подтверждается QEMU monitor'ом до того, как
-    # guest успеет вычитать последний PS/2 packet. Под TCG без settle
+    # guest успеет вычитать последний HID report. Под TCG без settle
     # mouse-down изредка приходил в предыдущую координату и ложно
     # ломал double-click/close lifecycle checks.
     sleep "${GUI_MOUSE_SETTLE_SECONDS:-0.25}"
 }
 
 # Критичные lifecycle-clicks не должны зависеть от накопленного
-# relative PS/2 remainder. Снача гарантированно упираемся в (0, 0),
+# relative USB mouse remainder. Сначала гарантированно упираемся в (0, 0),
 # затем идём в абсолютную guest-координату малыми пакетами.
 move_mouse_to() {
     local x="$1"
@@ -191,6 +191,9 @@ echo "[gui-test] qemu accel=$ACCEL, cpu=$CPU_MODEL, memory=${MEMORY_MB}MiB, time
 qemu-system-x86_64 \
     -machine q35 -cpu "$CPU_MODEL" -smp 2 -m "$MEMORY_MB" -accel "$ACCEL" \
     -device virtio-vga,edid=on,xres=1280,yres=800 \
+    -device qemu-xhci,id=xhci \
+    -device usb-kbd,bus=xhci.0 \
+    -device usb-mouse,bus=xhci.0 \
     -drive if=pflash,format=raw,readonly=on,file=build/ovmf/OVMF_CODE.fd \
     -drive if=pflash,format=raw,file="$RUN_DIR/VARS.fd" \
     -drive if=none,id=systemdisk,format=raw,file=build/system.vfs \
@@ -222,6 +225,8 @@ grep -Fq '[supervisor] persistent displayd/compositord atomic-present services r
     "$RUN_DIR/serial.log"
 grep -Eq '\[video\] scanout=virtio-gpu mode=1280x800 format=bgr888 present=immediate page-flip=no' \
     "$RUN_DIR/serial.log"
+grep -Fq '[usb] hid attached port=' "$RUN_DIR/serial.log"
+grep -Fq 'mouse=xhci-usb-hid' "$RUN_DIR/serial.log"
 grep -q '\[display-metrics\] logical=1280x800 physical=1280x800 device-scale-milli=1000 framebuffer=1280x800 compositor-scale-milli=1000' \
     "$RUN_DIR/serial.log"
 grep -q '\[isolation\] user #UD contained; kernel and GUI continue' "$RUN_DIR/serial.log"
@@ -308,12 +313,12 @@ send_command 'cat /lifecycle'
 wait_for_serial '[vfs] READ path=/lifecycle value=6'
 printf 'screendump %s/lifecycle.ppm\n' "$RUN_DIR" | hmp
 
-# Команда идёт через настоящий PS/2 keyboard path.
+# Команда идёт через настоящий xHCI USB keyboard path.
 send_command 'help'
 wait_for_serial '[terminal] command: help'
 
 # System fonts: family, bold+italic and variable em-size are changed through
-# the same PS/2 terminal path as a human uses. Then restore the default
+# the same USB HID terminal path as a human uses. Then restore the default
 # console profile so the remaining screenshot geometry is deterministic.
 send_command 'font family sans'
 wait_for_serial '[font] terminal family=sans size=18 style=regular'
@@ -330,7 +335,7 @@ wait_for_serial '[font] terminal family=console size=20 style=regular'
 send_command 'font size 18'
 wait_for_serial '[font] terminal family=console size=18 style=regular'
 
-# Input/resource services: hardware PS/2 rate plus portable software profile,
+# Input/resource services: USB capabilities plus portable software profile,
 # animated cursor preview and hot-swappable visual packs.
 send_command 'mouse rate 200'
 wait_for_serial '[input] mouse profile updated rate=200'
@@ -487,7 +492,7 @@ printf 'mouse_button 0\n' | hmp
 wait_for_serial '[wm] drag finished id=0x03'
 sleep 0.25
 # Запоминаем именно опубликованную WM geometry: HMP передаёт относительные
-# PS/2 packets, поэтому итоговая позиция может отличаться на несколько пикселей.
+# HID reports, поэтому итоговая позиция может отличаться на несколько пикселей.
 base_geometry=$(grep -F '[wm] drag finished id=0x03' "$RUN_DIR/serial.log" | tail -1)
 base_x=$(printf '%s\n' "$base_geometry" | sed -nE 's/.* rect=([0-9]+),([0-9]+),([0-9]+)x([0-9]+).*/\1/p')
 base_y=$(printf '%s\n' "$base_geometry" | sed -nE 's/.* rect=([0-9]+),([0-9]+),([0-9]+)x([0-9]+).*/\2/p')
@@ -518,7 +523,7 @@ sleep 0.25
 printf 'screendump %s/dragged.ppm\n' "$RUN_DIR" | hmp
 
 # Resize за правый верхний угол проверяет обе оси и layer cache. Итоговая
-# geometry берётся из telemetry оконного сервера: relative PS/2 aggregation
+# geometry берётся из telemetry оконного сервера: relative HID aggregation
 # вправе дать на несколько пикселей разный drag, но hit-test проверяется всегда
 # в трёх пикселях от фактической exclusive right/top границы.
 drag_geometry=$(grep -F '[wm] drag finished id=0x03' "$RUN_DIR/serial.log" | tail -1)
@@ -589,7 +594,7 @@ wait_for_serial '[app] spawn id=0x06 kind=SETTINGS'
 wait_for_serial '[desktop-menu] command=properties'
 
 # Settings rect≈(260,134,760,620): work-area clamp поднимает окно целиком над
-# taskbar. QEMU HMP не публикует wheel packet для negotiated PS/2 mouse во
+# taskbar. QEMU HMP не публикует wheel report для USB mouse во
 # всех версиях, поэтому интеграционно проверяем тот же ScrollModel через
 # фокусированный пункт + PageDown. Wheel routing покрыт SystemUI unit tests.
 move_mouse_to 600 390
@@ -599,7 +604,7 @@ printf 'mouse_button 0\n' | hmp
 printf 'sendkey pgdn 20\n' | hmp
 wait_for_serial '[settings] resolution-list scrolled input=keyboard'
 # Выбираем осенние обои и UI scale 125%. Абсолютная постановка делает тест
-# независимым от числа wheel packets виртуального PS/2 устройства.
+# независимым от числа wheel reports виртуального USB устройства.
 move_mouse_to 639 595
 printf 'mouse_button 1\n' | hmp
 sleep "${GUI_CLICK_SECONDS:-0.5}"

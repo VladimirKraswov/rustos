@@ -358,6 +358,7 @@ dependencies = [
  "rustos-rune-format",
  "rustos-system-assets",
  "rustos-system-ui",
+ "rustos-usb",
  "rustos-video",
  "u8g2-fonts",
 ]
@@ -447,6 +448,10 @@ dependencies = [
  "rustos-video",
  "unicode-segmentation",
 ]
+
+[[package]]
+name = "rustos-usb"
+version = "0.1.0"
 
 [[package]]
 name = "rustos-vfs-client"

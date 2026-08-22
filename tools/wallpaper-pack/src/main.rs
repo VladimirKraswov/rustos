@@ -163,7 +163,7 @@ mod tests {
     #[test]
     fn one_block_has_fixed_size_and_distinct_indices() {
         let mut input = [0u8; 4 * 4 * 3];
-        for (index, pixel) in input.chunks_exact_mut(3).enumerate() {
+        for (index, pixel) in input.as_chunks_mut::<3>().0.iter_mut().enumerate() {
             pixel.copy_from_slice(&[(index * 16) as u8, 80, 220]);
         }
         let encoded = encode(&input, 4, 4);
