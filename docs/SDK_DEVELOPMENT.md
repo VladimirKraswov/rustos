@@ -63,6 +63,11 @@ ELF64 после linker — промежуточный файл. Устанав�
 `.rune`, созданный `rustos-rune`; расположение в system image добавляется
 отдельным небольшим change в `scripts/build.sh`/image manifest.
 
+Для устанавливаемого приложения добавь рядом UTF-8 manifest, как в
+`sdk/examples/hello/hello.rune-abi`. Он задаёт stable package ID, runtime ABI,
+lifecycle, version, локализованное имя, icons и resources. Packer встраивает
+их в один RUNE и отклоняет абсолютные/родительские resource paths.
+
 ## Небольшая системная утилита
 
 Утилита остаётся обычным приложением. Она не получает системные права только
@@ -101,6 +106,12 @@ export rustos_text_measure measure(*const_u8,usize,*mut_u64)->i32 function
    pointers/lengths и panic boundary;
 2. safe Rust facade: slices, typed errors, RAII handles; все `unsafe` спрятаны;
 3. consumer example, который импортирует facade, а не raw symbol.
+
+Исходная ABI-схема встраивается в DLL как `INTERFACE_SCHEMA`. Целевая команда
+`rustos sdk resolve` генерирует из неё safe Rust crate в общий cache, поэтому
+разработчик не копирует declarations в каждый проект. Готовые Rust bindings
+могут поставляться как оптимизация, но schema остаётся единственным источником
+истины и позднее генерирует также C/Node.js bindings.
 
 Имена функций, canonical signatures и manifest должны совпадать. Не используй
 в публичной сигнатуре `bool`, Rust enum, `char`, `String`, slice, reference,
@@ -148,7 +159,8 @@ slice. Они обязательны до объявления service productio
 ## GUI сейчас и позже
 
 `rustos-system-ui` уже является общей component library, но GUI applications
-в `kernel/src/apps` пока bootstrap-объекты. При их доработке:
+в `kernel/src/apps` пока bootstrap-объекты. Публичная ring-3 граница будет
+состоять только из Window/SystemUI/Canvas/Graphics facades. При их доработке:
 
 - state принадлежит экземпляру приложения;
 - retained tree строится `UiBuilder`;
@@ -156,11 +168,18 @@ slice. Они обязательны до объявления service productio
 - только backend adapter знает `Framebuffer`/fonts;
 - runtime damage передаётся compositor;
 - стандартный control не рисуется вручную.
+- приложение не зависит от `rustos-abi`, `rustos-runtime`, surface/ui-gpu,
+  VirGL, video или Mesa platform crates;
+- один application RUNE работает с forced software и GPU provider.
 
 Не добавляй выдуманный ring-3 API до реализации `uid`/UI session ABI. Перенос
 bootstrap-приложения на компоненты и последующий перенос его process boundary —
 два разных changes. Для Terminal действует
 `docs/TERMINAL_SYSTEM_UI_MIGRATION.md`.
+
+Полный стабильный контракт описан в `docs/APPLICATION_MODEL.md`. CI запускает
+`scripts/check-sdk-boundaries.sh`, чтобы пример приложения не протащил
+внутренний transport напрямую.
 
 ## Definition of done малой задачи
 

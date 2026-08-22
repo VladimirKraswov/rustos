@@ -1,6 +1,7 @@
 [package]
 name = "rustos-surface-client"
-description = "Безопасный client facade surface.dll поверх capability IPC"
+description = "Внутренний facade uid/renderd/compositord для surface capability IPC"
+publish = false
 version.workspace = true
 edition.workspace = true
 license.workspace = true

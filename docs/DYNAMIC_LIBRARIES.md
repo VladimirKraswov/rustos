@@ -19,6 +19,12 @@ RELRO. Sealed RX/RO regions используют одни физические �
 ширины. Rust ABI не стабилен между версиями compiler и наружу не выходит.
 Безопасные Rust crates являются тонкими wrappers поверх C ABI.
 
+Копировать Rust declarations в каждый проект не требуется. Каждая публичная
+DLL несёт `INTERFACE_SCHEMA`: канонический RUIDL-контракт функций, типов,
+ownership и ошибок. SDK генерирует из него safe Rust crate и кэширует по hash
+схемы/target ABI. Необязательный `SDK_BINDINGS` может ускорять offline build,
+но остаётся производным артефактом, а не вторым источником истины.
+
 ## DLL не заменяет системный сервис
 
 ```text
@@ -53,6 +59,12 @@ Unload допускается только после завершения вы�
 реализация не выгружает system DLL до выхода процесса: это проще, быстрее и
 исключает use-after-unload.
 
+Зависимости транзитивны: DLL объявляет собственные прямые dependencies, а
+resolver строит и проверяет весь graph до map. Приложение не копирует
+транзитивный список и не получает общий symbol namespace. Это позволяет DLL
+использовать другую DLL без `PATH`/current-directory lookup и search-order
+hijacking.
+
 ## Исполняемый RUNE resolver
 
 User-space crate `rustos-rune-loader` уже загружает нативные RUNE libraries:
@@ -80,6 +92,15 @@ Boot-test защищает следующие свойства:
 
 SDK использует декларативный `RUNE-ABI 1` manifest из `sdk/abi`. Команда
 `rustos-rune pack-manifest` запрещает необъявленные undefined imports,
-проверяет exports против `.dynsym` и формирует import/export/dependency
-records. Следующее расширение генератора создаст из того же manifest C header
-и safe Rust wrapper, чтобы документация и бинарный контракт не расходились.
+проверяет exports против `.dynsym`, формирует import/export/dependency records
+и встраивает исходную схему. Следующий обязательный этап — `rustos sdk resolve`
+и генерация safe Rust/C bindings из этого же record.
+
+Сейчас embedded источник уже можно проверить и прочитать без ELF sections:
+
+```bash
+cargo run -p rustos-rune -- schema /system/lib/example.rune
+```
+
+Полная модель executable/DLL/package boundary описана в
+[`APPLICATION_MODEL.md`](APPLICATION_MODEL.md).

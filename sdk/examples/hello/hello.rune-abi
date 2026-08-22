@@ -1,0 +1,13 @@
+RUNE-ABI 1
+package org.rustos.examples.hello
+kind application
+runtime-abi 1 1
+version 0 1 0
+lifecycle multi-instance
+name default "Hello RustOS"
+name ru-RU "Привет, RustOS"
+summary default "Minimal independent RustOS application"
+summary ru-RU "Минимальное независимое приложение RustOS"
+vendor "RustOS Project"
+category development.examples
+icon 64 64 100 svg any application assets/hello.svg

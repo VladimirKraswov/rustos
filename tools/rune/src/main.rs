@@ -9,13 +9,18 @@
 #[cfg(target_os = "rustos")]
 use rustos_crt as _;
 
-use std::{env, fs, path::Path, process};
+use std::{env, fs, io::Write, path::Path, process};
 
 use rustos_rune_format::{
-    architecture, dependency_flags, export_flags, file_flags, import_flags, interface_id,
-    record_kind, region_flags, relocation_kind, sha256_with_zeroed_range, symbol_id, Container,
-    InterfaceId, CONTENT_HASH_OFFSET, DEPENDENCY_SIZE, EXPORT_SIZE, FORMAT_VERSION, HEADER_SIZE,
-    IMPORT_SIZE, MAGIC, PAGE_SIZE, RELOCATION_SIZE, TOC_ENTRY_SIZE,
+    architecture, artifact_kind, capability_flags, dependency_flags, export_flags, file_flags,
+    icon_format, icon_purpose, icon_theme, import_flags, interface_id, lifecycle, manifest_flags,
+    metadata_flags, metadata_key, parse_icon_header, parse_interface_schema_header,
+    parse_metadata_entry, parse_resource_header, record_flags, record_kind, region_flags,
+    relocation_kind, resource_encoding, sha256_with_zeroed_range, symbol_id, Container,
+    InterfaceId, CAPABILITY_REQUEST_SIZE, CONTENT_HASH_OFFSET, DEPENDENCY_SIZE, EXPORT_SIZE,
+    FORMAT_VERSION, HEADER_SIZE, ICON_HEADER_SIZE, IMPORT_SIZE, INTERFACE_SCHEMA_HEADER_SIZE,
+    MAGIC, MANIFEST_SIZE, METADATA_ENTRY_SIZE, PAGE_SIZE, RELOCATION_SIZE, RESOURCE_HEADER_SIZE,
+    TOC_ENTRY_SIZE,
 };
 
 const ELF_HEADER_SIZE: usize = 64;
@@ -66,6 +71,24 @@ impl ArtifactKind {
             Self::Driver => file_flags::DRIVER,
         }
     }
+
+    const fn wire_kind(self) -> u16 {
+        match self {
+            Self::Application => artifact_kind::APPLICATION,
+            Self::Library => artifact_kind::LIBRARY,
+            Self::Service => artifact_kind::SERVICE,
+            Self::Driver => artifact_kind::DRIVER,
+        }
+    }
+
+    const fn default_lifecycle(self) -> u16 {
+        match self {
+            Self::Application => lifecycle::MULTI_INSTANCE,
+            Self::Library => lifecycle::IN_PROCESS_LIBRARY,
+            Self::Service => lifecycle::MANAGED_SERVICE,
+            Self::Driver => lifecycle::MANAGED_DRIVER,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -87,6 +110,43 @@ struct ManifestDependency {
 }
 
 #[derive(Clone, Debug)]
+struct ManifestMetadata {
+    key: u16,
+    name: String,
+    locale: String,
+    value: String,
+}
+
+#[derive(Clone, Debug)]
+struct ManifestIcon {
+    width: u16,
+    height: u16,
+    scale_percent: u16,
+    format: u16,
+    theme: u16,
+    purpose: u16,
+    path: String,
+    bytes: Vec<u8>,
+}
+
+#[derive(Clone, Debug)]
+struct ManifestResource {
+    logical_name: String,
+    content_type: String,
+    path: String,
+    bytes: Vec<u8>,
+}
+
+#[derive(Clone, Debug)]
+struct ManifestCapability {
+    service: InterfaceId,
+    rights: u64,
+    abi_version: u16,
+    slot_hint: u16,
+    flags: u32,
+}
+
+#[derive(Clone, Debug)]
 struct AbiManifest {
     package: String,
     kind: ArtifactKind,
@@ -95,6 +155,16 @@ struct AbiManifest {
     imports: Vec<ManifestSymbol>,
     exports: Vec<ManifestSymbol>,
     dependencies: Vec<ManifestDependency>,
+    runtime_abi_minimum: u16,
+    runtime_abi_maximum: u16,
+    lifecycle: Option<u16>,
+    flags: u32,
+    version: (u32, u32, u32),
+    metadata: Vec<ManifestMetadata>,
+    icons: Vec<ManifestIcon>,
+    resources: Vec<ManifestResource>,
+    capabilities: Vec<ManifestCapability>,
+    schema_source: Vec<u8>,
 }
 
 #[derive(Clone, Copy)]
@@ -175,6 +245,7 @@ fn run() -> Result<(), String> {
     match args.as_slice() {
         [_, command, input] if command == "verify" => verify(Path::new(input)),
         [_, command, input] if command == "inspect" => inspect(Path::new(input)),
+        [_, command, input] if command == "schema" => print_schema(Path::new(input)),
         [_, input, output] => pack(Path::new(input), Path::new(output), None, None),
         [_, command, input, output, name] if command == "pack" => {
             pack(Path::new(input), Path::new(output), Some(name), None)
@@ -183,11 +254,15 @@ fn run() -> Result<(), String> {
             let manifest_path = Path::new(manifest);
             let source = fs::read_to_string(manifest_path)
                 .map_err(|error| format!("{}: {error}", manifest_path.display()))?;
-            let manifest = parse_manifest(&source)?;
+            let mut manifest = parse_manifest(&source)?;
+            load_manifest_assets(
+                &mut manifest,
+                manifest_path.parent().unwrap_or_else(|| Path::new(".")),
+            )?;
             pack(Path::new(input), Path::new(output), None, Some(&manifest))
         }
         _ => Err(
-            "usage: rustos-rune <input.elf> <output.rune> | pack <input> <output> <package> | pack-manifest <input> <output> <abi.rune> | verify|inspect <file>"
+            "usage: rustos-rune <input.elf> <output.rune> | pack <input> <output> <package> | pack-manifest <input> <output> <manifest.rune-abi> | verify|inspect|schema <file>"
                 .into(),
         ),
     }
@@ -238,15 +313,24 @@ fn parse_manifest(source: &str) -> Result<AbiManifest, String> {
     let mut imports = Vec::new();
     let mut exports = Vec::new();
     let mut dependencies = Vec::new();
+    let mut runtime_abi_minimum = 1u16;
+    let mut runtime_abi_maximum = 1u16;
+    let mut requested_lifecycle = None;
+    let mut flags = 0u32;
+    let mut version = (0u32, 1u32, 0u32);
+    let mut metadata = Vec::new();
+    let mut icons = Vec::new();
+    let mut resources = Vec::new();
+    let mut capabilities = Vec::new();
     let mut saw_header = false;
 
     for (line_index, raw_line) in source.lines().enumerate() {
-        let line = raw_line.split('#').next().unwrap_or("").trim();
-        if line.is_empty() {
+        let line_number = line_index + 1;
+        let fields = manifest_fields(raw_line, line_number)?;
+        if fields.is_empty() {
             continue;
         }
-        let fields: Vec<_> = line.split_ascii_whitespace().collect();
-        let line_number = line_index + 1;
+        let fields: Vec<_> = fields.iter().map(String::as_str).collect();
         if !saw_header {
             if fields.as_slice() != ["RUNE-ABI", "1"] {
                 return Err(format!(
@@ -276,6 +360,94 @@ fn parse_manifest(source: &str) -> Result<AbiManifest, String> {
                 abi_version = value
                     .parse()
                     .map_err(|_| format!("manifest line {line_number}: invalid ABI version"))?;
+            }
+            ["runtime-abi", minimum, maximum] => {
+                runtime_abi_minimum = parse_abi(minimum, line_number)?;
+                runtime_abi_maximum = parse_abi(maximum, line_number)?;
+                if runtime_abi_minimum > runtime_abi_maximum {
+                    return Err(format!(
+                        "manifest line {line_number}: invalid runtime ABI range"
+                    ));
+                }
+            }
+            ["version", major, minor, patch] => {
+                version = (
+                    parse_u32(major, line_number, "major version")?,
+                    parse_u32(minor, line_number, "minor version")?,
+                    parse_u32(patch, line_number, "patch version")?,
+                );
+            }
+            ["lifecycle", value] => {
+                requested_lifecycle = Some(parse_lifecycle(value, line_number)?);
+            }
+            ["flag", "background-allowed"] => flags |= manifest_flags::BACKGROUND_ALLOWED,
+            ["flag", "restartable"] => flags |= manifest_flags::RESTARTABLE,
+            ["name", locale, value] => metadata.push(ManifestMetadata {
+                key: metadata_key::DISPLAY_NAME,
+                name: String::new(),
+                locale: parse_locale(locale, line_number)?,
+                value: (*value).to_owned(),
+            }),
+            ["summary", locale, value] => metadata.push(ManifestMetadata {
+                key: metadata_key::SUMMARY,
+                name: String::new(),
+                locale: parse_locale(locale, line_number)?,
+                value: (*value).to_owned(),
+            }),
+            ["vendor", value] => metadata.push(ManifestMetadata {
+                key: metadata_key::VENDOR,
+                name: String::new(),
+                locale: String::new(),
+                value: (*value).to_owned(),
+            }),
+            ["category", value] => metadata.push(ManifestMetadata {
+                key: metadata_key::CATEGORY,
+                name: String::new(),
+                locale: String::new(),
+                value: (*value).to_owned(),
+            }),
+            ["homepage", value] => metadata.push(ManifestMetadata {
+                key: metadata_key::HOMEPAGE,
+                name: String::new(),
+                locale: String::new(),
+                value: (*value).to_owned(),
+            }),
+            ["metadata", name, locale, value] => metadata.push(ManifestMetadata {
+                key: metadata_key::CUSTOM,
+                name: (*name).to_owned(),
+                locale: parse_locale(locale, line_number)?,
+                value: (*value).to_owned(),
+            }),
+            ["icon", width, height, scale, format, theme, purpose, path] => {
+                icons.push(ManifestIcon {
+                    width: parse_u16(width, line_number, "icon width")?,
+                    height: parse_u16(height, line_number, "icon height")?,
+                    scale_percent: parse_u16(scale, line_number, "icon scale")?,
+                    format: parse_icon_format(format, line_number)?,
+                    theme: parse_icon_theme(theme, line_number)?,
+                    purpose: parse_icon_purpose(purpose, line_number)?,
+                    path: (*path).to_owned(),
+                    bytes: Vec::new(),
+                });
+            }
+            ["resource", logical_name, content_type, path] => {
+                validate_resource_name(logical_name, line_number)?;
+                validate_content_type(content_type, line_number)?;
+                resources.push(ManifestResource {
+                    logical_name: (*logical_name).to_owned(),
+                    content_type: (*content_type).to_owned(),
+                    path: (*path).to_owned(),
+                    bytes: Vec::new(),
+                });
+            }
+            ["capability", policy, service, abi, rights, slot] => {
+                capabilities.push(ManifestCapability {
+                    service: interface_id(service),
+                    rights: parse_u64(rights, line_number, "capability rights")?,
+                    abi_version: parse_abi(abi, line_number)?,
+                    slot_hint: parse_u16(slot, line_number, "capability slot")?,
+                    flags: parse_capability_policy(policy, line_number)?,
+                });
             }
             ["dependency", file, interface, minimum, maximum] => {
                 dependencies.push(ManifestDependency {
@@ -322,6 +494,16 @@ fn parse_manifest(source: &str) -> Result<AbiManifest, String> {
         imports,
         exports,
         dependencies,
+        runtime_abi_minimum,
+        runtime_abi_maximum,
+        lifecycle: requested_lifecycle,
+        flags,
+        version,
+        metadata,
+        icons,
+        resources,
+        capabilities,
+        schema_source: source.as_bytes().to_vec(),
     };
     for import in &manifest.imports {
         if import.minimum_abi == 0
@@ -338,7 +520,51 @@ fn parse_manifest(source: &str) -> Result<AbiManifest, String> {
             ));
         }
     }
+    validate_manifest_lifecycle(&manifest)?;
     Ok(manifest)
+}
+
+/// Разбирает UTF-8 поля с двойными кавычками. Это позволяет хранить русское
+/// имя и описание прямо рядом с ABI, не вводя TOML/JSON parser в native SDK.
+fn manifest_fields(line: &str, line_number: usize) -> Result<Vec<String>, String> {
+    let mut fields = Vec::new();
+    let mut field = String::new();
+    let mut quoted = false;
+    let mut escaped = false;
+    for character in line.chars() {
+        if escaped {
+            field.push(match character {
+                'n' => '\n',
+                'r' => '\r',
+                't' => '\t',
+                '"' => '"',
+                '\\' => '\\',
+                _ => return Err(format!("manifest line {line_number}: unsupported escape")),
+            });
+            escaped = false;
+        } else if quoted && character == '\\' {
+            escaped = true;
+        } else if character == '"' {
+            quoted = !quoted;
+        } else if !quoted && character == '#' {
+            break;
+        } else if !quoted && character.is_ascii_whitespace() {
+            if !field.is_empty() {
+                fields.push(core::mem::take(&mut field));
+            }
+        } else {
+            field.push(character);
+        }
+    }
+    if quoted || escaped {
+        return Err(format!(
+            "manifest line {line_number}: unterminated quoted value"
+        ));
+    }
+    if !field.is_empty() {
+        fields.push(field);
+    }
+    Ok(fields)
 }
 
 fn parse_abi(value: &str, line: usize) -> Result<u16, String> {
@@ -347,6 +573,184 @@ fn parse_abi(value: &str, line: usize) -> Result<u16, String> {
         .ok()
         .filter(|value| *value != 0)
         .ok_or_else(|| format!("manifest line {line}: ABI version must be 1..65535"))
+}
+
+fn parse_u16(value: &str, line: usize, field: &str) -> Result<u16, String> {
+    value
+        .parse::<u16>()
+        .ok()
+        .filter(|value| *value != 0)
+        .ok_or_else(|| format!("manifest line {line}: invalid {field}"))
+}
+
+fn parse_u32(value: &str, line: usize, field: &str) -> Result<u32, String> {
+    value
+        .parse::<u32>()
+        .map_err(|_| format!("manifest line {line}: invalid {field}"))
+}
+
+fn parse_u64(value: &str, line: usize, field: &str) -> Result<u64, String> {
+    let parsed = value
+        .strip_prefix("0x")
+        .map(|hex| u64::from_str_radix(hex, 16))
+        .unwrap_or_else(|| value.parse::<u64>());
+    parsed.map_err(|_| format!("manifest line {line}: invalid {field}"))
+}
+
+fn parse_capability_policy(value: &str, line: usize) -> Result<u32, String> {
+    match value {
+        "required" => Ok(capability_flags::REQUIRED),
+        "optional" => Ok(capability_flags::OPTIONAL),
+        "required-many" => Ok(capability_flags::REQUIRED | capability_flags::MULTIPLE),
+        "optional-many" => Ok(capability_flags::OPTIONAL | capability_flags::MULTIPLE),
+        _ => Err(format!("manifest line {line}: unknown capability policy")),
+    }
+}
+
+fn parse_locale(value: &str, line: usize) -> Result<String, String> {
+    if value == "default" {
+        return Ok(String::new());
+    }
+    if value.len() > 35
+        || !value.is_ascii()
+        || value
+            .split('-')
+            .any(|part| part.is_empty() || !part.bytes().all(|byte| byte.is_ascii_alphanumeric()))
+    {
+        return Err(format!("manifest line {line}: invalid BCP 47 locale"));
+    }
+    Ok(value.to_owned())
+}
+
+fn parse_lifecycle(value: &str, line: usize) -> Result<u16, String> {
+    match value {
+        "multi-instance" => Ok(lifecycle::MULTI_INSTANCE),
+        "single-instance" => Ok(lifecycle::SINGLE_INSTANCE),
+        "managed-service" => Ok(lifecycle::MANAGED_SERVICE),
+        "managed-driver" => Ok(lifecycle::MANAGED_DRIVER),
+        "in-process-library" => Ok(lifecycle::IN_PROCESS_LIBRARY),
+        _ => Err(format!("manifest line {line}: unknown lifecycle")),
+    }
+}
+
+fn parse_icon_format(value: &str, line: usize) -> Result<u16, String> {
+    match value {
+        "rgba8" => Ok(icon_format::RGBA8_PREMULTIPLIED),
+        "png" => Ok(icon_format::PNG),
+        "svg" => Ok(icon_format::SVG_UTF8),
+        _ => Err(format!("manifest line {line}: unknown icon format")),
+    }
+}
+
+fn parse_icon_theme(value: &str, line: usize) -> Result<u16, String> {
+    match value {
+        "any" => Ok(icon_theme::ANY),
+        "light" => Ok(icon_theme::LIGHT),
+        "dark" => Ok(icon_theme::DARK),
+        "high-contrast" => Ok(icon_theme::HIGH_CONTRAST),
+        _ => Err(format!("manifest line {line}: unknown icon theme")),
+    }
+}
+
+fn parse_icon_purpose(value: &str, line: usize) -> Result<u16, String> {
+    match value {
+        "application" => Ok(icon_purpose::APPLICATION),
+        "badge" => Ok(icon_purpose::SMALL_BADGE),
+        "document" => Ok(icon_purpose::DOCUMENT),
+        _ => Err(format!("manifest line {line}: unknown icon purpose")),
+    }
+}
+
+fn validate_resource_name(value: &str, line: usize) -> Result<(), String> {
+    if value.is_empty()
+        || value.starts_with('/')
+        || value.contains('\\')
+        || value
+            .split('/')
+            .any(|part| part.is_empty() || part == "." || part == "..")
+    {
+        return Err(format!(
+            "manifest line {line}: resource name must be a relative canonical path"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_content_type(value: &str, line: usize) -> Result<(), String> {
+    let Some((kind, subtype)) = value.split_once('/') else {
+        return Err(format!("manifest line {line}: invalid content type"));
+    };
+    if kind.is_empty()
+        || subtype.is_empty()
+        || !value.is_ascii()
+        || value.bytes().any(|byte| byte.is_ascii_whitespace())
+    {
+        return Err(format!("manifest line {line}: invalid content type"));
+    }
+    Ok(())
+}
+
+fn validate_manifest_lifecycle(manifest: &AbiManifest) -> Result<(), String> {
+    let actual = manifest
+        .lifecycle
+        .unwrap_or_else(|| manifest.kind.default_lifecycle());
+    let valid = match manifest.kind {
+        ArtifactKind::Application => matches!(
+            actual,
+            lifecycle::MULTI_INSTANCE | lifecycle::SINGLE_INSTANCE
+        ),
+        ArtifactKind::Library => actual == lifecycle::IN_PROCESS_LIBRARY,
+        ArtifactKind::Service => actual == lifecycle::MANAGED_SERVICE,
+        ArtifactKind::Driver => actual == lifecycle::MANAGED_DRIVER,
+    };
+    if !valid {
+        return Err("manifest lifecycle does not match artifact kind".into());
+    }
+    if manifest.flags & manifest_flags::BACKGROUND_ALLOWED != 0
+        && manifest.kind != ArtifactKind::Application
+    {
+        return Err("background-allowed is valid only for applications".into());
+    }
+    for (index, capability) in manifest.capabilities.iter().enumerate() {
+        if manifest.capabilities[..index]
+            .iter()
+            .any(|previous| previous.slot_hint == capability.slot_hint)
+        {
+            return Err(format!(
+                "capability slot {} is declared more than once",
+                capability.slot_hint
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn load_manifest_assets(manifest: &mut AbiManifest, base: &Path) -> Result<(), String> {
+    for icon in &mut manifest.icons {
+        let path = base.join(&icon.path);
+        icon.bytes = fs::read(&path).map_err(|error| format!("{}: {error}", path.display()))?;
+        if icon.format == icon_format::RGBA8_PREMULTIPLIED {
+            let expected = usize::from(icon.width)
+                .checked_mul(usize::from(icon.height))
+                .and_then(|pixels| pixels.checked_mul(4))
+                .ok_or("icon dimensions overflow")?;
+            if icon.bytes.len() != expected {
+                return Err(format!(
+                    "{}: RGBA8 icon has {} bytes, expected {expected}",
+                    path.display(),
+                    icon.bytes.len()
+                ));
+            }
+        }
+        if icon.format == icon_format::SVG_UTF8 && core::str::from_utf8(&icon.bytes).is_err() {
+            return Err(format!("{}: SVG icon is not UTF-8", path.display()));
+        }
+    }
+    for resource in &mut manifest.resources {
+        let path = base.join(&resource.path);
+        resource.bytes = fs::read(&path).map_err(|error| format!("{}: {error}", path.display()))?;
+    }
+    Ok(())
 }
 
 fn parse_symbol_kind(value: &str, line: usize) -> Result<u32, String> {
@@ -370,6 +774,9 @@ fn verify(path: &Path) -> Result<(), String> {
     if slice_count == 0 {
         return Err("container has no architecture slice".into());
     }
+    if container.manifest().is_none() {
+        return Err("container has no typed manifest".into());
+    }
     println!(
         "RUNE OK: {} bytes, {} records, {} slice(s)",
         bytes.len(),
@@ -390,8 +797,9 @@ fn inspect(path: &Path) -> Result<(), String> {
     );
     for (index, entry) in container.entries().enumerate() {
         println!(
-            "  {index:02}: kind={} arch={} flags=0x{:x} rva=0x{:x} file=0x{:x} mem=0x{:x} name={:?}",
+            "  {index:02}: kind={}({}) arch={} flags=0x{:x} rva=0x{:x} file=0x{:x} mem=0x{:x} name={:?}",
             entry.kind,
+            record_kind_name(entry.kind),
             entry.architecture,
             entry.flags,
             entry.virtual_address,
@@ -400,7 +808,152 @@ fn inspect(path: &Path) -> Result<(), String> {
             container.name(entry).unwrap_or("<invalid>")
         );
     }
+    if let Some(manifest) = container.manifest() {
+        println!(
+            "  manifest: kind={} lifecycle={} runtime-abi={}..={} version={}.{}.{}",
+            artifact_kind_name(manifest.artifact_kind),
+            lifecycle_name(manifest.lifecycle),
+            manifest.runtime_abi_minimum,
+            manifest.runtime_abi_maximum,
+            manifest.version_major,
+            manifest.version_minor,
+            manifest.version_patch
+        );
+    }
+    for entry in container.entries() {
+        let Some(payload) = container.payload(entry) else {
+            continue;
+        };
+        match entry.kind {
+            record_kind::METADATA => {
+                for bytes in payload.as_chunks::<METADATA_ENTRY_SIZE>().0 {
+                    let metadata = parse_metadata_entry(bytes).unwrap();
+                    println!(
+                        "  metadata: key={} locale={:?} value={:?}",
+                        metadata_key_name(metadata.key),
+                        container
+                            .string(metadata.locale_offset, metadata.locale_length)
+                            .unwrap(),
+                        container
+                            .string(metadata.value_offset, metadata.value_length)
+                            .unwrap()
+                    );
+                }
+            }
+            record_kind::ICON => {
+                let icon = parse_icon_header(payload).unwrap();
+                println!(
+                    "  icon: {}x{} scale={} format={} theme={} purpose={} bytes={}",
+                    icon.width,
+                    icon.height,
+                    icon.scale_percent,
+                    icon.format,
+                    icon.theme,
+                    icon.purpose,
+                    icon.data_size
+                );
+            }
+            record_kind::RESOURCE => {
+                let resource = parse_resource_header(payload).unwrap();
+                println!(
+                    "  resource: name={:?} type={:?} bytes={}",
+                    container.name(entry).unwrap(),
+                    container
+                        .string(resource.content_type_offset, resource.content_type_length)
+                        .unwrap(),
+                    resource.uncompressed_size
+                );
+            }
+            record_kind::INTERFACE_SCHEMA => {
+                let schema = parse_interface_schema_header(payload).unwrap();
+                println!(
+                    "  interface-schema: abi={} source-bytes={} id={:02x?}",
+                    schema.abi_version, schema.source_size, schema.interface.0
+                );
+            }
+            _ => {}
+        }
+    }
     Ok(())
+}
+
+fn print_schema(path: &Path) -> Result<(), String> {
+    let bytes = fs::read(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    let container = Container::parse(&bytes).map_err(|error| format!("invalid RUNE: {error:?}"))?;
+    let mut found = None;
+    for entry in container
+        .entries()
+        .filter(|entry| entry.kind == record_kind::INTERFACE_SCHEMA)
+    {
+        if found.is_some() {
+            return Err("container has several interface schemas; select by InterfaceId".into());
+        }
+        let payload = container.payload(entry).ok_or("invalid interface schema")?;
+        parse_interface_schema_header(payload).ok_or("invalid interface schema")?;
+        found = Some(&payload[INTERFACE_SCHEMA_HEADER_SIZE..]);
+    }
+    let source = found.ok_or("container has no interface schema")?;
+    std::io::stdout()
+        .write_all(source)
+        .map_err(|error| format!("stdout: {error}"))?;
+    Ok(())
+}
+
+fn record_kind_name(kind: u16) -> &'static str {
+    match kind {
+        record_kind::SLICE => "slice",
+        record_kind::REGION => "region",
+        record_kind::RELOCATIONS => "relocations",
+        record_kind::IMPORTS => "imports",
+        record_kind::EXPORTS => "exports",
+        record_kind::DEPENDENCIES => "dependencies",
+        record_kind::TLS => "tls",
+        record_kind::RELRO => "relro",
+        record_kind::CAPABILITIES => "capabilities",
+        record_kind::STRINGS => "strings",
+        record_kind::DEBUG => "debug",
+        record_kind::SIGNATURE => "signature",
+        record_kind::MANIFEST => "manifest",
+        record_kind::METADATA => "metadata",
+        record_kind::ICON => "icon",
+        record_kind::RESOURCE => "resource",
+        record_kind::INTERFACE_SCHEMA => "interface-schema",
+        record_kind::SDK_BINDINGS => "sdk-bindings",
+        _ => "unknown",
+    }
+}
+
+fn artifact_kind_name(kind: u16) -> &'static str {
+    match kind {
+        artifact_kind::APPLICATION => "application",
+        artifact_kind::LIBRARY => "library",
+        artifact_kind::SERVICE => "service",
+        artifact_kind::DRIVER => "driver",
+        _ => "unknown",
+    }
+}
+
+fn lifecycle_name(value: u16) -> &'static str {
+    match value {
+        lifecycle::MULTI_INSTANCE => "multi-instance",
+        lifecycle::SINGLE_INSTANCE => "single-instance",
+        lifecycle::MANAGED_SERVICE => "managed-service",
+        lifecycle::MANAGED_DRIVER => "managed-driver",
+        lifecycle::IN_PROCESS_LIBRARY => "in-process-library",
+        _ => "unknown",
+    }
+}
+
+fn metadata_key_name(key: u16) -> &'static str {
+    match key {
+        metadata_key::DISPLAY_NAME => "display-name",
+        metadata_key::SUMMARY => "summary",
+        metadata_key::VENDOR => "vendor",
+        metadata_key::CATEGORY => "category",
+        metadata_key::HOMEPAGE => "homepage",
+        metadata_key::CUSTOM => "custom",
+        _ => "unknown",
+    }
 }
 
 fn convert_elf(
@@ -589,6 +1142,14 @@ fn convert_elf(
         )?;
     }
 
+    let manifest_index = append_package_records(
+        &mut records,
+        &mut strings,
+        package_name,
+        manifest,
+        artifact_flags,
+    )?;
+
     let strings_index = records.len() as u32;
     let mut string_record = OutputRecord::metadata(record_kind::STRINGS, architecture::ANY);
     string_record.alignment = 1;
@@ -597,7 +1158,223 @@ fn convert_elf(
     string_record.payload = strings;
     records.push(string_record);
 
-    encode(records, strings_index, package_name, artifact_flags)
+    encode(
+        records,
+        strings_index,
+        manifest_index,
+        package_name,
+        artifact_flags,
+    )
+}
+
+fn append_package_records(
+    records: &mut Vec<OutputRecord>,
+    strings: &mut Vec<u8>,
+    package_name: &str,
+    manifest: Option<&AbiManifest>,
+    artifact_flags: u32,
+) -> Result<u32, String> {
+    if let Some(manifest) = manifest.filter(|manifest| manifest.interface.is_some()) {
+        let interface = manifest.interface.unwrap();
+        let source_size = u32::try_from(manifest.schema_source.len())
+            .map_err(|_| "interface schema is too large")?;
+        let mut payload = vec![0u8; INTERFACE_SCHEMA_HEADER_SIZE];
+        payload[..16].copy_from_slice(&interface.0);
+        put_u16(&mut payload, 16, 1);
+        put_u16(&mut payload, 18, manifest.abi_version);
+        put_u32(&mut payload, 20, source_size);
+        payload.extend_from_slice(&manifest.schema_source);
+        let (name_offset, name_length) = add_string(strings, "interface-schema")?;
+        let mut record = OutputRecord::metadata(record_kind::INTERFACE_SCHEMA, architecture::ANY);
+        record.alignment = 8;
+        record.file_size = payload.len() as u64;
+        record.memory_size = record.file_size;
+        record.name_offset = name_offset;
+        record.name_length = name_length;
+        record.payload = payload;
+        records.push(record);
+    }
+
+    if let Some(manifest) = manifest.filter(|manifest| !manifest.capabilities.is_empty()) {
+        let mut payload = Vec::with_capacity(manifest.capabilities.len() * CAPABILITY_REQUEST_SIZE);
+        for capability in &manifest.capabilities {
+            payload.extend_from_slice(&capability.service.0);
+            payload.extend_from_slice(&capability.rights.to_le_bytes());
+            payload.extend_from_slice(&capability.abi_version.to_le_bytes());
+            payload.extend_from_slice(&capability.slot_hint.to_le_bytes());
+            payload.extend_from_slice(&capability.flags.to_le_bytes());
+        }
+        let (name_offset, name_length) = add_string(strings, "capability-requests")?;
+        let mut record = OutputRecord::metadata(record_kind::CAPABILITIES, architecture::ANY);
+        record.alignment = 8;
+        record.file_size = payload.len() as u64;
+        record.memory_size = record.file_size;
+        record.name_offset = name_offset;
+        record.name_length = name_length;
+        record.payload = payload;
+        records.push(record);
+    }
+
+    let mut metadata = manifest
+        .map(|manifest| manifest.metadata.clone())
+        .unwrap_or_default();
+    if !metadata
+        .iter()
+        .any(|entry| entry.key == metadata_key::DISPLAY_NAME && entry.locale.is_empty())
+    {
+        metadata.push(ManifestMetadata {
+            key: metadata_key::DISPLAY_NAME,
+            name: String::new(),
+            locale: String::new(),
+            value: package_name.to_owned(),
+        });
+    }
+
+    let metadata_index = if metadata.is_empty() {
+        u32::MAX
+    } else {
+        let mut payload = Vec::with_capacity(metadata.len() * METADATA_ENTRY_SIZE);
+        for entry in &metadata {
+            let (locale_offset, locale_length) = add_string(strings, &entry.locale)?;
+            let (name_offset, name_length) = add_string(strings, &entry.name)?;
+            let (value_offset, value_length) = add_string(strings, &entry.value)?;
+            payload.extend_from_slice(&entry.key.to_le_bytes());
+            payload.extend_from_slice(&0u16.to_le_bytes());
+            let flags = if entry.locale.is_empty() {
+                0
+            } else {
+                metadata_flags::LOCALIZED
+            };
+            payload.extend_from_slice(&flags.to_le_bytes());
+            payload.extend_from_slice(&locale_offset.to_le_bytes());
+            payload.extend_from_slice(&locale_length.to_le_bytes());
+            payload.extend_from_slice(&0u16.to_le_bytes());
+            payload.extend_from_slice(&name_offset.to_le_bytes());
+            payload.extend_from_slice(&name_length.to_le_bytes());
+            payload.extend_from_slice(&0u16.to_le_bytes());
+            payload.extend_from_slice(&value_offset.to_le_bytes());
+            payload.extend_from_slice(&value_length.to_le_bytes());
+            payload.extend_from_slice(&0u16.to_le_bytes());
+        }
+        let index = records.len() as u32;
+        let mut record = OutputRecord::metadata(record_kind::METADATA, architecture::ANY);
+        let (name_offset, name_length) = add_string(strings, "package-metadata")?;
+        record.alignment = 4;
+        record.file_size = payload.len() as u64;
+        record.memory_size = record.file_size;
+        record.name_offset = name_offset;
+        record.name_length = name_length;
+        record.payload = payload;
+        records.push(record);
+        index
+    };
+
+    let mut default_icon_index = u32::MAX;
+    if let Some(manifest) = manifest {
+        for icon in &manifest.icons {
+            let index = records.len() as u32;
+            if default_icon_index == u32::MAX && icon.purpose == icon_purpose::APPLICATION {
+                default_icon_index = index;
+            }
+            let mut payload = vec![0u8; ICON_HEADER_SIZE];
+            put_u16(&mut payload, 0, icon.width);
+            put_u16(&mut payload, 2, icon.height);
+            put_u16(&mut payload, 4, icon.scale_percent);
+            put_u16(&mut payload, 6, icon.format);
+            put_u16(&mut payload, 8, icon.theme);
+            put_u16(&mut payload, 10, icon.purpose);
+            put_u64(&mut payload, 16, icon.bytes.len() as u64);
+            payload.extend_from_slice(&icon.bytes);
+            let label = format!("icon-{}x{}-{}", icon.width, icon.height, icon.scale_percent);
+            let (name_offset, name_length) = add_string(strings, &label)?;
+            let mut record = OutputRecord::metadata(record_kind::ICON, architecture::ANY);
+            record.alignment = 8;
+            record.file_size = payload.len() as u64;
+            record.memory_size = record.file_size;
+            record.name_offset = name_offset;
+            record.name_length = name_length;
+            record.payload = payload;
+            records.push(record);
+        }
+        for resource in &manifest.resources {
+            let (name_offset, name_length) = add_string(strings, &resource.logical_name)?;
+            let (content_type_offset, content_type_length) =
+                add_string(strings, &resource.content_type)?;
+            let mut payload = vec![0u8; RESOURCE_HEADER_SIZE];
+            put_u32(&mut payload, 0, content_type_offset);
+            put_u16(&mut payload, 4, content_type_length);
+            put_u16(&mut payload, 6, resource_encoding::RAW);
+            put_u64(&mut payload, 8, resource.bytes.len() as u64);
+            put_u64(&mut payload, 16, resource.bytes.len() as u64);
+            payload.extend_from_slice(&resource.bytes);
+            let mut record = OutputRecord::metadata(record_kind::RESOURCE, architecture::ANY);
+            record.alignment = 8;
+            record.file_size = payload.len() as u64;
+            record.memory_size = record.file_size;
+            record.name_offset = name_offset;
+            record.name_length = name_length;
+            record.payload = payload;
+            records.push(record);
+        }
+    }
+
+    let (kind, runtime_minimum, runtime_maximum, lifecycle, flags, version) = manifest
+        .map(|manifest| {
+            (
+                manifest.kind.wire_kind(),
+                manifest.runtime_abi_minimum,
+                manifest.runtime_abi_maximum,
+                manifest
+                    .lifecycle
+                    .unwrap_or_else(|| manifest.kind.default_lifecycle()),
+                manifest.flags,
+                manifest.version,
+            )
+        })
+        .unwrap_or((
+            artifact_kind_from_flags(artifact_flags),
+            1,
+            1,
+            lifecycle::MULTI_INSTANCE,
+            0,
+            (0, 1, 0),
+        ));
+    let mut payload = vec![0u8; MANIFEST_SIZE];
+    put_u16(&mut payload, 0, 1);
+    put_u16(&mut payload, 2, kind);
+    put_u32(&mut payload, 4, flags);
+    put_u16(&mut payload, 8, runtime_minimum);
+    put_u16(&mut payload, 10, runtime_maximum);
+    put_u16(&mut payload, 12, lifecycle);
+    put_u32(&mut payload, 16, version.0);
+    put_u32(&mut payload, 20, version.1);
+    put_u32(&mut payload, 24, version.2);
+    put_u32(&mut payload, 28, metadata_index);
+    put_u32(&mut payload, 32, default_icon_index);
+    let index = records.len() as u32;
+    let (name_offset, name_length) = add_string(strings, "manifest")?;
+    let mut record = OutputRecord::metadata(record_kind::MANIFEST, architecture::ANY);
+    record.flags = record_flags::REQUIRED;
+    record.alignment = 8;
+    record.file_size = MANIFEST_SIZE as u64;
+    record.memory_size = MANIFEST_SIZE as u64;
+    record.name_offset = name_offset;
+    record.name_length = name_length;
+    record.payload = payload;
+    records.push(record);
+    Ok(index)
+}
+
+fn artifact_kind_from_flags(flags: u32) -> u16 {
+    if flags & file_flags::LIBRARY != 0 {
+        artifact_kind::LIBRARY
+    } else if flags & file_flags::SERVICE != 0 {
+        artifact_kind::SERVICE
+    } else if flags & file_flags::DRIVER != 0 {
+        artifact_kind::DRIVER
+    } else {
+        artifact_kind::APPLICATION
+    }
 }
 
 fn dynamic_symbols(elf: &[u8]) -> Result<Vec<ElfSymbol<'_>>, String> {
@@ -1039,6 +1816,7 @@ fn normalize_relocation(
 fn encode(
     mut records: Vec<OutputRecord>,
     strings_index: u32,
+    manifest_index: u32,
     package_name: &str,
     artifact_flags: u32,
 ) -> Result<Vec<u8>, String> {
@@ -1071,7 +1849,7 @@ fn encode(
     put_u32(&mut output, 32, records.len() as u32);
     put_u32(&mut output, 36, TOC_ENTRY_SIZE as u32);
     put_u32(&mut output, 40, strings_index);
-    put_u32(&mut output, 44, u32::MAX);
+    put_u32(&mut output, 44, manifest_index);
     let package_digest = sha256_with_zeroed_range(package_name.as_bytes(), 0..0);
     output[48..64].copy_from_slice(&package_digest[..16]);
 
@@ -1214,5 +1992,39 @@ mod tests {
         assert_eq!(read_u64(&8u64.to_le_bytes(), 0).unwrap(), 8);
         assert!(read_u64(&[0; 7], 0).is_err());
         assert!(read_u32(&[0; 8], usize::MAX).is_err());
+    }
+
+    #[test]
+    fn manifest_supports_utf8_metadata_and_packaged_assets() {
+        let manifest = parse_manifest(
+            r#"
+                RUNE-ABI 1
+                package org.rustos.example
+                kind application
+                runtime-abi 1 3
+                version 2 4 6
+                lifecycle multi-instance
+                name default "File Explorer"
+                name ru-RU "Проводник файлов"
+                summary ru-RU "Открывает файлы # символ не комментарий"
+                capability optional org.rustos.vfs/1 1 0x3 4
+                icon 64 64 200 svg dark application assets/icon.svg
+                resource ui/main application/rui assets/main.rui
+            "#,
+        )
+        .unwrap();
+        assert_eq!(manifest.runtime_abi_maximum, 3);
+        assert_eq!(manifest.version, (2, 4, 6));
+        assert_eq!(manifest.metadata.len(), 3);
+        assert_eq!(manifest.metadata[1].value, "Проводник файлов");
+        assert_eq!(manifest.icons.len(), 1);
+        assert_eq!(manifest.resources[0].logical_name, "ui/main");
+        assert_eq!(manifest.capabilities[0].rights, 3);
+    }
+
+    #[test]
+    fn manifest_rejects_unterminated_quotes_and_parent_resource_path() {
+        assert!(manifest_fields("name ru-RU \"Проводник", 7).is_err());
+        assert!(validate_resource_name("../secret", 8).is_err());
     }
 }

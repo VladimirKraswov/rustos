@@ -78,9 +78,9 @@ for library in "$ARM_RUNE_LIB_DIR/"*.rune
 do
     cargo run -q -p rustos-rune -- verify "$library"
 done
-cargo run -q -p rustos-rune -- \
+cargo run -q -p rustos-rune -- pack-manifest \
     "$STD_TARGET_DIR/aarch64-unknown-rustos/debug/rustos-sdk-hello" \
-    "$ARM_RUNE_APP_DIR/hello.rune"
+    "$ARM_RUNE_APP_DIR/hello.rune" sdk/examples/hello/hello.rune-abi
 cargo run -q -p rustos-rune -- verify "$ARM_RUNE_APP_DIR/hello.rune"
 
 echo "[build-arm] 3/8 kernel (aarch64-unknown-rustos, build-std=core)"

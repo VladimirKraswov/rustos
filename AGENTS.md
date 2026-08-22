@@ -26,6 +26,11 @@
   Bootstrap-код в kernel допускается только как явно названный переходный слой.
 - Обычное приложение не обращается к портам, MMIO, framebuffer, page tables или
   физическим кадрам. Оно использует typed API, DLL facade и capabilities.
+- Обычное приложение также не зависит напрямую от `rustos-abi`,
+  `rustos-runtime`, `rustos-surface-client`, `rustos-ui-gpu`, `rustos-virgl`,
+  `rustos-video` или внутренней Mesa platform layer. Публичная граница GUI —
+  только Window/SystemUI/Canvas/Graphics facade из SDK. Смена CPU/GPU backend
+  меняет системные providers, но не исходники и не RUNE-пакет приложения.
 - Межпроцессные и DLL-границы не экспортируют Rust ABI. Используй `extern "C"`,
   `#[repr(C)]`, целые фиксированной ширины, offsets/handles и явное владение.
 - Указатели одного процесса не передаются другому. Большие данные идут через

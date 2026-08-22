@@ -10,8 +10,9 @@ bootstrap CPU desktop к постоянно работающему GPU desktop. 
 Обычный интерактивный сеанс считается GPU-ускоренным только одновременно при
 выполнении всех условий:
 
-- desktop, chrome окон, SystemUI, terminal и Проводник публикуют собственные
-  `GraphicsBuffer`, а не рисуют в общий kernel framebuffer;
+- системные render providers публикуют отдельные `GraphicsBuffer` для desktop,
+  chrome окон и content каждого приложения; Terminal, Проводник и сторонние
+  программы при этом используют только публичный Window/SystemUI/Canvas API;
 - геометрия компонентов растеризуется GPU, текст берётся из glyph atlas,
   изображения и иконки — из texture atlas;
 - `compositord` смешивает client buffers непосредственно в один из трёх
@@ -37,15 +38,16 @@ CPU разрешено использовать для layout, формиров�
 ```text
 inputd ── input events ───────────────────────────────┐
                                                      v
-application ── SystemUI display list ──► librender.dll / renderd
-    │                                      │
-    │                                      ├─ GPU command batches
-    │                                      ├─ glyph/icon atlases
-    │                                      └─ per-window GraphicsBuffer[3]
-    │                                                   │
-    └─ surface commit + damage + acquire timeline ──────┤
-                                                        v
-                                                compositord
+application ──► window.dll / system-ui.dll / graphics.dll
+    │              │ typed state, events, UI IR, Canvas/OpenGL calls
+    │              v
+    │        windowd / uid / renderd
+    │              ├─ выбранный системой GPU или software backend
+    │              ├─ glyph/icon atlases и GPU command batches
+    │              └─ per-window GraphicsBuffer[3]
+    │                              │ internal surface protocol
+    │                              v
+    └──────────────────────► compositord
                                       z-order / clip / transform / occlusion
                                                         │
                                       scanout GraphicsBuffer[3] + timeline
@@ -63,16 +65,23 @@ atlas и fallback policy не входят в TCB.
 
 ## Единый renderer API
 
-`rustos-system-ui` продолжает формировать renderer-neutral display list.
+`rustos-system-ui` продолжает формировать renderer-neutral display list внутри
+системного UI runtime. Это не публичный формат приложения и не часть SDK.
 Реализации backend имеют одинаковую семантику:
 
 - `GpuRenderBackend` — основной backend обычного сеанса;
 - `SoftwareRenderBackend` — fallback и эталон для pixel-diff тестов;
 - `HeadlessRenderBackend` — semantics/layout тесты без pixels.
 
-Приложение не выбирает VirGL, Venus, V3D или software renderer. Оно создаёт
-surface, получает metrics, строит display list и делает commit. Выбор device и
-восстановление принадлежат графическим сервисам.
+Приложение не создаёт surface, не получает `GraphicsBuffer` и не строит GPU
+display list. Оно создаёт `Window`, подключает дерево компонентов либо
+инициализирует `Canvas2D`/`Canvas3D` в части окна. System UI runtime сам строит
+display list, выбирает backend, владеет buffer queue и делает commit. Выбор
+VirGL/Venus/V3D/software и восстановление принадлежат графическим сервисам.
+
+`Canvas3D` позволяет выбрать программный стандарт (`OpenGL`, `OpenGL ES`, в
+будущем Vulkan), но не устройство и не способ исполнения. Один и тот же RUNE
+binary получает аппаратную Mesa при доступном GPU и software Mesa при fallback.
 
 ## Формат GPU-кадра SystemUI
 
@@ -132,13 +141,15 @@ acquire point. Resize создаёт новую generation очереди; ст�
 Готовность: библиотека компонентов рисуется GPU backend и совпадает с
 эталонным software screenshot в установленном допуске.
 
-### G3. Настоящие оконные surfaces
+### G3. Внутренние оконные surfaces
 
 - `surface_create/commit/destroy`, generation и release feedback в
   `compositord`;
 - отдельный triple-buffer queue каждого окна;
 - resize без растягивания старого bitmap и close без сохранения процесса;
-- shared read-only страницы библиотек не заменяют владение pixels.
+- shared read-only страницы библиотек не заменяют владение pixels;
+- surface API остаётся внутренним контрактом `uid/renderd/compositord` и не
+  появляется в обычном application SDK.
 
 Готовность: восемь независимых окон непрерывно обновляются; падение одного
 клиента освобождает только его buffers.
@@ -153,19 +164,21 @@ acquire point. Resize создаёт новую generation очереди; ст�
 Готовность: drag неизменившегося окна публикует transform-only frame,
 `readback=0`, CPU pixel counter не растёт.
 
-### G5. Миграция программ
+### G5. Переключение системных providers без миграции приложений
 
-Порядок выбран так, чтобы каждый шаг оставлял рабочую систему:
+Меняется реализация под публичным API, а не код Terminal/Проводника:
 
-1. desktop/chrome/start/taskbar;
-2. библиотека компонентов;
-3. terminal;
-4. Проводник;
-5. параметры рабочего стола;
-6. Aurora 3D и последующие приложения.
+1. `windowd` переносит decorations, desktop, Start и taskbar из bootstrap;
+2. `uid` начинает исполнять тот же component tree через GPU backend;
+3. `graphics.dll` связывает Canvas2D/Canvas3D с renderd и Mesa;
+4. Terminal, Проводник и Settings запускаются без изменения UI-кода;
+5. тот же application binary проверяется с GPU и принудительным software
+   backend;
+6. kernel GUI остаётся только recovery console, а обычная загрузка больше не
+   создаёт `DesktopSession` в kernel.
 
-После миграции kernel GUI остаётся только recovery console. Обычная загрузка
-не создаёт `DesktopSession` в kernel.
+Если смена renderer требует исправлять приложение, этап считается
+архитектурно проваленным.
 
 ### G6. Mesa и несколько GPU backend
 
@@ -220,6 +233,7 @@ Release-сборка на профиле UTM Apple Silicon должна держ
   renderer, поэтому критерий «полностью GPU-ускорен» пока честно не выполнен.
 
 Следующая точка переключения — multi-layer оконная композиция без readback и
-отправка `GpuUiInstance` batches в `renderd`. После миграции desktop/chrome
+внутренняя передача `GpuUiInstance` batches из `uid` в `renderd`. Публичный код
+приложений при этом не меняется. После переключения системных providers
 kernel GUI перестаёт стартовать в штатном сеансе и остаётся только аварийным
 fallback.

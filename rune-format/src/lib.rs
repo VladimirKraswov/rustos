@@ -20,6 +20,11 @@ pub const IMPORT_SIZE: usize = 48;
 pub const EXPORT_SIZE: usize = 56;
 pub const DEPENDENCY_SIZE: usize = 48;
 pub const CAPABILITY_REQUEST_SIZE: usize = 32;
+pub const MANIFEST_SIZE: usize = 64;
+pub const METADATA_ENTRY_SIZE: usize = 32;
+pub const ICON_HEADER_SIZE: usize = 32;
+pub const RESOURCE_HEADER_SIZE: usize = 24;
+pub const INTERFACE_SCHEMA_HEADER_SIZE: usize = 32;
 pub const PAGE_SIZE: u64 = 4096;
 
 /// Смещение hash-поля. При вычислении digest эти 32 байта считаются нулями.
@@ -47,6 +52,93 @@ pub mod record_kind {
     pub const STRINGS: u16 = 10;
     pub const DEBUG: u16 = 11;
     pub const SIGNATURE: u16 = 12;
+    /// Корневой типизированный manifest артефакта. Header ссылается на него
+    /// через `manifest_index`, поэтому launcher не ищет manifest по имени.
+    pub const MANIFEST: u16 = 13;
+    /// Локализованные и расширяемые пары metadata key/value.
+    pub const METADATA: u16 = 14;
+    /// Один вариант иконки. В container допустимо несколько размеров и тем.
+    pub const ICON: u16 = 15;
+    /// Именованный неизменяемый ресурс приложения.
+    pub const RESOURCE: u16 = 16;
+    /// Каноническая language-neutral схема публичного DLL/API интерфейса.
+    pub const INTERFACE_SCHEMA: u16 = 17;
+    /// Необязательные производные bindings/docs для конкретного SDK.
+    pub const SDK_BINDINGS: u16 = 18;
+}
+
+/// Общий флаг TOC record. Низкие биты принадлежат конкретному виду record,
+/// старший бит одинаково трактуется всеми версиями parser.
+pub mod record_flags {
+    /// Parser, который не знает такой `kind`, обязан отказать в загрузке.
+    pub const REQUIRED: u32 = 1 << 31;
+}
+
+pub mod artifact_kind {
+    pub const APPLICATION: u16 = 1;
+    pub const LIBRARY: u16 = 2;
+    pub const SERVICE: u16 = 3;
+    pub const DRIVER: u16 = 4;
+}
+
+pub mod lifecycle {
+    /// Каждый запуск создаёт новый независимый экземпляр приложения.
+    pub const MULTI_INSTANCE: u16 = 1;
+    /// Supervisor активирует уже работающий экземпляр вместо второго запуска.
+    pub const SINGLE_INSTANCE: u16 = 2;
+    pub const MANAGED_SERVICE: u16 = 3;
+    pub const MANAGED_DRIVER: u16 = 4;
+    /// Библиотека не имеет самостоятельного процесса.
+    pub const IN_PROCESS_LIBRARY: u16 = 5;
+}
+
+pub mod manifest_flags {
+    /// Приложение может продолжить работу без окон после закрытия последнего.
+    pub const BACKGROUND_ALLOWED: u32 = 1 << 0;
+    /// Supervisor может перезапустить экземпляр после fault.
+    pub const RESTARTABLE: u32 = 1 << 1;
+}
+
+pub mod metadata_key {
+    pub const DISPLAY_NAME: u16 = 1;
+    pub const SUMMARY: u16 = 2;
+    pub const VENDOR: u16 = 3;
+    pub const CATEGORY: u16 = 4;
+    pub const HOMEPAGE: u16 = 5;
+    /// Расширение с UTF-8 именем key в самой записи.
+    pub const CUSTOM: u16 = u16::MAX;
+}
+
+pub mod metadata_flags {
+    /// Пустой locale означает fallback, непустой — BCP 47 language tag.
+    pub const LOCALIZED: u32 = 1 << 0;
+}
+
+pub mod icon_format {
+    /// Premultiplied RGBA, строки плотно упакованы сверху вниз.
+    pub const RGBA8_PREMULTIPLIED: u16 = 1;
+    pub const PNG: u16 = 2;
+    pub const SVG_UTF8: u16 = 3;
+}
+
+pub mod icon_theme {
+    pub const ANY: u16 = 0;
+    pub const LIGHT: u16 = 1;
+    pub const DARK: u16 = 2;
+    pub const HIGH_CONTRAST: u16 = 3;
+}
+
+pub mod icon_purpose {
+    pub const APPLICATION: u16 = 1;
+    pub const SMALL_BADGE: u16 = 2;
+    pub const DOCUMENT: u16 = 3;
+}
+
+pub mod resource_encoding {
+    pub const RAW: u16 = 0;
+    /// Зарезервировано для потокового zstd decoder; до его появления packer
+    /// не должен создавать такие records.
+    pub const ZSTD: u16 = 1;
 }
 
 pub mod architecture {
@@ -159,6 +251,67 @@ pub struct CapabilityRequest {
     pub flags: u32,
 }
 
+/// Корневое описание запуска. Большие и расширяемые данные вынесены в
+/// отдельные records, чтобы fixed header RUNE и trusted parser оставались
+/// маленькими.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Manifest {
+    pub schema_version: u16,
+    pub artifact_kind: u16,
+    pub flags: u32,
+    pub runtime_abi_minimum: u16,
+    pub runtime_abi_maximum: u16,
+    pub lifecycle: u16,
+    pub version_major: u32,
+    pub version_minor: u32,
+    pub version_patch: u32,
+    pub metadata_index: u32,
+    pub default_icon_index: u32,
+}
+
+/// Metadata хранит строки в общей UTF-8 table. Известные keys компактны, а
+/// `CUSTOM` позволяет добавить новое поле без изменения wire layout.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MetadataEntry {
+    pub key: u16,
+    pub flags: u32,
+    pub locale_offset: u32,
+    pub locale_length: u16,
+    pub name_offset: u32,
+    pub name_length: u16,
+    pub value_offset: u32,
+    pub value_length: u16,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct IconHeader {
+    pub width: u16,
+    pub height: u16,
+    /// Масштаб в процентах: 100, 125, 150, 200 и так далее.
+    pub scale_percent: u16,
+    pub format: u16,
+    pub theme: u16,
+    pub purpose: u16,
+    pub data_size: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ResourceHeader {
+    pub content_type_offset: u32,
+    pub content_type_length: u16,
+    pub encoding: u16,
+    pub uncompressed_size: u64,
+    pub data_size: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InterfaceSchemaHeader {
+    pub interface: InterfaceId,
+    pub schema_version: u16,
+    pub abi_version: u16,
+    pub source_size: u32,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FormatError {
     Truncated,
@@ -169,6 +322,7 @@ pub enum FormatError {
     InvalidRecord,
     InvalidHash,
     MissingSlice,
+    UnsupportedRequiredRecord,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -240,6 +394,15 @@ impl<'a> Container<'a> {
         {
             return Err(FormatError::InvalidTable);
         }
+        if header.manifest_index != u32::MAX
+            && container
+                .entry(header.manifest_index as usize)
+                .map(|entry| entry.kind)
+                != Some(record_kind::MANIFEST)
+        {
+            return Err(FormatError::InvalidTable);
+        }
+        validate_semantic_records(&container)?;
         if sha256_with_zeroed_range(bytes, CONTENT_HASH_OFFSET..CONTENT_HASH_OFFSET + 32)
             != header.content_hash
         {
@@ -297,6 +460,15 @@ impl<'a> Container<'a> {
         self.entries()
             .find(|entry| entry.kind == record_kind::SLICE && entry.architecture == architecture)
             .ok_or(FormatError::MissingSlice)
+    }
+
+    /// Возвращает корневой manifest либо `None` для раннего bootstrap container.
+    pub fn manifest(&self) -> Option<Manifest> {
+        let entry = self.entry(self.header.manifest_index as usize)?;
+        if entry.kind != record_kind::MANIFEST {
+            return None;
+        }
+        parse_manifest(self.payload(entry)?)
     }
 }
 
@@ -368,6 +540,71 @@ pub fn parse_capability_request(bytes: &[u8]) -> Option<CapabilityRequest> {
         abi_version: read_u16(bytes, 24)?,
         slot_hint: read_u16(bytes, 26)?,
         flags: read_u32(bytes, 28)?,
+    })
+}
+
+pub fn parse_manifest(bytes: &[u8]) -> Option<Manifest> {
+    let bytes = bytes.get(..MANIFEST_SIZE)?;
+    Some(Manifest {
+        schema_version: read_u16(bytes, 0)?,
+        artifact_kind: read_u16(bytes, 2)?,
+        flags: read_u32(bytes, 4)?,
+        runtime_abi_minimum: read_u16(bytes, 8)?,
+        runtime_abi_maximum: read_u16(bytes, 10)?,
+        lifecycle: read_u16(bytes, 12)?,
+        version_major: read_u32(bytes, 16)?,
+        version_minor: read_u32(bytes, 20)?,
+        version_patch: read_u32(bytes, 24)?,
+        metadata_index: read_u32(bytes, 28)?,
+        default_icon_index: read_u32(bytes, 32)?,
+    })
+}
+
+pub fn parse_metadata_entry(bytes: &[u8]) -> Option<MetadataEntry> {
+    let bytes = bytes.get(..METADATA_ENTRY_SIZE)?;
+    Some(MetadataEntry {
+        key: read_u16(bytes, 0)?,
+        flags: read_u32(bytes, 4)?,
+        locale_offset: read_u32(bytes, 8)?,
+        locale_length: read_u16(bytes, 12)?,
+        name_offset: read_u32(bytes, 16)?,
+        name_length: read_u16(bytes, 20)?,
+        value_offset: read_u32(bytes, 24)?,
+        value_length: read_u16(bytes, 28)?,
+    })
+}
+
+pub fn parse_icon_header(bytes: &[u8]) -> Option<IconHeader> {
+    let bytes = bytes.get(..ICON_HEADER_SIZE)?;
+    Some(IconHeader {
+        width: read_u16(bytes, 0)?,
+        height: read_u16(bytes, 2)?,
+        scale_percent: read_u16(bytes, 4)?,
+        format: read_u16(bytes, 6)?,
+        theme: read_u16(bytes, 8)?,
+        purpose: read_u16(bytes, 10)?,
+        data_size: read_u64(bytes, 16)?,
+    })
+}
+
+pub fn parse_resource_header(bytes: &[u8]) -> Option<ResourceHeader> {
+    let bytes = bytes.get(..RESOURCE_HEADER_SIZE)?;
+    Some(ResourceHeader {
+        content_type_offset: read_u32(bytes, 0)?,
+        content_type_length: read_u16(bytes, 4)?,
+        encoding: read_u16(bytes, 6)?,
+        uncompressed_size: read_u64(bytes, 8)?,
+        data_size: read_u64(bytes, 16)?,
+    })
+}
+
+pub fn parse_interface_schema_header(bytes: &[u8]) -> Option<InterfaceSchemaHeader> {
+    let bytes = bytes.get(..INTERFACE_SCHEMA_HEADER_SIZE)?;
+    Some(InterfaceSchemaHeader {
+        interface: InterfaceId(read_array(bytes, 0)?),
+        schema_version: read_u16(bytes, 16)?,
+        abi_version: read_u16(bytes, 18)?,
+        source_size: read_u32(bytes, 20)?,
     })
 }
 
@@ -469,6 +706,278 @@ fn validate_entry(file_len: usize, entry: TocEntry) -> Result<(), FormatError> {
         || checked_range(file_len, entry.offset, entry.file_size).is_none()
         || entry.file_size > entry.memory_size
         || entry.flags & region_flags::WRITE != 0 && entry.flags & region_flags::EXECUTE != 0
+    {
+        return Err(FormatError::InvalidRecord);
+    }
+    if !known_record_kind(entry.kind) && entry.flags & record_flags::REQUIRED != 0 {
+        return Err(FormatError::UnsupportedRequiredRecord);
+    }
+    Ok(())
+}
+
+const fn known_record_kind(kind: u16) -> bool {
+    matches!(
+        kind,
+        record_kind::SLICE
+            | record_kind::REGION
+            | record_kind::RELOCATIONS
+            | record_kind::IMPORTS
+            | record_kind::EXPORTS
+            | record_kind::DEPENDENCIES
+            | record_kind::TLS
+            | record_kind::RELRO
+            | record_kind::CAPABILITIES
+            | record_kind::STRINGS
+            | record_kind::DEBUG
+            | record_kind::SIGNATURE
+            | record_kind::MANIFEST
+            | record_kind::METADATA
+            | record_kind::ICON
+            | record_kind::RESOURCE
+            | record_kind::INTERFACE_SCHEMA
+            | record_kind::SDK_BINDINGS
+    )
+}
+
+fn validate_semantic_records(container: &Container<'_>) -> Result<(), FormatError> {
+    let mut manifest_count = 0usize;
+    for entry in container.entries() {
+        if entry.name_length != 0 && container.name(entry).is_none() {
+            return Err(FormatError::InvalidRecord);
+        }
+        let payload = container.payload(entry).ok_or(FormatError::InvalidRecord)?;
+        match entry.kind {
+            record_kind::MANIFEST => {
+                manifest_count += 1;
+                validate_manifest_record(container, entry, payload)?;
+            }
+            record_kind::METADATA => validate_metadata_record(container, payload)?,
+            record_kind::CAPABILITIES => validate_capability_record(payload)?,
+            record_kind::ICON => validate_icon_record(payload)?,
+            record_kind::RESOURCE => validate_resource_record(container, entry, payload)?,
+            record_kind::INTERFACE_SCHEMA => validate_interface_schema_record(payload)?,
+            _ => {}
+        }
+    }
+    if manifest_count != usize::from(container.header.manifest_index != u32::MAX) {
+        return Err(FormatError::InvalidRecord);
+    }
+    Ok(())
+}
+
+fn validate_capability_record(payload: &[u8]) -> Result<(), FormatError> {
+    let (requests, remainder) = payload.as_chunks::<CAPABILITY_REQUEST_SIZE>();
+    if !remainder.is_empty() {
+        return Err(FormatError::InvalidRecord);
+    }
+    for bytes in requests {
+        let request = parse_capability_request(bytes).ok_or(FormatError::InvalidRecord)?;
+        let availability =
+            request.flags & (capability_flags::REQUIRED | capability_flags::OPTIONAL);
+        if request.abi_version == 0
+            || request.slot_hint == 0
+            || !matches!(
+                availability,
+                capability_flags::REQUIRED | capability_flags::OPTIONAL
+            )
+            || request.flags
+                & !(capability_flags::REQUIRED
+                    | capability_flags::OPTIONAL
+                    | capability_flags::MULTIPLE)
+                != 0
+        {
+            return Err(FormatError::InvalidRecord);
+        }
+    }
+    Ok(())
+}
+
+fn validate_manifest_record(
+    container: &Container<'_>,
+    entry: TocEntry,
+    payload: &[u8],
+) -> Result<(), FormatError> {
+    if entry.architecture != architecture::ANY
+        || payload.len() != MANIFEST_SIZE
+        || payload[14..16].iter().any(|byte| *byte != 0)
+        || payload[36..64].iter().any(|byte| *byte != 0)
+    {
+        return Err(FormatError::InvalidRecord);
+    }
+    let manifest = parse_manifest(payload).ok_or(FormatError::InvalidRecord)?;
+    let expected_file_flag = match manifest.artifact_kind {
+        artifact_kind::APPLICATION => file_flags::APPLICATION,
+        artifact_kind::LIBRARY => file_flags::LIBRARY,
+        artifact_kind::SERVICE => file_flags::SERVICE,
+        artifact_kind::DRIVER => file_flags::DRIVER,
+        _ => 0,
+    };
+    let expected_lifecycle = match manifest.artifact_kind {
+        artifact_kind::APPLICATION => matches!(
+            manifest.lifecycle,
+            lifecycle::MULTI_INSTANCE | lifecycle::SINGLE_INSTANCE
+        ),
+        artifact_kind::LIBRARY => manifest.lifecycle == lifecycle::IN_PROCESS_LIBRARY,
+        artifact_kind::SERVICE => manifest.lifecycle == lifecycle::MANAGED_SERVICE,
+        artifact_kind::DRIVER => manifest.lifecycle == lifecycle::MANAGED_DRIVER,
+        _ => false,
+    };
+    let role_flags = container.header.flags
+        & (file_flags::APPLICATION
+            | file_flags::LIBRARY
+            | file_flags::SERVICE
+            | file_flags::DRIVER);
+    if manifest.schema_version != 1
+        || !(artifact_kind::APPLICATION..=artifact_kind::DRIVER).contains(&manifest.artifact_kind)
+        || role_flags != expected_file_flag
+        || !expected_lifecycle
+        || manifest.flags & !(manifest_flags::BACKGROUND_ALLOWED | manifest_flags::RESTARTABLE) != 0
+        || manifest.runtime_abi_minimum == 0
+        || manifest.runtime_abi_minimum > manifest.runtime_abi_maximum
+        || !matches!(
+            manifest.lifecycle,
+            lifecycle::MULTI_INSTANCE
+                | lifecycle::SINGLE_INSTANCE
+                | lifecycle::MANAGED_SERVICE
+                | lifecycle::MANAGED_DRIVER
+                | lifecycle::IN_PROCESS_LIBRARY
+        )
+    {
+        return Err(FormatError::InvalidRecord);
+    }
+    if manifest.metadata_index != u32::MAX
+        && container
+            .entry(manifest.metadata_index as usize)
+            .map(|record| record.kind)
+            != Some(record_kind::METADATA)
+    {
+        return Err(FormatError::InvalidRecord);
+    }
+    if manifest.default_icon_index != u32::MAX
+        && container
+            .entry(manifest.default_icon_index as usize)
+            .map(|record| record.kind)
+            != Some(record_kind::ICON)
+    {
+        return Err(FormatError::InvalidRecord);
+    }
+    Ok(())
+}
+
+fn validate_metadata_record(container: &Container<'_>, payload: &[u8]) -> Result<(), FormatError> {
+    let (entries, remainder) = payload.as_chunks::<METADATA_ENTRY_SIZE>();
+    if !remainder.is_empty() {
+        return Err(FormatError::InvalidRecord);
+    }
+    for bytes in entries {
+        if read_u16(bytes, 2) != Some(0)
+            || read_u16(bytes, 14) != Some(0)
+            || read_u16(bytes, 22) != Some(0)
+            || read_u16(bytes, 30) != Some(0)
+        {
+            return Err(FormatError::InvalidRecord);
+        }
+        let metadata = parse_metadata_entry(bytes).ok_or(FormatError::InvalidRecord)?;
+        if container
+            .string(metadata.locale_offset, metadata.locale_length)
+            .is_none()
+            || container
+                .string(metadata.name_offset, metadata.name_length)
+                .is_none()
+            || container
+                .string(metadata.value_offset, metadata.value_length)
+                .is_none()
+            || metadata.key == metadata_key::CUSTOM && metadata.name_length == 0
+            || metadata.flags & !metadata_flags::LOCALIZED != 0
+            || metadata.locale_length == 0 && metadata.flags & metadata_flags::LOCALIZED != 0
+            || metadata.locale_length != 0 && metadata.flags & metadata_flags::LOCALIZED == 0
+        {
+            return Err(FormatError::InvalidRecord);
+        }
+    }
+    Ok(())
+}
+
+fn validate_icon_record(payload: &[u8]) -> Result<(), FormatError> {
+    if payload.len() < ICON_HEADER_SIZE || payload[12..16].iter().any(|byte| *byte != 0) {
+        return Err(FormatError::InvalidRecord);
+    }
+    let icon = parse_icon_header(payload).ok_or(FormatError::InvalidRecord)?;
+    let expected = ICON_HEADER_SIZE
+        .checked_add(usize::try_from(icon.data_size).map_err(|_| FormatError::InvalidRecord)?)
+        .ok_or(FormatError::InvalidRecord)?;
+    if icon.width == 0
+        || icon.height == 0
+        || icon.scale_percent == 0
+        || expected != payload.len()
+        || !matches!(
+            icon.format,
+            icon_format::RGBA8_PREMULTIPLIED | icon_format::PNG | icon_format::SVG_UTF8
+        )
+        || !matches!(
+            icon.theme,
+            icon_theme::ANY | icon_theme::LIGHT | icon_theme::DARK | icon_theme::HIGH_CONTRAST
+        )
+        || !matches!(
+            icon.purpose,
+            icon_purpose::APPLICATION | icon_purpose::SMALL_BADGE | icon_purpose::DOCUMENT
+        )
+    {
+        return Err(FormatError::InvalidRecord);
+    }
+    if icon.format == icon_format::RGBA8_PREMULTIPLIED {
+        let expected_rgba = usize::from(icon.width)
+            .checked_mul(usize::from(icon.height))
+            .and_then(|pixels| pixels.checked_mul(4))
+            .ok_or(FormatError::InvalidRecord)?;
+        if expected_rgba as u64 != icon.data_size {
+            return Err(FormatError::InvalidRecord);
+        }
+    }
+    Ok(())
+}
+
+fn validate_resource_record(
+    container: &Container<'_>,
+    entry: TocEntry,
+    payload: &[u8],
+) -> Result<(), FormatError> {
+    if payload.len() < RESOURCE_HEADER_SIZE || entry.name_length == 0 {
+        return Err(FormatError::InvalidRecord);
+    }
+    let resource = parse_resource_header(payload).ok_or(FormatError::InvalidRecord)?;
+    let expected = RESOURCE_HEADER_SIZE
+        .checked_add(usize::try_from(resource.data_size).map_err(|_| FormatError::InvalidRecord)?)
+        .ok_or(FormatError::InvalidRecord)?;
+    if expected != payload.len()
+        || container
+            .string(resource.content_type_offset, resource.content_type_length)
+            .is_none()
+        || !matches!(
+            resource.encoding,
+            resource_encoding::RAW | resource_encoding::ZSTD
+        )
+        || resource.encoding == resource_encoding::RAW
+            && resource.uncompressed_size != resource.data_size
+    {
+        return Err(FormatError::InvalidRecord);
+    }
+    Ok(())
+}
+
+fn validate_interface_schema_record(payload: &[u8]) -> Result<(), FormatError> {
+    if payload.len() < INTERFACE_SCHEMA_HEADER_SIZE || payload[24..32].iter().any(|byte| *byte != 0)
+    {
+        return Err(FormatError::InvalidRecord);
+    }
+    let schema = parse_interface_schema_header(payload).ok_or(FormatError::InvalidRecord)?;
+    let expected = INTERFACE_SCHEMA_HEADER_SIZE
+        .checked_add(usize::try_from(schema.source_size).map_err(|_| FormatError::InvalidRecord)?)
+        .ok_or(FormatError::InvalidRecord)?;
+    if schema.schema_version != 1
+        || schema.abi_version == 0
+        || expected != payload.len()
+        || core::str::from_utf8(&payload[INTERFACE_SCHEMA_HEADER_SIZE..]).is_err()
     {
         return Err(FormatError::InvalidRecord);
     }
@@ -621,6 +1130,83 @@ impl Sha256 {
 mod tests {
     use super::*;
 
+    fn put_u16(bytes: &mut [u8], offset: usize, value: u16) {
+        bytes[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn put_u32(bytes: &mut [u8], offset: usize, value: u32) {
+        bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn put_u64(bytes: &mut [u8], offset: usize, value: u64) {
+        bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn manifest_fixture() -> [u8; 404] {
+        const RECORDS: usize = 3;
+        const MANIFEST_OFFSET: usize = HEADER_SIZE + RECORDS * TOC_ENTRY_SIZE;
+        const STRINGS_OFFSET: usize = MANIFEST_OFFSET + MANIFEST_SIZE;
+        const STRINGS: &[u8] = b"hellomanifeststrings";
+        let mut bytes = [0u8; STRINGS_OFFSET + STRINGS.len()];
+        bytes[..8].copy_from_slice(&MAGIC);
+        put_u16(&mut bytes, 8, FORMAT_VERSION);
+        put_u16(&mut bytes, 10, HEADER_SIZE as u16);
+        put_u32(&mut bytes, 12, file_flags::APPLICATION);
+        let file_len = bytes.len() as u64;
+        put_u64(&mut bytes, 16, file_len);
+        put_u64(&mut bytes, 24, HEADER_SIZE as u64);
+        put_u32(&mut bytes, 32, RECORDS as u32);
+        put_u32(&mut bytes, 36, TOC_ENTRY_SIZE as u32);
+        put_u32(&mut bytes, 40, 2);
+        put_u32(&mut bytes, 44, 1);
+
+        let slice = HEADER_SIZE;
+        put_u16(&mut bytes, slice, record_kind::SLICE);
+        put_u16(&mut bytes, slice + 2, architecture::X86_64);
+        put_u32(&mut bytes, slice + 4, file_flags::APPLICATION);
+        put_u64(&mut bytes, slice + 40, PAGE_SIZE);
+        put_u16(&mut bytes, slice + 52, 5);
+        put_u16(&mut bytes, slice + 54, 1);
+
+        let manifest_record = HEADER_SIZE + TOC_ENTRY_SIZE;
+        put_u16(&mut bytes, manifest_record, record_kind::MANIFEST);
+        put_u32(&mut bytes, manifest_record + 4, record_flags::REQUIRED);
+        put_u64(&mut bytes, manifest_record + 8, MANIFEST_OFFSET as u64);
+        put_u64(&mut bytes, manifest_record + 16, MANIFEST_SIZE as u64);
+        put_u64(&mut bytes, manifest_record + 32, MANIFEST_SIZE as u64);
+        put_u64(&mut bytes, manifest_record + 40, 8);
+        put_u32(&mut bytes, manifest_record + 48, 5);
+        put_u16(&mut bytes, manifest_record + 52, 8);
+        put_u16(&mut bytes, manifest_record + 54, 1);
+
+        let strings_record = HEADER_SIZE + 2 * TOC_ENTRY_SIZE;
+        put_u16(&mut bytes, strings_record, record_kind::STRINGS);
+        put_u64(&mut bytes, strings_record + 8, STRINGS_OFFSET as u64);
+        put_u64(&mut bytes, strings_record + 16, STRINGS.len() as u64);
+        put_u64(&mut bytes, strings_record + 32, STRINGS.len() as u64);
+        put_u64(&mut bytes, strings_record + 40, 1);
+        put_u32(&mut bytes, strings_record + 48, 13);
+        put_u16(&mut bytes, strings_record + 52, 7);
+        put_u16(&mut bytes, strings_record + 54, 1);
+
+        put_u16(&mut bytes, MANIFEST_OFFSET, 1);
+        put_u16(&mut bytes, MANIFEST_OFFSET + 2, artifact_kind::APPLICATION);
+        put_u16(&mut bytes, MANIFEST_OFFSET + 8, 1);
+        put_u16(&mut bytes, MANIFEST_OFFSET + 10, 1);
+        put_u16(&mut bytes, MANIFEST_OFFSET + 12, lifecycle::MULTI_INSTANCE);
+        put_u32(&mut bytes, MANIFEST_OFFSET + 20, 1);
+        put_u32(&mut bytes, MANIFEST_OFFSET + 28, u32::MAX);
+        put_u32(&mut bytes, MANIFEST_OFFSET + 32, u32::MAX);
+        bytes[STRINGS_OFFSET..].copy_from_slice(STRINGS);
+        let digest = sha256_with_zeroed_range(
+            &bytes,
+            CONTENT_HASH_OFFSET..CONTENT_HASH_OFFSET + CONTENT_HASH_SIZE,
+        );
+        bytes[CONTENT_HASH_OFFSET..CONTENT_HASH_OFFSET + CONTENT_HASH_SIZE]
+            .copy_from_slice(&digest);
+        bytes
+    }
+
     #[test]
     fn sha256_known_vector() {
         let digest = sha256_with_zeroed_range(b"abc", 3..3);
@@ -645,5 +1231,44 @@ mod tests {
             symbol_id(vfs, "read(u64,*mut u8,u64)->i64"),
             symbol_id(vfs, "write(u64,*const u8,u64)->i64")
         );
+    }
+
+    #[test]
+    fn parses_typed_manifest_and_rejects_bad_cross_reference() {
+        let bytes = manifest_fixture();
+        let container = Container::parse(&bytes).unwrap();
+        let manifest = container.manifest().unwrap();
+        assert_eq!(manifest.artifact_kind, artifact_kind::APPLICATION);
+        assert_eq!(manifest.lifecycle, lifecycle::MULTI_INSTANCE);
+
+        let mut invalid = bytes;
+        put_u32(&mut invalid, HEADER_SIZE + 3 * TOC_ENTRY_SIZE + 28, 77);
+        let digest = sha256_with_zeroed_range(
+            &invalid,
+            CONTENT_HASH_OFFSET..CONTENT_HASH_OFFSET + CONTENT_HASH_SIZE,
+        );
+        invalid[CONTENT_HASH_OFFSET..CONTENT_HASH_OFFSET + CONTENT_HASH_SIZE]
+            .copy_from_slice(&digest);
+        assert!(matches!(
+            Container::parse(&invalid),
+            Err(FormatError::InvalidRecord)
+        ));
+    }
+
+    #[test]
+    fn rejects_unknown_required_record_before_execution() {
+        let mut bytes = manifest_fixture();
+        put_u16(&mut bytes, HEADER_SIZE, 0x7fff);
+        put_u32(&mut bytes, HEADER_SIZE + 4, record_flags::REQUIRED);
+        let digest = sha256_with_zeroed_range(
+            &bytes,
+            CONTENT_HASH_OFFSET..CONTENT_HASH_OFFSET + CONTENT_HASH_SIZE,
+        );
+        bytes[CONTENT_HASH_OFFSET..CONTENT_HASH_OFFSET + CONTENT_HASH_SIZE]
+            .copy_from_slice(&digest);
+        assert!(matches!(
+            Container::parse(&bytes),
+            Err(FormatError::UnsupportedRequiredRecord)
+        ));
     }
 }

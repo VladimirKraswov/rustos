@@ -5,6 +5,10 @@
 //! pixels: прямоугольники растрирует fragment shader, а text/image resource ID
 //! разрешает общий atlas renderd. Низкоуровневый VirGL/Vulkan transport живёт
 //! ниже и может меняться без изменения компонентов.
+//!
+//! Это внутренняя библиотека `uid/renderd`, не SDK приложения. Приложение
+//! передаёт UI IR и типизированное состояние через `system-ui.dll`; решение
+//! CPU/GPU и формат instances не пересекают публичную границу.
 
 #![no_std]
 #![warn(missing_docs)]

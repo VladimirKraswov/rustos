@@ -25,3 +25,24 @@ import add org.example.math/1 add(i64,i64)->i64 1 2 function
 ID, проверяет `.dynsym` ELF intermediate и не позволяет получить RUNE с
 необъявленным импортом. Это одновременно документация, проверка совместимости
 ABI и вход будущего генератора безопасных Rust/C wrappers.
+
+Для application/service тот же UTF-8 manifest может содержать package fields:
+
+```text
+runtime-abi 1 1
+version 1 0 0
+lifecycle multi-instance
+name default "Files"
+name ru-RU "Проводник"
+summary ru-RU "Просмотр файлов"
+vendor "RustOS Project"
+category system.files
+capability required org.rustos.vfs/1 1 0x3 4
+icon 64 64 100 svg any application assets/files.svg
+resource ui/main application/rui assets/main.rui
+```
+
+Последние поля `capability` — policy, service interface, ABI, rights mask и
+startup slot hint. Запрос не выдаёт право сам: supervisor может ослабить либо
+отклонить его. Пути icons/resources разрешаются относительно manifest,
+встраиваются в RUNE и проверяются общим container hash.

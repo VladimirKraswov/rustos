@@ -81,6 +81,11 @@ bootstrap через тот же broker; оконная multi-layer композ
 перехода всего desktop на GPU и порядок удаления bootstrap readback закреплены
 в [GPU_ACCELERATION.md](GPU_ACCELERATION.md).
 
+Долгоживущая граница RUNE application, DLL/RUIDL, capability namespace и
+системных Window/SystemUI/Graphics API описана в
+[APPLICATION_MODEL.md](APPLICATION_MODEL.md). Обычное приложение не зависит
+от renderer, surface transport и конкретного драйвера.
+
 MADT перечисляет CPU, BSP последовательно выполняет INIT–SIPI–SIPI. AP
 проходит 16 -> 32 -> 64 bit trampoline, получает отдельный stack, включает
 свой local APIC и публикует ID. Предпочтителен x2APIC/MSR, а старый TCG

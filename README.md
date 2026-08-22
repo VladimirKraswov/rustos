@@ -164,6 +164,7 @@ desktop ещё не переключены на этот путь. Нативн�
 [Mesa и Aurora 3D](docs/MESA.md),
 [USB и HID](docs/USB.md),
 [микроядро](docs/MICROKERNEL.md), [DLL](docs/DYNAMIC_LIBRARIES.md),
+[модель приложений и RUNE](docs/APPLICATION_MODEL.md),
 [IPC](docs/IPC.md), [процессы и память ABI](docs/PROCESS_MEMORY_ABI.md),
 [self-hosting Rust](docs/SELF_HOSTING.md),
 [сборка](docs/BUILDING.md).

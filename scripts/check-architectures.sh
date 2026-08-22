@@ -6,6 +6,8 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
+bash scripts/check-sdk-boundaries.sh
+
 violations=""
 while IFS= read -r source; do
     case "$source" in

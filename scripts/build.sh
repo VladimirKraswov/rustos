@@ -62,9 +62,9 @@ cargo run -q -p rustos-rune -- pack-manifest \
 for library in "$RUNE_LIB_DIR/"*.rune; do
     cargo run -q -p rustos-rune -- verify "$library"
 done
-cargo run -q -p rustos-rune -- \
+cargo run -q -p rustos-rune -- pack-manifest \
     "$STD_TARGET_DIR/x86_64-unknown-rustos/debug/rustos-sdk-hello" \
-    "$RUNE_APP_DIR/hello.rune"
+    "$RUNE_APP_DIR/hello.rune" sdk/examples/hello/hello.rune-abi
 cargo run -q -p rustos-rune -- verify "$RUNE_APP_DIR/hello.rune"
 
 echo "[build] 2/9 kernel (x86_64-unknown-rustos, build-std=core)"

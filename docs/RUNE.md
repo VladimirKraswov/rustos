@@ -97,8 +97,8 @@ SDK headers. Linux-specific `ioctl`, `/proc`, signals и fork semantics треб
 | 56 | 4 | link на связанный record |
 | 60 | 4 | reserved |
 
-Неизвестный optional record можно пропустить по размеру. Неизвестный record,
-помеченный будущим флагом `REQUIRED`, обязан давать отказ загрузки.
+Неизвестный optional record можно пропустить по размеру. Неизвестный record со
+старшим флагом `REQUIRED` даёт `UnsupportedRequiredRecord` до отображения кода.
 
 ## Records
 
@@ -115,11 +115,36 @@ SDK headers. Linux-specific `ioctl`, `/proc`, signals и fork semantics треб
 | `STRINGS` | UTF-8 diagnostic names |
 | `DEBUG` | отделяемая debug metadata |
 | `SIGNATURE` | подпись hash + package policy |
+| `MANIFEST` | корень запуска: роль, lifecycle, runtime ABI и semantic version |
+| `METADATA` | локализованные UTF-8 имя, описание, vendor и custom fields |
+| `ICON` | варианты иконки по размеру, scale, theme и purpose |
+| `RESOURCE` | встроенный immutable asset с logical name и content type |
+| `INTERFACE_SCHEMA` | канонический RUIDL-контракт публичной DLL |
+| `SDK_BINDINGS` | необязательные производные bindings/docs для SDK |
 
 `REGION` никогда не может быть одновременно writable и executable. Loader
 сначала создаёт private writable staging только там, где нужна relocation,
 затем устанавливает конечные права и RELRO. RX/RO страницы sealed library
 после этого допускают физическое разделение между процессами.
+
+Корневой `MANIFEST` required; header ссылается на него индексом, поэтому
+launcher не ищет manifest по имени. Fixed manifest остаётся маленьким, а
+metadata, icons и resources расширяются отдельными bounded records.
+
+## Приложение, metadata и resources
+
+RUNE application является полноценным запускаемым файлом, а не голым образом
+кода. Manifest содержит роль, lifecycle, runtime ABI range, semantic version и
+ссылки на metadata/default icon.
+
+`METADATA` использует общую UTF-8 string table и BCP 47 locale. `ICON` допускает
+RGBA8 premultiplied, PNG и UTF-8 SVG; несколько records позволяют shell выбрать
+размер и тему без запуска программы. `RESOURCE` имеет безопасное относительное
+logical name, content type, encoding и явный uncompressed size. Все payloads
+покрываются container hash.
+
+Пример manifest и полный контракт приложения находятся в
+[`APPLICATION_MODEL.md`](APPLICATION_MODEL.md).
 
 ## Динамические библиотеки и ABI
 
@@ -138,12 +163,16 @@ Rust ABI не экспортируется: между версиями compiler
 явное владение buffers/handles. Безопасный Rust crate остаётся тонкой
 обёрткой поверх этого ABI.
 
-В v1 зарезервированы фиксированные wire records:
+Формат использует фиксированные wire records:
 
 - `Import` — 48 байт: interface, symbol, ABI range, flags, diagnostic name;
 - `Export` — 56 байт: interface, symbol, RVA, ABI version, flags, name;
 - `Dependency` — 48 байт: interface, optional package ID, ABI range, policy;
 - `CapabilityRequest` — 32 байта: service interface, rights, ABI, slot hint.
+
+Packer сохраняет проверенный исходник ABI-схемы в `INTERFACE_SCHEMA`. Runtime
+loader не отображает его в executable memory; SDK извлекает схему, генерирует
+Rust/C facade и кэширует результат по hash schema/target ABI.
 
 Relocation ссылается на import по индексу. Resolver выбирает provider из
 подписанного package graph, проверяет ABI и тип symbol, eagerly применяет
@@ -189,6 +218,9 @@ cargo run -p rustos-rune -- verify output.rune
 
 # Читаемый список records
 cargo run -p rustos-rune -- inspect output.rune
+
+# Проверенная embedded interface schema DLL в stdout
+cargo run -p rustos-rune -- schema library.rune
 ```
 
 Build автоматически конвертирует все запускаемые system programs и кладёт в
@@ -204,6 +236,8 @@ initramfs только `.rune`. Kernel остаётся фиксированны
 - application/library regions, normalized relative/import/PC32/TLS relocations;
 - kernel dispatch по magic, W^X и frame cleanup;
 - manifest parser проверяет declared imports/exports против ELF `.dynsym`;
+- typed manifest, UTF-8 metadata, icon/resource и embedded interface-schema
+  records проверяются no-alloc parser'ом;
 - ring-3 resolver находит provider по interface ID/ABI range, применяет
   relocations, строит combined TLS, закрывает RELRO и разделяет sealed RX;
 - `rune-runner` читает application и dependency closure непосредственно из
