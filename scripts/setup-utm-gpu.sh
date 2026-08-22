@@ -92,10 +92,14 @@ on run argv
         set drives of c to {}
         set espArgument to "if=none,media=disk,format=raw,id=rustosesp,file=" & espPath
         set systemArgument to "if=none,media=disk,format=raw,id=rustossystem,file=" & systemPath
-        set qemu additional arguments of c to {{argument string:"-machine"}, {argument string:"virt,acpi=off,gic-version=3"}, {argument string:"-global"}, {argument string:"virtio-mmio.force-legacy=false"}, {argument string:"-drive"}, {argument string:espArgument, file urls:{espImage}}, {argument string:"-device"}, {argument string:"virtio-blk-pci,drive=rustosesp,bootindex=0"}, {argument string:"-drive"}, {argument string:systemArgument, file urls:{systemImage}}, {argument string:"-device"}, {argument string:"virtio-blk-device,drive=rustossystem"}, {argument string:"-device"}, {argument string:"qemu-xhci,id=xhci"}, {argument string:"-device"}, {argument string:"usb-kbd,bus=xhci.0"}, {argument string:"-device"}, {argument string:"usb-mouse,bus=xhci.0"}, {argument string:"-device"}, {argument string:"virtio-keyboard-device"}, {argument string:"-device"}, {argument string:"virtio-mouse-device"}}
+        -- Не подключаем параллельный virtio-mouse. QEMU/UTM отправляет host
+        -- events активному input handler'у, а RustOS справедливо подавляет
+        -- fallback, когда USB HID уже перечислен. Два устройства приводили к
+        -- split-brain: UTM писал в virtio, пока PlatformInput слушал xHCI.
+        set qemu additional arguments of c to {{argument string:"-machine"}, {argument string:"virt,acpi=off,gic-version=3"}, {argument string:"-global"}, {argument string:"virtio-mmio.force-legacy=false"}, {argument string:"-drive"}, {argument string:espArgument, file urls:{espImage}}, {argument string:"-device"}, {argument string:"virtio-blk-pci,drive=rustosesp,bootindex=0"}, {argument string:"-drive"}, {argument string:systemArgument, file urls:{systemImage}}, {argument string:"-device"}, {argument string:"virtio-blk-device,drive=rustossystem"}, {argument string:"-device"}, {argument string:"qemu-xhci,id=xhci"}, {argument string:"-device"}, {argument string:"usb-kbd,bus=xhci.0"}, {argument string:"-device"}, {argument string:"usb-mouse,bus=xhci.0"}}
         update configuration of vm with c
     end tell
 end run
 APPLESCRIPT
 
-echo "[utm-gpu] ready: name=$VM_NAME id=$VM_ID backend=VirGL/ANGLE-Metal accel=HVF"
+echo "[utm-gpu] ready: name=$VM_NAME id=$VM_ID backend=VirGL/ANGLE-Metal accel=HVF input=xhci-usb-hid"

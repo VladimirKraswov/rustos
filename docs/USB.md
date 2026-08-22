@@ -78,6 +78,10 @@ make test-arm-gui
 keyboard/mouse events через QEMU и проверяют результат в terminal/SystemUI.
 AArch64-тест намеренно не подключает параллельные virtio-input устройства,
 чтобы событие не могло случайно пройти через fallback вместо USB.
+UTM-профиль следует тому же правилу: одновременные `usb-mouse` и
+`virtio-mouse` создают два host input handler'а, тогда как guest multiplexor
+подавляет fallback при найденном USB HID. Для одного типа ввода в VM должен
+существовать ровно один основной виртуальный контроллер.
 
 ## Честная граница текущего этапа
 
