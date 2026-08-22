@@ -52,15 +52,14 @@ DCL OUT[1], COLOR\n\
 const FRAGMENT_SHADER: &[u8] = b"FRAG\n\
 DCL IN[0], COLOR, LINEAR\n\
 DCL OUT[0], COLOR\n\
-IMM[0] FLT32 { 0.9400, 0.9400, 0.9400, 1.0000 }\n\
-IMM[1] FLT32 { 0.0150, 0.0200, 0.0450, 0.0000 }\n\
-  0: MAD OUT[0], IN[0], IMM[0], IMM[1]\n\
+  0: MOV OUT[0], IN[0]\n\
   1: END\n\0";
 
 /// Одна interleaved вершина bootstrap Gallium pipeline.
 ///
-/// Координаты уже находятся в clip space. Цвет содержит результат расчёта
-/// освещения state tracker'ом; fragment shader выполняет финальный tone pass.
+/// Координаты уже находятся в clip space. Цвет premultiplied и проходит
+/// fragment shader без RGB-offset: иначе полупрозрачные края текста и фигур
+/// получают тёмный ореол и перестают совпадать с CPU fallback.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Vertex {
@@ -390,7 +389,42 @@ pub fn encode_mesh_swapchain(
     initialize_surface: bool,
     initialize_pipeline: bool,
 ) -> Result<usize, EncodeError> {
-    encode_mesh_swapchain_pass(
+    encode_mesh_swapchain_format(
+        output,
+        width,
+        height,
+        color_resource,
+        vertex_resource,
+        vertices,
+        clear,
+        surface_handle,
+        initialize_surface,
+        initialize_pipeline,
+        FORMAT_BGRX8888,
+    )
+}
+
+/// Вариант swapchain encoder для явно заданного render-target format.
+/// Оконный 3D Canvas использует premultiplied BGRA surface, а scanout — BGRX;
+/// shader/pipeline при этом остаются общими и не пересоздаются.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_mesh_swapchain_format(
+    output: &mut [u32],
+    width: u32,
+    height: u32,
+    color_resource: u32,
+    vertex_resource: u32,
+    vertices: &[Vertex],
+    clear: [f32; 4],
+    surface_handle: u32,
+    initialize_surface: bool,
+    initialize_pipeline: bool,
+    color_format: u32,
+) -> Result<usize, EncodeError> {
+    if !matches!(color_format, FORMAT_BGRX8888 | FORMAT_BGRA8888) {
+        return Err(EncodeError::InvalidExtent);
+    }
+    encode_mesh_swapchain_pass_format(
         output,
         width,
         height,
@@ -402,6 +436,7 @@ pub fn encode_mesh_swapchain(
         initialize_surface,
         initialize_pipeline,
         true,
+        color_format,
     )
 }
 
@@ -422,6 +457,37 @@ pub fn encode_mesh_swapchain_pass(
     initialize_pipeline: bool,
     clear_target: bool,
 ) -> Result<usize, EncodeError> {
+    encode_mesh_swapchain_pass_format(
+        output,
+        width,
+        height,
+        color_resource,
+        vertex_resource,
+        vertices,
+        clear,
+        surface_handle,
+        initialize_surface,
+        initialize_pipeline,
+        clear_target,
+        FORMAT_BGRX8888,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_mesh_swapchain_pass_format(
+    output: &mut [u32],
+    width: u32,
+    height: u32,
+    color_resource: u32,
+    vertex_resource: u32,
+    vertices: &[Vertex],
+    clear: [f32; 4],
+    surface_handle: u32,
+    initialize_surface: bool,
+    initialize_pipeline: bool,
+    clear_target: bool,
+    color_format: u32,
+) -> Result<usize, EncodeError> {
     // 2..=7 заняты immutable pipeline objects. Остальные bounded handles
     // позволяют одному context держать независимые desktop и app surfaces.
     if surface_handle == 0 || (2..=7).contains(&surface_handle) || surface_handle > 63 {
@@ -439,7 +505,7 @@ pub fn encode_mesh_swapchain_pass(
         initialize_surface,
         initialize_pipeline,
         clear_target,
-        FORMAT_BGRX8888,
+        color_format,
     )
 }
 

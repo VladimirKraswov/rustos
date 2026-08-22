@@ -71,15 +71,17 @@ Host renderer дополнительно разрешает resource handles т�
 `GraphicsBuffer` передаётся compositor'у только с `READ`, а acquire timeline —
 только с `WAIT`. `compositord` проверяет неизменяемый descriptor и передаёт
 готовый кадр `displayd`. Драйвер делает `SET_SCANOUT` и `RESOURCE_FLUSH` того
-же VirGL resource: между 3D render target и экраном нет guest CPU copy.
+же VirGL resource: между 3D render target и экраном нет guest CPU copy. Обе
+команды публикуются асинхронно в controlq. Display release ждёт одновременно
+estimated-vblank deadline и реальный fenced `RESOURCE_FLUSH`; CPU больше не
+busy-wait'ит host renderer на каждом page flip.
 
-Оконная Aurora 3D пока дополнительно использует совместимый retained-surface
-adapter на основе
-`VIRTIO_GPU_CMD_TRANSFER_FROM_HOST_3D`: после fence готовые GPU pixels попадают
-в attached system-memory backing и вставляются в desktop scene. Это GPU
-readback, не CPU rasterization. Штатный SystemUI уже идёт через отдельный
-zero-copy путь; adapter Aurora должен исчезнуть после перехода к независимым
-per-window GPU surfaces.
+Оконная Aurora передаёт в SystemUI только семантический `Canvas3D` record.
+`renderd` рисует сцену в GPU-only resource и копирует её прямо в retained
+surface конкретного окна. Scene frame не входит в static content hash:
+анимация обновляет только Canvas, не растеризует заново заголовок, текст и
+рамку. Два экземпляра Aurora имеют разные layer/cache identities и проходят
+один z-ordered composition без `TRANSFER_FROM_HOST_3D` и readback.
 
 На устройстве без VirGL Aurora использует локальный software fallback в том же
 окне. Ошибка renderer'а не переключает всю ОС, не закрывает чужие окна и не
@@ -128,7 +130,7 @@ UTM запускает AArch64 через HVF, принимает VirGL кома
 
 ```text
 [gpu-demo] AURORA_3D_READY frames=48 renderer=mesa-virgl cpu-raster=no
-[virgl-test] WINDOWED_READBACK_READY source=host-gpu cpu-raster=no
+[virgl-test] WINDOWED_CANVAS_READY source=gpu-surface readback=0 cpu-raster=no
 [virgl-test] MESA_SHOWCASE_READY scanout=graphics-buffer cpu-raster=no
 rustos-gui-check: stage и освещённый объект присутствуют в screenshot
 ```
@@ -139,7 +141,7 @@ rustos-gui-check: stage и освещённый объект присутств�
 GraphicsBuffer → compositor → scanout, но ещё не является полной upstream Mesa:
 
 - platform seed поддерживает одну bounded OpenGL-core-подобную сцену;
-- один context и один in-flight submission на process ABI;
+- один context и до трёх in-flight submissions на bootstrap process ABI;
 - первый DMA import требует один физически непрерывный extent;
 - нет device-local allocator, eviction, reset/replay и приоритетных engines;
 - Virtio/VirGL — виртуальная GPU-модель, а не native V3D/Mali/Intel/AMD driver.

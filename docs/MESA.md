@@ -19,22 +19,23 @@ diffuse/specular lighting и TGSI vertex/fragment shaders. Guest CPU форми�
 пикселей выполняются VirGL renderer'ом.
 
 ```text
-Aurora window ── bounded request ──► compositord ──► renderd ──► VirGL
-      ▲                                      GraphicsBuffer + fence │
-      └── finished BGRX surface ◄── TRANSFER_FROM_HOST_3D ◄─────────┘
-      │
-      └── CPU compositor damage ──► virtio-gpu scanout broker
+Aurora window ── semantic Canvas3D ──► renderd ──► VirGL/host GPU
+      │                                      │ GPU-only BGRA surface
+      │                                      v
+      └──────── retained window surface ◄─ ordered GPU copy
+                                             │
+desktop + windows ── z-order/transforms ──► GPU compositor ──► scanout
 ```
 
 Приложение не получает GPU, scanout или MMIO capability. Ошибка/завершение
 launcher'а не уничтожает графические сервисы; supervisor продолжает следить за
 ними как за постоянными процессами.
 
-Readback — переходный мост, а не CPU rasterization: triangles и pixels создаёт
-host GPU, guest CPU только включает готовую поверхность в bootstrap desktop.
-После переноса всего оконного compositor'а в ring 3 этот шаг заменит zero-copy
-composition GraphicsBuffer'ов. Если VirGL отсутствует или потерян, Aurora
-локально включает software renderer; остальные окна и shell не меняют режим.
+Readback в оконном пути удалён. Анимация меняет только содержимое Canvas;
+неизменившиеся chrome/текст/рамка остаются в retained surface, а перетаскивание
+меняет лишь transform готового слоя. Если VirGL отсутствует или потерян,
+Aurora локально включает software renderer; остальные окна и shell не меняют
+режим.
 
 ## Воспроизводимая upstream база
 
@@ -85,7 +86,8 @@ Mesa или OpenGL.
 make test-virgl
 ```
 
-Тест проверяет оконный GPU readback, 48 последовательных GPU frames,
+Тест проверяет два независимых оконных Canvas (включая retained animation
+update), 48 последовательных GPU frames,
 timeline/vblank, цветной screenshot и отсутствие guest CPU rasterization. Артефакты:
 `build/test-results/virgl/showcase.{xwd,ppm}`.
 
@@ -99,8 +101,9 @@ make test-utm-gpu
 
 В этой конфигурации RustOS исполняется нативно через HVF, guest VirGL проходит
 через UTM virglrenderer и ANGLE/Metal. Это настоящий ускоренный transport и
-рабочий вертикальный 3D-срез, но пока не полный upstream Mesa: SystemUI всё
-ещё использует CPU 2D renderer, а EGL/GLES/GLSL/NIR cross-port остаётся
+рабочий вертикальный 3D-срез, но пока не полный upstream Mesa. Штатный SystemUI
+уже растеризуется и композируется VirGL backend'ом; CPU остаётся для layout,
+формирования команд и recovery fallback. EGL/GLES/GLSL/NIR cross-port остаётся
 следующим самостоятельным этапом.
 
 Render path уже использует настоящий трёхбуферный swapchain: три различных
@@ -108,4 +111,6 @@ Render path уже использует настоящий трёхбуферн�
 GPU submission in-flight. `compositord` применяет mailbox-политику и удаляет
 устаревший готовый frame вместо накопления FIFO-задержки; reuse каждого buffer
 разрешён только после его fence. `make test-utm-gpu` требует наблюдаемый
-`peak-inflight=3`, поэтому это не декларативный флаг.
+`peak-inflight=2` или `3` (в зависимости от скорости host completion), поэтому
+это не декларативный флаг: очередь действительно держит несколько команд в
+работе, а три swapchain image остаются независимыми.

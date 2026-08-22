@@ -12,10 +12,11 @@ use core::panic::PanicInfo;
 
 use rustos_abi::{
     gpu::{
-        frame_flag, gpu_ui_checksum, virgl_format, GpuContextCreate, GpuDeviceInfo, GpuRenderFrame,
-        GpuResourceCreate, GpuResourceImport, GpuSubmit, GpuUiFrameHeader, GpuUiLayer, GpuUiQuad,
-        GPU_ABI_VERSION, GPU_MAX_COMMAND_BYTES, GPU_RENDERED_FRAME_HANDLE_COUNT,
-        GPU_RENDERED_FRAME_OPCODE, GPU_RENDER_REQUEST_OPCODE, GPU_UI_STREAM_BYTES,
+        frame_flag, gpu_ui_checksum, gpu_ui_static_content_hash, virgl_format, GpuContextCreate,
+        GpuDeviceInfo, GpuRenderFrame, GpuResourceCreate, GpuResourceImport, GpuSubmit,
+        GpuUiFrameHeader, GpuUiLayer, GpuUiQuad, GPU_ABI_VERSION, GPU_MAX_COMMAND_BYTES,
+        GPU_RENDERED_FRAME_HANDLE_COUNT, GPU_RENDERED_FRAME_OPCODE, GPU_RENDER_REQUEST_OPCODE,
+        GPU_UI_STREAM_BYTES,
     },
     graphics_buffer::{BufferUsage, GraphicsBufferDesc, MemoryDomain, PixelFormatCode},
     ipc::TransferredHandle,
@@ -92,6 +93,7 @@ static mut GLYPH_COMPOSITE_SCRATCH: [rustos_virgl::CompositeLayer; GLYPH_BATCH] 
 struct CachedUiLayer {
     id: u64,
     content_hash: u64,
+    static_content_hash: u64,
     resource: u32,
     width: u32,
     height: u32,
@@ -104,6 +106,7 @@ impl CachedUiLayer {
     const EMPTY: Self = Self {
         id: 0,
         content_hash: 0,
+        static_content_hash: 0,
         resource: 0,
         width: 0,
         height: 0,
@@ -142,10 +145,94 @@ struct GlyphAtlas {
     len: usize,
 }
 
-impl GlyphAtlas {
+/// Один переиспользуемый GPU-only render target для системных 3D Canvas.
+///
+/// Canvas последовательно рисуется и копируется в независимую surface окна
+/// внутри одного VirGL context. Порядок команд гарантирует, что следующий
+/// экземпляр не перезапишет ресурс до завершения предыдущего copy. Ни одного
+/// GPU -> CPU readback в этом пути нет.
+struct EmbeddedCanvas3d {
+    resource: u32,
+    mesa: Option<rustos_mesa::Context>,
+}
+
+impl EmbeddedCanvas3d {
     const fn new(resource: u32) -> Self {
         Self {
             resource,
+            mesa: None,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn render_into_layer(
+        &mut self,
+        context: Handle,
+        submissions: &mut UiSubmissionQueue,
+        vertex_resource: u32,
+        pipeline_initialized: &mut bool,
+        scene_frame: u32,
+        layer_resource: u32,
+        layer_width: u32,
+        layer_height: u32,
+        destination: rustos_virgl::BlitRect,
+    ) -> Result<(), ()> {
+        if self.mesa.is_none() {
+            let mut mesa = rustos_mesa::Context::new(
+                rustos_mesa::VirglWinsysSurface {
+                    width: 800,
+                    height: 450,
+                    color_resource: self.resource,
+                    vertex_resource,
+                    color_format: rustos_virgl::FORMAT_BGRA8888,
+                },
+                rustos_mesa::ApiProfile::OpenGlCore,
+            )
+            .map_err(|_| ())?;
+            mesa.configure_shared_pipeline([56, 57, 58], *pipeline_initialized)
+                .map_err(|_| ())?;
+            self.mesa = Some(mesa);
+        }
+        // Scene draw и последующий GPU copy образуют один submit. Раньше
+        // каждый Canvas создавал два fence и принудительный drain после трёх
+        // команд; два окна превращали лёгкую сцену из 48 vertices в цепочку
+        // синхронных round-trip. Один ordered stream сохраняет тот же результат
+        // и оставляет место финальному composition fence.
+        let mut commands = [0u32; 1_024];
+        let render_words = self
+            .mesa
+            .as_mut()
+            .ok_or(())?
+            .render_aurora_frame(&mut commands, scene_frame)
+            .map_err(|_| ())?;
+        let canvas_layer = rustos_virgl::CompositeLayer {
+            resource: self.resource,
+            format: rustos_virgl::FORMAT_BGRA8888,
+            source: rustos_virgl::BlitRect::new(0, 0, 800, 450),
+            destination,
+            linear_filter: destination.width != 800 || destination.height != 450,
+            alpha_blend: false,
+        };
+        let copy_words = rustos_virgl::encode_composite_pass(
+            &mut commands[render_words..],
+            layer_width,
+            layer_height,
+            layer_resource,
+            rustos_virgl::FORMAT_BGRA8888,
+            destination,
+            core::slice::from_ref(&canvas_layer),
+        )
+        .map_err(|_| ())?;
+        submit_ui_commands(context, submissions, &commands, render_words + copy_words)?;
+        *pipeline_initialized = true;
+        Ok(())
+    }
+}
+
+impl GlyphAtlas {
+    const fn new() -> Self {
+        Self {
+            resource: 0,
             entries: [GlyphAtlasEntry::EMPTY; GLYPH_ATLAS_ENTRIES],
             len: 0,
         }
@@ -334,18 +421,15 @@ pub extern "C" fn _start(frame_endpoint: u64, render_capability: u64, abi_versio
     }
     let mut compositor_textures = [0u32; 3];
     let mut wallpaper_textures = [0u32; 3];
-    let glyph_resource = gpu_resource_create(
-        context,
-        &GpuResourceCreate::sampled_texture(
-            GLYPH_ATLAS_SIDE,
-            GLYPH_ATLAS_SIDE,
-            virgl_format::B8G8R8A8_UNORM,
-        ),
-    );
-    if glyph_resource <= 0 {
+    // Coverage-span backend не резервирует 16 MiB device memory для
+    // экспериментального atlas до появления первого atlas primitive.
+    let mut glyph_atlas = GlyphAtlas::new();
+    let canvas_resource =
+        gpu_resource_create(context, &GpuResourceCreate::window_surface(800, 450));
+    if canvas_resource <= 0 {
         process_exit(218);
     }
-    let mut glyph_atlas = GlyphAtlas::new(glyph_resource as u32);
+    let mut canvas_3d = EmbeddedCanvas3d::new(canvas_resource as u32);
     let mut ui_layers = [CachedUiLayer::EMPTY; UI_FRAME_LAYERS];
     for (index, layer) in ui_layers.iter_mut().enumerate() {
         // 1, 8, 9 принадлежат desktop swapchain; 16..=18 — Aurora.
@@ -412,6 +496,7 @@ pub extern "C" fn _start(frame_endpoint: u64, render_capability: u64, abi_versio
                         height,
                         color_resource: slot.target_resource,
                         vertex_resource,
+                        color_format: rustos_virgl::FORMAT_BGRX8888,
                     },
                     rustos_mesa::ApiProfile::OpenGlCore,
                 ) {
@@ -482,6 +567,7 @@ pub extern "C" fn _start(frame_endpoint: u64, render_capability: u64, abi_versio
                 vertex_resource,
                 &mut wallpaper_textures,
                 &mut glyph_atlas,
+                &mut canvas_3d,
                 &mut ui_layers,
                 &mut ui_pipeline_initialized,
                 &mut ui_submissions,
@@ -545,6 +631,7 @@ fn render_system_ui_frame(
     vertex_resource: u32,
     wallpaper_resources: &mut [u32; 3],
     glyph_atlas: &mut GlyphAtlas,
+    canvas_3d: &mut EmbeddedCanvas3d,
     layer_cache: &mut [CachedUiLayer; UI_FRAME_LAYERS],
     pipeline_initialized: &mut bool,
     submissions: &mut UiSubmissionQueue,
@@ -558,6 +645,7 @@ fn render_system_ui_frame(
     {
         return Err(1);
     }
+    let transform_only = header.is_transform_only();
     let shared_layers = unsafe {
         core::slice::from_raw_parts(
             stream
@@ -581,7 +669,8 @@ fn render_system_ui_frame(
     let mut expected_first = 0u32;
     for (index, layer) in shared_layers.iter().enumerate() {
         if layer.validate(width, height, header.quad_count).is_err()
-            || layer.first_quad != expected_first
+            || (!transform_only && layer.first_quad != expected_first)
+            || (transform_only && (layer.first_quad != 0 || layer.quad_count != 0))
             || shared_layers[..index]
                 .iter()
                 .any(|previous| previous.id == layer.id)
@@ -591,10 +680,12 @@ fn render_system_ui_frame(
         let first = layer.first_quad as usize;
         let end = first + layer.quad_count as usize;
         let layer_quads = &shared_quads[first..end];
-        if rustos_abi::gpu::gpu_ui_content_hash(layer_quads) != layer.content_hash
-            || layer_quads
-                .iter()
-                .any(|quad| quad.validate(layer.width, layer.height).is_err())
+        if !transform_only
+            && (layer.quad_count == 0
+                || rustos_abi::gpu::gpu_ui_content_hash(layer_quads) != layer.content_hash
+                || layer_quads
+                    .iter()
+                    .any(|quad| quad.validate(layer.width, layer.height).is_err()))
         {
             return Err(2);
         }
@@ -635,6 +726,14 @@ fn render_system_ui_frame(
             .position(|cached| cached.id == layer.id)
             .or_else(|| layer_cache.iter().position(|cached| cached.id == 0))
             .ok_or(3)?;
+        if transform_only
+            && (layer_cache[cache_index].resource == 0
+                || layer_cache[cache_index].width != layer.width
+                || layer_cache[cache_index].height != layer.height
+                || layer_cache[cache_index].content_hash != layer.content_hash)
+        {
+            return Err(15);
+        }
         if layer_cache[cache_index].resource != 0
             && (layer_cache[cache_index].width != layer.width
                 || layer_cache[cache_index].height != layer.height)
@@ -659,21 +758,35 @@ fn render_system_ui_frame(
         }
         let first = layer.first_quad as usize;
         let end = first + layer.quad_count as usize;
-        if layer_cache[cache_index].content_hash != layer.content_hash {
+        if !transform_only && layer_cache[cache_index].content_hash != layer.content_hash {
+            let static_content_hash = gpu_ui_static_content_hash(&quads[first..end]);
             let mut rasterizer = UiLayerRasterizer {
                 context,
                 submissions,
                 vertex_resource,
                 wallpaper_resources,
                 glyph_atlas,
+                canvas_3d,
                 pipeline_initialized,
             };
-            rasterize_ui_layer(
-                &mut rasterizer,
-                &mut layer_cache[cache_index],
-                &quads[first..end],
-            )
-            .map_err(|_| 6)?;
+            if layer_cache[cache_index].surface_initialized
+                && layer_cache[cache_index].static_content_hash == static_content_hash
+            {
+                update_canvas_layers(
+                    &mut rasterizer,
+                    &layer_cache[cache_index],
+                    &quads[first..end],
+                )
+                .map_err(|_| 6)?;
+            } else {
+                rasterize_ui_layer(
+                    &mut rasterizer,
+                    &mut layer_cache[cache_index],
+                    &quads[first..end],
+                )
+                .map_err(|_| 6)?;
+                layer_cache[cache_index].static_content_hash = static_content_hash;
+            }
             layer_cache[cache_index].content_hash = layer.content_hash;
         }
         layer_cache[cache_index].seen_frame = header.frame_id;
@@ -697,7 +810,14 @@ fn render_system_ui_frame(
             release_cached_layer(context, submissions, cached).map_err(|_| 7)?;
         }
     }
-    drain_ui_submissions(context, submissions).map_err(|_| 8)?;
+    // Все вспомогательные draw/copy принадлежат одному VirGL context и
+    // предшествуют финальному composition в одной controlq. Не ждём их здесь:
+    // completion финального fence транзитивно подтверждает весь кадр. Drain
+    // нужен только если все три kernel inflight slots уже заняты и для
+    // composition сейчас физически нет свободного descriptor.
+    if submissions.count == SWAPCHAIN_IMAGES {
+        drain_ui_submissions(context, submissions).map_err(|_| 8)?;
+    }
 
     // Steady-state drag попадает только сюда: content_hash окна совпадает,
     // поэтому GPU получает один composition pass с новым destination rect.
@@ -723,6 +843,10 @@ fn render_system_ui_frame(
     if fence <= 0 {
         return Err(10);
     }
+    // Compositord ждёт этот final fence до следующего SystemUI request.
+    // Следовательно, auxiliary timelines уже завершены до повторного
+    // использования их монотонных values и отдельный syscall wait не нужен.
+    submissions.count = 0;
     Ok(fence as u64)
 }
 
@@ -736,6 +860,7 @@ struct UiLayerRasterizer<'a> {
     vertex_resource: u32,
     wallpaper_resources: &'a mut [u32; 3],
     glyph_atlas: &'a mut GlyphAtlas,
+    canvas_3d: &'a mut EmbeddedCanvas3d,
     pipeline_initialized: &'a mut bool,
 }
 
@@ -773,6 +898,27 @@ fn rasterize_ui_layer(
 
     let mut cursor = 0usize;
     while cursor < quads.len() {
+        if let Some((_instance_id, scene_frame)) = quads[cursor].canvas_3d_info() {
+            let quad = quads[cursor];
+            renderer.canvas_3d.render_into_layer(
+                renderer.context,
+                renderer.submissions,
+                renderer.vertex_resource,
+                renderer.pipeline_initialized,
+                scene_frame,
+                cached.resource,
+                cached.width,
+                cached.height,
+                rustos_virgl::BlitRect::new(
+                    u32::from(quad.x),
+                    gpu_y(cached.height, u32::from(quad.y), u32::from(quad.height)),
+                    u32::from(quad.width),
+                    u32::from(quad.height),
+                ),
+            )?;
+            cursor += 1;
+            continue;
+        }
         if quads[cursor].glyph_info().is_some() {
             let glyph_layers = unsafe { &mut *core::ptr::addr_of_mut!(GLYPH_COMPOSITE_SCRATCH) };
             let mut count = 0usize;
@@ -860,6 +1006,7 @@ fn rasterize_ui_layer(
             && count < UI_BATCH_QUADS
             && quads[cursor].wallpaper_id().is_none()
             && quads[cursor].glyph_info().is_none()
+            && quads[cursor].canvas_3d_info().is_none()
         {
             quad_vertices(
                 quads[cursor],
@@ -889,7 +1036,40 @@ fn rasterize_ui_layer(
     drain_ui_submissions(renderer.context, renderer.submissions)
 }
 
-/// Возвращает source rectangle glyph в постоянном BGRA SDF atlas. Новый
+/// Обновляет только анимированные GPU Canvas внутри уже готового retained
+/// слоя. Chrome, заголовок, текст и рамка окна не меняются между кадрами и
+/// потому не проходят повторную растеризацию. Если в слое нет Canvas,
+/// совпадение static hash означает обычную замену метаданных без GPU работы.
+fn update_canvas_layers(
+    renderer: &mut UiLayerRasterizer<'_>,
+    cached: &CachedUiLayer,
+    quads: &[GpuUiQuad],
+) -> Result<(), ()> {
+    for quad in quads {
+        let Some((_instance_id, scene_frame)) = quad.canvas_3d_info() else {
+            continue;
+        };
+        renderer.canvas_3d.render_into_layer(
+            renderer.context,
+            renderer.submissions,
+            renderer.vertex_resource,
+            renderer.pipeline_initialized,
+            scene_frame,
+            cached.resource,
+            cached.width,
+            cached.height,
+            rustos_virgl::BlitRect::new(
+                u32::from(quad.x),
+                gpu_y(cached.height, u32::from(quad.y), u32::from(quad.height)),
+                u32::from(quad.width),
+                u32::from(quad.height),
+            ),
+        )?;
+    }
+    Ok(())
+}
+
+/// Возвращает source rectangle glyph в постоянном BGRA coverage atlas. Новый
 /// символ растеризуется/загружается один раз; повторные окна и кадры делят
 /// один device-local resource, не копируя bitmap в SystemUI stream.
 fn ensure_glyph_atlas_entry(
@@ -898,6 +1078,20 @@ fn ensure_glyph_atlas_entry(
     atlas: &mut GlyphAtlas,
     quad: GpuUiQuad,
 ) -> Result<rustos_virgl::BlitRect, ()> {
+    if atlas.resource == 0 {
+        let resource = gpu_resource_create(
+            context,
+            &GpuResourceCreate::sampled_texture(
+                GLYPH_ATLAS_SIDE,
+                GLYPH_ATLAS_SIDE,
+                virgl_format::B8G8R8A8_UNORM,
+            ),
+        );
+        if resource <= 0 {
+            return Err(());
+        }
+        atlas.resource = resource as u32;
+    }
     let (character, style, crop_x, crop_y) = quad.glyph_info().ok_or(())?;
     let entry_index = atlas.entries[..atlas.len].iter().position(|entry| {
         entry.character == character as u32 && entry.style == style && entry.color == quad.colors[0]
@@ -936,7 +1130,10 @@ fn ensure_glyph_atlas_entry(
         for gpu_row in 0..height {
             let source_row = height - gpu_row - 1;
             for x in 0..width {
-                let coverage = sdf_alpha(&raster.pixels, width, height, x, source_row);
+                // SDF нельзя использовать как готовую alpha без специального
+                // smoothstep shader: это раздувает контур. Храним точное
+                // anti-aliased coverage системного rasterizer'а.
+                let coverage = raster.pixels[source_row * width + x];
                 let alpha = scale_channel(source_alpha, coverage);
                 let offset = (gpu_row * width + x) * 4;
                 pixels[offset..offset + 4].copy_from_slice(&[
@@ -1005,46 +1202,6 @@ fn decode_glyph_style(style: u32) -> Result<rustos_system_fonts::Style, ()> {
         italic: style & ui_glyph_style::ITALIC != 0,
         size: ((style & ui_glyph_style::SIZE_MASK) >> ui_glyph_style::SIZE_SHIFT) as u16,
     })
-}
-
-/// Преобразует 8-bit coverage в короткое signed-distance поле. Полутоновые
-/// edge samples сохраняются точно, а полностью внутренние/внешние pixels
-/// получают расстояние до ближайшей границы. Такой atlas устойчив к
-/// bilinear sampling и не возвращает ступеньки span-rasterizer'а.
-fn sdf_alpha(bitmap: &[u8], width: usize, height: usize, x: usize, y: usize) -> u8 {
-    let coverage = bitmap[y * width + x];
-    if coverage != 0 && coverage != u8::MAX {
-        return coverage;
-    }
-    let inside = coverage >= 128;
-    let mut best_squared = 25usize;
-    for dy in -4i32..=4 {
-        for dx in -4i32..=4 {
-            let nx = x as i32 + dx;
-            let ny = y as i32 + dy;
-            if nx < 0 || ny < 0 || nx >= width as i32 || ny >= height as i32 {
-                if inside {
-                    best_squared = best_squared.min((dx * dx + dy * dy) as usize);
-                }
-                continue;
-            }
-            let neighbor_inside = bitmap[ny as usize * width + nx as usize] >= 128;
-            if neighbor_inside != inside {
-                best_squared = best_squared.min((dx * dx + dy * dy) as usize);
-            }
-        }
-    }
-    let distance = integer_sqrt(best_squared.min(16)) as i32;
-    let signed = if inside { distance } else { -distance };
-    (128 + signed * 42).clamp(0, 255) as u8
-}
-
-fn integer_sqrt(value: usize) -> usize {
-    let mut result = 0usize;
-    while (result + 1) * (result + 1) <= value {
-        result += 1;
-    }
-    result
 }
 
 fn scale_channel(channel: u8, alpha: u8) -> u8 {

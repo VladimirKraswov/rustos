@@ -32,7 +32,7 @@ pub const GPU_DEMO_DONE_OPCODE: u16 = 0x5111;
 /// renderer'у и выдаётся только доверенному `renderd`.
 pub const GPU_UI_STREAM_BYTES: usize = 1024 * 1024;
 /// Версия внутреннего SystemUI GPU stream.
-pub const GPU_UI_STREAM_VERSION: u16 = 2;
+pub const GPU_UI_STREAM_VERSION: u16 = 3;
 
 /// Биты [`GpuUiLayer::flags`]. Слой хранит собственную GPU surface, поэтому
 /// его положение на экране не входит в `content_hash` и может меняться без
@@ -50,10 +50,16 @@ pub mod ui_quad_flag {
     /// Quad показывает одну из встроенных wallpaper textures. Стабильный
     /// идентификатор ресурса передаётся как `colors[0]`.
     pub const WALLPAPER_TEXTURE: u32 = 1 << 0;
-    /// Quad ссылается на Unicode glyph в постоянном SDF atlas renderd.
+    /// Quad ссылается на Unicode glyph в постоянном coverage atlas renderd.
+    /// Формат primitive не привязан к конкретной технике сглаживания: будущий
+    /// SDF/R8 backend сможет заменить rasterizer без изменения ABI приложений.
     pub const GLYPH_ATLAS: u32 = 1 << 1;
+    /// Область управляемого системой 3D Canvas. Приложение передаёт только
+    /// идентификатор экземпляра и номер кадра; GPU resource и VirGL context
+    /// остаются у изолированного `renderd`.
+    pub const CANVAS_3D: u32 = 1 << 2;
     /// Все известные биты текущей версии.
-    pub const KNOWN: u32 = WALLPAPER_TEXTURE | GLYPH_ATLAS;
+    pub const KNOWN: u32 = WALLPAPER_TEXTURE | GLYPH_ATLAS | CANVAS_3D;
 }
 
 /// Compact encoding системного font style внутри glyph primitive.
@@ -122,7 +128,8 @@ pub struct GpuUiFrameHeader {
     pub layer_count: u32,
     /// Суммарное число quad records после массива слоёв.
     pub quad_count: u32,
-    /// В текущей версии весь кадр всегда содержит полный display list.
+    /// [`GpuUiFrameHeader::FULL_FRAME`] или компактный
+    /// [`GpuUiFrameHeader::TRANSFORM_ONLY`].
     pub flags: u32,
     /// Должно быть равно нулю.
     pub reserved_header: u32,
@@ -135,6 +142,9 @@ pub struct GpuUiFrameHeader {
 impl GpuUiFrameHeader {
     /// Флаг полного, самодостаточного кадра.
     pub const FULL_FRAME: u32 = 1;
+    /// Кадр содержит только полный ordered список transforms уже известных
+    /// surfaces. Quad payload отсутствует и не копируется через IPC.
+    pub const TRANSFORM_ONLY: u32 = 1 << 1;
 
     /// Создаёт заголовок завершённого кадра.
     pub const fn new(
@@ -157,6 +167,28 @@ impl GpuUiFrameHeader {
             checksum: 0,
             reserved: [0; 2],
         }
+    }
+
+    /// Создаёт компактный transform-only кадр.
+    pub const fn new_transform(width: u32, height: u32, frame_id: u64, layer_count: u32) -> Self {
+        Self {
+            version: GPU_UI_STREAM_VERSION,
+            size: core::mem::size_of::<Self>() as u16,
+            width,
+            height,
+            frame_id,
+            layer_count,
+            quad_count: 0,
+            flags: Self::TRANSFORM_ONLY,
+            reserved_header: 0,
+            checksum: 0,
+            reserved: [0; 2],
+        }
+    }
+
+    /// Требует ли кадр повторной растеризации display list.
+    pub const fn is_transform_only(&self) -> bool {
+        self.flags == Self::TRANSFORM_ONLY
     }
 
     /// Проверяет только metadata; каждый quad проверяется отдельно.
@@ -183,9 +215,10 @@ impl GpuUiFrameHeader {
             || self.frame_id == 0
             || self.layer_count == 0
             || self.layer_count > 64
-            || self.quad_count == 0
             || bytes > GPU_UI_STREAM_BYTES
-            || self.flags != Self::FULL_FRAME
+            || !matches!(self.flags, Self::FULL_FRAME | Self::TRANSFORM_ONLY)
+            || (self.flags == Self::FULL_FRAME && self.quad_count == 0)
+            || (self.flags == Self::TRANSFORM_ONLY && self.quad_count != 0)
             || self.reserved_header != 0
             || self.reserved != [0; 2]
         {
@@ -251,7 +284,6 @@ impl GpuUiLayer {
             || self.height == 0
             || right > frame_width
             || bottom > frame_height
-            || self.quad_count == 0
             || quad_end > total_quads
             || self.flags & !ui_layer_flag::KNOWN != 0
             || self.reserved_header != 0
@@ -352,6 +384,30 @@ impl GpuUiQuad {
         }
     }
 
+    /// Создаёт ссылку на аппаратно растеризуемую Aurora-сцену.
+    ///
+    /// Это внутренний semantic primitive SystemUI, а не передача GPU handle
+    /// приложению. Благодаря ему кадр остаётся на GPU и больше не проходит
+    /// дорогой маршрут GPU -> CPU -> GPU.
+    pub const fn aurora_canvas(
+        x: u16,
+        y: u16,
+        width: u16,
+        height: u16,
+        instance_id: u32,
+        scene_frame: u32,
+    ) -> Self {
+        Self {
+            x,
+            y,
+            width,
+            height,
+            colors: [scene_frame, instance_id, 0, 0],
+            flags: ui_quad_flag::CANVAS_3D,
+            reserved: 0,
+        }
+    }
+
     /// Проверяет bounded physical geometry.
     pub fn validate(&self, frame_width: u32, frame_height: u32) -> Result<(), GpuAbiError> {
         let right = u32::from(self.x)
@@ -373,6 +429,8 @@ impl GpuUiQuad {
                 && (char::from_u32(self.colors[1]).is_none()
                     || !ui_glyph_style::valid(self.colors[2])
                     || self.colors[3] & 0xffc0_ffc0 != 0))
+            || (self.flags == ui_quad_flag::CANVAS_3D
+                && (self.colors[1] == 0 || self.colors[2] != 0 || self.colors[3] != 0))
         {
             return Err(GpuAbiError::InvalidValue);
         }
@@ -408,12 +466,40 @@ impl GpuUiQuad {
             (self.colors[3] >> 16) as u16,
         ))
     }
+
+    /// Возвращает `(instance_id, scene_frame)` аппаратного 3D Canvas.
+    pub const fn canvas_3d_info(&self) -> Option<(u32, u32)> {
+        if self.flags == ui_quad_flag::CANVAS_3D {
+            Some((self.colors[1], self.colors[0]))
+        } else {
+            None
+        }
+    }
 }
 
 /// Детерминированный checksum SystemUI command stream.
 pub fn gpu_ui_content_hash(quads: &[GpuUiQuad]) -> u64 {
     let mut hash = 0xcbf2_9ce4_8422_2325u64;
     hash_bytes(&mut hash, as_bytes(quads));
+    hash
+}
+
+/// Hash неизменяемой части retained-слоя SystemUI.
+///
+/// Счётчик кадра семантического 3D Canvas намеренно не входит в результат:
+/// renderd может один раз растеризовать chrome окна, а затем обновлять только
+/// принадлежащую приложению GPU surface. Геометрия Canvas, instance id и все
+/// остальные primitives по-прежнему входят в hash, поэтому изменение layout
+/// никогда не будет ошибочно принято за дешёвый animation update.
+pub fn gpu_ui_static_content_hash(quads: &[GpuUiQuad]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for quad in quads {
+        let mut stable = *quad;
+        if stable.canvas_3d_info().is_some() {
+            stable.colors[0] = 0;
+        }
+        hash_bytes(&mut hash, as_bytes(core::slice::from_ref(&stable)));
+    }
     hash
 }
 
@@ -1346,5 +1432,32 @@ mod tests {
         );
         assert_eq!(glyph.validate(1280, 720), Ok(()));
         assert_eq!(glyph.glyph_info().map(|value| value.0), Some('Я'));
+
+        let canvas = GpuUiQuad::aurora_canvas(40, 80, 800, 450, 7, 42);
+        assert_eq!(canvas.validate(1280, 720), Ok(()));
+        assert_eq!(canvas.canvas_3d_info(), Some((7, 42)));
+        let next_canvas_frame = GpuUiQuad::aurora_canvas(40, 80, 800, 450, 7, 43);
+        let another_canvas = GpuUiQuad::aurora_canvas(40, 80, 800, 450, 8, 43);
+        assert_ne!(
+            gpu_ui_content_hash(core::slice::from_ref(&canvas)),
+            gpu_ui_content_hash(core::slice::from_ref(&next_canvas_frame))
+        );
+        assert_eq!(
+            gpu_ui_static_content_hash(core::slice::from_ref(&canvas)),
+            gpu_ui_static_content_hash(core::slice::from_ref(&next_canvas_frame))
+        );
+        assert_ne!(
+            gpu_ui_static_content_hash(core::slice::from_ref(&canvas)),
+            gpu_ui_static_content_hash(core::slice::from_ref(&another_canvas))
+        );
+
+        let mut transform_layer = layer;
+        transform_layer.first_quad = 0;
+        transform_layer.quad_count = 0;
+        let mut transform = GpuUiFrameHeader::new_transform(1280, 720, 8, 1);
+        transform.checksum = gpu_ui_checksum(core::slice::from_ref(&transform_layer), &[]);
+        assert_eq!(transform.validate(), Ok(()));
+        assert!(transform.is_transform_only());
+        assert_eq!(transform_layer.validate(1280, 720, 0), Ok(()));
     }
 }

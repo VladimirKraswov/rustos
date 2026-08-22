@@ -9,7 +9,7 @@
 
 #![no_std]
 
-use rustos_virgl::{encode_mesh_swapchain, EncodeError, Vertex};
+use rustos_virgl::{encode_mesh_swapchain_format, EncodeError, Vertex};
 
 /// Версия RustOS Mesa platform ABI.
 pub const PLATFORM_ABI_VERSION: u16 = 1;
@@ -29,6 +29,8 @@ pub struct VirglWinsysSurface {
     pub color_resource: u32,
     /// Context-local vertex-buffer resource id.
     pub vertex_resource: u32,
+    /// VirGL format render target (`BGRX8888` scanout или `BGRA8888` Canvas).
+    pub color_format: u32,
 }
 
 /// Выбранный профиль graphics API.
@@ -60,6 +62,10 @@ impl Context {
             || surface.height > 16_384
             || surface.color_resource == 0
             || surface.vertex_resource == 0
+            || !matches!(
+                surface.color_format,
+                rustos_virgl::FORMAT_BGRX8888 | rustos_virgl::FORMAT_BGRA8888
+            )
         {
             return Err(MesaError::InvalidSurface);
         }
@@ -142,7 +148,7 @@ impl Context {
             .ok_or(MesaError::InvalidSurface)?;
         let surface_handle = self.surface_handles[surface_index];
         let initialize_surface = !self.surface_initialized[surface_index];
-        let result = encode_mesh_swapchain(
+        let result = encode_mesh_swapchain_format(
             commands,
             self.surface.width,
             self.surface.height,
@@ -153,6 +159,7 @@ impl Context {
             surface_handle,
             initialize_surface,
             !self.pipeline_initialized,
+            self.surface.color_format,
         );
         let words = result.map_err(MesaError::Transport)?;
         self.pipeline_initialized = true;
@@ -414,6 +421,7 @@ mod tests {
                 height: 800,
                 color_resource: 41,
                 vertex_resource: 42,
+                color_format: rustos_virgl::FORMAT_BGRX8888,
             },
             ApiProfile::OpenGlCore,
         )
@@ -442,6 +450,7 @@ mod tests {
                     height: 800,
                     color_resource: 1,
                     vertex_resource: 2,
+                    color_format: rustos_virgl::FORMAT_BGRX8888,
                 },
                 ApiProfile::OpenGlCore,
             ),

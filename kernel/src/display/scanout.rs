@@ -294,6 +294,20 @@ where
         .map_err(map_scanout_error)
 }
 
+/// Возвращает true только когда host GPU подтвердил fenced FLUSH импортированного
+/// кадра. Для CPU primary path отдельного imported fence нет, поэтому его
+/// прежняя estimated-vblank семантика остаётся без изменений.
+pub fn graphics_present_complete(sequence: u64) -> Result<bool, DisplayBrokerError> {
+    let mut guard = DEVICE.acquire()?;
+    guard
+        .get()
+        .as_mut()
+        .ok_or(DisplayBrokerError::Unavailable)?
+        .gpu
+        .imported_present_complete(sequence)
+        .map_err(map_mode_error)
+}
+
 pub fn render_info() -> Result<GpuDeviceInfo, DisplayBrokerError> {
     let mut guard = DEVICE.acquire()?;
     guard
@@ -453,20 +467,6 @@ pub fn drain_next_render() -> Result<RenderCompletion, DisplayBrokerError> {
         .ok_or(DisplayBrokerError::Unavailable)?
         .gpu
         .drain_next_render()
-        .map_err(map_mode_error)
-}
-
-/// Копирует завершённый VirGL render target в attached guest-memory backing.
-/// Это не rasterization: pixels создаёт host GPU, команда лишь выполняет
-/// explicit readback для временного kernel compositor bridge.
-pub fn download_render_target(graphics_object: u16) -> Result<(), DisplayBrokerError> {
-    let mut guard = DEVICE.acquire()?;
-    guard
-        .get()
-        .as_mut()
-        .ok_or(DisplayBrokerError::Unavailable)?
-        .gpu
-        .download_imported(graphics_object)
         .map_err(map_mode_error)
 }
 

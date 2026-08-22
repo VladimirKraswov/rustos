@@ -90,9 +90,9 @@ Display list компилируется в bounded batches, а не в один 
 1. непрозрачные прямоугольники и простые границы объединяются по pipeline;
 2. rounded rectangle, border и shadow используют аналитический fragment
    shader, поэтому радиус не превращается в сотни маленьких CPU-отрезков;
-3. glyph quad ссылается на общий SDF atlas; bootstrap VirGL хранит
-   premultiplied color в ключе tile, а следующий R8 shader backend отделит
-   distance от tint без изменения wire primitive;
+3. bootstrap-текст компилируется в premultiplied coverage spans внутри
+   retained surface; следующий SDF/R8 shader backend заменит их glyph quad'ами
+   без изменения публичного component API;
 4. icon/image quad ссылается на immutable RGBA atlas;
 5. clip превращается в scissor, одинаковые соседние scissor объединяются;
 6. переполнение batch завершает его целиком и начинает следующий — частично
@@ -161,7 +161,8 @@ acquire point. Resize создаёт новую generation очереди; ст�
 - z-order, clip, transforms, opacity, occlusion и damage;
 - один atomic commit на refresh, triple buffering и mailbox;
 - hardware cursor plane, direct scanout и overlay fast paths;
-- полное удаление windowed `download_render_target`.
+- запрет GPU readback в оконном пути проверяется тестовым marker
+  `readback=0` и отсутствием `TRANSFER_FROM_HOST_3D` в драйвере;
 
 Готовность: drag неизменившегося окна публикует transform-only frame,
 `readback=0`, CPU pixel counter не растёт.
@@ -229,9 +230,9 @@ Release-сборка на профиле UTM Apple Silicon должна держ
   постоянному ring-3 `renderd`. VirGL выполняет blending и запись geometry,
   icon/image и wallpaper pixels; CPU backend остаётся recovery fallback.
   Единый `rustos-system-fonts` формирует одинаковые Latin/Cyrillic metrics для
-  обоих backend. GPU display list передаёт один semantic glyph primitive, а
-  `renderd` лениво строит постоянный 2048×2048 SDF atlas для family, weight,
-  italic, size и color без повторной загрузки glyph в steady state;
+  обоих backend. Текущий GPU путь использует проверенные premultiplied coverage
+  spans системного rasterizer'а: это устраняет чёрные фоны и отличается от
+  bitmap scaling, но ещё не является финальным SDF/R8 glyph atlas;
 - G3: общая generation-checked `SurfaceQueue`, динамические IPC endpoint'ы и
   клиентская `surface.dll` реализованы; отдельный ring-3 процесс проходит
   `create/commit/direct-scanout/release/feedback/destroy`, а stale event
@@ -241,6 +242,11 @@ Release-сборка на профиле UTM Apple Silicon должна держ
   растеризует только изменившийся слой и одним GPU pass смешивает их в
   triple-buffered zero-copy scanout. При drag ядро повторно не обходит UI:
   меняются только `x/y` layer descriptor и checksum нового кадра;
+- semantic Canvas имеет отдельный static content hash: Aurora обновляет только
+  GPU scene region, а неизменный chrome окна не проходит повторный draw;
+- `SET_SCANOUT` и `RESOURCE_FLUSH` выполняются асинхронно. Release timeline
+  продвигается только после device completion, однако input thread никогда не
+  busy-wait'ит page flip; newest SystemUI frame хранится mailbox'ом;
 - resize/close уничтожают VirGL surface object и device-local resource только
   после bounded fence drain. Аппаратный cursor plane остаётся независимым от
   damage. Проверочный marker содержит

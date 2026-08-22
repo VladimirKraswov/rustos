@@ -114,6 +114,8 @@ grep -Fq '[gpu-demo] AURORA_3D_READY frames=48 renderer=mesa-virgl cpu-raster=no
     "$RUN_DIR/serial.log"
 grep -Fq '[gpu-compositor] layers=3 damage=scissor blend=premultiplied readback=0 cpu-raster=0' \
     "$RUN_DIR/serial.log"
-grep -Fq '[virgl-test] WINDOWED_READBACK_READY source=host-gpu cpu-raster=no' \
+grep -Fq '[virgl-test] WINDOWED_CANVAS_READY source=gpu-surface readback=0 cpu-raster=no' \
+    "$RUN_DIR/serial.log"
+grep -Fq '[gpu-canvas] WINDOWED_CANVAS_READY source=gpu-surface readback=0 instances=2' \
     "$RUN_DIR/serial.log"
 echo "[virgl-test] PASS: Mesa/VirGL Aurora 3D reached scanout without guest CPU rasterization"

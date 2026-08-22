@@ -53,7 +53,6 @@ const CMD_CTX_DESTROY: u32 = 0x0201;
 const CMD_CTX_ATTACH_RESOURCE: u32 = 0x0202;
 const CMD_CTX_DETACH_RESOURCE: u32 = 0x0203;
 const CMD_RESOURCE_CREATE_3D: u32 = 0x0204;
-const CMD_TRANSFER_FROM_HOST_3D: u32 = 0x0206;
 const CMD_SUBMIT_3D: u32 = 0x0207;
 #[cfg(target_arch = "aarch64")]
 const CMD_UPDATE_CURSOR: u32 = 0x0300;
@@ -70,7 +69,10 @@ const RESOURCE_FLAG_Y_0_TOP: u32 = 1;
 // только metadata; фактическую память по-прежнему ограничивает allocator.
 const MAX_RENDER_RESOURCES: usize = 64;
 const PRIMARY_BUFFER_COUNT: usize = 3;
-const MAX_PENDING_PRESENT_COMMANDS: usize = PRIMARY_BUFFER_COUNT * 3;
+// Три CPU primary buffer требуют по три команды. Ещё девять записей оставляют
+// bounded запас асинхронным SET_SCANOUT/FLUSH импортированных GPU swapchain
+// images: host latency не должна снова превращать atomic present в busy-wait.
+const MAX_PENDING_PRESENT_COMMANDS: usize = PRIMARY_BUFFER_COUNT * 6;
 const MAX_READY_RENDER_COMPLETIONS: usize = 8;
 #[cfg(target_arch = "aarch64")]
 const CURSOR_EXTENT: u32 = 64;
@@ -289,33 +291,6 @@ struct Submit3dRequest {
     padding: u32,
 }
 
-/// Wire layout `virtio_gpu_transfer_host_3d`. В отличие от 2D transfer этот
-/// запрос копирует уже отрисованный host/GPU resource обратно в attached
-/// system-memory backing, чтобы software compositor мог включить поверхность
-/// в обычное окно без повторной CPU-растеризации.
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct Transfer3dRequest {
-    header: ControlHeader,
-    box_3d: GpuBox,
-    offset: u64,
-    resource: u32,
-    level: u32,
-    stride: u32,
-    layer_stride: u32,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct GpuBox {
-    x: u32,
-    y: u32,
-    z: u32,
-    width: u32,
-    height: u32,
-    depth: u32,
-}
-
 #[derive(Clone, Copy)]
 struct Resource {
     id: u32,
@@ -327,6 +302,7 @@ struct PendingPresentCommand {
     fence: u64,
     slot: u8,
     final_command: bool,
+    imported_sequence: u64,
 }
 
 impl PendingPresentCommand {
@@ -334,6 +310,7 @@ impl PendingPresentCommand {
         fence: 0,
         slot: 0,
         final_command: false,
+        imported_sequence: 0,
     };
 }
 
@@ -386,6 +363,8 @@ pub struct VirtioGpu {
     ready_render_write: usize,
     async_device_failed: bool,
     async_present_logged: bool,
+    submitted_imported_sequence: u64,
+    completed_imported_sequence: u64,
     #[cfg(target_arch = "aarch64")]
     cursor_resource: Resource,
     next_resource: u32,
@@ -436,6 +415,8 @@ impl VirtioGpu {
             ready_render_write: 0,
             async_device_failed: false,
             async_present_logged: false,
+            submitted_imported_sequence: 0,
+            completed_imported_sequence: 0,
             #[cfg(target_arch = "aarch64")]
             cursor_resource: placeholder,
             next_resource: 1,
@@ -1122,6 +1103,11 @@ impl VirtioGpu {
                 if pending.final_command {
                     self.primary_busy[usize::from(pending.slot)] = false;
                 }
+                if pending.imported_sequence != 0 {
+                    self.completed_imported_sequence = self
+                        .completed_imported_sequence
+                        .max(pending.imported_sequence);
+                }
                 continue;
             }
             if self.ready_render[self.ready_render_write].is_some() {
@@ -1188,17 +1174,54 @@ impl VirtioGpu {
         if resource.width != self.mode.width || resource.height != self.mode.height {
             return Err(ScanoutError::InvalidSurface);
         }
-        self.drain_primary_presents()
+        // В старом пути каждый кадр синхронно ждал все controlq responses,
+        // затем отдельно ждал SET_SCANOUT и RESOURCE_FLUSH. На UTM/Metal это
+        // было главным источником многосекундной input latency. Все команды
+        // одной virtqueue упорядочены, поэтому достаточно неблокирующе снять
+        // готовые completions и поставить новый page-flip в ту же очередь.
+        self.drain_async_completions()
             .map_err(|_| ScanoutError::DeviceLost)?;
-        if self.active_scanout_resource != resource.id {
-            self.set_scanout_resource(resource.id, self.mode)
-                .map_err(|_| ScanoutError::DeviceLost)?;
+        self.pending_present = false;
+        let required_commands = usize::from(self.active_scanout_resource != resource.id) + 1;
+        if self
+            .pending_present_commands
+            .iter()
+            .filter(|pending| pending.fence == 0)
+            .count()
+            < required_commands
+        {
+            return Err(ScanoutError::DeviceLost);
         }
-        self.flush_resource(
-            resource.id,
-            Rect::new(0, 0, self.mode.width, self.mode.height),
-        )
-        .map_err(|_| ScanoutError::DeviceLost)?;
+        if self.active_scanout_resource != resource.id {
+            let scanout = SetScanoutRequest {
+                header: self.header(CMD_SET_SCANOUT),
+                rect: GpuRect {
+                    x: 0,
+                    y: 0,
+                    width: self.mode.width,
+                    height: self.mode.height,
+                },
+                scanout: self.scanout,
+                resource: resource.id,
+            };
+            self.submit_present_command(&scanout, scanout.header.fence_id, 0, false, 0)
+                .map_err(|_| ScanoutError::DeviceLost)?;
+            self.active_scanout_resource = resource.id;
+        }
+        let flush = FlushRequest {
+            header: self.header(CMD_RESOURCE_FLUSH),
+            rect: GpuRect {
+                x: 0,
+                y: 0,
+                width: self.mode.width,
+                height: self.mode.height,
+            },
+            resource: resource.id,
+            padding: 0,
+        };
+        self.submit_present_command(&flush, flush.header.fence_id, 0, false, sequence)
+            .map_err(|_| ScanoutError::DeviceLost)?;
+        self.submitted_imported_sequence = self.submitted_imported_sequence.max(sequence);
         // Возврат к CPU desktop должен начинаться с полного содержимого, а
         // не с небольшого damage поверх последнего старого primary resource.
         let full = Rect::new(0, 0, self.mode.width, self.mode.height);
@@ -1210,40 +1233,14 @@ impl VirtioGpu {
         }))
     }
 
-    /// Синхронизирует imported VirGL render target с его guest backing.
-    /// Вызов выполняется только после успешного render fence и поэтому не
-    /// является частью submit hot path.
-    pub fn download_imported(&mut self, graphics_object: u16) -> Result<(), ModeSetError> {
-        let resource = self
-            .render_resources
-            .iter()
-            .copied()
-            .find(|resource| resource.used && resource.graphics_object == graphics_object)
-            .ok_or(ModeSetError::UnsupportedMode)?;
-        if !resource.has_backing {
-            return Err(ModeSetError::UnsupportedMode);
-        }
-        let mut request = Transfer3dRequest {
-            header: self.header(CMD_TRANSFER_FROM_HOST_3D),
-            box_3d: GpuBox {
-                x: 0,
-                y: 0,
-                z: 0,
-                width: resource.width,
-                height: resource.height,
-                depth: 1,
-            },
-            offset: 0,
-            resource: resource.id,
-            level: 0,
-            stride: resource.width.saturating_mul(4),
-            layer_stride: resource
-                .width
-                .saturating_mul(resource.height)
-                .saturating_mul(4),
-        };
-        request.header.context_id = resource.context;
-        self.command_nodata(&request)
+    /// Проверяет completion именно fenced RESOURCE_FLUSH данного GPU кадра.
+    /// Таймер vblank отвечает только за pacing; release buffer запрещён до
+    /// ответа устройства, иначе renderd смог бы перезаписать ещё сканируемую
+    /// swapchain image.
+    pub fn imported_present_complete(&mut self, sequence: u64) -> Result<bool, ModeSetError> {
+        self.drain_async_completions()?;
+        Ok(sequence > self.submitted_imported_sequence
+            || sequence <= self.completed_imported_sequence)
     }
 
     pub fn destroy_render_context(&mut self, context: u32) {
@@ -1495,7 +1492,7 @@ impl VirtioGpu {
             resource,
             padding: 0,
         };
-        self.submit_present_command(&transfer, transfer.header.fence_id, slot, false)?;
+        self.submit_present_command(&transfer, transfer.header.fence_id, slot, false, 0)?;
         let scanout = SetScanoutRequest {
             header: self.header(CMD_SET_SCANOUT),
             rect: GpuRect {
@@ -1507,7 +1504,7 @@ impl VirtioGpu {
             scanout: self.scanout,
             resource,
         };
-        self.submit_present_command(&scanout, scanout.header.fence_id, slot, false)?;
+        self.submit_present_command(&scanout, scanout.header.fence_id, slot, false, 0)?;
         let flush = FlushRequest {
             header: self.header(CMD_RESOURCE_FLUSH),
             rect: GpuRect {
@@ -1519,7 +1516,7 @@ impl VirtioGpu {
             resource,
             padding: 0,
         };
-        self.submit_present_command(&flush, flush.header.fence_id, slot, true)?;
+        self.submit_present_command(&flush, flush.header.fence_id, slot, true, 0)?;
         self.primary_busy[slot] = true;
         self.primary_damage[slot] = Rect::EMPTY;
         self.primary_next = (slot + 1) % PRIMARY_BUFFER_COUNT;
@@ -1560,6 +1557,7 @@ impl VirtioGpu {
         fence: u64,
         slot: usize,
         final_command: bool,
+        imported_sequence: u64,
     ) -> Result<(), ModeSetError> {
         let Some(record_index) = self
             .pending_present_commands
@@ -1576,6 +1574,7 @@ impl VirtioGpu {
             fence,
             slot: slot as u8,
             final_command,
+            imported_sequence,
         };
         let bytes = unsafe {
             core::slice::from_raw_parts(

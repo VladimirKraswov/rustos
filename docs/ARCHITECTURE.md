@@ -79,14 +79,16 @@ zero-copy surface. Интерактивный desktop публикует rendere
 независимых desktop/window/popup layers в ring-3 `renderd`. Каждый слой имеет
 устойчивые identity/content hash и собственную device-local surface; VirGL
 повторно растеризует только изменившееся содержимое, а drag публикует лишь
-новый transform. Общий SDF glyph atlas обслуживает Latin/кириллицу, размеры и
-начертания. Финальный pass пишет прямо в scanout-compatible `GraphicsBuffer`,
+новый transform. Текст сейчас записывается как premultiplied coverage spans в
+retained surface: это сохраняет правильный source-over и не перерисовывается
+при drag. Общий SDF/R8 glyph atlas остаётся следующей оптимизацией и не изменит
+формат приложения. Финальный pass пишет прямо в scanout-compatible `GraphicsBuffer`,
 latest-frame mailbox отбрасывает устаревшие кадры. CPU renderer включается
 только при отказе GPU.
 Контракт описан в
 [GRAPHICS_ABI.md](GRAPHICS_ABI.md), [GPU_RENDERING.md](GPU_RENDERING.md) и
 [ADR-0001](adr/0001-modern-graphics-architecture.md). Проверяемые критерии
-перехода всего desktop на GPU и порядок удаления bootstrap readback закреплены
+перехода всего desktop на GPU и запрет возврата bootstrap readback закреплены
 в [GPU_ACCELERATION.md](GPU_ACCELERATION.md).
 
 Долгоживущая граница RUNE application, DLL/RUIDL, capability namespace и

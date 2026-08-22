@@ -75,6 +75,19 @@ impl Recorder {
 // переноса windowd в ring 3 это статическое хранилище исчезнет вместе с
 // kernel adapter'ом; сейчас оно не раздувает маленький kernel stack.
 static mut RECORDER: Recorder = Recorder::new();
+static mut TRANSFORM_LAYERS: [GpuUiLayer; MAX_LAYERS] = [GpuUiLayer {
+    id: 0,
+    content_hash: 0,
+    x: 0,
+    y: 0,
+    width: 0,
+    height: 0,
+    first_quad: 0,
+    quad_count: 0,
+    flags: 0,
+    reserved_header: 0,
+    reserved: [0; 2],
+}; MAX_LAYERS];
 
 pub(crate) fn begin(width: u32, height: u32) {
     let recorder = unsafe { &mut *core::ptr::addr_of_mut!(RECORDER) };
@@ -160,25 +173,13 @@ pub(crate) fn wallpaper(rect: Rect, id: u32) {
     );
 }
 
-/// Один Unicode glyph вместо сотен coverage spans. Renderd лениво строит
-/// общий SDF atlas, а `crop` сохраняет точный ScrollView/window clipping.
-pub(crate) fn glyph(
-    rect: Rect,
-    color: Color,
-    character: char,
-    style: u32,
-    crop_x: u16,
-    crop_y: u16,
-) {
+/// Записывает системный 3D Canvas без пикселей и GPU handles. Renderd сам
+/// выбирает backend, создаёт surface и смешивает готовую сцену в слой окна.
+pub(crate) fn aurora_canvas(rect: Rect, instance_id: u32, scene_frame: u32) {
     quad(
         rect,
-        [
-            premultiplied_rgba(color, u8::MAX),
-            character as u32,
-            style,
-            u32::from(crop_x) | (u32::from(crop_y) << 16),
-        ],
-        rustos_abi::gpu::ui_quad_flag::GLYPH_ATLAS,
+        [scene_frame, instance_id, 0, 0],
+        rustos_abi::gpu::ui_quad_flag::CANVAS_3D,
     );
 }
 
@@ -329,14 +330,22 @@ pub(crate) fn transform_layer(
     layer.x = bounds.x;
     layer.y = bounds.y;
     recorder.frame_id = recorder.frame_id.wrapping_add(1).max(1);
-    let layers = &recorder.layers[..recorder.layer_len];
-    let quads = &recorder.quads[..recorder.len];
-    let mut header = GpuUiFrameHeader::new(
+    let transform_layers = unsafe { &mut *core::ptr::addr_of_mut!(TRANSFORM_LAYERS) };
+    for (target, source) in transform_layers[..recorder.layer_len]
+        .iter_mut()
+        .zip(&recorder.layers[..recorder.layer_len])
+    {
+        *target = *source;
+        target.first_quad = 0;
+        target.quad_count = 0;
+    }
+    let layers = &transform_layers[..recorder.layer_len];
+    let quads = &[];
+    let mut header = GpuUiFrameHeader::new_transform(
         recorder.width,
         recorder.height,
         recorder.frame_id,
         layers.len() as u32,
-        quads.len() as u32,
     );
     header.checksum = gpu_ui_checksum(layers, quads);
     Some((header, layers, quads))

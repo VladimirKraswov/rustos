@@ -158,8 +158,9 @@ surface queues начато: `surface.dll` и boot-test уже проходят 
 `create/commit/direct-scanout/release/feedback/destroy` между независимым
 ring-3 приложением и compositord. Штатный desktop уже композируется из
 независимых GPU surfaces окон: drag меняет только transform, текст использует
-общий Latin/Cyrillic SDF atlas, аппаратный cursor не повреждает кадр. Ownership
-слоёв пока остаётся у bootstrap window session; следующий шаг — постоянные
+единый Latin/Cyrillic rasterizer и корректные premultiplied coverage spans,
+аппаратный cursor не повреждает кадр. SDF/R8 atlas остаётся следующим этапом
+оптимизации текста. Ownership слоёв пока остаётся у bootstrap window session; следующий шаг — постоянные
 ring-3 `windowd`/`uid`. Нативный `rustc` ещё не заявлен готовым.
 
 Подробнее: [архитектуры CPU](docs/ARCHITECTURES.md), [архитектура системы](docs/ARCHITECTURE.md),

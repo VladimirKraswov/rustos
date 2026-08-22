@@ -243,20 +243,16 @@ pub fn run_gpu_compositor_probe(width: u32, height: u32) -> Result<(), ProcessEr
     manager::run_gpu_compositor_probe(width, height)
 }
 
+/// Проверяет оконный semantic 3D Canvas без GPU readback.
+#[cfg(feature = "virgl-test")]
+pub fn run_gpu_canvas_probe(width: u32, height: u32) -> Result<(), ProcessError> {
+    manager::run_gpu_canvas_probe(width, height)
+}
+
 /// Запускает bounded аппаратную Aurora 3D-демонстрацию.
 #[cfg(feature = "virgl-test")]
 pub fn run_interactive_gpu_demo(frame_count: u32) -> Result<(), ProcessError> {
     manager::run_interactive_gpu_demo(frame_count)
-}
-
-/// Запрашивает один GPU-rendered frame для обычного desktop-окна.
-pub fn render_interactive_gpu_demo_frame(
-    width: u32,
-    height: u32,
-    scene_frame: u32,
-    output: &mut [u32],
-) -> Result<(), ProcessError> {
-    manager::render_interactive_gpu_demo_frame(width, height, scene_frame, output)
 }
 
 /// Выполняет одну команду из GUI terminal и захватывает объединённый

@@ -607,6 +607,19 @@ impl Framebuffer {
         }
     }
 
+    /// Размещает управляемый системой аппаратный 3D Canvas.
+    ///
+    /// Приложение не получает GPU capability и не знает выбранный backend.
+    /// В GPU-сеансе в display list попадает только semantic primitive; CPU
+    /// fallback вызывающий код рисует обычным framebuffer API.
+    pub fn draw_aurora_canvas(&mut self, rect: Rect, instance_id: u32, scene_frame: u32) -> bool {
+        if !self.gpu_recording || rect.is_empty() || instance_id == 0 {
+            return false;
+        }
+        crate::gui::gpu_scene::aurora_canvas(rect, instance_id, scene_frame);
+        true
+    }
+
     /// Заливает скруглённый прямоугольник. Прямые участки остаются быстрыми
     /// span-fill, а только маленькие corner tiles получают 4×4 coverage
     /// supersampling. Поэтому checkbox/toggle/card имеют гладкий силуэт без

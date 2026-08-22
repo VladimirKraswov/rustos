@@ -6,11 +6,12 @@
 
 ## Контекст
 
-Текущий графический путь RustOS — это надёжный bootstrap: SystemUI рисует CPU,
-ядро собирает единый back buffer и публикует повреждённые области через
-virtio-gpu 2D либо firmware framebuffer. Он нужен для загрузки, диагностики и
-аварийного режима, но не описывает GPU-память, многоплоскостное видео,
-асинхронные очереди, fences и независимые пользовательские процессы.
+Первоначальный графический путь RustOS был надёжным CPU bootstrap: ядро
+собирало единый back buffer и публиковало damage через virtio-gpu 2D либо
+firmware framebuffer. Сейчас штатный desktop уже использует изолированные
+`renderd`/`compositord`/`displayd`, retained GPU surfaces, асинхронные fences и
+zero-copy scanout; старый путь сохранён только для загрузки, диагностики и
+аварийного режима без VirGL.
 
 Расширять монолитный kernel `Framebuffer` до OpenGL/Vulkan нельзя: это смешает
 политику окон, display modeset, выполнение недоверенных GPU-команд и аварийный
@@ -61,13 +62,15 @@ reset. Оно не реализует Vulkan, OpenGL, оконную полит�
    `SyncPoint`/timeline, kernel objects и surface commit/release/feedback ABI.
 2. **Готово:** непередаваемая ring-3 scanout capability, atomic full-frame
    present, estimated vblank feedback и постоянные supervisor-сервисы.
-3. PCI bridges, ECAM, MSI/MSI-X, IRQ capabilities, scatter/gather DMA и IOMMU.
-4. Асинхронный virtio transport, несколько запросов in-flight, fences,
-   cursor queue, blob resources и несколько outputs.
-5. Подключить client-owned surface queues окон, multi-buffer damage и inputd.
-6. Mesa platform, `libdrm-rustos`, EGL platform и Vulkan WSI.
-7. VirGL как первый ускоренный end-to-end milestone, затем Venus.
-8. GPU backend SystemUI без изменения API компонентов.
+3. **Частично готово:** асинхронный virtio transport, несколько запросов
+   in-flight, fences и cursor queue; впереди blob resources и несколько outputs.
+4. **Готово для текущего desktop:** retained оконные surfaces, transform-only
+   drag, multi-buffer damage и GPU backend SystemUI без изменения API компонентов.
+5. **Готово как первый end-to-end backend:** Mesa/VirGL, EGL/OpenGL ES ABI и
+   zero-copy composition; следующим стандартным backend станет Venus/Vulkan.
+6. PCI bridges, ECAM, MSI/MSI-X, IRQ capabilities, scatter/gather DMA и IOMMU.
+7. Полные client-owned surface queues и выделенный `inputd`.
+8. `libdrm-rustos`, Vulkan WSI, blob resources и несколько outputs.
 9. Raspberry Pi VC4/V3D как первая фиксированная физическая ARM-цель.
 
 Первый пакет сохраняет рабочее поведение desktop, но не старые имена API. Весь

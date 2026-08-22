@@ -190,32 +190,12 @@ fn draw_char_clipped(
     style: FontStyle,
     clip: Rect,
 ) -> i32 {
-    if fb.gpu_recording() {
-        let metrics = rustos_system_fonts::metrics(character, raster_style(style));
-        let advance = i32::from(metrics.advance);
-        if metrics.width == 0 || metrics.height == 0 {
-            return advance;
-        }
-        let glyph_rect = Rect::new(
-            x + i32::from(metrics.bearing_x),
-            y + i32::from(metrics.bearing_y),
-            u32::from(metrics.width),
-            u32::from(metrics.height),
-        );
-        let screen = Rect::new(0, 0, fb.width(), fb.height());
-        let visible = glyph_rect.intersection(clip).intersection(screen);
-        if !visible.is_empty() {
-            crate::gui::gpu_scene::glyph(
-                visible,
-                color,
-                character,
-                gpu_style(style),
-                visible.x.saturating_sub(glyph_rect.x) as u16,
-                visible.y.saturating_sub(glyph_rect.y) as u16,
-            );
-        }
-        return advance;
-    }
+    // Пока VirGL textured pipeline не выполняет настоящий source-over,
+    // glyph atlas нельзя копировать BLIT-командой: нулевая alpha становится
+    // чёрным прямоугольником. Тот же системный rasterizer формирует короткие
+    // coverage spans, а GPU color pipeline корректно смешивает их. Surface
+    // кэширует результат, поэтому стоимость платится только при изменении
+    // текста, но качество совпадает с CPU fallback.
     let raster = rustos_system_fonts::rasterize(character, raster_style(style));
     let advance = i32::from(raster.advance);
     if raster.width == 0 || raster.height == 0 {
@@ -278,13 +258,4 @@ fn raster_style(style: FontStyle) -> rustos_system_fonts::Style {
         italic: style.italic,
         size: style.size,
     }
-}
-
-fn gpu_style(style: FontStyle) -> u32 {
-    rustos_abi::gpu::ui_glyph_style::pack(
-        style.family == FontFamily::Sans,
-        style.weight == FontWeight::Bold,
-        style.italic,
-        style.size.clamp(10, 48),
-    )
 }

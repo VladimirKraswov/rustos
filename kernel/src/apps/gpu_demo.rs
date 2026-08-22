@@ -1,14 +1,15 @@
 //! Оконное системное приложение «Aurora 3D».
 //!
-//! Приложение владеет retained surface, но не GPU capability. Каждый кадр
-//! запрашивается у изолированного `renderd`; при отсутствии VirGL тот же
-//! surface заполняет bounded software renderer. Поэтому отказ GPU не ломает
-//! desktop, а окно, taskbar и ввод остаются обычными объектами оконной системы.
+//! Приложение владеет состоянием сцены, но не GPU capability. В ускоренном
+//! режиме оно помещает в display list semantic 3D Canvas: изолированный
+//! `renderd` сам создаёт surface и оставляет кадр на GPU. При отсутствии
+//! VirGL тот же Canvas заполняется bounded software renderer'ом. Поэтому
+//! backend не просачивается в API приложения, а отказ GPU не ломает desktop.
 
 use crate::{
     font,
     graphics::{Color, Framebuffer, Rect},
-    process, serial,
+    serial,
 };
 
 pub const SURFACE_WIDTH: u32 = 800;
@@ -27,13 +28,14 @@ pub enum RendererBackend {
 /// Независимое состояние одного экземпляра демо.
 pub struct GpuDemo {
     pixels: [u32; SURFACE_PIXELS],
+    /// Стабильный id Canvas не является GPU handle и безопасен в stream.
+    instance_id: u32,
     frame: u32,
     last_frame_ms: u64,
     fps_epoch_ms: u64,
     fps_frames: u32,
     fps: u16,
     backend: RendererBackend,
-    retry_after_frame: u32,
     backend_logged: bool,
 }
 
@@ -44,13 +46,14 @@ impl GpuDemo {
     /// # Safety
     /// `destination` указывает на уникальное неинициализированное хранилище
     /// размером `Self` с правильным выравниванием.
-    pub unsafe fn initialize_in_place(destination: *mut Self, now_ms: u64) {
+    pub unsafe fn initialize_in_place(destination: *mut Self, now_ms: u64, instance_id: u32) {
         // SAFETY: контракт функции гарантирует весь диапазон Self; pixels —
         // первый полностью принадлежащий destination field.
         unsafe {
             core::ptr::addr_of_mut!((*destination).pixels)
                 .cast::<u32>()
                 .write_bytes(0, SURFACE_PIXELS);
+            core::ptr::addr_of_mut!((*destination).instance_id).write(instance_id.max(1));
             core::ptr::addr_of_mut!((*destination).frame).write(0);
             core::ptr::addr_of_mut!((*destination).last_frame_ms)
                 .write(now_ms.saturating_sub(GPU_FRAME_INTERVAL_MS));
@@ -58,7 +61,6 @@ impl GpuDemo {
             core::ptr::addr_of_mut!((*destination).fps_frames).write(0);
             core::ptr::addr_of_mut!((*destination).fps).write(0);
             core::ptr::addr_of_mut!((*destination).backend).write(RendererBackend::Probing);
-            core::ptr::addr_of_mut!((*destination).retry_after_frame).write(0);
             core::ptr::addr_of_mut!((*destination).backend_logged).write(false);
         }
     }
@@ -66,31 +68,22 @@ impl GpuDemo {
     /// GPU получает 60 Hz pacing hint, а тяжёлый CPU fallback ограничивается
     /// 30 Hz. Оба пути запускаются только после input polling оконного сервера,
     /// поэтому renderer не может вытеснить уже ожидающее событие мыши.
-    pub fn tick(&mut self, now_ms: u64) -> bool {
-        let frame_interval_ms = if self.backend == RendererBackend::Software {
-            SOFTWARE_FRAME_INTERVAL_MS
-        } else {
+    pub fn tick(&mut self, now_ms: u64, gpu_recording: bool) -> bool {
+        let frame_interval_ms = if gpu_recording {
             GPU_FRAME_INTERVAL_MS
+        } else {
+            SOFTWARE_FRAME_INTERVAL_MS
         };
         if now_ms.saturating_sub(self.last_frame_ms) < frame_interval_ms {
             return false;
         }
         self.last_frame_ms = now_ms;
-        let should_probe_gpu = self.backend != RendererBackend::Software
-            || self.frame.wrapping_sub(self.retry_after_frame) < 0x8000_0000;
-        let gpu_rendered = should_probe_gpu
-            && process::render_interactive_gpu_demo_frame(
-                SURFACE_WIDTH,
-                SURFACE_HEIGHT,
-                self.frame,
-                &mut self.pixels,
-            )
-            .is_ok();
-        if gpu_rendered {
+        if gpu_recording {
+            // Никакого synchronous request/readback здесь больше нет. Сам
+            // кадр построит renderd, когда оконный сервер опубликует Canvas.
             self.backend = RendererBackend::Virgl;
         } else {
             self.backend = RendererBackend::Software;
-            self.retry_after_frame = self.frame.wrapping_add(120);
             self.render_software_frame();
         }
         if !self.backend_logged {
@@ -169,7 +162,14 @@ impl GpuDemo {
             content.height.saturating_sub(header_height + 24),
         );
         let destination = aspect_fit(available, SURFACE_WIDTH, SURFACE_HEIGHT);
-        framebuffer.blit_bgrx_bilinear(&self.pixels, SURFACE_WIDTH, SURFACE_HEIGHT, destination);
+        if !framebuffer.draw_aurora_canvas(destination, self.instance_id, self.frame) {
+            framebuffer.blit_bgrx_bilinear(
+                &self.pixels,
+                SURFACE_WIDTH,
+                SURFACE_HEIGHT,
+                destination,
+            );
+        }
         framebuffer.rounded_border(destination, 8, 1, Color::rgb(70, 93, 130));
     }
 

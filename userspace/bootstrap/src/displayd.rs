@@ -48,23 +48,19 @@ pub extern "C" fn _start(endpoint: u64, scanout: u64, abi_version: u64) -> ! {
             process_exit(173);
         }
         match message.header.opcode {
-            DISPLAY_QUERY_OPCODE => handle_query(scanout, &message),
-            DISPLAY_PRESENT_OPCODE => handle_present(scanout, &message),
+            DISPLAY_QUERY_OPCODE => handle_query(info, &message),
+            DISPLAY_PRESENT_OPCODE => handle_present(scanout, info, &message),
             _ => process_exit(174),
         }
     }
 }
 
-fn handle_query(scanout: Handle, message: &Message) {
+fn handle_query(info: DisplayScanoutInfo, message: &Message) {
     if message.header.payload_len != 0 || message.header.handle_count != DISPLAY_QUERY_HANDLE_COUNT
     {
         process_exit(175);
     }
     let reply = message.handles[0].handle;
-    let mut info = empty_scanout_info();
-    if display_get_info(scanout, &mut info) != syscall::status::OK || info.validate().is_err() {
-        process_exit(176);
-    }
     let mut response = Message::EMPTY;
     response.header.opcode = DISPLAY_INFO_OPCODE;
     response.header.flags = rustos_abi::ipc::flags::REPLY;
@@ -78,7 +74,7 @@ fn handle_query(scanout: Handle, message: &Message) {
     }
 }
 
-fn handle_present(scanout: Handle, message: &Message) {
+fn handle_present(scanout: Handle, info: DisplayScanoutInfo, message: &Message) {
     if message.header.payload_len != 64
         || message.header.handle_count != DISPLAY_PRESENT_HANDLE_COUNT
     {
@@ -93,13 +89,12 @@ fn handle_present(scanout: Handle, message: &Message) {
     let release = message.handles[2].handle;
     let feedback_endpoint = message.handles[3].handle;
     let mut descriptor = empty_descriptor();
-    let mut info = empty_scanout_info();
 
-    // Ни timeline, ни GraphicsBuffer не могут подменить эксклюзивный scanout.
-    if display_get_info(acquire, &mut info) != syscall::status::ACCESS_DENIED
-        || display_get_info(scanout, &mut info) != syscall::status::OK
-        || graphics_buffer_get_info(acquire, &mut descriptor) != syscall::status::ACCESS_DENIED
-        || graphics_buffer_get_info(buffer, &mut descriptor) != syscall::status::OK
+    // Scanout metrics неизменяемы в пределах generation displayd. Проверки
+    // type confusion выполняет capability resolver каждого syscall; горячий
+    // present path больше не делает три заведомо неуспешных диагностических
+    // вызова на каждый кадр.
+    if graphics_buffer_get_info(buffer, &mut descriptor) != syscall::status::OK
         || descriptor.validate().is_err()
         || descriptor.width != present.width
         || descriptor.height != present.height

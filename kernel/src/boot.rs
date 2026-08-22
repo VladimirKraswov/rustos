@@ -197,38 +197,12 @@ pub fn kernel_main(info: &BootInfo) -> ! {
                     serial::put_str("[virgl-test] FATAL: GPU compositor probe failed\n");
                     exit_kernel(0x55);
                 }
-                let pixels = u64::from(scanout.width) * u64::from(scanout.height);
-                let frames = pixels.saturating_mul(4).div_ceil(4096);
-                let readback = memory::allocate(frames, 1).unwrap_or_else(|_| {
-                    serial::put_str("[virgl-test] FATAL: readback allocation failed\n");
-                    exit_kernel(0x55);
-                });
-                // SAFETY: allocator предоставил уникальный identity-mapped
-                // диапазон не меньше `pixels * 4`; slice живёт до free ниже.
-                let output = unsafe {
-                    core::slice::from_raw_parts_mut(readback.phys as *mut u32, pixels as usize)
-                };
-                if process::render_interactive_gpu_demo_frame(
-                    scanout.width,
-                    scanout.height,
-                    0,
-                    output,
-                )
-                .is_err()
-                {
-                    let _ = memory::free(readback);
-                    serial::put_str("[virgl-test] FATAL: windowed GPU readback failed\n");
-                    exit_kernel(0x55);
-                }
-                let first = output.first().copied().unwrap_or(0);
-                let last = output.last().copied().unwrap_or(0);
-                let _ = memory::free(readback);
-                if first == 0 && last == 0 {
-                    serial::put_str("[virgl-test] FATAL: empty windowed GPU surface\n");
+                if process::run_gpu_canvas_probe(scanout.width, scanout.height).is_err() {
+                    serial::put_str("[virgl-test] FATAL: windowed GPU Canvas failed\n");
                     exit_kernel(0x55);
                 }
                 serial::put_str(
-                    "[virgl-test] WINDOWED_READBACK_READY source=host-gpu cpu-raster=no\n",
+                    "[virgl-test] WINDOWED_CANVAS_READY source=gpu-surface readback=0 cpu-raster=no\n",
                 );
                 if process::run_interactive_gpu_demo(48).is_err() {
                     serial::put_str("[virgl-test] FATAL: Aurora 3D application failed\n");

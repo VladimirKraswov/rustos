@@ -56,6 +56,34 @@ struct PreparedFrame {
     acquire_value: u64,
 }
 
+/// Постоянная release timeline внутреннего desktop swapchain.
+///
+/// Создание/уничтожение kernel object на каждый vblank было чистой служебной
+/// нагрузкой. Значение монотонно растёт, а displayd получает обычную
+/// capability-копию того же timeline вместе с каждым present.
+struct PresentClock {
+    timeline: Handle,
+    value: u64,
+}
+
+impl PresentClock {
+    fn new() -> Self {
+        let value = sync_timeline_create(&SyncTimelineCreate::new(0));
+        if value <= 0 {
+            process_exit(187);
+        }
+        Self {
+            timeline: Handle(value as u32),
+            value: 0,
+        }
+    }
+
+    fn advance(&mut self) -> u64 {
+        self.value = self.value.saturating_add(1);
+        self.value
+    }
+}
+
 #[derive(Clone, Copy)]
 struct ClientSurface {
     owner_pid: u64,
@@ -92,6 +120,7 @@ pub extern "C" fn _start(display_endpoint: u64, feedback_endpoint: u64, abi_vers
     let display_endpoint = Handle(display_endpoint as u32);
     let feedback_endpoint = Handle(feedback_endpoint as u32);
     let info = query_display(display_endpoint, feedback_endpoint);
+    let mut present_clock = PresentClock::new();
     let mut frame_id = 1u64;
     let mut next_surface_id = 1u64;
     let mut surfaces = [ClientSurface::EMPTY; MAX_CLIENT_SURFACES];
@@ -99,7 +128,14 @@ pub extern "C" fn _start(display_endpoint: u64, feedback_endpoint: u64, abi_vers
     // навсегда зафиксировал бы размер renderd target равным scanout и не дал
     // бы приложениям создавать компактные оконные surfaces.
     let first = prepare_cpu_frame(info);
-    present_frame(display_endpoint, feedback_endpoint, info, first, frame_id);
+    present_frame(
+        display_endpoint,
+        feedback_endpoint,
+        info,
+        first,
+        frame_id,
+        &mut present_clock,
+    );
 
     loop {
         let mut control = Message::EMPTY;
@@ -150,9 +186,9 @@ pub extern "C" fn _start(display_endpoint: u64, feedback_endpoint: u64, abi_vers
             info.height
         };
         if windowed {
-            // Windowed Aurora пока позже забирается bootstrap desktop через
-            // readback. Compositor probe принципиально только ждёт GPU fence:
-            // его цель — проверить multi-surface blit без CPU pixels.
+            // Bounded windowed запрос здесь остаётся диагностикой отдельного
+            // render target. Рабочая Aurora приходит в обычном SystemUI
+            // stream как semantic Canvas и смешивается renderd без readback.
             frame_id = frame_id.saturating_add(1);
             let frame = prepare_gpu_frame(
                 render_width,
@@ -173,6 +209,7 @@ pub extern "C" fn _start(display_endpoint: u64, feedback_endpoint: u64, abi_vers
                 render_width,
                 render_height,
                 &mut frame_id,
+                &mut present_clock,
             );
         }
     }
@@ -427,6 +464,7 @@ fn close_prepared_and_release(prepared: PreparedFrame, release: Handle) {
 /// Держит до трёх GPU кадров впереди displayd. Если более свежий frame уже
 /// готов, а старый опоздал к refresh boundary, stale buffer отбрасывается —
 /// это mailbox semantics, а не растущая FIFO задержка.
+#[allow(clippy::too_many_arguments)]
 fn present_swapchain(
     display: Handle,
     feedback: Handle,
@@ -435,6 +473,7 @@ fn present_swapchain(
     width: u32,
     height: u32,
     frame_id: &mut u64,
+    present_clock: &mut PresentClock,
 ) {
     const IMAGE_COUNT: usize = 3;
     let mut queue = SurfaceQueue::<PreparedFrame, IMAGE_COUNT>::new(IMAGE_COUNT)
@@ -474,7 +513,7 @@ fn present_swapchain(
             consumed = consumed.saturating_add(1);
         }
         let (slot, id, prepared) = selection.selected;
-        present_frame(display, feedback, info, prepared, id);
+        present_frame(display, feedback, info, prepared, id, present_clock);
         queue.release(slot).unwrap_or_else(|_| process_exit(206));
         consumed = consumed.saturating_add(1);
     }
@@ -502,9 +541,20 @@ fn present_frame(
     info: DisplayScanoutInfo,
     prepared: PreparedFrame,
     frame_id: u64,
+    clock: &mut PresentClock,
 ) {
-    let (_, release) = present_frame_raw(display, feedback_endpoint, info, prepared, frame_id);
-    close_prepared_and_release(prepared, release);
+    let release_value = clock.advance();
+    let _ = present_frame_on_timeline(
+        display,
+        feedback_endpoint,
+        info,
+        prepared,
+        frame_id,
+        clock.timeline,
+        release_value,
+    );
+    let _ = handle_close(prepared.buffer);
+    let _ = handle_close(prepared.acquire);
 }
 
 fn present_frame_raw(
@@ -519,6 +569,28 @@ fn present_frame_raw(
         process_exit(187);
     }
     let release = Handle(release_value as u32);
+    let feedback = present_frame_on_timeline(
+        display,
+        feedback_endpoint,
+        info,
+        prepared,
+        frame_id,
+        release,
+        1,
+    );
+    (feedback, release)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn present_frame_on_timeline(
+    display: Handle,
+    feedback_endpoint: Handle,
+    info: DisplayScanoutInfo,
+    prepared: PreparedFrame,
+    frame_id: u64,
+    release: Handle,
+    release_value: u64,
+) -> DisplayPresentFeedback {
     let metrics = SurfaceMetrics::new(info.width, info.height, info.width, info.height, 1000);
     let surface = SurfaceCreateRequest::new(metrics, 3);
     let commit = SurfaceCommit::full_damage(SurfaceId(0x7fff), metrics, frame_id, 0);
@@ -529,7 +601,7 @@ fn present_frame_raw(
         frame_id,
         &prepared.descriptor,
         prepared.acquire_value,
-        1,
+        release_value,
     );
     let mut message = Message::EMPTY;
     message.header.opcode = DISPLAY_PRESENT_OPCODE;
@@ -558,8 +630,11 @@ fn present_frame_raw(
         rights: Rights::SEND,
     };
     if ipc_send(display, &message) != syscall::status::OK
-        || sync_timeline_wait(&SyncTimelineWait::new(release, 1, SYNC_TIMEOUT_INFINITE))
-            != syscall::status::OK
+        || sync_timeline_wait(&SyncTimelineWait::new(
+            release,
+            release_value,
+            SYNC_TIMEOUT_INFINITE,
+        )) != syscall::status::OK
     {
         process_exit(190);
     }
@@ -580,7 +655,7 @@ fn present_frame_raw(
     if feedback.frame_id != frame_id || feedback.output != info.output {
         process_exit(196);
     }
-    (feedback, release)
+    feedback
 }
 
 fn prepare_cpu_frame(info: DisplayScanoutInfo) -> PreparedFrame {
@@ -738,9 +813,9 @@ fn wait_prepared(prepared: PreparedFrame) {
 }
 
 fn discard_frame(prepared: PreparedFrame) {
-    // Полученные handles являются производными копиями. Оригинальный
-    // GraphicsBuffer остаётся у renderd и будет прочитан оконным compositor'ом
-    // после возврата scheduler'а в kernel desktop.
+    // Полученные handles являются производными копиями. Диагностический
+    // target уже проверен acquire fence; рабочий оконный Canvas использует
+    // отдельный retained путь и от этого handle не зависит.
     if handle_close(prepared.buffer) != syscall::status::OK
         || handle_close(prepared.acquire) != syscall::status::OK
     {

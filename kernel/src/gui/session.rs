@@ -277,11 +277,13 @@ impl ApplicationMemory {
         Some(result)
     }
 
-    fn new_gpu_demo(kind: ApplicationKind, now_ms: u64) -> Option<Self> {
+    fn new_gpu_demo(kind: ApplicationKind, now_ms: u64, instance_id: u32) -> Option<Self> {
         let result = Self::allocate_for::<GpuDemo>(kind)?;
         // SAFETY: allocate_for выделил уникальный диапазон полного размера;
         // большой pixel surface строится на месте без временного значения.
-        unsafe { GpuDemo::initialize_in_place(result.pointer.cast::<GpuDemo>(), now_ms) };
+        unsafe {
+            GpuDemo::initialize_in_place(result.pointer.cast::<GpuDemo>(), now_ms, instance_id)
+        };
         Some(result)
     }
 
@@ -420,6 +422,9 @@ struct DesktopSession {
     window_count: usize,
     focused: Option<WindowId>,
     next_window_id: u64,
+    /// Следующее окно, с которого начинается обход анимаций. Без cursor
+    /// первый тяжёлый клиент навсегда лишал кадров все последующие окна.
+    animation_cursor: usize,
     cascade: u32,
     window_events: WindowEventQueue<WINDOW_EVENT_CAPACITY>,
     interaction: WindowInteraction,
@@ -493,6 +498,7 @@ impl DesktopSession {
             window_count: 0,
             focused: None,
             next_window_id: 1,
+            animation_cursor: 0,
             cascade: 0,
             window_events: WindowEventQueue::new(),
             interaction: WindowInteraction::None,
@@ -994,7 +1000,9 @@ impl DesktopSession {
     }
 
     fn tick_animated_application(&mut self, now_ms: u64) -> Option<WindowId> {
-        for index in 0..MAX_WINDOWS {
+        let gpu_recording = self.framebuffer.gpu_recording();
+        for offset in 0..MAX_WINDOWS {
+            let index = (self.animation_cursor + offset) % MAX_WINDOWS;
             let Some(slot) = self.windows[index].as_mut() else {
                 continue;
             };
@@ -1003,7 +1011,8 @@ impl DesktopSession {
             }
             let id = slot.model.id();
             if let Application::GpuDemo(demo) = slot.application.get_mut() {
-                if demo.tick(now_ms) {
+                if demo.tick(now_ms, gpu_recording) {
+                    self.animation_cursor = (index + 1) % MAX_WINDOWS;
                     return Some(id);
                 }
             }
@@ -1926,7 +1935,7 @@ impl DesktopSession {
                 })
             }
             ApplicationKind::GpuDemo => {
-                ApplicationMemory::new_gpu_demo(kind, arch::monotonic_milliseconds())
+                ApplicationMemory::new_gpu_demo(kind, arch::monotonic_milliseconds(), id.0 as u32)
             }
         }?;
         let frames = memory.frames();
@@ -2462,10 +2471,9 @@ impl DesktopSession {
         let Some(rect) = self.window_rect(window) else {
             return false;
         };
-        let Some((header, layers, quads)) = crate::gui::gpu_scene::transform_layer(
-            0x1000_0000_0000_0000 | window.0,
-            window_damage(rect),
-        ) else {
+        let Some((header, layers, quads)) =
+            crate::gui::gpu_scene::transform_layer(0x1000_0000_0000_0000 | window.0, rect)
+        else {
             return false;
         };
         self.present_gpu_stream(header, layers, quads)
@@ -2502,6 +2510,31 @@ impl DesktopSession {
     fn render_scene(&mut self) {
         if self.framebuffer.gpu_recording() {
             let screen = Rect::new(0, 0, self.framebuffer.width(), self.framebuffer.height());
+            // Popup содержит прозрачные области, а VirGL BLIT не является
+            // alpha compositor. При открытом меню строим один непрозрачный
+            // snapshot всей сцены: это редкое событие и оно гарантирует
+            // правильный z-order без чёрных прямоугольников и stale damage.
+            if self.shell.desktop_menu_is_open() || self.shell.is_open() {
+                crate::gui::gpu_scene::begin_layer(
+                    4,
+                    screen,
+                    rustos_abi::gpu::ui_layer_flag::OPAQUE,
+                );
+                self.render_base();
+                for index in 0..self.window_count {
+                    let id = self.z_order[index];
+                    if self.window_is_visible(id) {
+                        self.render_window(id);
+                    }
+                }
+                if self.shell.desktop_menu_is_open() {
+                    self.render_desktop_menu();
+                }
+                if self.shell.is_open() {
+                    self.render_start_menu();
+                }
+                return;
+            }
             crate::gui::gpu_scene::begin_layer(1, screen, rustos_abi::gpu::ui_layer_flag::OPAQUE);
             self.render_base();
             for index in 0..self.window_count {
@@ -2510,20 +2543,11 @@ impl DesktopSession {
                     if let Some(rect) = self.window_rect(id) {
                         crate::gui::gpu_scene::begin_layer(
                             0x1000_0000_0000_0000 | id.0,
-                            window_damage(rect),
-                            0,
+                            rect,
+                            rustos_abi::gpu::ui_layer_flag::OPAQUE,
                         );
                         self.render_window(id);
                     }
-                }
-            }
-            if self.shell.desktop_menu_is_open() || self.shell.is_open() {
-                crate::gui::gpu_scene::begin_layer(2, screen, 0);
-                if self.shell.desktop_menu_is_open() {
-                    self.render_desktop_menu();
-                }
-                if self.shell.is_open() {
-                    self.render_start_menu();
                 }
             }
             return;
@@ -2749,7 +2773,14 @@ impl DesktopSession {
         let focused = self.focused == Some(id);
 
         let screen = Rect::new(0, 0, self.framebuffer.width(), self.framebuffer.height());
-        self.framebuffer.soft_shadow(rect, Theme::RADIUS, screen);
+        if self.framebuffer.gpu_recording() {
+            // Независимая GPU surface окна обязана быть полностью
+            // непрозрачной, пока textured alpha compositor не введён в ABI.
+            // Прозрачная тень через BLIT оставляла следы при transform.
+            self.framebuffer.fill_rect(rect, Theme::PANEL);
+        } else {
+            self.framebuffer.soft_shadow(rect, Theme::RADIUS, screen);
+        }
         Panel {
             rect,
             color: Theme::PANEL,
