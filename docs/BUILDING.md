@@ -18,12 +18,14 @@ native AArch64 Linux при наличии `/dev/kvm` — KVM. Cross-ISA инт�
 
 ```text
 make bootstrap   подготовить OVMF
-make build/run   ARM+HVF на Apple Silicon, AMD64 на остальных хостах
+make build/run   ARM+UTM/HVF/VirGL на Apple Silicon, AMD64 на остальных
 make build-x86   явно собрать AMD64 GUI-образ
 make run-x86     явно запустить AMD64 VM
 make run-virgl   AMD64 + virtio-vga-gl; нужен QEMU с virglrenderer
 make build-arm   собрать полный ARM-образ (kernel/RUNE/VaraniaFS/AAVMF/ESP)
 make run-arm     запустить ARM-вариант (QEMU virt + UEFI)
+make setup-utm-gpu создать/обновить UTM VirGL/ANGLE-Metal профиль
+make run-utm-gpu собрать ARM и запустить ускоренную VM через публичный UTM API
 make lint        fmt + ShellCheck + Clippy -D warnings для host/обеих ISA/UEFI
 make test-host   ABI, SystemUI/assets, scheduler, loader/format/fs/tool tests
 make test-arch   собрать kernel/runtime/apps для AMD64 и AArch64
@@ -32,6 +34,7 @@ make test-arm-boot AAVMF + EL0/EL1/GICv3/PSCI/VFS test
 make test-arm-gui AAVMF + virtio GPU/input + SystemUI smoke test
 make test-gui    keyboard/mouse/window framebuffer test
 make test-virgl  ring-3 Mesa/VirGL Aurora 3D -> GraphicsBuffer -> scanout test
+make test-utm-gpu Apple Silicon E2E: RustOS VirGL -> UTM ANGLE -> Metal
 make bootstrap-mesa скачать и проверить закреплённый upstream Mesa source
 make test        полный test suite
 make clean       удалить генерируемые артефакты
@@ -70,6 +73,26 @@ scanout и обеспечивает runtime mode-set.
 — `tcg + cortex-a72`. Переопределяемые параметры: `ARM_SMP` (4),
 `ARM_MEMORY_MB` (1024), `ARM_CPU_MODEL`, `ARM_ACCEL`, `RUSTOS_FULLSCREEN`
 (1 на macOS).
+
+### Ускоренный профиль Apple Silicon
+
+`make run` на Apple Silicon эквивалентен `make run-utm-gpu`. Скрипт создаёт
+VM **RustOS GPU Development** через AppleScript API UTM, использует HVF и
+подключает `virtio-gpu-gl-device`. UTM передаёт VirGL в virglrenderer, а затем
+в ANGLE/Metal. Образы из `build/` подключаются напрямую и не копируются в
+скрытый каталог VM.
+
+```sh
+brew install --cask utm  # один раз
+make run                 # обычная интерактивная VM
+make test-utm-gpu        # serial E2E proof без guest CPU rasterization
+```
+
+Запуск бинарника
+`UTM.app/Contents/XPCServices/QEMUHelper.xpc/.../QEMULauncher` напрямую не
+поддерживается. Это sandboxed XPC helper: macOS требует, чтобы его породил
+родитель UTM. Репозиторий намеренно использует только `utmctl` и публичный
+AppleScript API.
 
 `make test-arm-boot` пересобирает kernel с `boot-test`, запускает headless
 QEMU и требует: Device Tree, GICv3/Generic Timer, минимум два timer tick и

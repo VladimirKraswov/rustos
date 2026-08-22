@@ -88,7 +88,12 @@ echo "[build-arm] 3/8 kernel (aarch64-unknown-rustos, build-std=core)"
 # scripts/build.sh). Пользовательские программы выше собраны PIE и
 # продолжают загружаться RUNE-loader'ом.
 KERNEL_RUSTFLAGS="-C force-unwind-tables=no -C relocation-model=static -C link-arg=-no-pie -C link-arg=-T$ROOT/kernel/aarch64-uefi.ld"
-if [[ "${RUSTOS_BOOT_TEST:-0}" == "1" ]]; then
+if [[ "${RUSTOS_VIRGL_TEST:-0}" == "1" ]]; then
+    echo "[build-arm] kernel mode: virgl-test"
+    CARGO_PROFILE_DEV_DEBUG=0 RUSTFLAGS="$KERNEL_RUSTFLAGS" \
+        cargo -Zjson-target-spec -Zbuild-std=core build -p rustos-kernel \
+        --target "$ARM_TARGET" --features virgl-test
+elif [[ "${RUSTOS_BOOT_TEST:-0}" == "1" ]]; then
     echo "[build-arm] kernel mode: boot-test"
     CARGO_PROFILE_DEV_DEBUG=0 RUSTFLAGS="$KERNEL_RUSTFLAGS" \
         cargo -Zjson-target-spec -Zbuild-std=core build -p rustos-kernel \

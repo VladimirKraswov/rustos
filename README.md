@@ -90,10 +90,16 @@ Firmware для ARM (AAVMF) уже закоммичен в `firmware/aarch64/`; 
 канонический загрузчик — `EFI/BOOT/BOOTAA64.EFI`, persistent диск —
 `build/arm-system.vfs`.
 
-На Apple Silicon `make build`/`make run` выбирают ARM-профиль: QEMU `virt`,
-HVF, CPU `host`, 4 vCPU, 1 ГиБ RAM, virtio-gpu и virtio-input. Это аппаратная
-виртуализация AArch64 без медленной эмуляции x86. Явный AMD64-профиль сохранён
-как `make build-x86`/`make run-x86`. На других хостах default остаётся AMD64.
+На Apple Silicon `make build` выбирает ARM, а `make run` — UTM GPU-профиль:
+QEMU `virt`, HVF, CPU `host`, 4 vCPU, 2 ГиБ RAM, `virtio-gpu-gl`, VirGL и
+ANGLE/Metal. Это аппаратная виртуализация AArch64 и host GPU acceleration без
+медленной эмуляции x86. Первый запуск требует установленный UTM
+(`brew install --cask utm`). Явные переносимый ARM и AMD64 профили сохранены
+как `make run-arm` и `make run-x86`. На других хостах default остаётся AMD64.
+
+UTM запускается только через `make run`, `make run-utm-gpu` или приложение
+UTM. Вложенный `QEMULauncher.app` — sandboxed XPC helper, а не самостоятельный
+QEMU executable; прямой запуск helper'а macOS завершит диагностикой sandbox.
 
 `make run` открывает графическое окно QEMU. Клавиатура сразу направлена в
 terminal. Мышью можно перемещать окно и использовать кнопки заголовка.
@@ -106,6 +112,7 @@ make test-host
 make test-arch
 make test
 make test-virgl   # отдельный E2E-тест; нужен QEMU с virtio-vga-gl
+make test-utm-gpu # Apple Silicon: VirGL -> UTM ANGLE -> Metal
 ```
 
 `make test` выполняет шесть разных сценариев:

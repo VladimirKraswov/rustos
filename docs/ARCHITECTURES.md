@@ -66,7 +66,7 @@ toolchain output. User stack соблюдает SysV AMD64 и AAPCS64.
 | page descriptor encoding | да | да, 4 KiB granule |
 | syscall/context ABI | работает: CPL3, `int 0x80` | работает: EL0, `svc #0` |
 | bootloader + запуск в VM | GRUB 2/Multiboot2 + OVMF | AAVMF + BOOTAA64.EFI |
-| interrupt controller / timer | xAPIC/x2APIC + TSC deadline | GICv3 + Generic Timer PPI 30 |
+| interrupt controller / timer | xAPIC/x2APIC + TSC deadline | GICv3 + virtual Generic Timer PPI 27 |
 | SMP startup | ACPI + INIT-SIPI | Device Tree + PSCI `CPU_ON` |
 | persistent block | virtio-blk PCI | virtio-blk modern MMIO |
 | display | virtio-gpu modern PCI | virtio-gpu modern MMIO |
@@ -91,8 +91,8 @@ RUNE/std/VFS/loader и маркер `RING3_MILESTONE_OK`. CI выполняет 
    EL2, строит 48-битный 4-KiB identity map и передаёт FDT в `BootInfo`;
 2. полные EL0/EL1 exception frames, `eret`/`svc`, отдельные process TTBR0,
    W^X и локализацию synchronous fault;
-3. GICv3 system-register interface и architected physical timer с настоящим
-   вытеснением пользовательских контекстов;
+3. GICv3 system-register interface и architected virtual timer с настоящим
+   вытеснением пользовательских контекстов в TCG, HVF/UTM и bare-metal EL1;
 4. bounded FDT parser и PSCI HVC/SMC conduit; до 64 CPU получают отдельные
    стеки, подтверждают online и пока безопасно parked;
 5. modern virtio-mmio block transport, persistent VaraniaFS, RUNE и

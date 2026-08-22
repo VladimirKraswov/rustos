@@ -97,6 +97,18 @@ headless CI означает host-side llvmpipe: guest по-прежнему н�
 пиксели, но это не доказательство физического GPU acceleration. На машине с
 аппаратным OpenGL тот же guest protocol использует host GPU.
 
+На Apple Silicon аппаратный маршрут проверяется отдельно:
+
+```sh
+make run-utm-gpu
+make test-utm-gpu
+```
+
+UTM запускает AArch64 через HVF, принимает VirGL команды
+`virtio-gpu-gl-device`, а host renderer UTM переводит их через ANGLE в Metal.
+Тест требует маркеры от ring-3 `renderd`, `GraphicsBuffer` scanout и
+`cpu-raster=no`; лог лежит в `build/test-results/utm-gpu/serial.log`.
+
 Успешный тест требует сразу три свидетельства:
 
 ```text

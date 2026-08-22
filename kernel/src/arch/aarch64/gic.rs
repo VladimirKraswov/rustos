@@ -3,7 +3,7 @@
 //! Здесь используются три независимых части GICv3:
 //!
 //! - Distributor описывает SPI и для scheduler PPI не программируется;
-//! - Redistributor CPU0 содержит SGI/PPI frame, где PPI 30 переводится в
+//! - Redistributor CPU0 содержит SGI/PPI frame, где PPI 27 переводится в
 //!   Group 1, получает priority и включается;
 //! - CPU interface доступен через `ICC_*_EL1` system registers и выполняет
 //!   обязательную пару acknowledge/EOI для каждого IRQ.
@@ -30,12 +30,16 @@ const WAKER_CHILDREN_ASLEEP: u32 = 1 << 2;
 const SPURIOUS_INTID_MIN: u32 = 1020;
 const RWP: u32 = 1 << 31;
 
-/// PPI 30 — EL1 physical timer (`CNTP_*`).
-pub const TIMER_IRQ: u32 = 30;
+/// PPI 27 — EL1 virtual timer (`CNTV_*`).
+///
+/// Virtual timer не требует пробрасывать physical timer programming registers
+/// через гипервизор и поэтому одинаково работает в QEMU TCG, HVF/UTM и на
+/// ARMv8 bare-metal без активного EL2.
+pub const TIMER_IRQ: u32 = 27;
 
 static LAST_INTID: AtomicU32 = AtomicU32::new(1023);
 
-/// Будит Redistributor CPU0 и включает Group-1 physical timer PPI.
+/// Будит Redistributor CPU0 и включает Group-1 virtual timer PPI.
 pub fn initialize() -> Result<(), ()> {
     // SAFETY: диапазон GICR присутствует в QEMU `virt` и отображён
     // загрузчиком как device-nGnRE.

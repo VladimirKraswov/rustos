@@ -246,7 +246,8 @@ rustos_sync_entry:
 rustos_irq_entry:
     SAVE_FRAME 1
     bl rustos_gic_acknowledge
-    cmp w0, #30
+    // PPI 27 — architected EL1 virtual timer (`CNTV_*`).
+    cmp w0, #27
     b.eq 1f
     // Любой неожиданный/spurious INTID не считается scheduler tick.
     mov x9, #2

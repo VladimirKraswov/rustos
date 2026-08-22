@@ -38,13 +38,14 @@ DEFAULT_RUN_TARGET := run-x86
 ifeq ($(HOST_SYSTEM),Darwin)
 ifneq ($(filter arm64 aarch64,$(HOST_MACHINE)),)
 DEFAULT_BUILD_TARGET := build-arm
-DEFAULT_RUN_TARGET := run-arm
+DEFAULT_RUN_TARGET := run-utm-gpu
 endif
 endif
 
 .PHONY: all bootstrap build build-x86 run run-x86 boot test test-host test-arch \
         test-boot test-arm test-arm-boot test-arm-gui test-gui bootstrap-arm build-arm \
-        bootstrap-mesa run-arm run-virgl test-virgl format lint clean
+        bootstrap-mesa run-arm run-utm-gpu setup-utm-gpu run-virgl test-virgl \
+        test-utm-gpu format lint clean
 
 all: build
 
@@ -81,6 +82,15 @@ build-arm:
 
 run-arm: build-arm
 	bash scripts/run-arm.sh
+
+setup-utm-gpu:
+	bash scripts/setup-utm-gpu.sh
+
+run-utm-gpu:
+	bash scripts/run-utm-gpu.sh
+
+test-utm-gpu:
+	bash scripts/test-utm-gpu.sh
 
 test: test-host test-arch test-boot test-arm-boot test-arm-gui test-gui
 

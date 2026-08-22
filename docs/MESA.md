@@ -81,6 +81,16 @@ make test-virgl
 цветной screenshot и отсутствие guest CPU rasterization. Артефакты:
 `build/test-results/virgl/showcase.{xwd,ppm}`.
 
-Homebrew QEMU на macOS пока не предоставляет `virtio-vga-gl`. На ARM-профиле
-ярлык остаётся видимым, но запуск честно сообщает отсутствие VirGL capability;
-software fallback не называется аппаратным ускорением.
+Homebrew QEMU на macOS не предоставляет пригодный `virtio-vga-gl`, поэтому
+ускоренный профиль Apple Silicon использует UTM:
+
+```sh
+make run-utm-gpu
+make test-utm-gpu
+```
+
+В этой конфигурации RustOS исполняется нативно через HVF, guest VirGL проходит
+через UTM virglrenderer и ANGLE/Metal. Это настоящий ускоренный transport и
+рабочий вертикальный 3D-срез, но пока не полный upstream Mesa: SystemUI всё
+ещё использует CPU 2D renderer, а EGL/GLES/GLSL/NIR cross-port остаётся
+следующим самостоятельным этапом.
