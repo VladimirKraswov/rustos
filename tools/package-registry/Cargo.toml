@@ -1,0 +1,18 @@
+[package]
+name = "rustos-package-registry-tool"
+description = "Host builder, verifier and atomic activator for signed RustOS registries"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "rustos-package"
+path = "src/main.rs"
+doc = false
+
+[dependencies]
+ed25519-dalek.workspace = true
+rustos-package-registry = { path = "../../package-registry" }
+rustos-rune-format = { path = "../../rune-format" }

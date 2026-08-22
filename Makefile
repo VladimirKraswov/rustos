@@ -16,6 +16,7 @@ SHELL := /bin/bash
 HOST_CRATES := \
 	rustos-abi rustos-microkernel rustos-video rustos-system-ui \
 	rustos-system-assets rustos-rune-format rustos-runtime rustos-vfs-client rustos-surface-client \
+	rustos-package-registry rustos-package-registry-tool \
 	rustos-elf-loader rustos-rune-loader rustos-virgl rustos-mesa rustos-usb varaniafs rustos-image rustos-pack \
 	rustos-ui-gpu rustos-gui-check rustos-hmp rustos-vfs-image rustos-rune rustos-ruidl \
 	rustos-ruidl-compiler rustos-rui rustos-wallpaper-pack
@@ -24,6 +25,7 @@ HOST_CRATE_ARGS := $(addprefix -p ,$(HOST_CRATES))
 DOC_CRATES := \
 	rustos-abi rustos-microkernel rustos-video rustos-system-ui \
 	rustos-system-assets rustos-rune-format rustos-runtime rustos-vfs-client rustos-surface-client \
+	rustos-package-registry \
 	rustos-elf-loader rustos-rune-loader rustos-ruidl rustos-ruidl-compiler rustos-virgl \
 	rustos-ui-gpu rustos-mesa rustos-usb varaniafs
 DOC_CRATE_ARGS := $(addprefix -p ,$(DOC_CRATES))
@@ -31,7 +33,7 @@ DOC_CRATE_ARGS := $(addprefix -p ,$(DOC_CRATES))
 RUSTOS_CRATES := \
 	rustos-kernel rustos-runtime rustos-crt rustos-bootstrap-apps \
 	rustos-vfs-client rustos-vfs-dll rustos-surface-client rustos-elf-loader rustos-rune-loader \
-	rustos-virgl rustos-ui-gpu rustos-mesa
+	rustos-package-registry rustos-virgl rustos-ui-gpu rustos-mesa
 RUSTOS_CRATE_ARGS := $(addprefix -p ,$(RUSTOS_CRATES))
 
 HOST_SYSTEM := $(shell uname -s)

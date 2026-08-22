@@ -104,8 +104,9 @@ pub unsafe extern "C" fn rustos_vfs_readdir(
     state: *mut VfsClient,
     directory: u64,
     entry: *mut DirectoryEntry,
+    present: *mut u8,
 ) -> i32 {
-    unsafe { client::rustos_vfs_readdir(state, directory, entry) }
+    unsafe { client::rustos_vfs_readdir(state, directory, entry, present) }
 }
 
 /// Создаёт каталог.

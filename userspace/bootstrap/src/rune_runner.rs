@@ -22,6 +22,7 @@ use rustos_abi::{
     },
     syscall, Handle, VmFlags, PAGE_SIZE,
 };
+use rustos_package_registry::{Registry, DEVELOPMENT_TRUSTED_KEY, MAX_REGISTRY_SIZE};
 use rustos_rune_format::{
     architecture, interface_id, parse_dependency, parse_export, record_kind, Container, Dependency,
     DEPENDENCY_SIZE, EXPORT_SIZE,
@@ -35,6 +36,7 @@ use rustos_runtime::{
 use rustos_vfs::VfsClient;
 
 const MAX_IMAGE_BYTES: usize = 32 * 1024 * 1024;
+const REGISTRY_PATH: &str = "/system/registry/current.ridx";
 const MAX_MODULES: usize = 8;
 const TARGET_STACK_BYTES: u64 = 8 * 1024 * 1024;
 const SERVICE_RIGHT_READ: u64 = 1 << 0;
@@ -107,6 +109,11 @@ pub extern "C" fn _start(start_address: u64, abi_version: u64, _reserved: u64) -
     let reply = startup_handle(info, StartupRole::VFS_REPLY).unwrap_or_else(|| process_exit(125));
     let mut vfs = VfsClient::connect(server, reply).unwrap_or_else(|_| process_exit(126));
 
+    let registry_bytes = read_file_bounded(&mut vfs, REGISTRY_PATH, MAX_REGISTRY_SIZE)
+        .unwrap_or_else(|_| process_exit(142));
+    let registry = Registry::verify(&registry_bytes, &[DEVELOPMENT_TRUSTED_KEY], 1)
+        .unwrap_or_else(|_| process_exit(143));
+
     let application_dir = parent_directory(&target_path).unwrap_or_else(|| process_exit(127));
     let private_directory = format!("{application_dir}/lib");
     let images = preload_graph(&mut vfs, &target_path, &application_dir, &private_directory)
@@ -114,6 +121,7 @@ pub extern "C" fn _start(start_address: u64, abi_version: u64, _reserved: u64) -
         // отличать transport fault, checksum I/O и отсутствующую DLL. Раньше
         // все эти случаи превращались в неинформативный exit 128.
         .unwrap_or_else(|error| process_exit(error));
+    verify_registered_graph(&registry, &images).unwrap_or_else(|| process_exit(144));
     let mut memory = RuntimeMemory;
     let mut loader = DynamicLoader::new(
         &images,
@@ -469,11 +477,15 @@ fn image_matches_dependency(image: &[u8], dependency: Dependency) -> bool {
 }
 
 fn read_file(vfs: &mut VfsClient, path: &str) -> Result<Vec<u8>, i32> {
+    read_file_bounded(vfs, path, MAX_IMAGE_BYTES)
+}
+
+fn read_file_bounded(vfs: &mut VfsClient, path: &str, maximum: usize) -> Result<Vec<u8>, i32> {
     use rustos_abi::vfs::{open_flags, seek_from};
 
     let file: VfsObject = vfs.open(path, open_flags::READ)?;
     let size = vfs.seek(file, 0, seek_from::END)? as usize;
-    if size == 0 || size > MAX_IMAGE_BYTES {
+    if size == 0 || size > maximum {
         let _ = vfs.close(file);
         return Err(rustos_abi::vfs::status::LIMIT_REACHED);
     }
@@ -490,6 +502,14 @@ fn read_file(vfs: &mut VfsClient, path: &str) -> Result<Vec<u8>, i32> {
     }
     vfs.close(file)?;
     Ok(bytes)
+}
+
+fn verify_registered_graph(registry: &Registry<'_>, images: &Images) -> Option<()> {
+    for image in &images.entries {
+        let container = Container::parse(&image.bytes).ok()?;
+        registry.require_container(&image.path, &container).ok()?;
+    }
+    Some(())
 }
 
 fn make_target_start_info(

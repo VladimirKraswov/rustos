@@ -146,6 +146,7 @@ patterns=(
     "\[std\] allocator fs threads futex process pipes stdio native SDK and VFS executable verified in ring3 RUNE"
     "\[vfsd\] restart recovered committed VaraniaFS metadata and file data"
     "\[loader\] atomic package prepare/capability-policy/commit imports TLS RELRO shared-RX verified"
+    "\[supervisor\] ring3 persistent launches=3 restart=1 signed-registry=Ed25519 verified"
     "\[microkernel\] RING3_MILESTONE_OK"
     "\[boot\] kernel test done, exit code=0"
 )

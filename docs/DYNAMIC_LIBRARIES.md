@@ -20,9 +20,9 @@ RELRO. Sealed RX/RO regions используют одни физические �
 Безопасные Rust crates являются тонкими wrappers поверх C ABI.
 
 Копировать Rust declarations в каждый проект не требуется. Каждая публичная
-DLL несёт `INTERFACE_SCHEMA`: сейчас это канонический RUIDL-контракт функций
-и скалярных ABI-типов; следующие расширения добавят структуры, ownership и
-наборы ошибок. `rustos-ruidl` уже генерирует из текущего контракта raw `-sys`
+DLL несёт `INTERFACE_SCHEMA`: канонический RUIDL-контракт функций, layouts,
+ownership/slices, linear handles, bounds и наборов ошибок. `rustos-ruidl`
+генерирует из текущего контракта raw `-sys`
 и safe Rust crates и кэширует по hash схемы/target ABI. Необязательный
 `SDK_BINDINGS` может ускорять offline build,
 но остаётся производным артефактом, а не вторым источником истины.

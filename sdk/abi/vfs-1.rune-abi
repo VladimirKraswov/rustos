@@ -4,14 +4,96 @@ kind library
 interface org.rustos.vfs/1
 abi 1
 capability required org.rustos.vfs/1 1 0x3 4
+
+# Layout и ownership являются частью того же RUIDL-контракта. Имена типов
+# канонические и language-neutral; Rust generator создаёт CamelCase facade.
+opaque client 32 8
+struct dirent 256 8
+field dirent object u64 0
+field dirent size u64 8
+field dirent kind u32 16
+field dirent name_length u16 20
+field dirent reserved u16 22
+field dirent name u8 24 232
+handle vfs_object u64 18446744073709551615
+
+error-set vfs_error i32 0 -2147483648
+error vfs_error INVALID_ARGUMENT -100
+error vfs_error NOT_FOUND -101
+error vfs_error ALREADY_EXISTS -102
+error vfs_error NOT_DIRECTORY -103
+error vfs_error IS_DIRECTORY -104
+error vfs_error NOT_EMPTY -105
+error vfs_error READ_ONLY -106
+error vfs_error NO_SPACE -107
+error vfs_error BAD_OBJECT -108
+error vfs_error IO -109
+error vfs_error LIMIT_REACHED -110
+error vfs_error PROTOCOL -111
+error vfs_error TRANSPORT_SEND -112
+error vfs_error TRANSPORT_RECEIVE -113
+
 export rustos_vfs_connect connect(*mut_client,u32,u32)->i32 function
 export rustos_vfs_open open(*mut_client,*const_u8,usize,u32,*mut_u64)->i32 function
 export rustos_vfs_close close(*mut_client,u64)->i32 function
 export rustos_vfs_read read(*mut_client,u64,*mut_u8,usize,*mut_usize)->i32 function
 export rustos_vfs_write write(*mut_client,u64,*const_u8,usize,*mut_usize)->i32 function
 export rustos_vfs_seek seek(*mut_client,u64,i64,u32,*mut_u64)->i32 function
-export rustos_vfs_readdir readdir(*mut_client,u64,*mut_dirent)->i32 function
+export rustos_vfs_readdir readdir(*mut_client,u64,*mut_dirent,*mut_u8)->i32 function
 export rustos_vfs_mkdir mkdir(*mut_client,*const_u8,usize)->i32 function
 export rustos_vfs_unlink unlink(*mut_client,*const_u8,usize)->i32 function
 export rustos_vfs_rename rename(*mut_client,*const_u8,usize,*const_u8,usize)->i32 function
 export rustos_vfs_sync sync(*mut_client)->i32 function
+
+out connect 0 client
+result connect vfs_error
+
+borrow open 0 exclusive client
+slice open 1 2 in utf8
+out open 4 vfs_object
+result open vfs_error
+
+borrow close 0 exclusive client
+handle-use close 1 vfs_object consume
+result close vfs_error
+
+borrow read 0 exclusive client
+handle-use read 1 vfs_object borrow
+slice read 2 3 out bytes
+out read 4 usize
+bound read 4 3
+result read vfs_error
+
+borrow write 0 exclusive client
+handle-use write 1 vfs_object borrow
+slice write 2 3 in bytes
+out write 4 usize
+bound write 4 3
+result write vfs_error
+
+borrow seek 0 exclusive client
+handle-use seek 1 vfs_object borrow
+out seek 4 u64
+result seek vfs_error
+
+borrow readdir 0 exclusive client
+handle-use readdir 1 vfs_object borrow
+out readdir 2 dirent
+out readdir 3 u8
+result readdir vfs_error
+
+borrow mkdir 0 exclusive client
+slice mkdir 1 2 in utf8
+result mkdir vfs_error
+
+borrow unlink 0 exclusive client
+slice unlink 1 2 in utf8
+result unlink vfs_error
+
+borrow rename 0 exclusive client
+slice rename 1 2 in utf8
+slice rename 3 4 in utf8
+result rename vfs_error
+
+borrow sync 0 exclusive client
+result sync vfs_error

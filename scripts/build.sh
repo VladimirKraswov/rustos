@@ -48,6 +48,12 @@ do
     cargo run -q -p rustos-rune -- verify "$RUNE_DIR/$program.rune"
 done
 
+# Supervisor — managed service, а не обычное multi-instance приложение.
+cargo run -q -p rustos-rune -- pack-manifest \
+    target/x86_64-unknown-rustos/debug/rustos-supervisor \
+    "$RUNE_DIR/supervisor.rune" sdk/abi/supervisor.rune-abi
+cargo run -q -p rustos-rune -- verify "$RUNE_DIR/supervisor.rune"
+
 # Динамические библиотеки и loader fixture используют тот же RUNE container,
 # но дополнительно получают строгие interface/symbol ABI records из SDK manifest.
 cargo run -q -p rustos-rune -- pack-manifest \
@@ -75,6 +81,24 @@ cargo run -q -p rustos-rune -- pack-manifest \
     "$STD_TARGET_DIR/x86_64-unknown-rustos/debug/rustos-sdk-hello" \
     "$RUNE_APP_DIR/hello.rune" sdk/examples/hello/hello.rune-abi
 cargo run -q -p rustos-rune -- verify "$RUNE_APP_DIR/hello.rune"
+
+# Подписанный индекс связывает canonical VFS path с package/build/content IDs.
+# Локальный образ использует явно помеченный development trust anchor; для
+# production tool принимает отдельные Ed25519 key files.
+REGISTRY_DIR="$ROOT/build/registry"
+mkdir -p "$REGISTRY_DIR"
+cargo run -q -p rustos-package-registry-tool --bin rustos-package -- build \
+    --generation 1 --output "$REGISTRY_DIR/current.ridx" --development-key \
+    "/system/lib/fixture-1.rune=$RUNE_LIB_DIR/fixture-1.rune" \
+    "/apps/loader-test/root.rune=$RUNE_LIB_DIR/loader-root.rune" \
+    "/apps/sdk/std-child.rune=$RUNE_DIR/std-child.rune" \
+    "/apps/examples/hello.rune=$RUNE_APP_DIR/hello.rune"
+cargo run -q -p rustos-package-registry-tool --bin rustos-package -- verify \
+    --minimum-generation 1 --development-key "$REGISTRY_DIR/current.ridx" \
+    "/system/lib/fixture-1.rune=$RUNE_LIB_DIR/fixture-1.rune" \
+    "/apps/loader-test/root.rune=$RUNE_LIB_DIR/loader-root.rune" \
+    "/apps/sdk/std-child.rune=$RUNE_DIR/std-child.rune" \
+    "/apps/examples/hello.rune=$RUNE_APP_DIR/hello.rune"
 
 echo "[build] 2/9 kernel (x86_64-unknown-rustos, build-std=core)"
 # Только ядро имеет фиксированный физический layout для GRUB. Пользовательские
@@ -130,6 +154,8 @@ cargo run -q -p rustos-vfs-image -- --put build/system.vfs \
     "$RUNE_DIR/std-child.rune" /apps/sdk/std-child.rune
 cargo run -q -p rustos-vfs-image -- --put build/system.vfs \
     "$RUNE_APP_DIR/hello.rune" /apps/examples/hello.rune
+cargo run -q -p rustos-vfs-image -- --put build/system.vfs \
+    "$REGISTRY_DIR/current.ridx" /system/registry/current.ridx
 cargo run -q -p rustos-vfs-image -- --verify build/system.vfs
 
 echo "[build] 6/9 GRUB 2 standalone EFI (Multiboot2)"

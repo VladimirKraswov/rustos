@@ -84,6 +84,10 @@ name = "rustos-rune-runner"
 path = "src/rune_runner.rs"
 
 [[bin]]
+name = "rustos-supervisor"
+path = "src/supervisor.rs"
+
+[[bin]]
 name = "rustos-std-smoke"
 path = "src/std_smoke.rs"
 required-features = ["std-port"]
@@ -110,6 +114,7 @@ rustos-vfs-client = { path = "../../libs/vfs" }
 rustos-elf-loader = { path = "../../libs/elf-loader" }
 rustos-rune-loader = { path = "../../libs/rune-loader" }
 rustos-rune-format = { path = "../../rune-format" }
+rustos-package-registry = { path = "../../package-registry" }
 varaniafs = { path = "../../varaniafs" }
 rustos-virgl = { path = "../../libs/virgl" }
 rustos-mesa = { path = "../../libs/mesa" }

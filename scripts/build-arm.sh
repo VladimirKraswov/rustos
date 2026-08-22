@@ -58,6 +58,10 @@ do
         "$ARM_RUNE_DIR/$program.rune"
     cargo run -q -p rustos-rune -- verify "$ARM_RUNE_DIR/$program.rune"
 done
+cargo run -q -p rustos-rune -- pack-manifest \
+    target/aarch64-unknown-rustos/debug/rustos-supervisor \
+    "$ARM_RUNE_DIR/supervisor.rune" sdk/abi/supervisor.rune-abi
+cargo run -q -p rustos-rune -- verify "$ARM_RUNE_DIR/supervisor.rune"
 for program in std-smoke std-main std-child rune
 do
     cargo run -q -p rustos-rune -- \
@@ -89,6 +93,21 @@ cargo run -q -p rustos-rune -- pack-manifest \
     "$STD_TARGET_DIR/aarch64-unknown-rustos/debug/rustos-sdk-hello" \
     "$ARM_RUNE_APP_DIR/hello.rune" sdk/examples/hello/hello.rune-abi
 cargo run -q -p rustos-rune -- verify "$ARM_RUNE_APP_DIR/hello.rune"
+
+ARM_REGISTRY_DIR="$ROOT/build/arm-registry"
+mkdir -p "$ARM_REGISTRY_DIR"
+cargo run -q -p rustos-package-registry-tool --bin rustos-package -- build \
+    --generation 1 --output "$ARM_REGISTRY_DIR/current.ridx" --development-key \
+    "/system/lib/fixture-1.rune=$ARM_RUNE_LIB_DIR/fixture-1.rune" \
+    "/apps/loader-test/root.rune=$ARM_RUNE_LIB_DIR/loader-root.rune" \
+    "/apps/sdk/std-child.rune=$ARM_RUNE_DIR/std-child.rune" \
+    "/apps/examples/hello.rune=$ARM_RUNE_APP_DIR/hello.rune"
+cargo run -q -p rustos-package-registry-tool --bin rustos-package -- verify \
+    --minimum-generation 1 --development-key "$ARM_REGISTRY_DIR/current.ridx" \
+    "/system/lib/fixture-1.rune=$ARM_RUNE_LIB_DIR/fixture-1.rune" \
+    "/apps/loader-test/root.rune=$ARM_RUNE_LIB_DIR/loader-root.rune" \
+    "/apps/sdk/std-child.rune=$ARM_RUNE_DIR/std-child.rune" \
+    "/apps/examples/hello.rune=$ARM_RUNE_APP_DIR/hello.rune"
 
 echo "[build-arm] 3/8 kernel (aarch64-unknown-rustos, build-std=core)"
 # Только ядро имеет фиксированный физический layout (зеркало x86:
@@ -140,6 +159,8 @@ cargo run -q -p rustos-vfs-image -- --put "$ROOT/build/arm-system.vfs" \
     "$ARM_RUNE_DIR/std-child.rune" /apps/sdk/std-child.rune
 cargo run -q -p rustos-vfs-image -- --put "$ROOT/build/arm-system.vfs" \
     "$ARM_RUNE_APP_DIR/hello.rune" /apps/examples/hello.rune
+cargo run -q -p rustos-vfs-image -- --put "$ROOT/build/arm-system.vfs" \
+    "$ARM_REGISTRY_DIR/current.ridx" /system/registry/current.ridx
 cargo run -q -p rustos-vfs-image -- --verify "$ROOT/build/arm-system.vfs"
 
 echo "[build-arm] 6/8 AAVMF UEFI firmware (64 MiB code + 64 MiB vars-template)"

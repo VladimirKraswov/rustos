@@ -57,11 +57,12 @@ Raw crate содержит все C ABI declarations, `#[link_name]`, точны
 types и непрозрачные `#[repr(C)]` types. Он явно называется `-sys` и является
 unsafe boundary.
 
-Safe facade автоматически публикует только функции, безопасность которых
-следует из схемы без предположений — сейчас это by-value scalar contracts.
-Pointer contracts остаются в `unsafe_api`, пока RUIDL не содержит явное
-описание ownership/borrow, длины и lifetime. Это намеренно: generator не
-превращает неизвестный `*mut T` в безопасный `&mut T` и не создаёт скрытый UB.
+Safe facade публикует pointer-функцию только когда схема полностью задаёт
+layout, borrow/out/slice ownership, linear handles, error set и bounds
+возвращаемых размеров. Из них generator строит `&str`, `&[u8]`,
+`&mut [u8]`, `Result`, opaque state и handle без `Copy`/`Clone`; `MaybeUninit`
+остаётся только внутри сгенерированного кода. Неполный контракт доступен лишь
+через явно названный `unsafe_api`: generator никогда не угадывает lifetime.
 Системные высокоуровневые facades, например VFS `File`/`Read`/`Write`, могут
 поставляться поверх generated raw crate; ручные raw declarations запрещены.
 
@@ -81,6 +82,30 @@ Generated safe call выглядит как обычный Rust:
 ```rust,ignore
 let value = rustos_math::add(20, 22);
 ```
+
+Контракт VFS показывает полный синтаксис:
+
+```text
+opaque client 32 8
+struct dirent 256 8
+field dirent object u64 0
+handle vfs_object u64 18446744073709551615
+error-set vfs_error i32 0 -2147483648
+error vfs_error NOT_FOUND -101
+
+export rustos_vfs_open open(*mut_client,*const_u8,usize,u32,*mut_u64)->i32 function
+borrow open 0 exclusive client
+slice open 1 2 in utf8
+out open 4 vfs_object
+result open vfs_error
+```
+
+Layout проверяется на размер, alignment, выход за границу и overlap. Для
+`result` все pointers обязаны иметь ровно один контракт; `out` должен быть
+mutable, а slice length — `usize` и принадлежать ровно одному срезу. Shared
+borrow принимает только raw const pointer, exclusive — mutable. Линейный
+`consume` передаёт владение при входе в provider независимо от результата
+вызова.
 
 ## Зависимости и package pin
 
@@ -122,10 +147,11 @@ transport bundle (например VFS request + private reply endpoint), не �
 
 - Формат и generator рассчитаны на 64-bit RustOS targets; cache разделяет
   AMD64 и AArch64 по target ABI.
-- Автоматическое доказательство safe pointer wrappers требует следующего
-  расширения RUIDL: structs/layout, ownership, slices, handles и error sets.
-- Подпись доверенного package registry и установка/обновление набора пакетов
-  остаются следующей policy-задачей; structural hash RUNE уже обязателен.
+- Output UTF-8 buffer намеренно не генерируется как `&mut str`: provider может
+  нарушить инвариант UTF-8. Для такого API используется byte slice и явный
+  validated-result type.
+- Production release должен заменить публичный development trust anchor своим
+  Ed25519 ключом. Development key подходит только для локальных образов.
 - Текущий VFS route выдаётся целиком как read/write service. Раздельное
   ограничение операций одного VFS endpoint требует session policy внутри
   `vfsd`; manifest уже переносит маску, но transport handle сам по себе умеет

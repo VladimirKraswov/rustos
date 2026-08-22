@@ -290,18 +290,21 @@ ring-3 resolver, typed manifest, UTF-8 metadata, icon/resource records и
 embedded interface schema. RUIDL compiler создаёт raw/safe crates в общем
 hash-cache, loader разделён на `prepare/capability-policy/commit`, а dependency
 может быть закреплена по PackageId. `hello.rune` собирается с локализованным
-manifest, SVG icon и required VFS route.
+manifest, SVG icon и required VFS route. RUIDL уже проверяет layout и ownership
+pointer API и генерирует safe slices/handles/Result. Установленный package set
+связан signed Ed25519 registry; host activator сначала фиксирует все
+content-addressed objects и только затем атомарно меняет `current`. Постоянный
+ring-3 supervisor принимает bounded launch IPC, создаёт `rune-runner`, ждёт
+точный `ExitReason` и применяет ограниченную restart policy.
 
 До зрелой границы ещё обязательны:
 
-1. ownership/layout/error annotations для полностью safe pointer wrappers;
-2. подписи package registry и атомарная установка package set;
-3. перенос оставшейся launch orchestration из kernel bootstrap в постоянный
-   ring-3 supervisor service;
-4. fault-injection всего запуска и unload/restart lifecycle;
-5. публичные `window/system-ui/graphics` DLL и независимый ring-3 sample;
-6. перевод desktop/Terminal/Проводника на эту границу;
-7. переключение системных UI/graphics providers на GPU без второго публичного
+1. production key provisioning, key rotation/revocation и offline recovery;
+2. shared-memory launch manifests для команд длиннее inline fast path;
+3. fault-injection всего запуска и unload/restart lifecycle;
+4. публичные `window/system-ui/graphics` DLL и независимый ring-3 sample;
+5. перевод desktop/Terminal/Проводника на эту границу;
+6. переключение системных UI/graphics providers на GPU без второго публичного
    API и без прямой зависимости приложений от renderer crates.
 
 ## Технические ориентиры

@@ -125,6 +125,10 @@ impl StartupRole {
     pub const DISPLAY: Self = Self(8);
     /// Объединённый keyboard/pointer input service.
     pub const INPUT: Self = Self(9);
+    /// Endpoint, на котором постоянный supervisor принимает launch requests.
+    pub const LAUNCH_CONTROL: Self = Self(10);
+    /// Endpoint lifecycle replies supervisor -> launcher/kernel adapter.
+    pub const LAUNCH_REPLY: Self = Self(11);
 }
 
 /// Элемент read-only capability namespace в [`ProcessStartInfo`].

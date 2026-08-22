@@ -147,6 +147,35 @@ pub fn kernel_main(info: &BootInfo) -> ! {
             );
             serial::put_str("[microkernel] RING3_MILESTONE_OK\n");
             if cfg!(feature = "boot-test") {
+                if process::start_interactive_services().is_err() {
+                    serial::put_str("[supervisor] FATAL: cannot start persistent service\n");
+                    exit_kernel(0x53);
+                }
+                let mut output = [0u8; 1024];
+                for _ in 0..2 {
+                    let result =
+                        process::run_interactive_command("/apps/examples/hello.rune", &mut output);
+                    if !result.is_ok_and(|exit| exit.status == 0 && exit.exception == 0) {
+                        serial::put_str(
+                            "[supervisor] FATAL: signed package launch lifecycle failed\n",
+                        );
+                        exit_kernel(0x56);
+                    }
+                }
+                #[cfg(feature = "boot-test")]
+                if process::exercise_interactive_supervisor_restart().is_err() {
+                    serial::put_str("[supervisor] FATAL: root service restart failed\n");
+                    exit_kernel(0x57);
+                }
+                let result =
+                    process::run_interactive_command("/apps/examples/hello.rune", &mut output);
+                if !result.is_ok_and(|exit| exit.status == 0 && exit.exception == 0) {
+                    serial::put_str("[supervisor] FATAL: launch after restart failed\n");
+                    exit_kernel(0x58);
+                }
+                serial::put_str(
+                    "[supervisor] ring3 persistent launches=3 restart=1 signed-registry=Ed25519 verified\n",
+                );
                 print_idle_notice();
                 exit_kernel(0);
             }

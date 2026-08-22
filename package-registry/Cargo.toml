@@ -1,0 +1,15 @@
+[package]
+name = "rustos-package-registry"
+description = "Bounded signed package registry format and runtime verifier"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+ed25519-dalek.workspace = true
+rustos-rune-format = { path = "../rune-format" }
+
+[dev-dependencies]
+ed25519-dalek.workspace = true

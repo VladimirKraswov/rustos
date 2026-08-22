@@ -217,6 +217,12 @@ pub fn pump_interactive_services() -> Result<(), ProcessError> {
     manager::pump_interactive_services()
 }
 
+/// Намеренно завершает root supervisor для проверки его bounded recovery.
+#[cfg(feature = "boot-test")]
+pub fn exercise_interactive_supervisor_restart() -> Result<(), ProcessError> {
+    manager::exercise_interactive_supervisor_restart()
+}
+
 /// Проверяет bounded GPU composition нескольких sampled surfaces.
 #[cfg(feature = "virgl-test")]
 pub fn run_gpu_compositor_probe(width: u32, height: u32) -> Result<(), ProcessError> {

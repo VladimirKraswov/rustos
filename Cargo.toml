@@ -31,6 +31,7 @@ members = [
     "libs/loader-fixture",
     "libs/loader-root",
     "rune-format",
+    "package-registry",
     "ruidl",
     "userspace/bootstrap",
     "kernel",
@@ -42,6 +43,7 @@ members = [
     "tools/vfs-image",
     "tools/rune",
     "tools/ruidl",
+    "tools/package-registry",
     "tools/rui",
     "tools/wallpaper-pack",
 ]
@@ -60,6 +62,9 @@ uefi = "=0.36.1"
 # Логирование загрузчика (уходит в UEFI ConOut). Уровень — debug, чтобы
 # видеть полный trace при сборке в dev-профиле.
 log = { version = "=0.4.22", default-features = false, features = ["max_level_debug"] }
+# Проверка package registry нужна до запуска общего crypto-service, поэтому
+# Ed25519 verifier собирается без std/alloc и без случайности.
+ed25519-dalek = { version = "=3.0.0", default-features = false, features = ["signature"] }
 
 [profile.dev]
 # debuginfo нужен для GDB, но opt-level=1 заметно ускоряет TCG-запуск в QEMU.

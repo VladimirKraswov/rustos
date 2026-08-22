@@ -1,0 +1,10 @@
+RUNE-ABI 1
+package org.rustos.system.supervisor
+kind service
+version 0 1 0
+lifecycle managed-service
+flag restartable
+name default "RustOS Process Supervisor"
+summary default "Постоянная ring-3 политика запуска и перезапуска приложений"
+vendor RustOS
+category system

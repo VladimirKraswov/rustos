@@ -452,19 +452,31 @@ pub unsafe extern "C" fn rustos_vfs_readdir(
     client: *mut VfsClient,
     directory: u64,
     entry: *mut DirectoryEntry,
+    present: *mut u8,
 ) -> i32 {
     let Some(client) = (unsafe { client.as_mut() }) else {
         return vfs::status::INVALID_ARGUMENT;
     };
-    if entry.is_null() {
+    if entry.is_null() || present.is_null() {
         return vfs::status::INVALID_ARGUMENT;
     }
     match client.read_dir(VfsObject(directory)) {
         Ok(Some(value)) => {
-            unsafe { entry.write(value) };
-            1
+            unsafe {
+                entry.write(value);
+                present.write(1);
+            }
+            vfs::status::OK
         }
-        Ok(None) => 0,
+        Ok(None) => {
+            // Оба out-параметра инициализируются при любом успешном возврате:
+            // это позволяет RUIDL generator доказуемо вернуть safe tuple.
+            unsafe {
+                entry.write(DirectoryEntry::EMPTY);
+                present.write(0);
+            }
+            vfs::status::OK
+        }
         Err(error) => error,
     }
 }

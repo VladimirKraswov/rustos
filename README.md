@@ -32,6 +32,10 @@ RustOS — учебная 64-битная микроядерная операц�
 - bounded endpoint IPC: block/wake, kernel-supplied sender PID, FIFO queue,
   process-owned динамические endpoint'ы и передача только ослабленных
   capabilities;
+- подписанный Ed25519 package registry с rollback generation, проверкой всего
+  RUNE closure и host-side атомарной активацией content-addressed package set;
+- постоянный ring-3 process supervisor: bounded launch IPC, capability
+  attenuation, wait/reap и ограниченный restart без package policy в ядре;
 - host-tested scheduler core: CPU affinity, приоритетные классы и bounded
   driver priority;
 - wide-screen GOP/virtio-gpu scanout поверх PCI (AMD64) и MMIO (AArch64),
@@ -166,6 +170,7 @@ desktop ещё не переключены на этот путь. Нативн�
 [микроядро](docs/MICROKERNEL.md), [DLL](docs/DYNAMIC_LIBRARIES.md),
 [модель приложений и RUNE](docs/APPLICATION_MODEL.md),
 [RUIDL и общий SDK cache](docs/RUIDL.md),
+[package registry и supervisor](docs/PACKAGE_REGISTRY.md),
 [IPC](docs/IPC.md), [процессы и память ABI](docs/PROCESS_MEMORY_ABI.md),
 [self-hosting Rust](docs/SELF_HOSTING.md),
 [сборка](docs/BUILDING.md).

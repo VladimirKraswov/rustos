@@ -156,6 +156,7 @@ patterns=(
     "\[vfsd\] open/read/write/seek/readdir/create/rename over shared memory verified"
     "\[vfsd\] restart recovered committed VaraniaFS metadata and file data"
     "\[loader\] atomic package prepare/capability-policy/commit imports TLS RELRO shared-RX verified"
+    "\[supervisor\] ring3 persistent launches=3 restart=1 signed-registry=Ed25519 verified"
     "\[process-manager\] dynamic create/exit/reap reclaimed all frames"
     "\[scheduler\] priority, affinity and fault-containment policy verified"
     "\[microkernel\] RING3_MILESTONE_OK"

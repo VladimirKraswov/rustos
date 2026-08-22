@@ -32,6 +32,7 @@ pub mod memmap;
 pub mod memory;
 pub mod pipe;
 pub mod process;
+pub mod supervisor;
 pub mod surface;
 pub mod sync;
 pub mod syscall;

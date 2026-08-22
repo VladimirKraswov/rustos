@@ -20,7 +20,7 @@ use rustos_abi::{
         GpuSubmit, GPU_DEMO_START_OPCODE, GPU_MAX_COMMAND_BYTES,
     },
     graphics_buffer::{BufferUsage, GraphicsBufferDesc, MemoryDomain},
-    ipc::{Message, IPC_MAX_HANDLES},
+    ipc::{Message, IPC_INLINE_BYTES, IPC_MAX_HANDLES},
     memory::{SharedMemoryCreate, SharedMemoryMap, VmFlags, VmMapRequest, MEMORY_ABI_VERSION},
     pipe::{PipeCreateResult, PIPE_ABI_VERSION},
     process::{
@@ -28,6 +28,7 @@ use rustos_abi::{
         StartupCapability, StartupRole, ThreadCreateRequest, ThreadCreateResult,
         PROCESS_ABI_VERSION, PROCESS_SPAWN_MAX_CAPABILITIES, PROCESS_START_INFO_ADDRESS,
     },
+    supervisor::{LaunchReply, LaunchRequest, LAUNCH_OPCODE, LAUNCH_REPLY_OPCODE},
     sync::{
         SyncPoint, SyncTimelineCreate, SyncTimelineSignal, SyncTimelineWait, SyncWaitMany,
         SyncWaitMode, SYNC_MAX_WAIT_POINTS, SYNC_TIMEOUT_INFINITE,
@@ -57,7 +58,7 @@ use super::{
 
 const MAX_PROCESSES: usize = 12;
 const MAX_THREADS: usize = 24;
-const STATIC_ENDPOINTS: usize = 7;
+const STATIC_ENDPOINTS: usize = 9;
 const MAX_ENDPOINTS: usize = 32;
 const ENDPOINT_QUEUE_CAPACITY: usize = 8;
 const ENDPOINT_SLOT: usize = 2;
@@ -4428,6 +4429,22 @@ impl ProcessManager {
             return status::INVALID_ARGUMENT;
         }
         let receiver_pid = self.endpoints[endpoint_index].receiver;
+        // Статический endpoint может завершаться kernel adapter'ом. Это не
+        // даёт user-space новых полномочий: handles запрещены, а сообщение
+        // лишь попадает в ту же bounded queue и позже забирается bootstrap UI.
+        if receiver_pid == ProcessId::KERNEL {
+            if message.header.handle_count != 0 {
+                return status::ACCESS_DENIED;
+            }
+            return self.endpoints[endpoint_index]
+                .queue
+                .push(message)
+                .map(|_| status::OK)
+                .unwrap_or_else(|error| match error {
+                    IpcQueueError::InvalidMessage => status::INVALID_ARGUMENT,
+                    IpcQueueError::QueueFull => status::QUEUE_FULL,
+                });
+        }
         let Some(receiver_index) = self.process_index(receiver_pid) else {
             return status::BAD_HANDLE;
         };
@@ -4942,6 +4959,9 @@ static mut ACTIVE_MANAGER: *mut ProcessManager = ptr::null_mut();
 static mut INTERACTIVE_SERVICES_READY: bool = false;
 static mut INTERACTIVE_GRAPHICS_SERVICES: Option<GraphicsServices> = None;
 static mut GRAPHICS_RESTARTS: u8 = 0;
+static mut INTERACTIVE_SUPERVISOR: Option<ProcessId> = None;
+static mut INTERACTIVE_COMMAND_PIPE: Option<u16> = None;
+static mut SUPERVISOR_RESTARTS: u8 = 0;
 
 pub(super) fn handle_active_trap(frame: &mut TrapFrame) -> Option<u64> {
     let manager = unsafe { ACTIVE_MANAGER.as_mut() }?;
@@ -5169,6 +5189,22 @@ pub(super) fn start_interactive_services() -> Result<(), ProcessError> {
         None,
     )?;
     manager.endpoints[SERVER_ENDPOINT as usize].receiver = server;
+    let command_pipe = manager
+        .pipes
+        .create()
+        .map_err(|_| ProcessError::AddressSpace)?;
+    let supervisor = match spawn_interactive_supervisor(manager, command_pipe) {
+        Ok(supervisor) => supervisor,
+        Err(error) => {
+            manager
+                .pipes
+                .release(command_pipe, Rights::READ.union(Rights::WRITE));
+            return Err(error);
+        }
+    };
+    // create() держит временную writer reference; постоянный writer уже
+    // принадлежит supervisor, kernel сохраняет только reader.
+    manager.pipes.release(command_pipe, Rights::WRITE);
     let graphics = if scanout::info().is_ok() {
         Some(spawn_graphics_services(manager)?)
     } else {
@@ -5188,7 +5224,13 @@ pub(super) fn start_interactive_services() -> Result<(), ProcessError> {
     unsafe { INTERACTIVE_SERVICES_READY = true };
     unsafe { INTERACTIVE_GRAPHICS_SERVICES = graphics };
     unsafe { GRAPHICS_RESTARTS = 0 };
+    unsafe { INTERACTIVE_SUPERVISOR = Some(supervisor) };
+    unsafe { INTERACTIVE_COMMAND_PIPE = Some(command_pipe) };
+    unsafe { SUPERVISOR_RESTARTS = 0 };
     serial::put_str("[services] persistent ring3 vfsd ready for GUI terminal\n");
+    serial::put_str(
+        "[supervisor] persistent ring3 launch/wait/restart service ready registry=Ed25519\n",
+    );
     if graphics.is_some() {
         if scanout::render_info().is_ok() {
             serial::put_str(
@@ -5205,6 +5247,121 @@ pub(super) fn start_interactive_services() -> Result<(), ProcessError> {
     Ok(())
 }
 
+fn spawn_interactive_supervisor(
+    manager: &mut ProcessManager,
+    command_pipe: u16,
+) -> Result<ProcessId, ProcessError> {
+    const SERVER_ENDPOINT: u8 = 1;
+    const VFS_REPLY_ENDPOINT: u8 = 2;
+    const CONTROL_ENDPOINT: u8 = 7;
+    const LAUNCH_REPLY_ENDPOINT: u8 = 8;
+    const SERVER_SLOT: usize = 2;
+    const VFS_REPLY_SLOT: usize = 3;
+    const OUTPUT_SLOT: usize = 4;
+    const CONTROL_SLOT: usize = 5;
+    const LAUNCH_REPLY_SLOT: usize = 6;
+    const ARGUMENTS: &[u8] = b"supervisor\0";
+
+    let mut capabilities = [EMPTY_CAPABILITY; MAX_CAPABILITIES];
+    capabilities[VFS_ROOT_SLOT] = CapabilityEntry {
+        kind: CapabilityKind::VfsRoot,
+        rights: Rights::READ.union(Rights::EXECUTE).union(Rights::TRANSFER),
+    };
+    capabilities[SERVER_SLOT] = CapabilityEntry {
+        kind: CapabilityKind::Endpoint(SERVER_ENDPOINT),
+        rights: Rights::SEND.union(Rights::TRANSFER),
+    };
+    capabilities[VFS_REPLY_SLOT] = CapabilityEntry {
+        kind: CapabilityKind::Endpoint(VFS_REPLY_ENDPOINT),
+        rights: Rights::SEND.union(Rights::RECEIVE).union(Rights::TRANSFER),
+    };
+    capabilities[OUTPUT_SLOT] = CapabilityEntry {
+        kind: CapabilityKind::Pipe(command_pipe),
+        rights: Rights::WRITE.union(Rights::TRANSFER),
+    };
+    capabilities[CONTROL_SLOT] = CapabilityEntry {
+        kind: CapabilityKind::Endpoint(CONTROL_ENDPOINT),
+        rights: Rights::RECEIVE,
+    };
+    capabilities[LAUNCH_REPLY_SLOT] = CapabilityEntry {
+        kind: CapabilityKind::Endpoint(LAUNCH_REPLY_ENDPOINT),
+        rights: Rights::SEND,
+    };
+    let mut start = SpawnData {
+        arguments: [0; MAX_ARGUMENT_BYTES],
+        argument_length: ARGUMENTS.len(),
+        argument_count: 1,
+        environment: [0; MAX_ENVIRONMENT_BYTES],
+        environment_length: 0,
+        environment_count: 0,
+        capabilities: [StartupCapability::EMPTY; PROCESS_SPAWN_MAX_CAPABILITIES],
+        capability_count: 7,
+    };
+    start.arguments[..ARGUMENTS.len()].copy_from_slice(ARGUMENTS);
+    start.capabilities[0] = startup_capability(
+        StartupRole::EXECUTABLE_NAMESPACE,
+        VFS_ROOT_SLOT,
+        capabilities[VFS_ROOT_SLOT].rights,
+    );
+    start.capabilities[1] = startup_capability(
+        StartupRole::VFS,
+        SERVER_SLOT,
+        capabilities[SERVER_SLOT].rights,
+    );
+    start.capabilities[2] = startup_capability(
+        StartupRole::VFS_REPLY,
+        VFS_REPLY_SLOT,
+        capabilities[VFS_REPLY_SLOT].rights,
+    );
+    start.capabilities[3] = startup_capability(
+        StartupRole::STDOUT,
+        OUTPUT_SLOT,
+        capabilities[OUTPUT_SLOT].rights,
+    );
+    start.capabilities[4] = startup_capability(
+        StartupRole::STDERR,
+        OUTPUT_SLOT,
+        capabilities[OUTPUT_SLOT].rights,
+    );
+    start.capabilities[5] = startup_capability(
+        StartupRole::LAUNCH_CONTROL,
+        CONTROL_SLOT,
+        capabilities[CONTROL_SLOT].rights,
+    );
+    start.capabilities[6] = startup_capability(
+        StartupRole::LAUNCH_REPLY,
+        LAUNCH_REPLY_SLOT,
+        capabilities[LAUNCH_REPLY_SLOT].rights,
+    );
+
+    manager.endpoints[CONTROL_ENDPOINT as usize] = Endpoint::EMPTY;
+    manager.endpoints[LAUNCH_REPLY_ENDPOINT as usize] = Endpoint::EMPTY;
+    let supervisor = manager.spawn_internal(
+        "system/bin/supervisor.rune",
+        SpawnOptions {
+            parent: ProcessId::KERNEL,
+            priority: PriorityClass::System,
+            boot_arguments: [0; 3],
+            expected: None,
+        },
+        capabilities,
+        Some(&start),
+    )?;
+    manager.endpoints[VFS_REPLY_ENDPOINT as usize].receiver = supervisor;
+    manager.endpoints[CONTROL_ENDPOINT as usize].receiver = supervisor;
+    // LAUNCH_REPLY_ENDPOINT намеренно остаётся kernel adapter'ом.
+    Ok(supervisor)
+}
+
+const fn startup_capability(role: StartupRole, slot: usize, rights: Rights) -> StartupCapability {
+    StartupCapability {
+        role,
+        flags: 0,
+        handle: Handle(slot as u32),
+        rights,
+    }
+}
+
 /// Короткий supervisor tick из bootstrap GUI loop. В норме все graphics
 /// threads blocked и функция ничего не планирует. После user fault пара
 /// полностью reaped/restarted; kernel desktop при этом продолжает работать.
@@ -5213,6 +5370,38 @@ pub(super) fn pump_interactive_services() -> Result<(), ProcessError> {
         return Err(ProcessError::UnexpectedExit);
     }
     let manager = unsafe { &mut *ptr::addr_of_mut!(MANAGER) };
+    let supervisor = unsafe { INTERACTIVE_SUPERVISOR }.ok_or(ProcessError::UnexpectedExit)?;
+    if !service_blocked_on(manager, supervisor, 7) {
+        if manager.has_runnable_threads() {
+            manager.run()?;
+        }
+        let exited = manager
+            .processes
+            .iter()
+            .flatten()
+            .find(|process| process.pid == supervisor)
+            .is_some_and(|process| process.exited);
+        if exited {
+            let restarts = unsafe { SUPERVISOR_RESTARTS };
+            if restarts >= 3 {
+                return Err(ProcessError::UnexpectedExit);
+            }
+            stop_direct_children(manager, supervisor, 85);
+            stop_service(manager, supervisor, 84);
+            let pipe = unsafe { INTERACTIVE_COMMAND_PIPE }.ok_or(ProcessError::UnexpectedExit)?;
+            drain_command_pipe(manager, pipe)?;
+            let restarted = spawn_interactive_supervisor(manager, pipe)?;
+            manager.run()?;
+            if !service_blocked_on(manager, restarted, 7) {
+                return Err(ProcessError::UnexpectedExit);
+            }
+            unsafe { INTERACTIVE_SUPERVISOR = Some(restarted) };
+            unsafe { SUPERVISOR_RESTARTS = restarts + 1 };
+            serial::put_str("[supervisor] ring3 process restarted count=");
+            serial::put_u32(u32::from(restarts + 1));
+            serial::put_str("\n");
+        }
+    }
     let Some(services) = (unsafe { INTERACTIVE_GRAPHICS_SERVICES }) else {
         // Firmware framebuffer не имеет transferable hardware authority.
         // VFS и kernel recovery desktop продолжают работать без displayd.
@@ -5253,6 +5442,21 @@ pub(super) fn pump_interactive_services() -> Result<(), ProcessError> {
     serial::put_u32(u32::from(restarts + 1));
     serial::put_str("\n");
     Ok(())
+}
+
+/// Boot-test ломает root supervisor в безопасной точке, чтобы проверить не
+/// только happy path, но и реальный reap/restart постоянного ring-3 сервиса.
+#[cfg(feature = "boot-test")]
+pub(super) fn exercise_interactive_supervisor_restart() -> Result<(), ProcessError> {
+    let supervisor = unsafe { INTERACTIVE_SUPERVISOR }.ok_or(ProcessError::UnexpectedExit)?;
+    {
+        let manager = unsafe { &mut *ptr::addr_of_mut!(MANAGER) };
+        manager.finish_process(supervisor, normal_exit(86));
+    }
+    pump_interactive_services()?;
+    (unsafe { SUPERVISOR_RESTARTS } == 1)
+        .then_some(())
+        .ok_or(ProcessError::UnexpectedExit)
 }
 
 /// Проверяет ring-3 multi-surface GPU composition без CPU readback.
@@ -5430,136 +5634,53 @@ pub(super) fn run_interactive_command(
     command: &str,
     output: &mut [u8],
 ) -> Result<InteractiveExit, ProcessError> {
-    const SERVER_ENDPOINT: u8 = 1;
-    const REPLY_ENDPOINT: u8 = 2;
-    const SERVER_SLOT: usize = 2;
-    const REPLY_SLOT: usize = 3;
-    const STDOUT_SLOT: usize = 4;
-    const STDERR_SLOT: usize = 5;
-
+    const CONTROL_ENDPOINT: u8 = 7;
+    const LAUNCH_REPLY_ENDPOINT: u8 = 8;
     if !unsafe { INTERACTIVE_SERVICES_READY } {
         return Err(ProcessError::UnexpectedExit);
     }
-    let mut words = command.split_ascii_whitespace();
-    let target = words.next().ok_or(ProcessError::MissingImage)?;
-    if target.is_empty() || !target.starts_with('/') || target.as_bytes().contains(&0) {
-        return Err(ProcessError::MissingImage);
-    }
-
-    let mut start = SpawnData {
-        arguments: [0; MAX_ARGUMENT_BYTES],
-        argument_length: 0,
-        argument_count: 0,
-        environment: [0; MAX_ENVIRONMENT_BYTES],
-        environment_length: 0,
-        environment_count: 0,
-        capabilities: [StartupCapability::EMPTY; PROCESS_SPAWN_MAX_CAPABILITIES],
-        capability_count: 5,
-    };
-    for argument in core::iter::once("rune-runner")
-        .chain(core::iter::once(target))
-        .chain(words)
-    {
-        let end = start
-            .argument_length
-            .checked_add(argument.len() + 1)
-            .ok_or(ProcessError::AddressSpace)?;
-        if end > start.arguments.len() || argument.as_bytes().contains(&0) {
-            return Err(ProcessError::AddressSpace);
-        }
-        start.arguments[start.argument_length..end - 1].copy_from_slice(argument.as_bytes());
-        start.argument_length = end;
-        start.argument_count += 1;
-    }
-    const ENVIRONMENT: &[u8] = b"PWD=/\0HOME=/home\0TMPDIR=/tmp\0";
-    start.environment[..ENVIRONMENT.len()].copy_from_slice(ENVIRONMENT);
-    start.environment_length = ENVIRONMENT.len();
-    start.environment_count = 3;
-
+    let request =
+        LaunchRequest::from_command(command, 0, 0).map_err(|_| ProcessError::MissingImage)?;
+    let target_length = request.command[..usize::from(request.command_length)]
+        .iter()
+        .position(|byte| *byte == 0)
+        .ok_or(ProcessError::MissingImage)?;
+    let target = str::from_utf8(&request.command[..target_length])
+        .map_err(|_| ProcessError::MissingImage)?;
     let manager = unsafe { &mut *ptr::addr_of_mut!(MANAGER) };
-    if manager.endpoints[SERVER_ENDPOINT as usize].receiver == ProcessId::KERNEL {
+    let supervisor = unsafe { INTERACTIVE_SUPERVISOR }.ok_or(ProcessError::UnexpectedExit)?;
+    if manager.endpoints[CONTROL_ENDPOINT as usize].receiver != supervisor
+        || manager.endpoints[LAUNCH_REPLY_ENDPOINT as usize].receiver != ProcessId::KERNEL
+        || !service_blocked_on(manager, supervisor, CONTROL_ENDPOINT)
+    {
         return Err(ProcessError::UnexpectedExit);
     }
-    let pipe = manager
+    let pipe = unsafe { INTERACTIVE_COMMAND_PIPE }.ok_or(ProcessError::UnexpectedExit)?;
+    // Предыдущий запуск обязан быть полностью осушен до публикации нового
+    // request: один pipe обслуживает последовательную terminal session.
+    if manager
         .pipes
-        .create()
-        .map_err(|_| ProcessError::AddressSpace)?;
-    let mut capabilities = [EMPTY_CAPABILITY; MAX_CAPABILITIES];
-    capabilities[VFS_ROOT_SLOT] = CapabilityEntry {
-        kind: CapabilityKind::VfsRoot,
-        rights: Rights::READ.union(Rights::EXECUTE).union(Rights::TRANSFER),
-    };
-    capabilities[SERVER_SLOT] = CapabilityEntry {
-        kind: CapabilityKind::Endpoint(SERVER_ENDPOINT),
-        rights: Rights::SEND.union(Rights::TRANSFER),
-    };
-    capabilities[REPLY_SLOT] = CapabilityEntry {
-        kind: CapabilityKind::Endpoint(REPLY_ENDPOINT),
-        rights: Rights::SEND.union(Rights::RECEIVE).union(Rights::TRANSFER),
-    };
-    let writer = CapabilityEntry {
-        kind: CapabilityKind::Pipe(pipe),
-        rights: Rights::WRITE.union(Rights::TRANSFER),
-    };
-    capabilities[STDOUT_SLOT] = writer;
-    capabilities[STDERR_SLOT] = writer;
-    start.capabilities[0] = StartupCapability {
-        role: StartupRole::EXECUTABLE_NAMESPACE,
-        flags: 0,
-        handle: Handle(VFS_ROOT_SLOT as u32),
-        rights: capabilities[VFS_ROOT_SLOT].rights,
-    };
-    start.capabilities[1] = StartupCapability {
-        role: StartupRole::VFS,
-        flags: 0,
-        handle: Handle(SERVER_SLOT as u32),
-        rights: capabilities[SERVER_SLOT].rights,
-    };
-    start.capabilities[2] = StartupCapability {
-        role: StartupRole::VFS_REPLY,
-        flags: 0,
-        handle: Handle(REPLY_SLOT as u32),
-        rights: capabilities[REPLY_SLOT].rights,
-    };
-    start.capabilities[3] = StartupCapability {
-        role: StartupRole::STDOUT,
-        flags: 0,
-        handle: Handle(STDOUT_SLOT as u32),
-        rights: writer.rights,
-    };
-    start.capabilities[4] = StartupCapability {
-        role: StartupRole::STDERR,
-        flags: 0,
-        handle: Handle(STDERR_SLOT as u32),
-        rights: writer.rights,
-    };
-
-    let child = match manager.spawn_internal(
-        "system/bin/rune-runner.rune",
-        SpawnOptions {
-            parent: ProcessId::KERNEL,
-            priority: PriorityClass::Interactive,
-            boot_arguments: [0; 3],
-            expected: None,
-        },
-        capabilities,
-        Some(&start),
-    ) {
-        Ok(child) => child,
-        Err(error) => {
-            manager
-                .pipes
-                .release(pipe, Rights::READ.union(Rights::WRITE));
-            return Err(error);
-        }
-    };
-    // create() резервирует исходную writer reference; две реальные writer
-    // capabilities уже учтены spawn_internal, поэтому исходную закрываем.
-    manager.pipes.release(pipe, Rights::WRITE);
-    manager.endpoints[REPLY_ENDPOINT as usize].receiver = child;
-
+        .get_mut(pipe)
+        .map_err(|_| ProcessError::UnexpectedExit)?
+        .length
+        != 0
+        || manager.endpoints[LAUNCH_REPLY_ENDPOINT as usize]
+            .queue
+            .pop()
+            .is_some()
+    {
+        return Err(ProcessError::UnexpectedExit);
+    }
+    let mut message = Message::EMPTY;
+    message.header.opcode = LAUNCH_OPCODE;
+    message.header.request_id = manager.context_switches.wrapping_add(1);
+    message.header.payload_len = IPC_INLINE_BYTES as u32;
+    message.payload = request.encode_inline();
+    manager
+        .deliver_kernel_control(CONTROL_ENDPOINT, message)
+        .map_err(|_| ProcessError::UnexpectedExit)?;
     let mut captured = 0usize;
-    let reason = loop {
+    let reply = loop {
         manager.run()?;
         let mut chunk = [0u8; PIPE_BUFFER_BYTES];
         let read = manager
@@ -5573,35 +5694,44 @@ pub(super) fn run_interactive_command(
         if read != 0 {
             manager.wake_pipe_waiters(pipe, true);
         }
-        let process = manager
-            .processes
-            .iter()
-            .flatten()
-            .find(|process| process.pid == child)
-            .ok_or(ProcessError::UnexpectedExit)?;
-        if process.exited {
-            break process.exit_reason;
+        if let Some(reply) = manager.endpoints[LAUNCH_REPLY_ENDPOINT as usize]
+            .queue
+            .pop()
+        {
+            if reply.header.opcode != LAUNCH_REPLY_OPCODE
+                || reply.header.request_id != message.header.request_id
+                || reply.header.payload_len as usize != size_of::<LaunchReply>()
+                || reply.header.handle_count != 0
+            {
+                return Err(ProcessError::UnexpectedExit);
+            }
+            break LaunchReply::decode_inline(&reply.payload)
+                .ok_or(ProcessError::UnexpectedExit)?;
         }
         if read == 0 {
             return Err(ProcessError::UnexpectedExit);
         }
     };
-
-    manager.reap_process(child);
-    manager.pipes.release(pipe, Rights::READ);
+    if reply.supervisor_status != status::OK as i32
+        || !service_blocked_on(manager, supervisor, CONTROL_ENDPOINT)
+    {
+        return Err(ProcessError::UnexpectedExit);
+    }
     serial::put_str("[terminal-run] path=");
     serial::put_str(target);
     serial::put_str(" status=");
-    serial::put_u32(reason.status as u32);
+    serial::put_u32(reply.reason.status as u32);
     serial::put_str(" exception=");
-    serial::put_u32(u32::from(reason.exception));
+    serial::put_u32(u32::from(reply.reason.exception));
+    serial::put_str(" attempts=");
+    serial::put_u32(u32::from(reply.attempts));
     serial::put_str(" output=");
     serial::put_u32(captured as u32);
     serial::put_str("\n");
     Ok(InteractiveExit {
         output_length: captured,
-        status: reason.status,
-        exception: reason.exception,
+        status: reply.reason.status,
+        exception: reply.reason.exception,
     })
 }
 
@@ -6033,6 +6163,35 @@ fn stop_service(manager: &mut ProcessManager, pid: ProcessId, status_value: i32)
         manager.finish_process(pid, normal_exit(status_value as i64 as u64));
     }
     manager.reap_process(pid);
+}
+
+/// Root supervisor не может передать живых детей своему преемнику: у них уже
+/// нет достоверного wait owner. Поэтому bootstrap monitor завершает только его
+/// прямых детей и полностью reaps их до публикации нового supervisor PID.
+fn stop_direct_children(manager: &mut ProcessManager, parent: ProcessId, status_value: i32) {
+    let mut children = [ProcessId::KERNEL; MAX_PROCESSES];
+    let mut count = 0usize;
+    for process in manager.processes.iter().flatten() {
+        if process.parent == parent && count < children.len() {
+            children[count] = process.pid;
+            count += 1;
+        }
+    }
+    for child in children.into_iter().take(count) {
+        stop_service(manager, child, status_value);
+    }
+}
+
+fn drain_command_pipe(manager: &mut ProcessManager, pipe: u16) -> Result<(), ProcessError> {
+    let object = manager
+        .pipes
+        .get_mut(pipe)
+        .map_err(|_| ProcessError::UnexpectedExit)?;
+    let mut discarded = [0u8; PIPE_BUFFER_BYTES];
+    let _ = object.read(&mut discarded);
+    (object.length == 0)
+        .then_some(())
+        .ok_or(ProcessError::UnexpectedExit)
 }
 
 fn run_ipc_phase(
