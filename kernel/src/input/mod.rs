@@ -80,6 +80,8 @@ pub struct PlatformInput {
     usb: Option<xhci::UsbInput>,
     fallback: FallbackInput,
     usb_turn: bool,
+    pending: Option<Event>,
+    reported_mouse_buttons: u8,
 }
 
 impl PlatformInput {
@@ -92,10 +94,60 @@ impl PlatformInput {
             usb,
             fallback,
             usb_turn: true,
+            pending: None,
+            reported_mouse_buttons: 0,
         }
     }
 
+    /// Возвращает одно семантическое событие, объединяя накопленные motion
+    /// reports до последней позиции. Нажатия/отпускания кнопок и клавиши
+    /// остаются строгими barriers и никогда не теряются.
     pub fn poll(&mut self) -> Option<Event> {
+        if let Some(event) = self.pending.take() {
+            self.remember_mouse_buttons(event);
+            return Some(event);
+        }
+        let first = self.poll_one()?;
+        let Event::Mouse(mut accumulated) = first else {
+            return Some(first);
+        };
+        let buttons = mouse_buttons(accumulated);
+        if buttons != self.reported_mouse_buttons {
+            self.reported_mouse_buttons = buttons;
+            return Some(Event::Mouse(accumulated));
+        }
+
+        // 64 reports значительно больше одного UTM/xHCI burst, но сохраняют
+        // bounded latency для клавиатуры и системных сервисов. Абсолютный HID
+        // tablet берёт последнюю координату; относительная мышь суммирует
+        // displacement. Поэтому окно следует за рукой, а не воспроизводит
+        // историю устаревших точек после медленного GPU кадра.
+        for _ in 1..64 {
+            let Some(next) = self.poll_one() else {
+                break;
+            };
+            match next {
+                Event::Key(_) => {
+                    self.pending = Some(next);
+                    break;
+                }
+                Event::Mouse(mouse) if mouse_buttons(mouse) != buttons => {
+                    self.pending = Some(Event::Mouse(mouse));
+                    break;
+                }
+                Event::Mouse(mouse) => {
+                    if !merge_mouse_motion(&mut accumulated, mouse) {
+                        self.pending = Some(Event::Mouse(mouse));
+                        break;
+                    }
+                }
+            }
+        }
+        self.reported_mouse_buttons = buttons;
+        Some(Event::Mouse(accumulated))
+    }
+
+    fn poll_one(&mut self) -> Option<Event> {
         for _ in 0..2 {
             self.usb_turn = !self.usb_turn;
             if self.usb_turn {
@@ -113,6 +165,12 @@ impl PlatformInput {
             }
         }
         None
+    }
+
+    fn remember_mouse_buttons(&mut self, event: Event) {
+        if let Event::Mouse(mouse) = event {
+            self.reported_mouse_buttons = mouse_buttons(mouse);
+        }
     }
 
     pub fn mouse_settings(&self) -> MouseSettings {
@@ -150,6 +208,47 @@ impl PlatformInput {
             fallback_backend_name()
         }
     }
+}
+
+fn merge_mouse_motion(accumulated: &mut MouseEvent, next: MouseEvent) -> bool {
+    match (&mut accumulated.motion, next.motion) {
+        (
+            PointerMotion::Relative { dx, dy },
+            PointerMotion::Relative {
+                dx: next_dx,
+                dy: next_dy,
+            },
+        ) => {
+            *dx = dx.saturating_add(next_dx);
+            *dy = dy.saturating_add(next_dy);
+        }
+        (
+            PointerMotion::Absolute {
+                x,
+                y,
+                maximum_x,
+                maximum_y,
+            },
+            PointerMotion::Absolute {
+                x: next_x,
+                y: next_y,
+                maximum_x: next_maximum_x,
+                maximum_y: next_maximum_y,
+            },
+        ) if *maximum_x == next_maximum_x && *maximum_y == next_maximum_y => {
+            *x = next_x;
+            *y = next_y;
+        }
+        _ => return false,
+    }
+    accumulated.wheel_x = accumulated.wheel_x.saturating_add(next.wheel_x);
+    accumulated.wheel_y = accumulated.wheel_y.saturating_add(next.wheel_y);
+    accumulated.packets = accumulated.packets.saturating_add(next.packets);
+    true
+}
+
+const fn mouse_buttons(event: MouseEvent) -> u8 {
+    (event.left as u8) | ((event.right as u8) << 1) | ((event.middle as u8) << 2)
 }
 
 const fn fallback_backend_name() -> &'static str {

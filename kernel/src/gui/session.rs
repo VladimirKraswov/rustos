@@ -2541,11 +2541,10 @@ impl DesktopSession {
                 let id = self.z_order[index];
                 if self.window_is_visible(id) {
                     if let Some(rect) = self.window_rect(id) {
-                        crate::gui::gpu_scene::begin_layer(
-                            0x1000_0000_0000_0000 | id.0,
-                            rect,
-                            rustos_abi::gpu::ui_layer_flag::OPAQUE,
-                        );
+                        // Оконная surface содержит premultiplied alpha:
+                        // прозрачные corner pixels сохраняют desktop под
+                        // системным скруглением без CPU readback.
+                        crate::gui::gpu_scene::begin_layer(0x1000_0000_0000_0000 | id.0, rect, 0);
                         self.render_window(id);
                     }
                 }
@@ -2773,12 +2772,7 @@ impl DesktopSession {
         let focused = self.focused == Some(id);
 
         let screen = Rect::new(0, 0, self.framebuffer.width(), self.framebuffer.height());
-        if self.framebuffer.gpu_recording() {
-            // Независимая GPU surface окна обязана быть полностью
-            // непрозрачной, пока textured alpha compositor не введён в ABI.
-            // Прозрачная тень через BLIT оставляла следы при transform.
-            self.framebuffer.fill_rect(rect, Theme::PANEL);
-        } else {
+        if !self.framebuffer.gpu_recording() {
             self.framebuffer.soft_shadow(rect, Theme::RADIUS, screen);
         }
         Panel {

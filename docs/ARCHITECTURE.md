@@ -87,7 +87,10 @@ latest-frame mailbox отбрасывает устаревшие кадры. CPU
 только при отказе GPU.
 Контракт описан в
 [GRAPHICS_ABI.md](GRAPHICS_ABI.md), [GPU_RENDERING.md](GPU_RENDERING.md) и
-[ADR-0001](adr/0001-modern-graphics-architecture.md). Проверяемые критерии
+[ADR-0001](adr/0001-modern-graphics-architecture.md). Окончательная
+driver-neutral граница providers, atomic scene/display transactions, recovery
+и измеримые критерии зрелости закреплены в
+[ADR-0002](adr/0002-driver-neutral-graphics-platform.md). Проверяемые критерии
 перехода всего desktop на GPU и запрет возврата bootstrap readback закреплены
 в [GPU_ACCELERATION.md](GPU_ACCELERATION.md).
 

@@ -3487,16 +3487,18 @@ impl ProcessManager {
         fence as i64
     }
 
-    fn poll_gpu_completion(&mut self) {
+    fn poll_gpu_completion(&mut self) -> bool {
+        let mut completed = false;
         for _ in 0..MAX_GPU_SUBMISSIONS {
             let completion = match scanout::poll_render() {
                 Ok(Some(completion)) => completion,
                 Ok(None) => break,
                 Err(_) => {
                     self.fail_gpu_submissions(status::IO_ERROR);
-                    break;
+                    return true;
                 }
             };
+            completed = true;
             let result = if completion.succeeded {
                 status::OK
             } else {
@@ -3513,6 +3515,7 @@ impl ProcessManager {
                 self.record_gpu_completion(completion.fence_id, status::IO_ERROR);
             }
         }
+        completed
     }
 
     fn finish_gpu_submission(&mut self, pending: PendingGpuSubmission, result: i64) {
@@ -3543,40 +3546,15 @@ impl ProcessManager {
         }
     }
 
-    /// Bootstrap scheduler пока не имеет отдельного kernel idle thread. Если
-    /// runnable user threads закончились ровно на ожидании GPU timeline,
-    /// осушаем один готовый fence и сразу будим соответствующий waiter. При
-    /// наличии другой работы completion остаётся неблокирующим timer bottom
-    /// half.
+    /// Неблокирующе снимает уже готовые GPU completions в idle boundary.
+    ///
+    /// Прежняя реализация вызывала `drain_next_render()` и крутилась до
+    /// следующего fence. Из-за этого один обычный `manager.run()` фактически
+    /// превращался в синхронный GPU RPC и на время host render задерживал
+    /// обработку HID. Idle GUI loop и IRQ/timer сами вызовут этот poll снова;
+    /// ждать устройство здесь запрещено.
     fn complete_idle_gpu_submission(&mut self) -> bool {
-        if self.gpu_submissions.iter().all(Option::is_none) {
-            return false;
-        }
-        let completion = match scanout::drain_next_render() {
-            Ok(completion) => completion,
-            Err(_) => {
-                self.fail_gpu_submissions(status::IO_ERROR);
-                return true;
-            }
-        };
-        let result = if completion.succeeded {
-            status::OK
-        } else {
-            status::IO_ERROR
-        };
-        if let Some(index) = self
-            .gpu_submissions
-            .iter()
-            .position(|pending| pending.is_some_and(|pending| pending.fence == completion.fence_id))
-        {
-            let pending = self.gpu_submissions[index]
-                .take()
-                .expect("matched GPU submission");
-            self.finish_gpu_submission(pending, result);
-        } else {
-            self.record_gpu_completion(completion.fence_id, status::IO_ERROR);
-        }
-        true
+        self.poll_gpu_completion()
     }
 
     fn gpu_completion_status(

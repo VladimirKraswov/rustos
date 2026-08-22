@@ -135,6 +135,11 @@ metadata.
 перенос desktop на `surface.dll`, после чего kernel renderer остаётся только
 для panic/recovery screen.
 
+Driver-neutral provider model, atomic-check/commit, buffer modifier contract,
+failure containment и performance gates описаны в
+[ADR-0002](adr/0002-driver-neutral-graphics-platform.md). VirGL является первым
+provider, а не частью API приложений или compositor protocol.
+
 Критерий integration test:
 
 ```text
