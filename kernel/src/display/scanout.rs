@@ -352,16 +352,18 @@ pub fn poll_render() -> Result<Option<RenderCompletion>, DisplayBrokerError> {
         .map_err(map_mode_error)
 }
 
-/// Безопасно осушает очередь перед уничтожением GPU context. Это не часть
-/// кадрового hot path: blocking разрешён только при завершении/падении renderd.
-pub fn drain_render(fence_id: u64) -> Result<RenderCompletion, DisplayBrokerError> {
+/// Безопасно получает следующий completion перед уничтожением GPU context.
+/// Это не часть кадрового hot path: blocking разрешён только при
+/// завершении/падении renderd. Конкретный fence сопоставляет process manager,
+/// потому что одновременно могут выполняться несколько независимых кадров.
+pub fn drain_next_render() -> Result<RenderCompletion, DisplayBrokerError> {
     let mut guard = DEVICE.acquire()?;
     guard
         .get()
         .as_mut()
         .ok_or(DisplayBrokerError::Unavailable)?
         .gpu
-        .drain_render(fence_id)
+        .drain_next_render()
         .map_err(map_mode_error)
 }
 

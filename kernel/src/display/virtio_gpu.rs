@@ -523,6 +523,7 @@ impl VirtioGpu {
         let target = self.resource.backing.phys as *mut u32;
         let mut rectangles = 0u32;
         let mut pixels = 0u64;
+        let mut commit = Rect::EMPTY;
         for requested in damage.iter().copied() {
             let rect = requested.intersection(bounds);
             if rect.is_empty() {
@@ -543,10 +544,24 @@ impl VirtioGpu {
                     }
                 }
             }
-            self.transfer(rect).map_err(|_| ScanoutError::DeviceLost)?;
-            self.flush(rect).map_err(|_| ScanoutError::DeviceLost)?;
+            commit = if commit.is_empty() {
+                rect
+            } else {
+                commit.union(rect)
+            };
             rectangles = rectangles.saturating_add(1);
             pixels = pixels.saturating_add(rect.area());
+        }
+        if !commit.is_empty() {
+            // Guest backing сохраняет предыдущий корректный кадр между
+            // present'ами. Поэтому промежутки внутри bounding rectangle уже
+            // содержат верные pixels, даже если caller прислал несколько
+            // непересекающихся damage-областей. Один transfer + один flush
+            // превращают событие compositor'а в единый device commit вместо
+            // двух синхронных round-trip на каждый прямоугольник.
+            self.transfer(commit)
+                .and_then(|_| self.flush(commit))
+                .map_err(|_| ScanoutError::DeviceLost)?;
         }
         Ok(PresentStats {
             sequence,
@@ -640,10 +655,9 @@ impl VirtioGpu {
             reserved_header: 0,
             features: feature::VIRGL | feature::ASYNC_FENCE | feature::ZERO_COPY_SCANOUT,
             max_command_bytes: GPU_MAX_COMMAND_BYTES,
-            // Transport держит четыре DMA slot, однако process ABI намеренно
-            // допускает один незавершённый submit на bootstrap-контекст. Так
-            // нельзя случайно переиспользовать timeline/ресурс раньше fence.
-            max_inflight: 1,
+            // Независимые swapchain buffers используют отдельные timelines;
+            // один и тот же timeline нельзя переиспользовать до completion.
+            max_inflight: 3,
             max_contexts: 1,
             capset_id: self.capset_id,
             capset_version: self.capset_version,
@@ -810,16 +824,14 @@ impl VirtioGpu {
             .map_err(map_transport)
     }
 
-    /// Дожидается конкретного fence только при аварийном teardown процесса.
+    /// Дожидается следующего completion только при аварийном teardown процесса.
     /// Обычный render path всегда неблокирующий и завершается из timer bottom
     /// half. Здесь ожидание необходимо, чтобы QEMU/реальный GPU не продолжал
     /// DMA после освобождения capability-backed кадров.
-    pub fn drain_render(&mut self, fence_id: u64) -> Result<RenderCompletion, ModeSetError> {
+    pub fn drain_next_render(&mut self) -> Result<RenderCompletion, ModeSetError> {
         for _ in 0..50_000_000 {
             if let Some(completion) = self.poll_render()? {
-                if completion.fence_id == fence_id {
-                    return Ok(completion);
-                }
+                return Ok(completion);
             }
             core::hint::spin_loop();
         }

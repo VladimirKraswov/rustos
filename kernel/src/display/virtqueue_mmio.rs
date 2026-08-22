@@ -54,7 +54,9 @@ const DESC_WRITE: u16 = 2;
 const CONTROL_QUEUE: u16 = 0;
 const MAX_QUEUE_SIZE: u16 = 64;
 const POLL_LIMIT: usize = 50_000_000;
-const COMMAND_SLOTS: usize = 4;
+// Совпадает с PCI transport: три render кадра не должны занимать последний
+// slot, нужный display/control command во время их выполнения.
+const COMMAND_SLOTS: usize = 8;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AsyncCompletion {

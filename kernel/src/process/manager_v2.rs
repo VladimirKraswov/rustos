@@ -65,6 +65,8 @@ const MAX_SHARED_PAGES: usize = 64;
 const MAX_SYNC_TIMELINES: usize = 32;
 const MAX_SYNC_WAITS: usize = MAX_THREADS;
 const MAX_GPU_IMPORTS: usize = 4;
+const MAX_GPU_SUBMISSIONS: usize = 3;
+const MAX_GPU_COMPLETIONS: usize = 8;
 /// Один mapping ограничен 1 GiB: достаточно для compiler arenas, но ошибка в
 /// user-space всё ещё не может одним syscall переполнить арифметику/metadata.
 const MAX_VM_SYSCALL_PAGES: u64 = 256 * 1024;
@@ -136,6 +138,19 @@ struct PendingGpuSubmission {
     fence: u64,
     timeline: TimelineId,
     value: u64,
+}
+
+#[derive(Clone, Copy)]
+struct CompletedGpuSubmission {
+    fence: u64,
+    result: i64,
+}
+
+impl CompletedGpuSubmission {
+    const EMPTY: Self = Self {
+        fence: 0,
+        result: status::NOT_FOUND,
+    };
 }
 
 #[derive(Clone, Copy)]
@@ -631,9 +646,9 @@ struct ProcessManager {
     display_present_deadline_ns: u64,
     gpu_context_active: bool,
     gpu_imports: [Option<u16>; MAX_GPU_IMPORTS],
-    gpu_submission: Option<PendingGpuSubmission>,
-    gpu_last_fence: u64,
-    gpu_last_status: i64,
+    gpu_submissions: [Option<PendingGpuSubmission>; MAX_GPU_SUBMISSIONS],
+    gpu_completions: [CompletedGpuSubmission; MAX_GPU_COMPLETIONS],
+    gpu_completion_cursor: usize,
     deferred_process_reap: Option<ProcessId>,
     deferred_thread_reap: Option<ThreadId>,
 }
@@ -667,9 +682,9 @@ impl ProcessManager {
             display_present_deadline_ns: 0,
             gpu_context_active: false,
             gpu_imports: [None; MAX_GPU_IMPORTS],
-            gpu_submission: None,
-            gpu_last_fence: 0,
-            gpu_last_status: status::NOT_FOUND,
+            gpu_submissions: [const { None }; MAX_GPU_SUBMISSIONS],
+            gpu_completions: [CompletedGpuSubmission::EMPTY; MAX_GPU_COMPLETIONS],
+            gpu_completion_cursor: 0,
             deferred_process_reap: None,
             deferred_thread_reap: None,
         }
@@ -701,9 +716,9 @@ impl ProcessManager {
         self.display_present_deadline_ns = 0;
         self.gpu_context_active = false;
         self.gpu_imports = [None; MAX_GPU_IMPORTS];
-        self.gpu_submission = None;
-        self.gpu_last_fence = 0;
-        self.gpu_last_status = status::NOT_FOUND;
+        self.gpu_submissions = [const { None }; MAX_GPU_SUBMISSIONS];
+        self.gpu_completions = [CompletedGpuSubmission::EMPTY; MAX_GPU_COMPLETIONS];
+        self.gpu_completion_cursor = 0;
         self.deferred_process_reap = None;
         self.deferred_thread_reap = None;
     }
@@ -3240,9 +3255,9 @@ impl ProcessManager {
             Ok(request) if request.validate().is_ok() => request,
             _ => return status::INVALID_ARGUMENT,
         };
-        if self.gpu_submission.is_some() {
+        let Some(submission_slot) = self.gpu_submissions.iter().position(Option::is_none) else {
             return status::BUSY;
-        }
+        };
         if let Err(error) = self.processes[process_index]
             .as_ref()
             .expect("process")
@@ -3262,6 +3277,18 @@ impl ProcessManager {
             Ok(_) => return status::ACCESS_DENIED,
             Err(error) => return error,
         };
+        // Без negotiated context timeline ordering завершение двух команд на
+        // одном SyncTimeline нельзя трактовать как упорядоченное. Triple
+        // buffering использует timeline на buffer и поэтому остаётся
+        // корректным даже при out-of-order device completion.
+        if self
+            .gpu_submissions
+            .iter()
+            .flatten()
+            .any(|submission| submission.timeline == timeline)
+        {
+            return status::BUSY;
+        }
         if match self.timelines.value(timeline) {
             Ok(value) => request.completion_value <= value,
             Err(_) => true,
@@ -3289,7 +3316,7 @@ impl ProcessManager {
                 return gpu_status(error);
             }
         };
-        self.gpu_submission = Some(PendingGpuSubmission {
+        self.gpu_submissions[submission_slot] = Some(PendingGpuSubmission {
             fence,
             timeline,
             value: request.completion_value,
@@ -3298,39 +3325,40 @@ impl ProcessManager {
     }
 
     fn poll_gpu_completion(&mut self) {
-        let Some(pending) = self.gpu_submission else {
-            return;
-        };
-        let completion = match scanout::poll_render() {
-            Ok(Some(completion)) => completion,
-            Ok(None) => return,
-            Err(_) => {
-                self.finish_gpu_submission(pending, status::IO_ERROR);
-                return;
-            }
-        };
-        if completion.fence_id != pending.fence {
-            // Синхронная display-команда могла завершиться раньше render
-            // fence. Ожидаемый submission остаётся активным и будет опрошен
-            // на следующем tick.
-            self.gpu_last_fence = completion.fence_id;
-            self.gpu_last_status = status::IO_ERROR;
+        if self.gpu_submissions.iter().all(Option::is_none) {
             return;
         }
-        let result = if completion.succeeded {
-            status::OK
-        } else {
-            status::IO_ERROR
-        };
-        self.finish_gpu_submission(pending, result);
+        for _ in 0..MAX_GPU_SUBMISSIONS {
+            let completion = match scanout::poll_render() {
+                Ok(Some(completion)) => completion,
+                Ok(None) => break,
+                Err(_) => {
+                    self.fail_gpu_submissions(status::IO_ERROR);
+                    break;
+                }
+            };
+            let result = if completion.succeeded {
+                status::OK
+            } else {
+                status::IO_ERROR
+            };
+            if let Some(index) = self.gpu_submissions.iter().position(|pending| {
+                pending.is_some_and(|pending| pending.fence == completion.fence_id)
+            }) {
+                let pending = self.gpu_submissions[index]
+                    .take()
+                    .expect("matched GPU submission");
+                self.finish_gpu_submission(pending, result);
+            } else {
+                self.record_gpu_completion(completion.fence_id, status::IO_ERROR);
+            }
+        }
     }
 
     fn finish_gpu_submission(&mut self, pending: PendingGpuSubmission, result: i64) {
-        self.gpu_last_fence = pending.fence;
-        self.gpu_last_status = result;
+        self.record_gpu_completion(pending.fence, result);
         let _ = self.timelines.signal(pending.timeline, pending.value);
         let _ = self.timelines.release(pending.timeline);
-        self.gpu_submission = None;
         // Сигнал от устройства приходит из kernel completion path, а не из
         // пользовательского SYNC_TIMELINE_SIGNAL syscall. Поэтому именно
         // здесь нужно выполнить ту же операцию пробуждения: иначе renderd
@@ -3338,19 +3366,52 @@ impl ProcessManager {
         self.wake_ready_sync_waiters();
     }
 
+    fn record_gpu_completion(&mut self, fence: u64, result: i64) {
+        self.gpu_completions[self.gpu_completion_cursor] = CompletedGpuSubmission { fence, result };
+        self.gpu_completion_cursor = (self.gpu_completion_cursor + 1) % MAX_GPU_COMPLETIONS;
+    }
+
+    fn fail_gpu_submissions(&mut self, result: i64) {
+        for index in 0..MAX_GPU_SUBMISSIONS {
+            if let Some(pending) = self.gpu_submissions[index].take() {
+                self.finish_gpu_submission(pending, result);
+            }
+        }
+    }
+
     /// Bootstrap scheduler пока не имеет отдельного kernel idle thread. Если
     /// runnable user threads закончились ровно на ожидании GPU timeline,
-    /// осушаем только этот fence и сразу будим waiter. При наличии другой
-    /// работы completion остаётся неблокирующим timer bottom half.
+    /// осушаем один готовый fence и сразу будим соответствующий waiter. При
+    /// наличии другой работы completion остаётся неблокирующим timer bottom
+    /// half.
     fn complete_idle_gpu_submission(&mut self) -> bool {
-        let Some(pending) = self.gpu_submission else {
+        if self.gpu_submissions.iter().all(Option::is_none) {
             return false;
+        }
+        let completion = match scanout::drain_next_render() {
+            Ok(completion) => completion,
+            Err(_) => {
+                self.fail_gpu_submissions(status::IO_ERROR);
+                return true;
+            }
         };
-        let result = match scanout::drain_render(pending.fence) {
-            Ok(completion) if completion.succeeded => status::OK,
-            Ok(_) | Err(_) => status::IO_ERROR,
+        let result = if completion.succeeded {
+            status::OK
+        } else {
+            status::IO_ERROR
         };
-        self.finish_gpu_submission(pending, result);
+        if let Some(index) = self
+            .gpu_submissions
+            .iter()
+            .position(|pending| pending.is_some_and(|pending| pending.fence == completion.fence_id))
+        {
+            let pending = self.gpu_submissions[index]
+                .take()
+                .expect("matched GPU submission");
+            self.finish_gpu_submission(pending, result);
+        } else {
+            self.record_gpu_completion(completion.fence_id, status::IO_ERROR);
+        }
         true
     }
 
@@ -3369,43 +3430,57 @@ impl ProcessManager {
             return status::ACCESS_DENIED;
         }
         if self
-            .gpu_submission
-            .is_some_and(|submission| submission.fence == fence)
+            .gpu_submissions
+            .iter()
+            .flatten()
+            .any(|submission| submission.fence == fence)
         {
             return status::BUSY;
         }
-        if fence == self.gpu_last_fence {
-            self.gpu_last_status
-        } else {
-            status::NOT_FOUND
-        }
+        self.gpu_completions
+            .iter()
+            .find(|completion| completion.fence == fence)
+            .map_or(status::NOT_FOUND, |completion| completion.result)
     }
 
     fn release_gpu_context(&mut self, context: u8) {
         if context != 1 || !self.gpu_context_active {
             return;
         }
-        if let Some(pending) = self.gpu_submission.take() {
-            // Нельзя освободить GraphicsBuffer, пока host renderer ещё может
-            // писать в его кадры. На штатном пути fence уже снят timer'ом;
-            // этот drain обслуживает kill/crash renderd.
-            let completion = scanout::drain_render(pending.fence);
-            self.gpu_last_fence = pending.fence;
-            self.gpu_last_status = if completion.is_ok_and(|done| done.succeeded) {
+        // Нельзя освободить GraphicsBuffer, пока host renderer ещё может
+        // писать в его кадры. На штатном пути fences уже сняты completion
+        // path; этот bounded drain обслуживает kill/crash renderd.
+        while self.gpu_submissions.iter().any(Option::is_some) {
+            let completion = match scanout::drain_next_render() {
+                Ok(completion) => completion,
+                Err(_) => {
+                    self.fail_gpu_submissions(status::IO_ERROR);
+                    break;
+                }
+            };
+            let result = if completion.succeeded {
                 status::OK
             } else {
                 status::IO_ERROR
             };
-            let _ = self.timelines.signal(pending.timeline, pending.value);
-            let _ = self.timelines.release(pending.timeline);
+            if let Some(index) = self.gpu_submissions.iter().position(|pending| {
+                pending.is_some_and(|pending| pending.fence == completion.fence_id)
+            }) {
+                let pending = self.gpu_submissions[index]
+                    .take()
+                    .expect("matched GPU submission");
+                self.finish_gpu_submission(pending, result);
+            } else {
+                self.record_gpu_completion(completion.fence_id, status::IO_ERROR);
+            }
         }
         scanout::destroy_render_context(u32::from(context));
         for object in self.gpu_imports.iter_mut().filter_map(Option::take) {
             self.graphics.release_capability(object);
         }
         self.gpu_context_active = false;
-        self.gpu_last_fence = 0;
-        self.gpu_last_status = status::NOT_FOUND;
+        self.gpu_completions = [CompletedGpuSubmission::EMPTY; MAX_GPU_COMPLETIONS];
+        self.gpu_completion_cursor = 0;
     }
 
     fn sync_timeline_create(&mut self, process_index: usize, request_address: u64) -> i64 {

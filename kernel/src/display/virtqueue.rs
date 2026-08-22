@@ -28,7 +28,10 @@ const DESC_WRITE: u16 = 2;
 const CONTROL_QUEUE: u16 = 0;
 const MAX_QUEUE_SIZE: u16 = 64;
 const POLL_LIMIT: usize = 50_000_000;
-const COMMAND_SLOTS: usize = 4;
+// Три независимых render submission плюс bootstrap/display commands должны
+// одновременно помещаться в controlq. Queue metadata остаётся bounded, а
+// каждый slot по-прежнему владеет отдельными request/response DMA pages.
+const COMMAND_SLOTS: usize = 8;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AsyncCompletion {
