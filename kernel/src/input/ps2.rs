@@ -6,7 +6,7 @@
 
 use crate::{
     arch,
-    input::{Event, Key, MouseEvent},
+    input::{Event, Key, MouseEvent, PointerMotion},
 };
 use rustos_abi::input::{MouseCapabilities, MouseSettings};
 
@@ -131,8 +131,25 @@ impl Ps2Input {
                             self.pending = Some(Event::Mouse(next));
                             break;
                         }
-                        accumulated.dx = accumulated.dx.saturating_add(next.dx);
-                        accumulated.dy = accumulated.dy.saturating_add(next.dy);
+                        match (&mut accumulated.motion, next.motion) {
+                            (
+                                PointerMotion::Relative { dx, dy },
+                                PointerMotion::Relative {
+                                    dx: next_dx,
+                                    dy: next_dy,
+                                },
+                            ) => {
+                                *dx = dx.saturating_add(next_dx);
+                                *dy = dy.saturating_add(next_dy);
+                            }
+                            // PS/2 всегда относительный. Проверка оставляет
+                            // coalescing корректным, даже если в общий input
+                            // pipeline позже попадёт абсолютный backend.
+                            _ => {
+                                self.pending = Some(Event::Mouse(next));
+                                break;
+                            }
+                        }
                         accumulated.wheel_x = accumulated.wheel_x.saturating_add(next.wheel_x);
                         accumulated.wheel_y = accumulated.wheel_y.saturating_add(next.wheel_y);
                         accumulated.packets = accumulated.packets.saturating_add(next.packets);
@@ -333,9 +350,7 @@ impl Ps2Input {
             0
         };
         Some(Event::Mouse(MouseEvent {
-            dx,
-            // PS/2: положительный Y направлен вверх; GUI — вниз.
-            dy,
+            motion: PointerMotion::Relative { dx, dy },
             wheel_x: 0,
             wheel_y,
             left: flags & 1 != 0,

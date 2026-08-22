@@ -25,7 +25,7 @@ use crate::{
         chrome::{Button, Label, Panel, Theme, Widget},
         cursor::Cursor,
     },
-    input::{Event, Key, MouseEvent, PlatformInput},
+    input::{Event, Key, MouseEvent, PlatformInput, PointerMotion},
     memory::{self, FrameBlock},
     process, serial,
 };
@@ -1343,10 +1343,25 @@ impl DesktopSession {
         let right_pressed = event.right && !self.previous_right;
         self.previous_right = event.right;
         let _middle_pressed = event.middle;
-        self.mouse_x = (self.mouse_x + event.dx as i32)
-            .clamp(0, self.framebuffer.width().saturating_sub(1) as i32);
-        self.mouse_y = (self.mouse_y + event.dy as i32)
-            .clamp(0, self.framebuffer.height().saturating_sub(1) as i32);
+        let maximum_pixel_x = self.framebuffer.width().saturating_sub(1);
+        let maximum_pixel_y = self.framebuffer.height().saturating_sub(1);
+        match event.motion {
+            PointerMotion::Relative { dx, dy } => {
+                self.mouse_x = (self.mouse_x + i32::from(dx)).clamp(0, maximum_pixel_x as i32);
+                self.mouse_y = (self.mouse_y + i32::from(dy)).clamp(0, maximum_pixel_y as i32);
+            }
+            PointerMotion::Absolute {
+                x,
+                y,
+                maximum_x,
+                maximum_y,
+            } => {
+                // Умножение выполняется до деления, чтобы весь диапазон HID
+                // точно покрывал framebuffer и не накапливал округление.
+                self.mouse_x = scale_absolute_axis(x, maximum_x, maximum_pixel_x) as i32;
+                self.mouse_y = scale_absolute_axis(y, maximum_y, maximum_pixel_y) as i32;
+            }
+        }
 
         match self.interaction {
             WindowInteraction::Move {
@@ -3041,6 +3056,14 @@ fn clipped_area(rect: Rect, width: u32, height: u32) -> u64 {
         .saturating_add(rect.height as i32)
         .clamp(0, height as i32) as u32;
     u64::from(x1.saturating_sub(x0)) * u64::from(y1.saturating_sub(y0))
+}
+
+fn scale_absolute_axis(value: u16, logical_maximum: u16, pixel_maximum: u32) -> u32 {
+    if logical_maximum == 0 || pixel_maximum == 0 {
+        return 0;
+    }
+    (u64::from(value.min(logical_maximum)) * u64::from(pixel_maximum) / u64::from(logical_maximum))
+        as u32
 }
 
 fn cursor_for_resize(edges: ResizeEdges) -> PointerCursor {

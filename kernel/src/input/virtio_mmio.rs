@@ -12,7 +12,7 @@ use rustos_abi::input::{MouseCapabilities, MouseSettings};
 
 use crate::{
     arch,
-    input::{Event, Key, MouseEvent},
+    input::{Event, Key, MouseEvent, PointerMotion},
     memory::{self, FrameBlock},
 };
 
@@ -395,8 +395,7 @@ impl VirtioInput {
                 let raw_y = self.pending_dy.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
                 let (dx, dy) = self.scale_motion(raw_x, raw_y);
                 let event = MouseEvent {
-                    dx,
-                    dy,
+                    motion: PointerMotion::Relative { dx, dy },
                     wheel_x: self.pending_wheel_x,
                     wheel_y: self.pending_wheel_y,
                     left: self.buttons & 1 != 0,

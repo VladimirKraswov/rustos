@@ -1,7 +1,7 @@
 //! Переносимая часть USB host stack RustOS.
 //!
 //! Этот crate не знает о MMIO, PCI, DMA и xHCI. Он целиком проверяет входные
-//! дескрипторы устройства и декодирует фиксированные HID Boot reports. Такое
+//! дескрипторы устройства и декодирует фиксированные HID reports. Такое
 //! разделение важно для микроядра: позднее тот же код без изменений переедет
 //! в изолированный `usbd`, а kernel сохранит только IRQ/IOMMU capabilities.
 
@@ -16,17 +16,20 @@ pub const PROTOCOL_KEYBOARD: u8 = 1;
 /// Boot mouse interface protocol.
 pub const PROTOCOL_MOUSE: u8 = 2;
 
-/// Тип найденного HID Boot interface.
+/// Поддерживаемый HID interface.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum HidBootKind {
+pub enum HidKind {
     Keyboard,
-    Mouse,
+    RelativePointer,
+    /// Абсолютный USB tablet, который UTM/QEMU использует для capture-free
+    /// указателя. Его шесть байт описаны стандартным HID report descriptor.
+    AbsolutePointer,
 }
 
 /// Данные, необходимые host-controller driver для настройки interrupt IN pipe.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct HidBootInterface {
-    pub kind: HidBootKind,
+pub struct HidInterface {
+    pub kind: HidKind,
     pub configuration_value: u8,
     pub interface_number: u8,
     pub endpoint_address: u8,
@@ -59,12 +62,12 @@ pub fn endpoint_zero_packet_size(descriptor: &[u8]) -> Result<u16, DescriptorErr
     }
 }
 
-/// Находит первый HID Boot keyboard/mouse interface с interrupt IN endpoint.
+/// Находит первый поддерживаемый HID interface с interrupt IN endpoint.
 ///
 /// Все `bLength` и `wTotalLength` проверяются до чтения полей. Неизвестные
 /// descriptors пропускаются: HID descriptor между interface и endpoint —
 /// нормальная часть конфигурации, а не ошибка парсера.
-pub fn find_hid_boot_interface(bytes: &[u8]) -> Result<HidBootInterface, DescriptorError> {
+pub fn find_hid_interface(bytes: &[u8]) -> Result<HidInterface, DescriptorError> {
     if bytes.len() < 9 {
         return Err(DescriptorError::Truncated);
     }
@@ -95,27 +98,51 @@ pub fn find_hid_boot_interface(bytes: &[u8]) -> Result<HidBootInterface, Descrip
                 let class = bytes[offset + 5];
                 let subclass = bytes[offset + 6];
                 let protocol = bytes[offset + 7];
-                interface = if class == CLASS_HID && subclass == SUBCLASS_BOOT {
+                interface = if class != CLASS_HID {
+                    None
+                } else if subclass == SUBCLASS_BOOT {
                     match protocol {
-                        PROTOCOL_KEYBOARD => Some((HidBootKind::Keyboard, bytes[offset + 2])),
-                        PROTOCOL_MOUSE => Some((HidBootKind::Mouse, bytes[offset + 2])),
+                        PROTOCOL_KEYBOARD => Some((HidKind::Keyboard, bytes[offset + 2], true)),
+                        PROTOCOL_MOUSE => Some((HidKind::RelativePointer, bytes[offset + 2], true)),
                         _ => None,
                     }
+                } else if subclass == 0 && protocol == 0 {
+                    // UTM предоставляет `usb-tablet` как report-protocol HID
+                    // без Boot subclass. На этом этапе принимаем только его
+                    // компактный interrupt report; произвольные HID layouts
+                    // появятся вместе с report-descriptor interpreter в usbd.
+                    Some((HidKind::AbsolutePointer, bytes[offset + 2], false))
                 } else {
                     None
                 };
             }
+            0x21 if length >= 9 => {
+                if let Some((HidKind::AbsolutePointer, _, layout_supported)) = interface.as_mut() {
+                    let descriptor_kind = bytes[offset + 6];
+                    let descriptor_length =
+                        u16::from_le_bytes([bytes[offset + 7], bytes[offset + 8]]);
+                    // Точная длина является частью стабильного QEMU
+                    // usb-tablet layout. Неизвестный report-protocol HID
+                    // нельзя ошибочно декодировать как координаты и кнопки.
+                    *layout_supported = descriptor_kind == 0x22 && descriptor_length == 74;
+                }
+            }
             5 if length >= 7 => {
                 let address = bytes[offset + 2];
                 let attributes = bytes[offset + 3] & 0x03;
-                if let Some((kind, interface_number)) = interface {
-                    if address & 0x80 != 0 && attributes == 0x03 {
+                if let Some((kind, interface_number, layout_supported)) = interface {
+                    if layout_supported && address & 0x80 != 0 && attributes == 0x03 {
                         let max_packet_size =
                             u16::from_le_bytes([bytes[offset + 4], bytes[offset + 5]]) & 0x07ff;
-                        if max_packet_size == 0 || max_packet_size > 1024 {
+                        let minimum_packet_size = match kind {
+                            HidKind::Keyboard => 8,
+                            HidKind::RelativePointer => 3,
+                            HidKind::AbsolutePointer => 6,
+                        };
+                        if max_packet_size < minimum_packet_size || max_packet_size > 1024 {
                             return Err(DescriptorError::Unsupported);
                         }
-                        return Ok(HidBootInterface {
+                        return Ok(HidInterface {
                             kind,
                             configuration_value,
                             interface_number,
@@ -183,6 +210,40 @@ pub struct MouseReport {
     pub wheel: i16,
 }
 
+/// Шестибайтный report абсолютного USB HID Tablet в QEMU/UTM.
+///
+/// Координаты задаются в диапазоне `0..=32767` независимо от размера экрана.
+/// Преобразование в пиксели выполняет window server: только он знает текущий
+/// видеорежим и не должен получать host-координаты через ABI драйвера.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct AbsolutePointerReport {
+    pub buttons: u8,
+    pub x: u16,
+    pub y: u16,
+    pub wheel: i16,
+}
+
+impl AbsolutePointerReport {
+    pub const MAXIMUM_COORDINATE: u16 = 0x7fff;
+
+    pub fn decode(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < 6 {
+            return None;
+        }
+        let x = u16::from_le_bytes([bytes[1], bytes[2]]);
+        let y = u16::from_le_bytes([bytes[3], bytes[4]]);
+        if x > Self::MAXIMUM_COORDINATE || y > Self::MAXIMUM_COORDINATE {
+            return None;
+        }
+        Some(Self {
+            buttons: bytes[0] & 0x1f,
+            x,
+            y,
+            wheel: i16::from(bytes[5] as i8),
+        })
+    }
+}
+
 impl MouseReport {
     pub fn decode(bytes: &[u8]) -> Option<Self> {
         if bytes.len() < 3 {
@@ -205,13 +266,17 @@ mod tests {
         9, 2, 34, 0, 1, 1, 0, 0xa0, 50, 9, 4, 0, 0, 1, 3, 1, 1, 0, 9, 0x21, 0x11, 0x01, 0, 1, 0x22,
         63, 0, 7, 5, 0x81, 3, 8, 0, 10,
     ];
+    const TABLET_CONFIGURATION: [u8; 34] = [
+        9, 2, 34, 0, 1, 1, 0, 0x80, 50, 9, 4, 0, 0, 1, 3, 0, 0, 0, 9, 0x21, 0x11, 0x01, 0, 1, 0x22,
+        74, 0, 7, 5, 0x81, 3, 8, 0, 10,
+    ];
 
     #[test]
     fn parses_boot_keyboard_around_hid_descriptor() {
         assert_eq!(
-            find_hid_boot_interface(&KEYBOARD_CONFIGURATION),
-            Ok(HidBootInterface {
-                kind: HidBootKind::Keyboard,
+            find_hid_interface(&KEYBOARD_CONFIGURATION),
+            Ok(HidInterface {
+                kind: HidKind::Keyboard,
                 configuration_value: 1,
                 interface_number: 0,
                 endpoint_address: 0x81,
@@ -226,14 +291,14 @@ mod tests {
         let mut malformed = KEYBOARD_CONFIGURATION;
         malformed[18] = 40;
         assert_eq!(
-            find_hid_boot_interface(&malformed),
+            find_hid_interface(&malformed),
             Err(DescriptorError::InvalidLength)
         );
         malformed = KEYBOARD_CONFIGURATION;
         malformed[2] = 0xff;
         malformed[3] = 0xff;
         assert_eq!(
-            find_hid_boot_interface(&malformed),
+            find_hid_interface(&malformed),
             Err(DescriptorError::Truncated)
         );
     }
@@ -266,5 +331,38 @@ mod tests {
         );
         assert_eq!(MouseReport::decode(&[0, 0, 0, 0xff]).unwrap().wheel, -1);
         assert!(MouseReport::decode(&[0, 0]).is_none());
+    }
+
+    #[test]
+    fn parses_and_decodes_qemu_absolute_tablet() {
+        assert_eq!(
+            find_hid_interface(&TABLET_CONFIGURATION),
+            Ok(HidInterface {
+                kind: HidKind::AbsolutePointer,
+                configuration_value: 1,
+                interface_number: 0,
+                endpoint_address: 0x81,
+                interval: 10,
+                max_packet_size: 8,
+            })
+        );
+        assert_eq!(
+            AbsolutePointerReport::decode(&[5, 0x34, 0x12, 0xff, 0x7f, 0xff]),
+            Some(AbsolutePointerReport {
+                buttons: 5,
+                x: 0x1234,
+                y: 0x7fff,
+                wheel: -1,
+            })
+        );
+        assert!(AbsolutePointerReport::decode(&[0, 0, 0, 0, 0]).is_none());
+        assert!(AbsolutePointerReport::decode(&[0, 0, 0x80, 0, 0, 0]).is_none());
+
+        let mut unknown_layout = TABLET_CONFIGURATION;
+        unknown_layout[25] = 73;
+        assert_eq!(
+            find_hid_interface(&unknown_layout),
+            Err(DescriptorError::Unsupported)
+        );
     }
 }

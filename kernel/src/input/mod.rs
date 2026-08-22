@@ -21,9 +21,25 @@ pub enum Key {
 }
 
 #[derive(Clone, Copy, Debug)]
+pub enum PointerMotion {
+    Relative {
+        dx: i16,
+        dy: i16,
+    },
+    /// Координаты устройства вместе с их логическим максимумом. Window
+    /// server преобразует их после выбора видеорежима, поэтому смена
+    /// разрешения не требует перенастройки USB HID устройства.
+    Absolute {
+        x: u16,
+        y: u16,
+        maximum_x: u16,
+        maximum_y: u16,
+    },
+}
+
+#[derive(Clone, Copy, Debug)]
 pub struct MouseEvent {
-    pub dx: i16,
-    pub dy: i16,
+    pub motion: PointerMotion,
     /// Горизонтальная прокрутка в аппаратных шагах. Положительное значение
     /// означает движение содержимого вправо.
     pub wheel_x: i16,

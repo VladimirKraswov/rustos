@@ -92,14 +92,16 @@ on run argv
         set drives of c to {}
         set espArgument to "if=none,media=disk,format=raw,id=rustosesp,file=" & espPath
         set systemArgument to "if=none,media=disk,format=raw,id=rustossystem,file=" & systemPath
-        -- Не подключаем параллельный virtio-mouse. QEMU/UTM отправляет host
-        -- events активному input handler'у, а RustOS справедливо подавляет
-        -- fallback, когда USB HID уже перечислен. Два устройства приводили к
-        -- split-brain: UTM писал в virtio, пока PlatformInput слушал xHCI.
-        set qemu additional arguments of c to {{argument string:"-machine"}, {argument string:"virt,acpi=off,gic-version=3"}, {argument string:"-global"}, {argument string:"virtio-mmio.force-legacy=false"}, {argument string:"-drive"}, {argument string:espArgument, file urls:{espImage}}, {argument string:"-device"}, {argument string:"virtio-blk-pci,drive=rustosesp,bootindex=0"}, {argument string:"-drive"}, {argument string:systemArgument, file urls:{systemImage}}, {argument string:"-device"}, {argument string:"virtio-blk-device,drive=rustossystem"}, {argument string:"-device"}, {argument string:"qemu-xhci,id=xhci"}, {argument string:"-device"}, {argument string:"usb-kbd,bus=xhci.0"}, {argument string:"-device"}, {argument string:"usb-mouse,bus=xhci.0"}}
+        -- UTM сам создаёт input-xHCI и подключает к нему usb-tablet,
+        -- usb-mouse и usb-kbd. Нельзя добавлять ещё один input-xHCI вручную:
+        -- frontend посылает host events в своё устройство, а guest мог
+        -- выбрать одноимённое устройство на другом контроллере. Служебный
+        -- controller UTM для usbredir не содержит HID и в input route не
+        -- участвует. Absolute tablet — основной capture-free pointer RustOS.
+        set qemu additional arguments of c to {{argument string:"-machine"}, {argument string:"virt,acpi=off,gic-version=3"}, {argument string:"-global"}, {argument string:"virtio-mmio.force-legacy=false"}, {argument string:"-drive"}, {argument string:espArgument, file urls:{espImage}}, {argument string:"-device"}, {argument string:"virtio-blk-pci,drive=rustosesp,bootindex=0"}, {argument string:"-drive"}, {argument string:systemArgument, file urls:{systemImage}}, {argument string:"-device"}, {argument string:"virtio-blk-device,drive=rustossystem"}}
         update configuration of vm with c
     end tell
 end run
 APPLESCRIPT
 
-echo "[utm-gpu] ready: name=$VM_NAME id=$VM_ID backend=VirGL/ANGLE-Metal accel=HVF input=xhci-usb-hid"
+echo "[utm-gpu] ready: name=$VM_NAME id=$VM_ID backend=VirGL/ANGLE-Metal accel=HVF input=utm-xhci-hid-tablet"

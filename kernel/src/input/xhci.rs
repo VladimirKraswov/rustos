@@ -1,4 +1,4 @@
-//! Современный xHCI USB host controller и HID Boot keyboard/mouse.
+//! Современный xHCI USB host controller и HID keyboard/pointer.
 //!
 //! Драйвер использует DMA command/event/transfer rings и не исполняет policy
 //! оконной системы. Сейчас он работает как bounded bootstrap transport в
@@ -9,13 +9,13 @@ use core::ptr;
 
 use rustos_abi::input::{MouseCapabilities, MouseSettings};
 use rustos_usb::{
-    endpoint_zero_packet_size, find_hid_boot_interface, HidBootInterface, HidBootKind,
+    endpoint_zero_packet_size, find_hid_interface, AbsolutePointerReport, HidInterface, HidKind,
     KeyboardReport, MouseReport,
 };
 
 use crate::{
     arch,
-    input::{Event, Key, MouseEvent},
+    input::{Event, Key, MouseEvent, PointerMotion},
     memory::{self, FrameBlock},
     serial,
 };
@@ -508,7 +508,7 @@ struct UsbDevice {
     speed: u8,
     slot: u8,
     endpoint_id: u8,
-    interface: HidBootInterface,
+    interface: HidInterface,
     frames: FrameBlock,
     control_ring: ProducerRing,
     interrupt_ring: ProducerRing,
@@ -601,14 +601,16 @@ impl UsbInput {
         self.devices
             .iter()
             .flatten()
-            .any(|device| device.interface.kind == HidBootKind::Keyboard)
+            .any(|device| device.interface.kind == HidKind::Keyboard)
     }
 
     pub fn has_mouse(&self) -> bool {
-        self.devices
-            .iter()
-            .flatten()
-            .any(|device| device.interface.kind == HidBootKind::Mouse)
+        self.devices.iter().flatten().any(|device| {
+            matches!(
+                device.interface.kind,
+                HidKind::RelativePointer | HidKind::AbsolutePointer
+            )
+        })
     }
 
     pub fn poll(&mut self) -> Option<Event> {
@@ -676,8 +678,9 @@ impl UsbInput {
                             serial::put_u32(u32::from(port));
                             serial::put_str(" kind=");
                             serial::put_str(match device.interface.kind {
-                                HidBootKind::Keyboard => "keyboard",
-                                HidBootKind::Mouse => "mouse",
+                                HidKind::Keyboard => "keyboard",
+                                HidKind::RelativePointer => "relative-pointer",
+                                HidKind::AbsolutePointer => "absolute-tablet",
                             });
                             serial::put_str(" speed=");
                             serial::put_u32(u32::from(device.speed));
@@ -713,8 +716,8 @@ impl UsbInput {
         };
         let control_ring = ProducerRing::initialize(frames.phys + PAGE_SIZE * 2);
         let interrupt_ring = ProducerRing::initialize(frames.phys + PAGE_SIZE * 3);
-        let placeholder = HidBootInterface {
-            kind: HidBootKind::Keyboard,
+        let placeholder = HidInterface {
+            kind: HidKind::Keyboard,
             configuration_value: 0,
             interface_number: 0,
             endpoint_address: 0,
@@ -784,12 +787,12 @@ impl UsbInput {
         self.control_in(device, 0x80, 6, 0x0200, 0, total as u16)?;
         let configuration =
             unsafe { core::slice::from_raw_parts(device.report_buffer() as *const u8, total) };
-        device.interface =
-            find_hid_boot_interface(configuration).map_err(|_| UsbError::Descriptor)?;
+        device.interface = find_hid_interface(configuration).map_err(|_| UsbError::Descriptor)?;
         device.endpoint_id = endpoint_context_index(device.interface.endpoint_address);
         device.report_size = match device.interface.kind {
-            HidBootKind::Keyboard => 8,
-            HidBootKind::Mouse => device.interface.max_packet_size.clamp(3, 8),
+            HidKind::Keyboard => 8,
+            HidKind::RelativePointer => device.interface.max_packet_size.clamp(3, 8),
+            HidKind::AbsolutePointer => device.interface.max_packet_size.clamp(6, 8),
         };
         self.build_endpoint_context(device);
         self.controller
@@ -801,14 +804,22 @@ impl UsbInput {
             u16::from(device.interface.configuration_value),
             0,
         )?;
-        self.control_no_data(
-            device,
-            0x21,
-            11,
-            0,
-            u16::from(device.interface.interface_number),
-        )?;
-        if device.interface.kind == HidBootKind::Keyboard {
+        // SET_PROTOCOL относится только к Boot subclass. Report-protocol
+        // tablet закономерно может ответить STALL; такой ответ нельзя считать
+        // отказом всего устройства.
+        if matches!(
+            device.interface.kind,
+            HidKind::Keyboard | HidKind::RelativePointer
+        ) {
+            self.control_no_data(
+                device,
+                0x21,
+                11,
+                0,
+                u16::from(device.interface.interface_number),
+            )?;
+        }
+        if device.interface.kind == HidKind::Keyboard {
             let _ = self.control_no_data(
                 device,
                 0x21,
@@ -1004,8 +1015,9 @@ impl UsbInput {
         let bytes =
             unsafe { core::slice::from_raw_parts(device.report_buffer() as *const u8, length) };
         match device.interface.kind {
-            HidBootKind::Keyboard => self.decode_keyboard(&mut device, bytes),
-            HidBootKind::Mouse => self.decode_mouse(bytes),
+            HidKind::Keyboard => self.decode_keyboard(&mut device, bytes),
+            HidKind::RelativePointer => self.decode_mouse(bytes),
+            HidKind::AbsolutePointer => self.decode_absolute_pointer(bytes),
         }
         arm_interrupt(&self.controller, &mut device);
         self.devices[index] = Some(device);
@@ -1032,10 +1044,30 @@ impl UsbInput {
         };
         let (dx, dy) = self.scale_motion(report.dx, report.dy);
         self.events.push(Event::Mouse(MouseEvent {
-            dx,
-            dy,
+            motion: PointerMotion::Relative { dx, dy },
             wheel_x: 0,
             // USB HID: положительное wheel означает вверх; UI — вниз.
+            wheel_y: -report.wheel,
+            left: report.buttons & 1 != 0,
+            right: report.buttons & 2 != 0,
+            middle: report.buttons & 4 != 0,
+            packets: 1,
+        }));
+    }
+
+    fn decode_absolute_pointer(&mut self, bytes: &[u8]) {
+        let Some(report) = AbsolutePointerReport::decode(bytes) else {
+            return;
+        };
+        self.events.push(Event::Mouse(MouseEvent {
+            motion: PointerMotion::Absolute {
+                x: report.x,
+                y: report.y,
+                maximum_x: AbsolutePointerReport::MAXIMUM_COORDINATE,
+                maximum_y: AbsolutePointerReport::MAXIMUM_COORDINATE,
+            },
+            wheel_x: 0,
+            // QEMU HID следует USB convention: плюс означает wheel-up.
             wheel_y: -report.wheel,
             left: report.buttons & 1 != 0,
             right: report.buttons & 2 != 0,

@@ -24,10 +24,11 @@ window server / приложения         не знают вид контро
 ```
 
 `rustos-usb` намеренно не зависит от ядра. Он строго проверяет длины device,
-configuration, interface и endpoint descriptors, выбирает HID Boot keyboard
-или mouse с interrupt-IN endpoint и декодирует отчёты. Ошибочный descriptor,
-HID rollover или укороченный report отвергается, а не превращается в выход за
-границы буфера. Host-тесты этого crate выполняются обычным `cargo test`.
+configuration, interface и endpoint descriptors, выбирает HID Boot keyboard,
+relative mouse либо абсолютный QEMU/UTM tablet с interrupt-IN endpoint и
+декодирует их отчёты. Ошибочный descriptor, HID rollover, координата вне
+логического диапазона или укороченный report отвергается, а не превращается в
+выход за границы буфера. Host-тесты этого crate выполняются обычным `cargo test`.
 
 `kernel/src/input/xhci.rs` — bounded bootstrap transport:
 
@@ -45,10 +46,13 @@ HID rollover или укороченный report отвергается, а н�
   может навсегда остановить загрузку или безгранично расходовать память.
 
 Клавиатура выдаёт только новые нажатия, отдельно ведёт Shift/Caps Lock и не
-повторяет уже удерживаемую клавишу как новое событие. Мышь принимает boot
-reports длиной 3 или 4 байта: относительные X/Y, три кнопки и колесо.
-Чувствительность и ускорение применяются fixed-point арифметикой с остатком,
-поэтому медленное движение не теряется.
+повторяет уже удерживаемую клавишу как новое событие. Относительная мышь
+принимает boot reports длиной 3 или 4 байта: X/Y, три кнопки и колесо.
+Абсолютный tablet передаёт кнопки, X/Y в диапазоне `0..=32767` и колесо;
+window server отображает этот диапазон на актуальный framebuffer. Поэтому
+указатель UTM работает без ручного mouse capture и после смены разрешения.
+Чувствительность и ускорение относительной мыши применяются fixed-point
+арифметикой с остатком, поэтому медленное движение не теряется.
 
 ## Переносимость и отображение MMIO
 
@@ -65,8 +69,12 @@ USB-клавиатура может работать вместе с PS/2-мыш
 
 ## Сборка и проверка
 
-Интерактивные QEMU/UTM-профили подключают `qemu-xhci`, `usb-kbd` и
-`usb-mouse`. Проверить parser отдельно и полный аппаратный маршрут можно так:
+Raw QEMU-профили явно подключают `qemu-xhci`, `usb-kbd` и `usb-mouse`. UTM уже
+создаёт собственный input-xHCI с `usb-tablet`, `usb-mouse` и `usb-kbd`;
+`scripts/setup-utm-gpu.sh` намеренно не дублирует эти устройства в additional
+arguments. UTM также может создать отдельный controller для `usbredir`, но без
+HID-устройств он не является вторым input route. Проверить parser отдельно и
+полный аппаратный маршрут можно так:
 
 ```sh
 cargo test -p rustos-usb
@@ -78,17 +86,19 @@ make test-arm-gui
 keyboard/mouse events через QEMU и проверяют результат в terminal/SystemUI.
 AArch64-тест намеренно не подключает параллельные virtio-input устройства,
 чтобы событие не могло случайно пройти через fallback вместо USB.
-UTM-профиль следует тому же правилу: одновременные `usb-mouse` и
-`virtio-mouse` создают два host input handler'а, тогда как guest multiplexor
-подавляет fallback при найденном USB HID. Для одного типа ввода в VM должен
-существовать ровно один основной виртуальный контроллер.
+UTM-профиль следует тому же правилу: один input controller может обслуживать
+несколько HID-функций, но вручную добавленный xHCI с мышью или параллельный
+`virtio-mouse` создают два host input route. Для одного типа ввода в VM должен
+существовать ровно один основной виртуальный controller; relative mouse
+остаётся fallback к tablet на том же UTM xHCI.
 
 ## Честная граница текущего этапа
 
-Сейчас реализованы xHCI root ports и HID Boot keyboard/mouse. Ещё не заявлены
-готовыми USB hubs, полноценный HID report-descriptor interpreter, mass storage,
-audio/video, isochronous endpoints, suspend/resume и USB-C policy. Транспорт
-пока опрашивает bounded event ring из bootstrap kernel.
+Сейчас реализованы xHCI root ports, HID Boot keyboard/mouse и проверенный
+шестибайтный absolute-tablet report QEMU/UTM. Ещё не заявлены готовыми USB hubs,
+универсальный HID report-descriptor interpreter для произвольных планшетов,
+mass storage, audio/video, isochronous endpoints, suspend/resume и USB-C policy.
+Транспорт пока опрашивает bounded event ring из bootstrap kernel.
 
 Следующая архитектурная граница — IRQ/MSI-X и IOMMU capabilities, после чего
 xHCI transport переносится в изолированный ring-3 `usbd`. Сбой parser'а или
