@@ -12,6 +12,7 @@ use crate::{
     apps::{
         desktop_settings::{DesktopSettings, DesktopSettingsAction, DesktopSettingsSnapshot},
         file_explorer::FileExplorer,
+        gpu_demo::GpuDemo,
         shell_ui::{active_icon_or_default, ShellAction, ShellUi},
         terminal::{
             CursorCommand, CursorThemeName, IconThemeName, MouseCommand, Terminal, TerminalAction,
@@ -60,6 +61,8 @@ const SETTINGS_MIN_WIDTH: u32 = 620;
 const SETTINGS_MIN_HEIGHT: u32 = 560;
 const EXPLORER_MIN_WIDTH: u32 = 940;
 const EXPLORER_MIN_HEIGHT: u32 = 440;
+const GPU_DEMO_MIN_WIDTH: u32 = 640;
+const GPU_DEMO_MIN_HEIGHT: u32 = 430;
 
 /// Bounded registry защищает ядро от исчерпания памяти одним GUI-клиентом.
 /// Состояние приложений при этом выделяется динамически из frame allocator,
@@ -157,6 +160,7 @@ enum ApplicationKind {
     FileExplorer,
     UiShowcase,
     DesktopSettings,
+    GpuDemo,
 }
 
 impl ApplicationKind {
@@ -166,6 +170,7 @@ impl ApplicationKind {
             Self::FileExplorer => "RustOS · Проводник",
             Self::UiShowcase => "RustOS · Библиотека компонентов",
             Self::DesktopSettings => "RustOS · Параметры рабочего стола",
+            Self::GpuDemo => "RustOS · Aurora 3D",
         }
     }
 
@@ -175,6 +180,7 @@ impl ApplicationKind {
             Self::FileExplorer => "Проводник",
             Self::UiShowcase => "Компоненты",
             Self::DesktopSettings => "Параметры",
+            Self::GpuDemo => "Aurora 3D",
         }
     }
 
@@ -186,6 +192,7 @@ impl ApplicationKind {
             Self::FileExplorer => "EXPLORER",
             Self::UiShowcase => "UI GALLERY",
             Self::DesktopSettings => "SETTINGS",
+            Self::GpuDemo => "AURORA 3D",
         }
     }
 
@@ -195,6 +202,7 @@ impl ApplicationKind {
             Self::FileExplorer => (EXPLORER_MIN_WIDTH, EXPLORER_MIN_HEIGHT),
             Self::UiShowcase => (GALLERY_MIN_WIDTH, GALLERY_MIN_HEIGHT),
             Self::DesktopSettings => (SETTINGS_MIN_WIDTH, SETTINGS_MIN_HEIGHT),
+            Self::GpuDemo => (GPU_DEMO_MIN_WIDTH, GPU_DEMO_MIN_HEIGHT),
         }
     }
 }
@@ -207,6 +215,7 @@ enum Application<'a> {
     FileExplorer(&'a mut FileExplorer),
     UiShowcase(&'a mut UiShowcase),
     DesktopSettings(&'a mut DesktopSettings),
+    GpuDemo(&'a mut GpuDemo),
 }
 
 /// Heap ядру не нужен: объект приложения размещается в непрерывных физических
@@ -249,6 +258,14 @@ impl ApplicationMemory {
         Some(result)
     }
 
+    fn new_gpu_demo(kind: ApplicationKind, now_ms: u64) -> Option<Self> {
+        let result = Self::allocate_for::<GpuDemo>(kind)?;
+        // SAFETY: allocate_for выделил уникальный диапазон полного размера;
+        // большой pixel surface строится на месте без временного значения.
+        unsafe { GpuDemo::initialize_in_place(result.pointer.cast::<GpuDemo>(), now_ms) };
+        Some(result)
+    }
+
     fn allocate_for<T>(kind: ApplicationKind) -> Option<Self> {
         let bytes = u64::try_from(size_of::<T>()).ok()?;
         let frames = bytes.checked_add(PAGE_SIZE - 1)? / PAGE_SIZE;
@@ -278,6 +295,9 @@ impl ApplicationMemory {
                 ApplicationKind::DesktopSettings => {
                     Application::DesktopSettings(&mut *self.pointer.cast::<DesktopSettings>())
                 }
+                ApplicationKind::GpuDemo => {
+                    Application::GpuDemo(&mut *self.pointer.cast::<GpuDemo>())
+                }
             }
         }
     }
@@ -305,6 +325,7 @@ impl Drop for ApplicationMemory {
                 ApplicationKind::DesktopSettings => {
                     ptr::drop_in_place(self.pointer.cast::<DesktopSettings>())
                 }
+                ApplicationKind::GpuDemo => ptr::drop_in_place(self.pointer.cast::<GpuDemo>()),
             }
         }
         let _ = memory::free(self.block);
@@ -401,6 +422,7 @@ struct DesktopSession {
     incremental_shell_logged: bool,
     display_fallback_logged: bool,
     desktop_icon_selected: bool,
+    desktop_gpu_demo_selected: bool,
     desktop_icon_pressed: bool,
     desktop_terminal_x: i32,
     desktop_terminal_y: i32,
@@ -471,6 +493,7 @@ impl DesktopSession {
             incremental_shell_logged: false,
             display_fallback_logged: false,
             desktop_icon_selected: false,
+            desktop_gpu_demo_selected: false,
             desktop_icon_pressed: false,
             desktop_terminal_x: 28,
             desktop_terminal_y: 35,
@@ -509,6 +532,17 @@ impl DesktopSession {
                     "[supervisor] display stack unavailable; kernel desktop fallback active\n",
                 );
                 self.display_fallback_logged = true;
+            }
+            if let Some(window) = self.tick_animated_application(arch::monotonic_milliseconds()) {
+                let old_cursor = self.cursor.rect();
+                self.cursor.restore(&mut self.framebuffer);
+                let mut damage = self.render_application_incremental(window);
+                self.cursor
+                    .draw(&mut self.framebuffer, self.mouse_x, self.mouse_y);
+                damage.add(old_cursor);
+                damage.add(self.cursor.rect());
+                self.framebuffer.present_damage(&damage);
+                continue;
             }
             if let Some(event) = self.input.poll() {
                 let old_cursor = self.cursor.rect();
@@ -787,6 +821,7 @@ impl DesktopSession {
                 }
             }
             Some(ApplicationKind::Terminal) => self.handle_terminal_key(id, key),
+            Some(ApplicationKind::GpuDemo) => Redraw::None,
             None => Redraw::None,
         }
     }
@@ -821,6 +856,17 @@ impl DesktopSession {
                 serial::put_str("[start] command=ui-gallery\n");
                 Redraw::Scene
             }
+            ShellAction::OpenGpuDemo => {
+                self.shell.set_open(false);
+                self.launch_gpu_demo();
+                Redraw::Scene
+            }
+            ShellAction::OpenDesktopSettings => {
+                self.shell.set_open(false);
+                let _ = self.open_or_focus_application(ApplicationKind::DesktopSettings);
+                serial::put_str("[start] command=desktop-settings\n");
+                Redraw::Scene
+            }
             ShellAction::ArrangeDesktop => {
                 self.shell.close_popups();
                 self.arrange_desktop_icons();
@@ -838,6 +884,36 @@ impl DesktopSession {
                 shutdown()
             }
         }
+    }
+
+    /// Единая точка запуска desktop и Start. Aurora теперь обычное приложение:
+    /// получает собственное окно, независимо сворачивается/закрывается и не
+    /// забирает scanout у desktop.
+    fn launch_gpu_demo(&mut self) {
+        serial::put_str("[gpu-demo] launch requested source=desktop-shell\n");
+        if self.spawn_application(ApplicationKind::GpuDemo).is_some() {
+            serial::put_str("[desktop] Aurora 3D window created gpu-fallback=automatic\n");
+        } else {
+            serial::put_str("[desktop] Aurora 3D window create failed\n");
+        }
+    }
+
+    fn tick_animated_application(&mut self, now_ms: u64) -> Option<WindowId> {
+        for index in 0..MAX_WINDOWS {
+            let Some(slot) = self.windows[index].as_mut() else {
+                continue;
+            };
+            if slot.model.is_minimized() {
+                continue;
+            }
+            let id = slot.model.id();
+            if let Application::GpuDemo(demo) = slot.application.get_mut() {
+                if demo.tick(now_ms) {
+                    return Some(id);
+                }
+            }
+        }
+        None
     }
 
     fn handle_settings_key(&mut self, id: WindowId, key: UiKey) -> Redraw {
@@ -931,7 +1007,9 @@ impl DesktopSession {
                         Application::FileExplorer(explorer) => {
                             explorer.set_scale(self.ui_scale_milli)
                         }
-                        Application::Terminal(_) | Application::DesktopSettings(_) => {}
+                        Application::Terminal(_)
+                        | Application::DesktopSettings(_)
+                        | Application::GpuDemo(_) => {}
                     }
                 }
                 serial::put_str("[settings] ui-scale=");
@@ -968,6 +1046,7 @@ impl DesktopSession {
         self.desktop_trash_x = 28;
         self.desktop_trash_y = 138;
         self.desktop_icon_selected = false;
+        self.desktop_gpu_demo_selected = false;
         self.desktop_icon_pressed = false;
     }
 
@@ -1214,7 +1293,7 @@ impl DesktopSession {
             }
             Some(Application::FileExplorer(explorer)) => explorer.scroll(x, y, wheel_x, wheel_y),
             Some(Application::DesktopSettings(settings)) => settings.scroll(x, y, wheel_x, wheel_y),
-            Some(Application::Terminal(_)) | None => false,
+            Some(Application::Terminal(_)) | Some(Application::GpuDemo(_)) | None => false,
         };
         if changed {
             serial::put_str("[pointer] wheel window=0x");
@@ -1382,7 +1461,15 @@ impl DesktopSession {
         } else {
             UiPointerKind::Move
         };
+        let programs_was_open = self.shell.programs_menu_is_open();
         let shell_result = self.shell.pointer(pointer_kind, x, y);
+        if programs_was_open != self.shell.programs_menu_is_open() {
+            serial::put_str(if self.shell.programs_menu_is_open() {
+                "[start] programs submenu opened applications=5\n"
+            } else {
+                "[start] programs submenu closed\n"
+            });
+        }
         if shell_result.action != ShellAction::None {
             return self.handle_shell_action(shell_result.action);
         }
@@ -1444,7 +1531,7 @@ impl DesktopSession {
                             return Redraw::Ui(id);
                         }
                     }
-                    Some(ApplicationKind::Terminal) | None => {}
+                    Some(ApplicationKind::Terminal) | Some(ApplicationKind::GpuDemo) | None => {}
                 }
             }
             return Redraw::None;
@@ -1452,6 +1539,7 @@ impl DesktopSession {
 
         if self.desktop_terminal_icon().contains(x, y) {
             self.desktop_icon_selected = true;
+            self.desktop_gpu_demo_selected = false;
             self.desktop_icon_pressed = true;
             let click = self.click_tracker.pressed(
                 arch::monotonic_milliseconds(),
@@ -1467,6 +1555,8 @@ impl DesktopSession {
             return Redraw::DesktopIcon;
         }
         if self.desktop_gpu_demo_icon().contains(x, y) {
+            self.desktop_icon_selected = false;
+            self.desktop_gpu_demo_selected = true;
             let click = self.click_tracker.pressed(
                 arch::monotonic_milliseconds(),
                 x,
@@ -1474,19 +1564,18 @@ impl DesktopSession {
                 self.input.mouse_settings(),
             );
             if click == ClickKind::Double {
-                match process::run_interactive_gpu_demo(180) {
-                    Ok(()) => {
-                        serial::put_str("[desktop] Aurora 3D completed; desktop scanout restored\n")
-                    }
-                    Err(_) => serial::put_str(
-                        "[desktop] Aurora 3D unavailable: VirGL capability is absent\n",
-                    ),
-                }
+                self.launch_gpu_demo();
                 return Redraw::Scene;
             }
-            return Redraw::None;
+            serial::put_str("[desktop] Aurora 3D selected; double-click to launch\n");
+            // Первый клик меняет только selection двух ярлыков. Полная
+            // композиция desktop задерживала второй клик под TCG настолько,
+            // что корректная double-click последовательность превращалась в
+            // два одиночных клика и приложение визуально «не запускалось».
+            return Redraw::DesktopIcon;
         }
         self.desktop_icon_selected = false;
+        self.desktop_gpu_demo_selected = false;
 
         if let Some(id) = self.task_window_at(x, y) {
             if self.window_is_minimized(id) {
@@ -1589,7 +1678,7 @@ impl DesktopSession {
                         Redraw::None
                     };
                 }
-                Some(ApplicationKind::Terminal) | None => {}
+                Some(ApplicationKind::Terminal) | Some(ApplicationKind::GpuDemo) | None => {}
             }
         }
 
@@ -1725,6 +1814,9 @@ impl DesktopSession {
                 ApplicationMemory::new(kind, move || {
                     DesktopSettings::new(content, snapshot, &modes[..count], recommended)
                 })
+            }
+            ApplicationKind::GpuDemo => {
+                ApplicationMemory::new_gpu_demo(kind, arch::monotonic_milliseconds())
             }
         }?;
         let frames = memory.frames();
@@ -2022,6 +2114,11 @@ impl DesktopSession {
         }
         let _ = self.framebuffer.cache_background();
         self.render_window(window);
+        if matches!(self.interaction, WindowInteraction::Move { .. }) {
+            if let Some(rect) = self.window_rect(window) {
+                let _ = self.framebuffer.cache_drag_layer(window_damage(rect));
+            }
+        }
     }
 
     fn finish_window_gesture(&mut self, window: WindowId, resized: bool) -> Redraw {
@@ -2036,7 +2133,7 @@ impl DesktopSession {
                     Some(Application::UiShowcase(showcase)) => showcase.resize(content),
                     Some(Application::DesktopSettings(settings)) => settings.resize(content),
                     Some(Application::FileExplorer(explorer)) => explorer.resize(content),
-                    Some(Application::Terminal(_)) | None => {}
+                    Some(Application::Terminal(_)) | Some(Application::GpuDemo(_)) | None => {}
                 }
             }
         }
@@ -2072,7 +2169,7 @@ impl DesktopSession {
                     Application::UiShowcase(showcase) => showcase.resize(content),
                     Application::DesktopSettings(settings) => settings.resize(content),
                     Application::FileExplorer(explorer) => explorer.resize(content),
-                    Application::Terminal(_) => {}
+                    Application::Terminal(_) | Application::GpuDemo(_) => {}
                 }
                 Some(event)
             } else {
@@ -2136,6 +2233,10 @@ impl DesktopSession {
                 settings.resize(content);
                 append_frame_damage(&mut damage, settings.draw(framebuffer, false));
             }
+            Application::GpuDemo(demo) => {
+                demo.draw(framebuffer, content);
+                damage.add(content);
+            }
         }
         if resizable {
             draw_resize_grip(framebuffer, window_rect, true);
@@ -2161,6 +2262,13 @@ impl DesktopSession {
                 self.shell
                     .draw_menu(&mut self.framebuffer, icon_pack, false),
             );
+            if self.shell.programs_menu_is_open() {
+                append_frame_damage(
+                    &mut damage,
+                    self.shell
+                        .draw_programs_menu(&mut self.framebuffer, icon_pack, false),
+                );
+            }
         }
         if self.shell.desktop_menu_is_open() {
             append_frame_damage(
@@ -2243,13 +2351,15 @@ impl DesktopSession {
             self.render_scene();
             return false;
         }
-        if first {
-            let _ = self.framebuffer.restore_background(window_damage(previous));
-        } else {
-            self.restore_preview(previous);
-        }
+        let _ = first;
+        self.restore_preview(previous);
         if let Some(rect) = self.window_rect(window) {
-            self.draw_drag_preview(window, rect);
+            let damage = window_damage(rect);
+            let copied = matches!(self.interaction, WindowInteraction::Move { .. })
+                && self.framebuffer.draw_cached_drag_layer(damage);
+            if !copied {
+                self.render_window(window);
+            }
         }
         self.drag_preview_visible = true;
         true
@@ -2268,39 +2378,14 @@ impl DesktopSession {
         true
     }
 
-    fn draw_drag_preview(&mut self, window: WindowId, rect: Rect) {
-        let title = self
-            .window_kind(window)
-            .map_or("RUSTOS", ApplicationKind::title);
-        self.framebuffer.fill_rounded_rect(
-            Rect::new(rect.x, rect.y, rect.width, TITLE_HEIGHT),
-            10,
-            Color::rgb(28, 43, 62),
-        );
-        self.framebuffer
-            .rounded_border(rect, Theme::RADIUS, 1, Theme::ACCENT);
-        font::draw_text(
-            &mut self.framebuffer,
-            rect.x + 12,
-            rect.y + 11,
-            title,
-            Theme::TEXT,
-            font::UI_TITLE.scaled(self.ui_scale_milli),
-        );
-    }
-
     fn restore_preview(&mut self, rect: Rect) {
-        for damage in preview_damage(rect) {
-            let _ = self.framebuffer.restore_background(damage);
-        }
+        let _ = self.framebuffer.restore_background(window_damage(rect));
     }
 
     fn present_preview(&mut self, rect: Rect) {
         let bounds = Rect::new(0, 0, self.framebuffer.width(), self.framebuffer.height());
         let mut region = DamageRegion::<4>::new(bounds);
-        for damaged in preview_damage(rect) {
-            region.add(damaged);
-        }
+        region.add(window_damage(rect));
         self.drag_present_pixels = self
             .drag_present_pixels
             .saturating_add(region.covered_pixels());
@@ -2342,6 +2427,16 @@ impl DesktopSession {
         } else {
             "full"
         });
+        if let Some(rect) = self.window_rect(window) {
+            serial::put_str(" rect=");
+            serial::put_u32(rect.x.max(0) as u32);
+            serial::put_str(",");
+            serial::put_u32(rect.y.max(0) as u32);
+            serial::put_str(",");
+            serial::put_u32(rect.width);
+            serial::put_str("x");
+            serial::put_u32(rect.height);
+        }
         serial::put_str("\n");
     }
 
@@ -2373,6 +2468,11 @@ impl DesktopSession {
     fn render_desktop_icons(&mut self) {
         self.render_terminal_desktop_icon();
         let demo = self.desktop_gpu_demo_icon();
+        if self.desktop_gpu_demo_selected {
+            self.framebuffer
+                .fill_rounded_rect(demo, 10, Theme::ACCENT_SOFT);
+            self.framebuffer.rounded_border(demo, 10, 1, Theme::ACCENT);
+        }
         self.draw_system_icon(
             IconKind::GpuDemo,
             Rect::new(demo.x + 12, demo.y + 3, 48, 48),
@@ -2490,6 +2590,8 @@ impl DesktopSession {
                     IconKind::Settings,
                     Rect::new(rect.x + 8, rect.y + 6, 22, 22),
                 ),
+                ApplicationKind::GpuDemo => self
+                    .draw_system_icon(IconKind::GpuDemo, Rect::new(rect.x + 8, rect.y + 6, 22, 22)),
             }
             Label {
                 rect: Rect::new(rect.x + 38, rect.y + 8, 310, 22),
@@ -2576,6 +2678,7 @@ impl DesktopSession {
                 settings.resize(content);
                 let _ = settings.draw(framebuffer, true);
             }
+            Application::GpuDemo(demo) => demo.draw(framebuffer, content),
         }
         if style.contains(WindowStyle::BORDER)
             && style.contains(WindowStyle::RESIZABLE)
@@ -2595,7 +2698,8 @@ impl DesktopSession {
             Application::Terminal(terminal) => terminal.draw_input_line(framebuffer, content),
             Application::FileExplorer(_)
             | Application::UiShowcase(_)
-            | Application::DesktopSettings(_) => None,
+            | Application::DesktopSettings(_)
+            | Application::GpuDemo(_) => None,
         }
     }
 
@@ -2645,6 +2749,8 @@ impl DesktopSession {
                     IconKind::Settings,
                     Rect::new(task.x + 6, task.y + 6, 26, 26),
                 ),
+                ApplicationKind::GpuDemo => self
+                    .draw_system_icon(IconKind::GpuDemo, Rect::new(task.x + 6, task.y + 6, 26, 26)),
             }
             if task.width >= 92 {
                 font::draw_text(
@@ -2669,6 +2775,11 @@ impl DesktopSession {
     fn render_start_menu(&mut self) {
         let icon_pack = active_icon_or_default(self.icon_packs.active());
         let _ = self.shell.draw_menu(&mut self.framebuffer, icon_pack, true);
+        if self.shell.programs_menu_is_open() {
+            let _ = self
+                .shell
+                .draw_programs_menu(&mut self.framebuffer, icon_pack, true);
+        }
     }
 
     fn render_desktop_menu(&mut self) {
@@ -2884,26 +2995,6 @@ const fn inset_rect(rect: Rect, amount: u32) -> Rect {
         rect.width.saturating_sub(amount.saturating_mul(2)),
         rect.height.saturating_sub(amount.saturating_mul(2)),
     )
-}
-
-fn preview_damage(rect: Rect) -> [Rect; 4] {
-    let body_height = rect.height.saturating_sub(TITLE_HEIGHT);
-    [
-        Rect::new(rect.x, rect.y, rect.width, TITLE_HEIGHT),
-        Rect::new(rect.x, rect.y + TITLE_HEIGHT as i32, 2, body_height),
-        Rect::new(
-            rect.x + rect.width.saturating_sub(2) as i32,
-            rect.y + TITLE_HEIGHT as i32,
-            2,
-            body_height,
-        ),
-        Rect::new(
-            rect.x,
-            rect.y + rect.height.saturating_sub(2) as i32,
-            rect.width,
-            2,
-        ),
-    ]
 }
 
 fn clipped_area(rect: Rect, width: u32, height: u32) -> u64 {

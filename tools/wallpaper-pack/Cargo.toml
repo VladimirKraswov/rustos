@@ -1,0 +1,11 @@
+[package]
+name = "rustos-wallpaper-pack"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "rustos-wallpaper-pack"
+path = "src/main.rs"
+

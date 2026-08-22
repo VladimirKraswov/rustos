@@ -482,16 +482,35 @@ pub struct GpuDemoRequest {
     pub version: u16,
     /// Размер структуры.
     pub size: u16,
-    /// Зарезервировано; равно нулю.
+    /// Флаги из [`demo_flag`].
     pub flags: u32,
     /// Число кадров, после которого scanout возвращается desktop.
     pub frame_count: u32,
     /// Желаемый интервал; vblank остаётся окончательным pacing source.
     pub frame_interval_ms: u32,
+    /// Ширина render target. Ноль означает текущий scanout.
+    pub width: u32,
+    /// Высота render target. Ноль означает текущий scanout.
+    pub height: u32,
+    /// Первый кадр анимации. Позволяет оконному серверу запрашивать по одному
+    /// кадру без пересоздания GPU context.
+    pub first_frame: u32,
+    /// Зарезервировано для выравнивания; равно нулю.
+    pub reserved0: u32,
     /// Детерминированный seed сцены.
     pub seed: u64,
     /// Зарезервировано.
-    pub reserved: [u64; 5],
+    pub reserved: [u64; 3],
+}
+
+/// Режимы запуска системной 3D-демонстрации.
+pub mod demo_flag {
+    /// Рендерить в off-screen GraphicsBuffer и вернуть управление desktop,
+    /// не передавая буфер displayd. Оконный compositor заберёт готовые pixels
+    /// после GPU fence и включит их в обычный damage/present.
+    pub const WINDOWED: u32 = 1 << 0;
+    /// Все известные биты текущего ABI.
+    pub const KNOWN: u32 = WINDOWED;
 }
 
 impl GpuDemoRequest {
@@ -503,21 +522,50 @@ impl GpuDemoRequest {
             flags: 0,
             frame_count,
             frame_interval_ms: 16,
+            width: 0,
+            height: 0,
+            first_frame: 0,
+            reserved0: 0,
             seed: 0x4155_524f_5241_3344,
-            reserved: [0; 5],
+            reserved: [0; 3],
+        }
+    }
+
+    /// Создаёт запрос одного кадра для обычного desktop-окна.
+    pub const fn windowed(width: u32, height: u32, frame: u32) -> Self {
+        Self {
+            version: GPU_ABI_VERSION,
+            size: core::mem::size_of::<Self>() as u16,
+            flags: demo_flag::WINDOWED,
+            frame_count: 1,
+            frame_interval_ms: 16,
+            width,
+            height,
+            first_frame: frame,
+            reserved0: 0,
+            seed: 0x4155_524f_5241_3344,
+            reserved: [0; 3],
         }
     }
 
     /// Проверяет bounded duration и все зарезервированные поля.
     pub fn validate(&self) -> Result<(), GpuAbiError> {
         validate_prefix(self.version, self.size, core::mem::size_of::<Self>())?;
-        if self.flags != 0 || self.reserved != [0; 5] {
+        if self.flags & !demo_flag::KNOWN != 0 || self.reserved0 != 0 || self.reserved != [0; 3] {
             return Err(GpuAbiError::ReservedNonZero);
         }
         if self.frame_count == 0
             || self.frame_count > 600
             || !(1..=1000).contains(&self.frame_interval_ms)
         {
+            return Err(GpuAbiError::InvalidValue);
+        }
+        let windowed = self.flags & demo_flag::WINDOWED != 0;
+        if windowed {
+            if !(64..=2048).contains(&self.width) || !(64..=2048).contains(&self.height) {
+                return Err(GpuAbiError::InvalidValue);
+            }
+        } else if self.width != 0 || self.height != 0 || self.first_frame != 0 {
             return Err(GpuAbiError::InvalidValue);
         }
         Ok(())
@@ -618,5 +666,11 @@ mod tests {
         let mut invalid = request;
         invalid.frame_count = 0;
         assert_eq!(invalid.validate(), Err(GpuAbiError::InvalidValue));
+        let windowed = GpuDemoRequest::windowed(800, 450, 91);
+        assert_eq!(windowed.validate(), Ok(()));
+        assert_eq!(
+            GpuDemoRequest::decode_inline(&windowed.encode_inline()),
+            Ok(windowed)
+        );
     }
 }

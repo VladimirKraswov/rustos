@@ -112,4 +112,6 @@ cp -f "$RUN_DIR/Xvfb_screen0" "$RUN_DIR/showcase.xwd"
 "$CHECK_TOOL" --virgl "$RUN_DIR/showcase.xwd" "$RUN_DIR/showcase.ppm"
 grep -Fq '[gpu-demo] AURORA_3D_READY frames=48 renderer=mesa-virgl cpu-raster=no' \
     "$RUN_DIR/serial.log"
+grep -Fq '[virgl-test] WINDOWED_READBACK_READY source=host-gpu cpu-raster=no' \
+    "$RUN_DIR/serial.log"
 echo "[virgl-test] PASS: Mesa/VirGL Aurora 3D reached scanout without guest CPU rasterization"

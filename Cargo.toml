@@ -38,6 +38,7 @@ members = [
     "tools/vfs-image",
     "tools/rune",
     "tools/rui",
+    "tools/wallpaper-pack",
 ]
 
 [workspace.package]

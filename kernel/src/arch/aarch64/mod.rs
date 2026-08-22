@@ -51,7 +51,7 @@ pub fn dma_read_barrier() {
 }
 
 /// Кадр, который vector stub сохраняет при входе EL0 -> EL1.
-#[repr(C)]
+#[repr(C, align(16))]
 #[derive(Debug)]
 pub struct TrapFrame {
     pub x: [u64; 31],
@@ -144,18 +144,6 @@ impl UserContext {
             fpcr: 0,
             fpsr: 0,
         }
-    }
-
-    pub const fn entry(&self) -> u64 {
-        self.instruction_pointer
-    }
-
-    pub const fn stack_pointer(&self) -> u64 {
-        self.stack_pointer
-    }
-
-    pub const fn arguments(&self) -> [u64; 3] {
-        [self.x[0], self.x[1], self.x[2]]
     }
 
     pub const fn thread_pointer(&self) -> u64 {
@@ -370,6 +358,34 @@ pub unsafe fn enter_user(
     interrupts: bool,
 ) -> u64 {
     unsafe { traps::enter_user(entry, stack, arguments, root, interrupts) }
+}
+
+/// Возобновляет полный сохранённый EL0 context после scheduler stop/run.
+///
+/// В отличие от начального [`enter_user`], эта граница восстанавливает все
+/// GPR, FP/SIMD, flags и TLS. Терять callee-saved регистры между двумя
+/// `ProcessManager::run` недопустимо для постоянных ring-3 сервисов.
+///
+/// # Safety
+///
+/// `context` принадлежит выбранному runnable thread, а `root` — его
+/// действующая таблица страниц с общими supervisor mappings.
+pub unsafe fn enter_user_context(context: &UserContext, root: u64) -> u64 {
+    let mut frame = TrapFrame {
+        x: [0; 31],
+        sp_el0: 0,
+        elr_el1: 0,
+        spsr_el1: 0,
+        esr_el1: 0,
+        far_el1: 0,
+        source: 0,
+        simd_padding: 0,
+        vector: [[0; 2]; 32],
+        fpcr: 0,
+        fpsr: 0,
+    };
+    context.restore(&mut frame);
+    unsafe { traps::enter_user_frame(&mut frame, root) }
 }
 
 pub const fn initial_user_stack(top: u64) -> u64 {

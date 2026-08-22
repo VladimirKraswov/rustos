@@ -17,7 +17,7 @@ HOST_CRATES := \
 	rustos-abi rustos-microkernel rustos-video rustos-system-ui \
 	rustos-system-assets rustos-rune-format rustos-runtime rustos-vfs-client \
 	rustos-elf-loader rustos-rune-loader rustos-virgl rustos-mesa varaniafs rustos-image rustos-pack \
-	rustos-gui-check rustos-hmp rustos-vfs-image rustos-rune rustos-rui
+	rustos-gui-check rustos-hmp rustos-vfs-image rustos-rune rustos-rui rustos-wallpaper-pack
 HOST_CRATE_ARGS := $(addprefix -p ,$(HOST_CRATES))
 
 DOC_CRATES := \

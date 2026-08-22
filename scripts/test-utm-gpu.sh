@@ -27,13 +27,16 @@ bash scripts/setup-utm-gpu.sh
 utmctl start "$VM_NAME" >/dev/null
 
 PTY=""
-for _ in {1..100}; do
+# Первый запуск после замены ESP/firmware заставляет UTM пересоздать QEMU
+# frontend и на загруженном macOS может занимать заметно больше десяти секунд.
+# Это startup-состояние host VM, ещё не timeout загрузки RustOS.
+for _ in {1..400}; do
     PTY="$(osascript -e 'tell application "UTM" to get address of first serial port of virtual machine named "'"$VM_NAME"'"' 2>/dev/null || true)"
     [[ -n "$PTY" && "$PTY" != "missing value" && -e "$PTY" ]] && break
-    sleep 0.1
+    sleep 0.25
 done
 if [[ -z "$PTY" || ! -e "$PTY" ]]; then
-    echo "[utm-gpu-test] serial PTTY unavailable" >&2
+    echo "[utm-gpu-test] serial PTY unavailable (state=$(utmctl status "$VM_NAME" 2>/dev/null || echo unknown))" >&2
     exit 3
 fi
 
@@ -59,6 +62,7 @@ for ((second = 0; second < TIMEOUT_SECONDS; second++)); do
 done
 
 grep -Fq '[gpu-demo] AURORA_3D_READY frames=48 renderer=mesa-virgl cpu-raster=no' "$SERIAL_LOG"
+grep -Fq '[virgl-test] WINDOWED_READBACK_READY source=host-gpu cpu-raster=no' "$SERIAL_LOG"
 grep -Fq '[virgl-test] MESA_SHOWCASE_READY scanout=graphics-buffer cpu-raster=no' "$SERIAL_LOG"
 if [[ "$READY" != "1" ]]; then
     echo "[utm-gpu-test] accelerated scene timeout" >&2

@@ -206,6 +206,7 @@ extern "C" {
         root: u64,
         interrupts: u64,
     ) -> u64;
+    fn rustos_enter_user_frame_asm(frame: *mut TrapFrame, root: u64) -> u64;
 }
 
 /// Устанавливает exception gates и доступный из CPL3 syscall gate 0x80.
@@ -283,6 +284,12 @@ pub unsafe fn enter_user(
             u64::from(interrupts),
         )
     }
+}
+
+/// Входит в сохранённый scheduler context, включая GPR и FXSAVE state.
+pub unsafe fn enter_user_frame(frame: &mut TrapFrame, root: u64) -> u64 {
+    // SAFETY: frame остаётся на kernel stack до возврата abort boundary.
+    unsafe { rustos_enter_user_frame_asm(frame, root) }
 }
 
 #[no_mangle]
@@ -435,6 +442,39 @@ rustos_enter_user_asm:
     mov rdi, rdx
     mov rsi, rcx
     mov rdx, r8
+    iretq
+
+.global rustos_enter_user_frame_asm
+rustos_enter_user_frame_asm:
+    push rbp
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    mov qword ptr [rip + rustos_saved_kernel_rsp], rsp
+    mov rax, cr3
+    mov qword ptr [rip + rustos_saved_kernel_cr3], rax
+    mov cr3, rsi
+    mov rsp, rdi
+    fxrstor64 [rsp]
+    add rsp, 512
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rbp
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    add rsp, 16
     iretq
 
 rustos_abort_user:

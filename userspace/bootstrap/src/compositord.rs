@@ -17,8 +17,8 @@ use rustos_abi::{
         DISPLAY_QUERY_HANDLE_COUNT, DISPLAY_QUERY_OPCODE,
     },
     gpu::{
-        GpuDemoRequest, GpuRenderFrame, GPU_DEMO_START_OPCODE, GPU_RENDERED_FRAME_HANDLE_COUNT,
-        GPU_RENDERED_FRAME_OPCODE, GPU_RENDER_REQUEST_OPCODE,
+        demo_flag, GpuDemoRequest, GpuRenderFrame, GPU_DEMO_START_OPCODE,
+        GPU_RENDERED_FRAME_HANDLE_COUNT, GPU_RENDERED_FRAME_OPCODE, GPU_RENDER_REQUEST_OPCODE,
     },
     graphics_buffer::{BufferUsage, GraphicsBufferDesc, MemoryDomain, PixelFormatCode},
     ipc::TransferredHandle,
@@ -57,11 +57,10 @@ pub extern "C" fn _start(display_endpoint: u64, feedback_endpoint: u64, abi_vers
     let feedback_endpoint = Handle(feedback_endpoint as u32);
     let info = query_display(display_endpoint, feedback_endpoint);
     let mut frame_id = 1u64;
-    let first = if gpu_mode {
-        prepare_gpu_frame(info, frame_id, Some(0))
-    } else {
-        prepare_cpu_frame(info)
-    };
+    // Стартовый desktop остаётся обычным CPU buffer. Иначе первый GPU кадр
+    // навсегда зафиксировал бы размер renderd target равным scanout и не дал
+    // бы приложениям создавать компактные оконные surfaces.
+    let first = prepare_cpu_frame(info);
     present_frame(display_endpoint, feedback_endpoint, info, first, frame_id);
 
     if !gpu_mode {
@@ -87,12 +86,25 @@ pub extern "C" fn _start(display_endpoint: u64, feedback_endpoint: u64, abi_vers
             Ok(request) => request,
             Err(_) => process_exit(211),
         };
-        // Каждый present ждёт release/vblank, поэтому очередь не убегает от
-        // monitor refresh и остаётся bounded даже при медленном GPU.
+        let windowed = request.flags & demo_flag::WINDOWED != 0;
+        let render_width = if windowed { request.width } else { info.width };
+        let render_height = if windowed {
+            request.height
+        } else {
+            info.height
+        };
+        // Каждый полноэкранный present ждёт release/vblank. Оконный запрос
+        // уже завершён acquire fence'ом renderd; его buffer остаётся у
+        // renderd, а kernel compositor скачает содержимое из host resource.
         for scene_frame in 0..request.frame_count {
             frame_id = frame_id.saturating_add(1);
-            let frame = prepare_gpu_frame(info, frame_id, Some(scene_frame));
-            present_frame(display_endpoint, feedback_endpoint, info, frame, frame_id);
+            let scene_frame = request.first_frame.saturating_add(scene_frame);
+            let frame = prepare_gpu_frame(render_width, render_height, frame_id, Some(scene_frame));
+            if windowed {
+                discard_windowed_frame(frame);
+            } else {
+                present_frame(display_endpoint, feedback_endpoint, info, frame, frame_id);
+            }
         }
     }
 }
@@ -246,15 +258,14 @@ fn prepare_cpu_frame(info: DisplayScanoutInfo) -> PreparedFrame {
 }
 
 fn prepare_gpu_frame(
-    info: DisplayScanoutInfo,
+    width: u32,
+    height: u32,
     frame_id: u64,
     scene_frame: Option<u32>,
 ) -> PreparedFrame {
     let request = match scene_frame {
-        Some(scene_frame) => {
-            GpuRenderFrame::aurora_request(info.width, info.height, frame_id, scene_frame)
-        }
-        None => GpuRenderFrame::request(info.width, info.height, frame_id),
+        Some(scene_frame) => GpuRenderFrame::aurora_request(width, height, frame_id, scene_frame),
+        None => GpuRenderFrame::request(width, height, frame_id),
     };
     let mut message = Message::EMPTY;
     message.header.opcode = GPU_RENDER_REQUEST_OPCODE;
@@ -276,8 +287,8 @@ fn prepare_gpu_frame(
     let rendered = match GpuRenderFrame::decode_inline(&frame.payload) {
         Ok(rendered)
             if rendered.fence_id != 0
-                && rendered.width == info.width
-                && rendered.height == info.height
+                && rendered.width == width
+                && rendered.height == height
                 && rendered.flags == request.flags
                 && rendered.scene_frame() == request.scene_frame() =>
         {
@@ -292,8 +303,8 @@ fn prepare_gpu_frame(
     let mut descriptor = empty_descriptor();
     if graphics_buffer_get_info(buffer, &mut descriptor) != syscall::status::OK
         || descriptor.validate().is_err()
-        || descriptor.width != info.width
-        || descriptor.height != info.height
+        || descriptor.width != width
+        || descriptor.height != height
         || descriptor.usage.contains(BufferUsage::CPU_WRITE)
         || !descriptor.usage.contains(BufferUsage::RENDER_TARGET)
         || !descriptor.usage.contains(BufferUsage::SCANOUT)
@@ -305,6 +316,17 @@ fn prepare_gpu_frame(
         buffer,
         acquire,
         acquire_value,
+    }
+}
+
+fn discard_windowed_frame(prepared: PreparedFrame) {
+    // Полученные handles являются производными копиями. Оригинальный
+    // GraphicsBuffer остаётся у renderd и будет прочитан оконным compositor'ом
+    // после возврата scheduler'а в kernel desktop.
+    if handle_close(prepared.buffer) != syscall::status::OK
+        || handle_close(prepared.acquire) != syscall::status::OK
+    {
+        process_exit(205);
     }
 }
 

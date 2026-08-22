@@ -295,6 +295,20 @@ pub fn drain_render(fence_id: u64) -> Result<RenderCompletion, DisplayBrokerErro
         .map_err(map_mode_error)
 }
 
+/// Копирует завершённый VirGL render target в attached guest-memory backing.
+/// Это не rasterization: pixels создаёт host GPU, команда лишь выполняет
+/// explicit readback для временного kernel compositor bridge.
+pub fn download_render_target(graphics_object: u16) -> Result<(), DisplayBrokerError> {
+    let mut guard = DEVICE.acquire()?;
+    guard
+        .get()
+        .as_mut()
+        .ok_or(DisplayBrokerError::Unavailable)?
+        .gpu
+        .download_imported(graphics_object)
+        .map_err(map_mode_error)
+}
+
 pub fn destroy_render_context(context: u32) {
     let Ok(mut guard) = DEVICE.acquire() else {
         return;

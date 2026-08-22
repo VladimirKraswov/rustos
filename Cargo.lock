@@ -483,6 +483,10 @@ name = "rustos-virgl"
 version = "0.1.0"
 
 [[package]]
+name = "rustos-wallpaper-pack"
+version = "0.1.0"
+
+[[package]]
 name = "skrifa"
 version = "0.44.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

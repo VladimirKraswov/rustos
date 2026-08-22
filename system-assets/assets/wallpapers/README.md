@@ -26,6 +26,11 @@ avoid oversaturation, excessive contrast and busy detail
 3. `winter-field.png` — снежное поле и замёрзшая река, редкие ели и мягкие
    горы под бледно-голубым небом.
 
-`packed/*.rgb565` — little-endian raw RGB565, 640×360, ровно 460800 байт.
-Они пересобираются `scripts/pack-wallpapers.sh` и непосредственно включаются
-в `rustos-system-assets`; PNG нужны как редактируемые master assets.
+`packed/*.rbc1` — 4×4 block-compressed RGB, 1280×720, ровно 460800 байт.
+Каждый блок хранит два RGB565 endpoint и 2-bit индекс texel; широкоформатное
+разрешение сохраняется до rasterization, а при нецелом масштабе
+desktop использует bilinear sampling, а не растягивает низкое изображение
+nearest-neighbor. Блочное хранение гарантирует загрузку GRUB/OVMF при
+минимальных 128 MiB RAM; framebuffer по-прежнему 24-bit. Файлы
+пересобираются `scripts/pack-wallpapers.sh` и непосредственно включаются в
+`rustos-system-assets`; PNG остаются полноцветными master assets.

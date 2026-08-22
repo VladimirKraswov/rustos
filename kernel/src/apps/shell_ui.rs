@@ -23,6 +23,9 @@ const COMMAND_SHUTDOWN: CommandId = CommandId(4);
 const COMMAND_ARRANGE_DESKTOP: CommandId = CommandId(5);
 const COMMAND_DESKTOP_PROPERTIES: CommandId = CommandId(6);
 const COMMAND_EXPLORER: CommandId = CommandId(7);
+const COMMAND_PROGRAMS: CommandId = CommandId(8);
+const COMMAND_GPU_DEMO: CommandId = CommandId(9);
+const COMMAND_SETTINGS: CommandId = CommandId(10);
 
 const TEXT_START: ResourceId = ResourceId(1);
 const IMAGE_RUSTOS: ResourceId = ResourceId(2);
@@ -42,9 +45,15 @@ const IMAGE_ARRANGE: ResourceId = ResourceId(15);
 const IMAGE_SETTINGS: ResourceId = ResourceId(16);
 const TEXT_EXPLORER: ResourceId = ResourceId(17);
 const IMAGE_EXPLORER: ResourceId = ResourceId(18);
+const TEXT_PROGRAMS: ResourceId = ResourceId(19);
+const IMAGE_PROGRAMS: ResourceId = ResourceId(20);
+const TEXT_GPU_DEMO: ResourceId = ResourceId(21);
+const IMAGE_GPU_DEMO: ResourceId = ResourceId(22);
+const TEXT_SETTINGS: ResourceId = ResourceId(23);
 
 type LauncherRuntime = Runtime<5, 16, 4>;
-type MenuRuntime = Runtime<22, 60, 8>;
+type MenuRuntime = Runtime<14, 40, 8>;
+type ProgramsMenuRuntime = Runtime<18, 52, 8>;
 type ClockRuntime = Runtime<5, 12, 4>;
 type DesktopMenuRuntime = Runtime<9, 28, 6>;
 
@@ -56,6 +65,8 @@ pub enum ShellAction {
     OpenTerminal,
     OpenFileExplorer,
     OpenGallery,
+    OpenGpuDemo,
+    OpenDesktopSettings,
     ArrangeDesktop,
     OpenDesktopProperties,
     Shutdown,
@@ -84,6 +95,7 @@ impl ShellInputResult {
 pub struct ShellUi {
     launcher: LauncherRuntime,
     menu: MenuRuntime,
+    programs_menu: ProgramsMenuRuntime,
     clock_view: ClockRuntime,
     desktop_menu: DesktopMenuRuntime,
     clock: SystemClock,
@@ -91,6 +103,7 @@ pub struct ShellUi {
     screen_width: u32,
     screen_height: u32,
     open: bool,
+    programs_open: bool,
     desktop_menu_open: bool,
     desktop_menu_rect: Rect,
 }
@@ -102,17 +115,23 @@ impl ShellUi {
         let clock_rect = clock_rect(screen_width, screen_height, taskbar_height);
         let mut launcher = LauncherRuntime::new(launcher_rect, shell_theme());
         let mut menu = MenuRuntime::new(menu_rect, shell_theme());
+        let mut programs_menu = ProgramsMenuRuntime::new(
+            programs_menu_rect(screen_width, screen_height, taskbar_height),
+            shell_theme(),
+        );
         let mut clock_view = ClockRuntime::new(clock_rect, taskbar_theme());
         let desktop_menu_rect =
             desktop_popup_rect(8, 8, screen_width, screen_height, taskbar_height);
         let mut desktop_menu = DesktopMenuRuntime::new(desktop_menu_rect, shell_theme());
         build_launcher(&mut launcher);
         build_menu(&mut menu);
+        build_programs_menu(&mut programs_menu);
         build_clock(&mut clock_view);
         build_desktop_menu(&mut desktop_menu);
         Self {
             launcher,
             menu,
+            programs_menu,
             clock_view,
             desktop_menu,
             clock: SystemClock::new(now_ms),
@@ -120,6 +139,7 @@ impl ShellUi {
             screen_width,
             screen_height,
             open: false,
+            programs_open: false,
             desktop_menu_open: false,
             desktop_menu_rect,
         }
@@ -134,6 +154,9 @@ impl ShellUi {
             return;
         }
         self.open = open;
+        if !open {
+            self.programs_open = false;
+        }
         if open {
             self.desktop_menu_open = false;
         }
@@ -159,6 +182,7 @@ impl ShellUi {
     /// его целиком внутри рабочей области, включая малые видеорежимы.
     pub fn open_desktop_menu(&mut self, x: i32, y: i32) {
         self.open = false;
+        self.programs_open = false;
         self.desktop_menu_open = true;
         self.desktop_menu_rect = desktop_popup_rect(
             x,
@@ -177,6 +201,7 @@ impl ShellUi {
             return;
         }
         self.open = false;
+        self.programs_open = false;
         self.desktop_menu_open = false;
         self.launcher.invalidate_all();
     }
@@ -188,6 +213,11 @@ impl ShellUi {
             .resize(launcher_rect(screen_height, self.taskbar_height));
         self.menu
             .resize(menu_rect(screen_height, self.taskbar_height));
+        self.programs_menu.resize(programs_menu_rect(
+            screen_width,
+            screen_height,
+            self.taskbar_height,
+        ));
         self.clock_view
             .resize(clock_rect(screen_width, screen_height, self.taskbar_height));
         self.desktop_menu_rect = desktop_popup_rect(
@@ -203,7 +233,7 @@ impl ShellUi {
     pub fn pointer(&mut self, kind: PointerKind, x: i32, y: i32) -> ShellInputResult {
         let event = InputEvent::Pointer(PointerEvent::at(kind, x, y));
         let launcher = self.launcher.dispatch(event);
-        let menu = if self.open {
+        let mut menu = if self.open {
             self.menu.dispatch(event)
         } else {
             DispatchResult {
@@ -213,12 +243,24 @@ impl ShellUi {
                 consumed: false,
             }
         };
+        if menu.command == COMMAND_PROGRAMS {
+            self.programs_open = !self.programs_open;
+            self.programs_menu.invalidate_all();
+            self.menu.invalidate_all();
+            menu.command = CommandId(0);
+            menu.changed = true;
+        }
+        let programs = if self.open && self.programs_open {
+            self.programs_menu.dispatch(event)
+        } else {
+            empty_dispatch()
+        };
         let desktop = if self.desktop_menu_open {
             self.desktop_menu.dispatch(event)
         } else {
             empty_dispatch()
         };
-        combine(launcher, menu, desktop)
+        combine(launcher, menu, programs, desktop)
     }
 
     pub fn key(&mut self, key: Key, shift: bool) -> ShellInputResult {
@@ -233,6 +275,8 @@ impl ShellUi {
         });
         let result = if self.desktop_menu_open {
             self.desktop_menu.dispatch(event)
+        } else if self.programs_open {
+            self.programs_menu.dispatch(event)
         } else {
             self.menu.dispatch(event)
         };
@@ -244,6 +288,8 @@ impl ShellUi {
     pub fn set_scale(&mut self, scale_milli: u16) {
         self.launcher.set_theme(shell_theme_scaled(scale_milli));
         self.menu.set_theme(shell_theme_scaled(scale_milli));
+        self.programs_menu
+            .set_theme(shell_theme_scaled(scale_milli));
         self.desktop_menu.set_theme(shell_theme_scaled(scale_milli));
         self.clock_view.set_theme(taskbar_theme_scaled(scale_milli));
     }
@@ -327,6 +373,30 @@ impl ShellUi {
             .unwrap_or_else(|_| FrameResult::empty())
     }
 
+    /// Рисует вложенное меню «Программы». Оно является отдельным focus scope,
+    /// поэтому hover и keyboard navigation не смешиваются с основным Start.
+    pub fn draw_programs_menu(
+        &mut self,
+        framebuffer: &mut Framebuffer,
+        icon_pack: IconPack,
+        full: bool,
+    ) -> FrameResult<8> {
+        if full {
+            self.programs_menu.invalidate_all();
+        }
+        let resources = ShellResources {
+            clock: &self.clock,
+            icon_pack,
+        };
+        let mut backend = ShellBackend {
+            framebuffer,
+            resources: &resources,
+        };
+        self.programs_menu
+            .render(&mut backend)
+            .unwrap_or_else(|_| FrameResult::empty())
+    }
+
     pub fn draw_desktop_menu(
         &mut self,
         framebuffer: &mut Framebuffer,
@@ -357,9 +427,18 @@ impl ShellUi {
         menu_rect(self.screen_height, self.taskbar_height)
     }
 
+    pub fn programs_menu_is_open(&self) -> bool {
+        self.open && self.programs_open
+    }
+
+    pub fn programs_menu_rect(&self) -> Rect {
+        programs_menu_rect(self.screen_width, self.screen_height, self.taskbar_height)
+    }
+
     pub fn interactive_at(&self, x: i32, y: i32) -> bool {
         self.launcher_rect().contains(x, y)
             || self.open && self.menu_rect().contains(x, y)
+            || self.programs_menu_is_open() && self.programs_menu_rect().contains(x, y)
             || self.desktop_menu_open && self.desktop_menu_rect.contains(x, y)
     }
 
@@ -448,36 +527,12 @@ fn build_menu(runtime: &mut MenuRuntime) {
         let _ = ui.text(header, TEXT_RUSTOS, label);
     }
 
-    let heading = LayoutSpec {
-        width: Length::Fill(1),
-        height: Length::Px(26),
-        ..LayoutSpec::default()
-    };
-    let mut heading_spec = NodeSpec::new(ComponentKind::Text);
-    heading_spec.layout = heading;
-    heading_spec.content = Content::Text(TEXT_APPLICATIONS);
-    heading_spec.style = style_class::HEADING;
-    let _ = ui.component(column, heading_spec);
     add_menu_button(
         &mut ui,
         column,
-        TEXT_EXPLORER,
-        IMAGE_EXPLORER,
-        COMMAND_EXPLORER,
-    );
-    add_menu_button(
-        &mut ui,
-        column,
-        TEXT_TERMINAL,
-        IMAGE_TERMINAL,
-        COMMAND_TERMINAL,
-    );
-    add_menu_button(
-        &mut ui,
-        column,
-        TEXT_GALLERY,
-        IMAGE_GALLERY,
-        COMMAND_GALLERY,
+        TEXT_PROGRAMS,
+        IMAGE_PROGRAMS,
+        COMMAND_PROGRAMS,
     );
 
     // Пустой прозрачный Column получает остаток высоты и прижимает clock и
@@ -522,6 +577,37 @@ fn build_menu(runtime: &mut MenuRuntime) {
         IMAGE_POWER,
         COMMAND_SHUTDOWN,
     );
+}
+
+fn build_programs_menu(runtime: &mut ProgramsMenuRuntime) {
+    let root = runtime.tree().root();
+    let mut ui = runtime.builder();
+    let surface = ui
+        .menu(root, LayoutSpec::fill())
+        .unwrap_or(rustos_system_ui::NodeId::NONE);
+    if surface.is_none() {
+        return;
+    }
+    let mut column = NodeSpec::new(ComponentKind::Column);
+    column.layout = LayoutSpec {
+        width: Length::Fill(1),
+        height: Length::Fill(1),
+        padding: Edges::all(8),
+        gap: 4,
+        ..LayoutSpec::default()
+    };
+    let Ok(column) = ui.component(surface, column) else {
+        return;
+    };
+    for (text, image, command) in [
+        (TEXT_EXPLORER, IMAGE_EXPLORER, COMMAND_EXPLORER),
+        (TEXT_TERMINAL, IMAGE_TERMINAL, COMMAND_TERMINAL),
+        (TEXT_GALLERY, IMAGE_GALLERY, COMMAND_GALLERY),
+        (TEXT_SETTINGS, IMAGE_SETTINGS, COMMAND_SETTINGS),
+        (TEXT_GPU_DEMO, IMAGE_GPU_DEMO, COMMAND_GPU_DEMO),
+    ] {
+        add_menu_button(&mut ui, column, text, image, command);
+    }
 }
 
 fn add_menu_button<const N: usize>(
@@ -616,19 +702,22 @@ fn build_desktop_menu(runtime: &mut DesktopMenuRuntime) {
 fn combine(
     launcher: DispatchResult,
     menu: DispatchResult,
+    programs: DispatchResult,
     desktop: DispatchResult,
 ) -> ShellInputResult {
     let command = if launcher.command != CommandId(0) {
         launcher.command
     } else if menu.command != CommandId(0) {
         menu.command
+    } else if programs.command != CommandId(0) {
+        programs.command
     } else {
         desktop.command
     };
     ShellInputResult {
         action: action_for(command),
-        changed: launcher.changed || menu.changed || desktop.changed,
-        consumed: launcher.consumed || menu.consumed || desktop.consumed,
+        changed: launcher.changed || menu.changed || programs.changed || desktop.changed,
+        consumed: launcher.consumed || menu.consumed || programs.consumed || desktop.consumed,
     }
 }
 
@@ -655,6 +744,8 @@ const fn action_for(command: CommandId) -> ShellAction {
         COMMAND_TERMINAL => ShellAction::OpenTerminal,
         COMMAND_EXPLORER => ShellAction::OpenFileExplorer,
         COMMAND_GALLERY => ShellAction::OpenGallery,
+        COMMAND_GPU_DEMO => ShellAction::OpenGpuDemo,
+        COMMAND_SETTINGS => ShellAction::OpenDesktopSettings,
         COMMAND_ARRANGE_DESKTOP => ShellAction::ArrangeDesktop,
         COMMAND_DESKTOP_PROPERTIES => ShellAction::OpenDesktopProperties,
         COMMAND_SHUTDOWN => ShellAction::Shutdown,
@@ -679,6 +770,24 @@ fn menu_rect(screen_height: u32, taskbar_height: u32) -> Rect {
         (screen_height as i32 - taskbar_height as i32 - HEIGHT as i32 - 6).max(6),
         WIDTH,
         HEIGHT.min(screen_height.saturating_sub(taskbar_height + 12)),
+    )
+}
+
+fn programs_menu_rect(screen_width: u32, screen_height: u32, taskbar_height: u32) -> Rect {
+    const WIDTH: u32 = 292;
+    const HEIGHT: u32 = 276;
+    let main = menu_rect(screen_height, taskbar_height);
+    let right = main.right().saturating_add(6);
+    let x = if right.saturating_add(WIDTH as i32) <= screen_width as i32 {
+        right
+    } else {
+        main.x.saturating_sub(WIDTH as i32 + 6).max(4)
+    };
+    Rect::new(
+        x,
+        main.y.saturating_add(58),
+        WIDTH.min(screen_width.saturating_sub(8).max(1)),
+        HEIGHT.min(screen_height.saturating_sub(taskbar_height + 12).max(1)),
     )
 }
 
@@ -753,6 +862,9 @@ impl ShellResources<'_> {
             TEXT_TIME => self.clock.time_text(),
             TEXT_DATE => self.clock.date_text(),
             TEXT_APPLICATIONS => "Приложения",
+            TEXT_PROGRAMS => "Программы  ›",
+            TEXT_GPU_DEMO => "Aurora 3D",
+            TEXT_SETTINGS => "Параметры рабочего стола",
             TEXT_ARRANGE_DESKTOP => "Упорядочить значки",
             TEXT_DESKTOP_PROPERTIES => "Параметры рабочего стола",
             _ => "",
@@ -852,6 +964,16 @@ impl RenderBackend for ShellBackend<'_, '_, '_> {
                 self.resources
                     .icon_pack
                     .draw(self.framebuffer, IconKind::Settings, rect);
+            }
+            IMAGE_PROGRAMS => {
+                self.resources
+                    .icon_pack
+                    .draw(self.framebuffer, IconKind::Grid, rect);
+            }
+            IMAGE_GPU_DEMO => {
+                self.resources
+                    .icon_pack
+                    .draw(self.framebuffer, IconKind::GpuDemo, rect);
             }
             _ => {}
         }

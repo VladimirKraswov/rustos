@@ -1,6 +1,6 @@
 //! CI-проверка GUI по PPM-скриншотам QEMU и XWD surface из Xvfb:
 //! `<terminal.ppm>` (окно открыто) `<dragged.ppm>` (окно перетащено)
-//! `<minimized.ppm>` (окно свёрнуто в taskbar).
+//! `<minimized.ppm>` (окно свёрнуто в taskbar) и две фактические позиции окна.
 //!
 //! Проверяются именно изменения геометрии: старый левый край окна стал
 //! обоями, новый правый — тёмным terminal, центр при минимизации — синий
@@ -240,6 +240,16 @@ fn main() {
         usage();
         std::process::exit(2);
     });
+    let old_x = parse_argument(&mut args, "old-x");
+    let old_y = parse_argument(&mut args, "old-y");
+    let new_x = parse_argument(&mut args, "new-x");
+    let new_y = parse_argument(&mut args, "new-y");
+    let window_width = parse_argument(&mut args, "window-width");
+    let window_height = parse_argument(&mut args, "window-height");
+    if args.next().is_some() {
+        usage();
+        std::process::exit(2);
+    }
     let before = match Image::read(Path::new(&before_path)) {
         Ok(image) => image,
         Err(error) => fatal(error),
@@ -260,14 +270,39 @@ fn main() {
         fatal("screenshots have different dimensions".into());
     }
 
-    // Окно стартует с x=120,y=57 и после тестового drag смещается вправо-
-    // вниз. Старый левый участок должен стать обоями, а новый правый —
-    // тёмной областью terminal. Это проверяет именно изменение геометрии,
-    // а не только получение mouse packet.
-    let old_only_before = before.rgb(130, 110);
-    let old_only_dragged = dragged.rgb(130, 110);
-    let new_only_before = before.rgb(before.width - 80, 200);
-    let new_only_dragged = dragged.rgb(before.width - 80, 200);
+    // Relative PS/2 packets под TCG вправе сдвинуть окно на немного разное
+    // расстояние. Поэтому проверяем фактическую геометрию из telemetry WM,
+    // а не исторические абсолютные координаты из тестового сценария.
+    let vertical_sample = old_y
+        .max(new_y)
+        .saturating_add(100)
+        .min(before.height.saturating_sub(1));
+    let (old_only_x, new_only_x) = if new_x > old_x {
+        (
+            old_x.saturating_add(20),
+            new_x.saturating_add(window_width).saturating_sub(20),
+        )
+    } else {
+        (
+            old_x.saturating_add(window_width).saturating_sub(20),
+            new_x.saturating_add(20),
+        )
+    };
+    if old_x == new_x
+        || old_y == new_y
+        || old_only_x >= before.width
+        || new_only_x >= before.width
+        || vertical_sample >= old_y.saturating_add(window_height)
+        || vertical_sample >= new_y.saturating_add(window_height)
+    {
+        fatal(format!(
+            "invalid drag geometry: old={old_x},{old_y} new={new_x},{new_y} size={window_width}x{window_height}"
+        ));
+    }
+    let old_only_before = before.rgb(old_only_x, vertical_sample);
+    let old_only_dragged = dragged.rgb(old_only_x, vertical_sample);
+    let new_only_before = before.rgb(new_only_x, vertical_sample);
+    let new_only_dragged = dragged.rgb(new_only_x, vertical_sample);
     if old_only_before == old_only_dragged
         || old_only_dragged[2] < 30
         || new_only_dragged.iter().any(|channel| *channel > 45)
@@ -278,15 +313,18 @@ fn main() {
         ));
     }
 
-    let center = (before.width / 2, before.height / 2);
-    let terminal_pixel = before.rgb(center.0, center.1);
-    let desktop_pixel = after.rgb(center.0, center.1);
-    if terminal_pixel.iter().any(|channel| *channel > 45) {
-        fatal(format!("terminal center is not dark: {terminal_pixel:?}"));
-    }
-    if desktop_pixel[2] < 35 || desktop_pixel == terminal_pixel {
+    // У новых фотографических обоев отдельный пиксель может случайно совпасть
+    // с тёмным terminal background. Title bar даёт устойчивый признак: до
+    // minimize это светлая поверхность окна, после — пиксель обоев.
+    let title_sample = (
+        old_x.saturating_add(window_width / 2),
+        old_y.saturating_add(16),
+    );
+    let title_before = before.rgb(title_sample.0, title_sample.1);
+    let title_after = after.rgb(title_sample.0, title_sample.1);
+    if title_before == title_after || title_before.iter().all(|channel| *channel < 45) {
         fatal(format!(
-            "minimize did not expose blue desktop: before={terminal_pixel:?}, after={desktop_pixel:?}"
+            "minimize did not remove window chrome: before={title_before:?}, after={title_after:?}"
         ));
     }
     let taskbar = after.rgb(before.width / 2, before.height - 12);
@@ -373,7 +411,18 @@ fn verify_virgl_showcase(image: &Image) {
 }
 
 fn usage() {
-    eprintln!("usage: rustos-gui-check <terminal.ppm> <dragged.ppm> <minimized.ppm> | --virgl <showcase.ppm|screen.xwd> [converted.ppm]");
+    eprintln!("usage: rustos-gui-check <terminal.ppm> <dragged.ppm> <minimized.ppm> <old-x> <old-y> <new-x> <new-y> <width> <height> | --virgl <showcase.ppm|screen.xwd> [converted.ppm]");
+}
+
+fn parse_argument(args: &mut impl Iterator<Item = std::ffi::OsString>, name: &str) -> usize {
+    args.next()
+        .and_then(|value| value.into_string().ok())
+        .and_then(|value| value.parse().ok())
+        .unwrap_or_else(|| {
+            eprintln!("missing or invalid {name}");
+            usage();
+            std::process::exit(2);
+        })
 }
 
 fn fatal(message: String) -> ! {

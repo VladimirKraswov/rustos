@@ -64,7 +64,7 @@ send_command() {
     # подтверждает принятие команды monitor'ом, но не окончание отложенной
     # make/break-пары PS/2 внутри гостя. Меньшая пауза изредка теряла соседние
     # буквы сразу после перепрограммирования PS/2 sample rate.
-    printf '%b' "$commands" | hmp 240
+    printf '%b' "$commands" | hmp "${GUI_KEY_PACKET_MS:-400}"
     # Enter отправляем отдельно: QEMU возвращает monitor prompt раньше, чем
     # release последней буквы гарантированно покинет PS/2 output buffer.
     sleep 0.2
@@ -111,7 +111,10 @@ move_mouse() {
         printf 'mouse_move %d %d\n' "$part_x" "$part_y" | hmp
         sent_x=$((sent_x + part_x))
         sent_y=$((sent_y + part_y))
-        sleep 0.1
+        # Hover может инициировать incremental repaint. На Apple Silicon TCG
+        # следующий трёхбайтовый PS/2 packet нельзя посылать, пока guest ещё
+        # обслуживает предыдущий: у старого 8042 всего один output byte.
+        sleep "${GUI_MOUSE_PACKET_SECONDS:-0.25}"
     done
     # `mouse_move` подтверждается QEMU monitor'ом до того, как
     # guest успеет вычитать последний PS/2 packet. Под TCG без settle
@@ -178,7 +181,7 @@ stop_qemu() {
 cleanup() {
     trap - EXIT INT TERM HUP
     stop_qemu
-    for file in serial.log qemu-stderr.log start-menu.ppm desktop-menu.ppm desktop-settings.ppm mode-720.ppm fonts.ppm cursor-busy.ppm wallpaper-autumn.ppm lifecycle.ppm terminal.ppm ui-gallery.ppm explorer.ppm dragged.ppm resized.ppm minimized.ppm; do
+    for file in serial.log qemu-stderr.log start-menu.ppm start-programs.ppm desktop-menu.ppm desktop-settings.ppm aurora-cpu.ppm mode-720.ppm fonts.ppm cursor-busy.ppm wallpaper-autumn.ppm lifecycle.ppm terminal.ppm ui-gallery.ppm explorer.ppm dragged.ppm resized.ppm minimized.ppm; do
         [[ -f "$RUN_DIR/$file" ]] && cp -f "$RUN_DIR/$file" "$RESULT_DIR/$file"
     done
 }
@@ -236,7 +239,7 @@ grep -Eq '\[clock\] source=cmos-rtc time=[0-2][0-9]:[0-5][0-9] date=[0-3][0-9]\.
 # capture, а popup состоит из Menu/Button/Image/Text и не меняет WindowId.
 move_mouse -578 377 5
 printf 'mouse_button 1\n' | hmp
-sleep 0.08
+sleep "${GUI_CLICK_SECONDS:-0.5}"
 printf 'mouse_button 0\n' | hmp
 wait_for_serial '[start] opened component-runtime=system-ui-v1'
 sleep 0.25
@@ -245,10 +248,23 @@ printf 'screendump %s/start-menu.ppm\n' "$RUN_DIR" | hmp
     echo "[gui-test] component Start screenshot is empty" >&2
     exit 1
 }
+# Вложенный пункт «Программы» обязан открыть отдельное меню всех launcher'ов.
+move_mouse_to 150 444
+printf 'mouse_button 1\n' | hmp
+sleep "${GUI_CLICK_SECONDS:-0.5}"
+printf 'mouse_button 0\n' | hmp
+wait_for_serial '[start] programs submenu opened applications=5'
+sleep 0.2
+printf 'screendump %s/start-programs.ppm\n' "$RUN_DIR" | hmp
+[[ -s "$RUN_DIR/start-programs.ppm" ]] || {
+    echo "[gui-test] programs submenu screenshot is empty" >&2
+    exit 1
+}
 # Повторное нажатие той же Button закрывает popup; возвращаем курсор в центр,
 # чтобы существующий lifecycle сценарий сохранил детерминированные координаты.
+move_mouse_to 62 777
 printf 'mouse_button 1\n' | hmp
-sleep 0.08
+sleep "${GUI_CLICK_SECONDS:-0.5}"
 printf 'mouse_button 0\n' | hmp
 wait_for_serial '[start] closed component-runtime=system-ui-v1'
 move_mouse 578 -377 5
@@ -276,7 +292,7 @@ wait_for_serial '[vfs] WRITE path=/lifecycle value=6'
 move_mouse_to 1170 102
 sleep 0.15
 printf 'mouse_button 1\n' | hmp
-sleep 0.08
+sleep "${GUI_CLICK_SECONDS:-0.5}"
 printf 'mouse_button 0\n' | hmp
 wait_for_serial '[app] exit id=0x02 kind=TERMINAL released-frames='
 grep -q 'windows=1' "$RUN_DIR/serial.log"
@@ -406,7 +422,7 @@ printf 'screendump %s/ui-gallery.ppm\n' "$RUN_DIR" | hmp
 # close center≈(1226,123).
 move_mouse_to 1226 123
 printf 'mouse_button 1\n' | hmp
-sleep 0.08
+sleep "${GUI_CLICK_SECONDS:-0.5}"
 printf 'mouse_button 0\n' | hmp
 wait_for_serial '[app] exit id=0x04 kind=UI GALLERY released-frames='
 
@@ -423,7 +439,7 @@ move_mouse_to 639 198
 # artifact, а при успехе ниже будет заменён состоянием после создания папки.
 printf 'screendump %s/explorer.ppm\n' "$RUN_DIR" | hmp
 printf 'mouse_button 1\n' | hmp
-sleep 0.08
+sleep "${GUI_CLICK_SECONDS:-0.5}"
 printf 'mouse_button 0\n' | hmp
 wait_for_serial '[explorer] operation=MKDIR path=/Новая папка'
 # Down/Up и command должны пройти application-local damage path. При
@@ -443,27 +459,26 @@ printf 'screendump %s/explorer.ppm\n' "$RUN_DIR" | hmp
 # чтобы оставшаяся geometry-regression не зависела от нового сценария.
 move_mouse_to 1254 121
 printf 'mouse_button 1\n' | hmp
-sleep 0.08
+sleep "${GUI_CLICK_SECONDS:-0.5}"
 printf 'mouse_button 0\n' | hmp
 wait_for_serial '[app] exit id=0x05 kind=EXPLORER released-frames='
-move_mouse -28 2 1
 
 # taskbar id=1 (первая кнопка), затем его close center≈(1142,43).
-move_mouse -1012 656 7
+move_mouse_to 214 779
 printf 'mouse_button 1\n' | hmp
-sleep 0.08
+sleep "${GUI_CLICK_SECONDS:-0.5}"
 printf 'mouse_button 0\n' | hmp
 wait_for_serial '[wm] focus id=0x01'
-move_mouse 928 -736 7
+move_mouse_to 1142 43
 printf 'mouse_button 1\n' | hmp
-sleep 0.08
+sleep "${GUI_CLICK_SECONDS:-0.5}"
 printf 'mouse_button 0\n' | hmp
 wait_for_serial '[app] exit id=0x01 kind=TERMINAL released-frames='
 
 # Reflow малого 1280x720 режима оставил id=3 в (176,26). Перед базовым
 # screenshot ставим его в прежнюю детерминированную geometry (120,57), чтобы
 # visual checker сравнивал именно движение, а не смену набора окон.
-move_mouse -542 0 4
+move_mouse_to 600 43
 printf 'mouse_button 1\n' | hmp
 wait_for_serial '[wm] drag started id=0x03'
 printf 'mouse_move -56 31\n' | hmp
@@ -471,31 +486,30 @@ sleep 0.2
 printf 'mouse_button 0\n' | hmp
 wait_for_serial '[wm] drag finished id=0x03'
 sleep 0.25
+# Запоминаем именно опубликованную WM geometry: HMP передаёт относительные
+# PS/2 packets, поэтому итоговая позиция может отличаться на несколько пикселей.
+base_geometry=$(grep -F '[wm] drag finished id=0x03' "$RUN_DIR/serial.log" | tail -1)
+base_x=$(printf '%s\n' "$base_geometry" | sed -nE 's/.* rect=([0-9]+),([0-9]+),([0-9]+)x([0-9]+).*/\1/p')
+base_y=$(printf '%s\n' "$base_geometry" | sed -nE 's/.* rect=([0-9]+),([0-9]+),([0-9]+)x([0-9]+).*/\2/p')
+base_width=$(printf '%s\n' "$base_geometry" | sed -nE 's/.* rect=([0-9]+),([0-9]+),([0-9]+)x([0-9]+).*/\3/p')
+[[ -n "$base_x" && -n "$base_y" && -n "$base_width" ]] || {
+    echo "[gui-test] base geometry marker is malformed: $base_geometry" >&2
+    exit 1
+}
 # Базовый кадр для geometry verifier: те же слои, что в dragged/minimized,
 # но до начала жеста. Ранний terminal screenshot с несколькими окнами уже
 # выполнил свою проверку, поэтому здесь безопасно обновить artifact.
 printf 'screendump %s/terminal.ppm\n' "$RUN_DIR" | hmp
 
-# Настоящий drag оставшегося id=3: cursor после позиционирования находится
-# около (544,74); выбираем свободную точку title и сдвигаем окно вправо-вниз.
-move_mouse 56 0 1
+# Настоящий drag оставшегося id=3 начинаем из фактической title geometry.
+# Это не зависит от clamp/reflow после смены видеорежима и закрытия соседей.
+move_mouse_to "$((base_x + base_width / 2))" "$((base_y + 17))"
 printf 'mouse_button 1\n' | hmp
 wait_for_serial '[wm] drag started id=0x03'
 drag_finished_before=$(grep -Fc '[wm] drag finished id=0x03' "$RUN_DIR/serial.log" || true)
-# Не один большой скачок, а серия движений: это regression для preview path.
-# Пауза не даёт искусственному HMP producer переполнить одно-byte 8042 быстрее,
-# чем это вообще способна сделать физическая PS/2-мышь.
-drag_commands=""
-for _ in $(seq 1 4); do
-    drag_commands="${drag_commands}mouse_move 30 20\n"
-done
-# На TCG monitor подтверждает command раньше, чем все три байта PS/2 packet
-# дошли до 8042. Частые HMP-команды могут поставить release между байтами
-# последнего движения и превратить корректный guest decoder в ложный timeout.
-# 100 ms всё ещё намного быстрее человеческого drag, но сохраняет packet
-# boundary и проверяет именно четыре независимых movement event.
-printf '%b' "$drag_commands" | hmp 100
-sleep 0.5
+# Не один большой скачок, а четыре движения через общий throttled helper:
+# каждый пакет успевает вызвать полную live-композицию окна до следующего.
+GUI_MOUSE_PACKET_SECONDS=1 move_mouse 120 80 4
 printf 'mouse_button 0\n' | hmp
 wait_for_serial_count '[wm] drag finished id=0x03' "$((drag_finished_before + 1))"
 grep -Eq '\[wm\] drag finished id=0x03 frames=[1-9][0-9]* packets=[1-9][0-9]* present-kpx=[1-9][0-9]* compositor=layer-cache' \
@@ -503,18 +517,23 @@ grep -Eq '\[wm\] drag finished id=0x03 frames=[1-9][0-9]* packets=[1-9][0-9]* pr
 sleep 0.25
 printf 'screendump %s/dragged.ppm\n' "$RUN_DIR" | hmp
 
-# Resize за правый верхний угол проверяет обе оси и layer cache с несколькими
-# окнами. Cursor после drag около (720,154), настоящий top-right edge —
-# около (1279,137): берём точку внутри 6px hit area, а не рядом с ней.
-move_mouse 559 -17 4
+# Resize за правый верхний угол проверяет обе оси и layer cache. Итоговая
+# geometry берётся из telemetry оконного сервера: relative PS/2 aggregation
+# вправе дать на несколько пикселей разный drag, но hit-test проверяется всегда
+# в трёх пикселях от фактической exclusive right/top границы.
+drag_geometry=$(grep -F '[wm] drag finished id=0x03' "$RUN_DIR/serial.log" | tail -1)
+drag_x=$(printf '%s\n' "$drag_geometry" | sed -nE 's/.* rect=([0-9]+),([0-9]+),([0-9]+)x([0-9]+).*/\1/p')
+drag_y=$(printf '%s\n' "$drag_geometry" | sed -nE 's/.* rect=([0-9]+),([0-9]+),([0-9]+)x([0-9]+).*/\2/p')
+drag_width=$(printf '%s\n' "$drag_geometry" | sed -nE 's/.* rect=([0-9]+),([0-9]+),([0-9]+)x([0-9]+).*/\3/p')
+drag_height=$(printf '%s\n' "$drag_geometry" | sed -nE 's/.* rect=([0-9]+),([0-9]+),([0-9]+)x([0-9]+).*/\4/p')
+[[ -n "$base_x" && -n "$base_y" && -n "$drag_x" && -n "$drag_y" && -n "$drag_width" && -n "$drag_height" ]] || {
+    echo "[gui-test] drag geometry marker is malformed: $drag_geometry" >&2
+    exit 1
+}
+move_mouse_to "$((drag_x + drag_width - 3))" "$((drag_y + 3))"
 printf 'mouse_button 1\n' | hmp
 wait_for_serial '[wm] resize started id=0x03'
-resize_commands=""
-for _ in $(seq 1 4); do
-    resize_commands="${resize_commands}mouse_move -10 8\n"
-done
-printf '%b' "$resize_commands" | hmp 30
-sleep 0.2
+GUI_MOUSE_PACKET_SECONDS=1 move_mouse -40 32 4
 printf 'mouse_button 0\n' | hmp
 wait_for_serial '[wm] resize finished id=0x03'
 grep -Eq '\[wm\] resize finished id=0x03 frames=[1-9][0-9]* packets=[1-9][0-9]* present-kpx=[1-9][0-9]* compositor=layer-cache' \
@@ -527,7 +546,7 @@ printf 'screendump %s/resized.ppm\n' "$RUN_DIR" | hmp
 printf 'mouse_move -79 -14\n' | hmp
 sleep 0.2
 printf 'mouse_button 1\n' | hmp
-sleep 0.08
+sleep "${GUI_CLICK_SECONDS:-0.5}"
 printf 'mouse_button 0\n' | hmp
 wait_for_serial '[wm] window minimized id=0x03'
 # Marker пишется при принятии window command. Даём медленному TCG закончить
@@ -538,32 +557,33 @@ printf 'screendump %s/minimized.ppm\n' "$RUN_DIR" \
     | hmp
 
 cargo run -q -p rustos-gui-check -- \
-    "$RUN_DIR/terminal.ppm" "$RUN_DIR/dragged.ppm" "$RUN_DIR/minimized.ppm"
+    "$RUN_DIR/terminal.ppm" "$RUN_DIR/dragged.ppm" "$RUN_DIR/minimized.ppm" \
+    "$base_x" "$base_y" "$drag_x" "$drag_y" "$drag_width" "$drag_height"
 
 # Desktop context menu принадлежит shell, открывается настоящей правой
 # кнопкой и не проходит сквозь popup. Сначала проверяем Arrange, затем отдельное
 # Settings-приложение и две команды его component tree.
-move_mouse -560 245 5
+move_mouse_to 600 400
 printf 'mouse_button 2\n' | hmp
-sleep 0.08
+sleep "${GUI_CLICK_SECONDS:-0.5}"
 printf 'mouse_button 0\n' | hmp
 wait_for_serial '[desktop-menu] opened component-runtime=system-ui-v1 x=600 y=400'
 sleep 0.2
 printf 'screendump %s/desktop-menu.ppm\n' "$RUN_DIR" | hmp
 move_mouse 100 30 2
 printf 'mouse_button 1\n' | hmp
-sleep 0.08
+sleep "${GUI_CLICK_SECONDS:-0.5}"
 printf 'mouse_button 0\n' | hmp
 wait_for_serial '[desktop-menu] command=arrange-icons'
 
 # Повторный popup в новой позиции, второй MenuItem — Properties.
 printf 'mouse_button 2\n' | hmp
-sleep 0.08
+sleep "${GUI_CLICK_SECONDS:-0.5}"
 printf 'mouse_button 0\n' | hmp
 wait_for_serial '[desktop-menu] opened component-runtime=system-ui-v1 x=700 y=430'
 move_mouse 100 84 2
 printf 'mouse_button 1\n' | hmp
-sleep 0.08
+sleep "${GUI_CLICK_SECONDS:-0.5}"
 printf 'mouse_button 0\n' | hmp
 wait_for_serial '[app] spawn id=0x06 kind=SETTINGS'
 wait_for_serial '[desktop-menu] command=properties'
@@ -574,7 +594,7 @@ wait_for_serial '[desktop-menu] command=properties'
 # фокусированный пункт + PageDown. Wheel routing покрыт SystemUI unit tests.
 move_mouse_to 600 390
 printf 'mouse_button 1\n' | hmp
-sleep 0.08
+sleep "${GUI_CLICK_SECONDS:-0.5}"
 printf 'mouse_button 0\n' | hmp
 printf 'sendkey pgdn 20\n' | hmp
 wait_for_serial '[settings] resolution-list scrolled input=keyboard'
@@ -582,18 +602,36 @@ wait_for_serial '[settings] resolution-list scrolled input=keyboard'
 # независимым от числа wheel packets виртуального PS/2 устройства.
 move_mouse_to 639 595
 printf 'mouse_button 1\n' | hmp
-sleep 0.08
+sleep "${GUI_CLICK_SECONDS:-0.5}"
 printf 'mouse_button 0\n' | hmp
 wait_for_serial '[settings] wallpaper=autumn'
 move_mouse 0 86 2
 printf 'mouse_button 1\n' | hmp
-sleep 0.08
+sleep "${GUI_CLICK_SECONDS:-0.5}"
 printf 'mouse_button 0\n' | hmp
 wait_for_serial '[settings] ui-scale=1250'
 sleep 0.25
 printf 'screendump %s/desktop-settings.ppm\n' "$RUN_DIR" | hmp
 [[ -s "$RUN_DIR/desktop-menu.ppm" && -s "$RUN_DIR/desktop-settings.ppm" ]] || {
     echo "[gui-test] desktop menu/settings screenshot is empty" >&2
+    exit 1
+}
+# CPU-only virtio-gpu профиль проверяет не заглушку, а настоящий lifecycle
+# ярлыка Aurora: отдельное окно создаётся двойным кликом и локально выбирает
+# software fallback, не блокируя shell или другие процессы.
+move_mouse_to 1002 151
+printf 'mouse_button 1\n' | hmp
+sleep "${GUI_CLICK_SECONDS:-0.5}"
+printf 'mouse_button 0\n' | hmp
+wait_for_serial '[app] exit id=0x06 kind=SETTINGS released-frames='
+move_mouse_to 150 70
+double_click_mouse
+wait_for_serial '[app] spawn id=0x07 kind=AURORA 3D'
+wait_for_serial '[gpu-demo-window] ready backend=cpu-fallback surface=800x450 windowed=yes'
+sleep 0.25
+printf 'screendump %s/aurora-cpu.ppm\n' "$RUN_DIR" | hmp
+[[ -s "$RUN_DIR/aurora-cpu.ppm" ]] || {
+    echo "[gui-test] Aurora CPU fallback screenshot is empty" >&2
     exit 1
 }
 printf 'quit\n' | hmp || true
@@ -604,4 +642,4 @@ for _ in $(seq 1 20); do
     sleep 0.1
 done
 stop_qemu
-echo "[gui-test] PASS: independent windows + Explorer, desktop popup/settings, lifecycle, VFS + ring3 RUN, buffered drag/resize/minimize"
+echo "[gui-test] PASS: independent windows + Explorer/Aurora, Start programs, desktop settings, VFS + live drag/resize"

@@ -44,6 +44,7 @@ const CMD_CTX_DESTROY: u32 = 0x0201;
 const CMD_CTX_ATTACH_RESOURCE: u32 = 0x0202;
 const CMD_CTX_DETACH_RESOURCE: u32 = 0x0203;
 const CMD_RESOURCE_CREATE_3D: u32 = 0x0204;
+const CMD_TRANSFER_FROM_HOST_3D: u32 = 0x0206;
 const CMD_SUBMIT_3D: u32 = 0x0207;
 const RESP_OK_NODATA: u32 = 0x1100;
 const RESP_OK_DISPLAY_INFO: u32 = 0x1101;
@@ -243,6 +244,33 @@ struct Submit3dRequest {
     header: ControlHeader,
     size: u32,
     padding: u32,
+}
+
+/// Wire layout `virtio_gpu_transfer_host_3d`. В отличие от 2D transfer этот
+/// запрос копирует уже отрисованный host/GPU resource обратно в attached
+/// system-memory backing, чтобы software compositor мог включить поверхность
+/// в обычное окно без повторной CPU-растеризации.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Transfer3dRequest {
+    header: ControlHeader,
+    box_3d: GpuBox,
+    offset: u64,
+    resource: u32,
+    level: u32,
+    stride: u32,
+    layer_stride: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct GpuBox {
+    x: u32,
+    y: u32,
+    z: u32,
+    width: u32,
+    height: u32,
+    depth: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -809,6 +837,42 @@ impl VirtioGpu {
             rectangles: 1,
             pixels: u64::from(self.mode.width) * u64::from(self.mode.height),
         }))
+    }
+
+    /// Синхронизирует imported VirGL render target с его guest backing.
+    /// Вызов выполняется только после успешного render fence и поэтому не
+    /// является частью submit hot path.
+    pub fn download_imported(&mut self, graphics_object: u16) -> Result<(), ModeSetError> {
+        let resource = self
+            .render_resources
+            .iter()
+            .copied()
+            .find(|resource| resource.used && resource.graphics_object == graphics_object)
+            .ok_or(ModeSetError::UnsupportedMode)?;
+        if !resource.has_backing {
+            return Err(ModeSetError::UnsupportedMode);
+        }
+        let mut request = Transfer3dRequest {
+            header: self.header(CMD_TRANSFER_FROM_HOST_3D),
+            box_3d: GpuBox {
+                x: 0,
+                y: 0,
+                z: 0,
+                width: resource.width,
+                height: resource.height,
+                depth: 1,
+            },
+            offset: 0,
+            resource: resource.id,
+            level: 0,
+            stride: resource.width.saturating_mul(4),
+            layer_stride: resource
+                .width
+                .saturating_mul(resource.height)
+                .saturating_mul(4),
+        };
+        request.header.context_id = resource.context;
+        self.command_nodata(&request)
     }
 
     pub fn destroy_render_context(&mut self, context: u32) {

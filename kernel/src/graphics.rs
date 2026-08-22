@@ -50,6 +50,13 @@ pub struct Framebuffer {
     /// миллион пикселей обоев на каждый пакет мыши.
     background: *mut u32,
     background_block: Option<FrameBlock>,
+    /// Полностью отрисованное окно на время move gesture. Буфер имеет размер
+    /// только window damage, а не всего экрана: content копируется как слой и
+    /// не растеризуется заново на каждый mouse packet.
+    drag_layer: *mut u32,
+    drag_layer_block: Option<FrameBlock>,
+    drag_layer_width: u32,
+    drag_layer_height: u32,
     width: u32,
     height: u32,
     stride: u32,
@@ -156,6 +163,10 @@ impl Framebuffer {
             back_bytes,
             background,
             background_block,
+            drag_layer: core::ptr::null_mut(),
+            drag_layer_block: None,
+            drag_layer_width: 0,
+            drag_layer_height: 0,
             width,
             height,
             stride,
@@ -189,6 +200,89 @@ impl Framebuffer {
     /// Доступен ли статический desktop-слой для damage-only compositor'а.
     pub fn has_background_cache(&self) -> bool {
         !self.background.is_null()
+    }
+
+    /// Сохраняет полностью сформированный window layer для live move.
+    /// Allocation происходит один раз на mouse-down, никогда в hot path
+    /// движения. Resize не использует этот кэш, потому что меняет layout.
+    pub fn cache_drag_layer(&mut self, rect: Rect) -> bool {
+        if rect.is_empty() {
+            return false;
+        }
+        let Some(bytes) = frame_bytes(rect.width, rect.height) else {
+            return false;
+        };
+        let required_frames = bytes.div_ceil(PAGE_SIZE);
+        let reusable = self
+            .drag_layer_block
+            .is_some_and(|block| block.frames >= required_frames);
+        if !reusable {
+            if let Some(block) = self.drag_layer_block.take() {
+                let _ = memory::free(block);
+            }
+            let Some(block) = reserve_back_buffer(bytes) else {
+                self.drag_layer = core::ptr::null_mut();
+                self.drag_layer_width = 0;
+                self.drag_layer_height = 0;
+                return false;
+            };
+            self.drag_layer = block.phys as *mut u32;
+            self.drag_layer_block = Some(block);
+        }
+        self.drag_layer_width = rect.width;
+        self.drag_layer_height = rect.height;
+        for destination_y in 0..rect.height {
+            for destination_x in 0..rect.width {
+                let source_x = rect.x.saturating_add(destination_x as i32);
+                let source_y = rect.y.saturating_add(destination_y as i32);
+                let value = if source_x >= 0
+                    && source_y >= 0
+                    && source_x < self.width as i32
+                    && source_y < self.height as i32
+                {
+                    self.read_raw(source_x as u32, source_y as u32)
+                } else {
+                    0
+                };
+                let index = destination_y as usize * rect.width as usize + destination_x as usize;
+                // SAFETY: storage содержит не меньше rect.width*rect.height
+                // u32, что проверено через frame_bytes/allocation выше.
+                unsafe { self.drag_layer.add(index).write(value) };
+            }
+        }
+        true
+    }
+
+    /// Композитит сохранённый layer в новое положение. Source и destination
+    /// имеют одинаковые размеры; clipping сдвигает source offset, поэтому
+    /// окно корректно уходит частично за левую/верхнюю границу экрана.
+    pub fn draw_cached_drag_layer(&mut self, rect: Rect) -> bool {
+        if self.drag_layer.is_null()
+            || rect.width != self.drag_layer_width
+            || rect.height != self.drag_layer_height
+        {
+            return false;
+        }
+        let Some((x0, y0, x1, y1)) = self.clipped(rect) else {
+            return true;
+        };
+        let source_x = (x0 as i32 - rect.x).max(0) as u32;
+        let source_y = (y0 as i32 - rect.y).max(0) as u32;
+        let copy_width = x1.saturating_sub(x0) as usize;
+        for row in 0..y1.saturating_sub(y0) {
+            let source_index = (source_y + row) as usize * rect.width as usize + source_x as usize;
+            let destination_index = (y0 + row) as usize * self.width as usize + x0 as usize;
+            // SAFETY: оба row диапазона предварительно clipped; буферы разные
+            // и принадлежат одному Framebuffer.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    self.drag_layer.add(source_index),
+                    self.back.add(destination_index),
+                    copy_width,
+                )
+            };
+        }
+        true
     }
 
     /// Имя bootstrap display driver'а для диагностики и GUI.
@@ -233,6 +327,53 @@ impl Framebuffer {
             return;
         }
         self.write_raw(x as u32, y as u32, self.pack(color));
+    }
+
+    /// Масштабирует linear B8G8R8X8 surface прямо в backbuffer. Координаты
+    /// вычисляются до растеризации, а четыре соседних texel смешиваются в
+    /// fixed-point — окно не превращается в крупные квадраты при resize.
+    pub fn blit_bgrx_bilinear(
+        &mut self,
+        source: &[u32],
+        source_width: u32,
+        source_height: u32,
+        destination: Rect,
+    ) {
+        if source_width == 0
+            || source_height == 0
+            || destination.is_empty()
+            || source.len()
+                != usize::try_from(u64::from(source_width) * u64::from(source_height))
+                    .unwrap_or(usize::MAX)
+        {
+            return;
+        }
+        let Some((x0, y0, x1, y1)) = self.clipped(destination) else {
+            return;
+        };
+        let max_source_x = source_width.saturating_sub(1);
+        let max_source_y = source_height.saturating_sub(1);
+        for y in y0..y1 {
+            let local_y = (y as i32 - destination.y).max(0) as u32;
+            let source_y_16 = scale_coordinate_16(local_y, destination.height, source_height);
+            let sy0 = ((source_y_16 >> 16) as u32).min(max_source_y);
+            let sy1 = sy0.saturating_add(1).min(max_source_y);
+            let fy = source_y_16 as u16;
+            for x in x0..x1 {
+                let local_x = (x as i32 - destination.x).max(0) as u32;
+                let source_x_16 = scale_coordinate_16(local_x, destination.width, source_width);
+                let sx0 = ((source_x_16 >> 16) as u32).min(max_source_x);
+                let sx1 = sx0.saturating_add(1).min(max_source_x);
+                let fx = source_x_16 as u16;
+                let row0 = sy0 as usize * source_width as usize;
+                let row1 = sy1 as usize * source_width as usize;
+                let top = mix_bgrx(source[row0 + sx0 as usize], source[row0 + sx1 as usize], fx);
+                let bottom = mix_bgrx(source[row1 + sx0 as usize], source[row1 + sx1 as usize], fx);
+                let pixel = mix_bgrx(top, bottom, fy);
+                let rgba = CpuPixelFormat::Bgr888.unpack(pixel);
+                self.write_raw(x, y, self.render_format.pack(rgba));
+            }
+        }
     }
 
     /// Смешивает пиксель текста/иконки с уже нарисованным фоном.
@@ -560,9 +701,9 @@ impl Framebuffer {
         }
     }
 
-    /// Масштабирует RGB565-обои в `rect` по правилу cover, сохраняя пропорции.
+    /// Масштабирует RGB888-обои в `rect` по правилу cover, сохраняя пропорции.
     /// Декодер не требует heap: исходник memory-mapped в read-only секцию, а
-    /// каждый пиксель сразу преобразуется в активный render format.
+    /// bilinear sample сразу преобразуется в активный render format.
     pub fn draw_wallpaper(&mut self, rect: Rect, image: Wallpaper) {
         self.draw_wallpaper_clipped(rect, rect, image);
     }
@@ -598,15 +739,13 @@ impl Framebuffer {
         let crop_y = image.height.saturating_sub(sample_height) / 2;
         for screen_y in clipped.y..clipped.bottom() {
             let destination_y = screen_y.saturating_sub(rect.y) as u32;
-            let source_y = crop_y
-                + (u64::from(destination_y) * u64::from(sample_height) / u64::from(rect.height))
-                    as u32;
+            let source_y_16 = (u64::from(crop_y) << 16)
+                + scale_coordinate_16(destination_y, rect.height, sample_height);
             for screen_x in clipped.x..clipped.right() {
                 let destination_x = screen_x.saturating_sub(rect.x) as u32;
-                let source_x = crop_x
-                    + (u64::from(destination_x) * u64::from(sample_width) / u64::from(rect.width))
-                        as u32;
-                let raw = self.pack(image.pixel(source_x, source_y));
+                let source_x_16 = (u64::from(crop_x) << 16)
+                    + scale_coordinate_16(destination_x, rect.width, sample_width);
+                let raw = self.pack(image.pixel_bilinear(source_x_16, source_y_16));
                 self.write_raw(screen_x as u32, screen_y as u32, raw);
             }
         }
@@ -768,6 +907,28 @@ impl Framebuffer {
             .clamp(0, self.height as i32) as u32;
         (x0 < x1 && y0 < y1).then_some((x0, y0, x1, y1))
     }
+}
+
+/// Преобразует координату центра destination pixel в 16.16 source space.
+/// Обе крайние точки совпадают, поэтому sampler не читает за изображением и
+/// не создаёт полупиксельную размытую рамку.
+fn scale_coordinate_16(destination: u32, destination_size: u32, source_size: u32) -> u64 {
+    if destination_size <= 1 || source_size <= 1 {
+        return 0;
+    }
+    u64::from(destination.min(destination_size - 1)) * (u64::from(source_size - 1) << 16)
+        / u64::from(destination_size - 1)
+}
+
+fn mix_bgrx(left: u32, right: u32, fraction: u16) -> u32 {
+    let fraction = u32::from(fraction);
+    let inverse = 65_536u32.saturating_sub(fraction);
+    let channel = |shift: u32| {
+        let a = (left >> shift) & 0xff;
+        let b = (right >> shift) & 0xff;
+        ((a * inverse + b * fraction + 32_768) >> 16) & 0xff
+    };
+    channel(0) | (channel(8) << 8) | (channel(16) << 16)
 }
 
 impl IconTarget for Framebuffer {
@@ -1069,6 +1230,7 @@ impl DisplayDriver for Framebuffer {
         }
         let old_back = self.back_block;
         let old_background = self.background_block;
+        let old_drag_layer = self.drag_layer_block.take();
         self.back_block = new_back;
         self.back = new_back.phys as *mut u32;
         self.back_phys = new_back.phys;
@@ -1077,6 +1239,9 @@ impl DisplayDriver for Framebuffer {
         self.background = new_background
             .map(|block| block.phys as *mut u32)
             .unwrap_or_default();
+        self.drag_layer = core::ptr::null_mut();
+        self.drag_layer_width = 0;
+        self.drag_layer_height = 0;
         self.width = requested.width;
         self.height = requested.height;
         self.stride = requested.width * 4;
@@ -1089,6 +1254,9 @@ impl DisplayDriver for Framebuffer {
         }
         let _ = memory::free(old_back);
         if let Some(block) = old_background {
+            let _ = memory::free(block);
+        }
+        if let Some(block) = old_drag_layer {
             let _ = memory::free(block);
         }
         Ok(self.mode())
@@ -1104,8 +1272,12 @@ impl Drop for Framebuffer {
         if let Some(block) = self.background_block.take() {
             let _ = memory::free(block);
         }
+        if let Some(block) = self.drag_layer_block.take() {
+            let _ = memory::free(block);
+        }
         self.back = core::ptr::null_mut();
         self.background = core::ptr::null_mut();
+        self.drag_layer = core::ptr::null_mut();
     }
 }
 

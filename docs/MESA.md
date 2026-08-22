@@ -11,25 +11,30 @@ RustOS содержит первый исполняемый срез порта 
 - `displayd.rune` — эксклюзивный atomic scanout;
 - `gpu-demo.rune` — непривилегированный launcher приложения Aurora 3D.
 
-Ярлык **Aurora 3D** находится на рабочем столе. Двойной щелчок запускает 180
-кадров. Сцена содержит анимированный perspective mesh, градиентный stage,
+Ярлык **Aurora 3D** находится на рабочем столе. Двойной щелчок создаёт обычное
+независимое окно: оно сворачивается, растягивается и закрывается тем же оконным
+сервером, что Терминал и Проводник. Сцена содержит анимированный perspective mesh, градиентный stage,
 diffuse/specular lighting и TGSI vertex/fragment shaders. Guest CPU формирует
 только вершины и команды: target не имеет `CPU_WRITE`, а rasterization и запись
 пикселей выполняются VirGL renderer'ом.
 
 ```text
-gpu-demo (intent only)
-        │ IPC
-        ▼
-compositord ── frame request ──► renderd ── Mesa state ──► VirGL
-        ▲                           │                         │
-        │ GraphicsBuffer+timeline  └─────────────────────────┘
-        └────────────── displayd ── atomic present/vblank ──► scanout
+Aurora window ── bounded request ──► compositord ──► renderd ──► VirGL
+      ▲                                      GraphicsBuffer + fence │
+      └── finished BGRX surface ◄── TRANSFER_FROM_HOST_3D ◄─────────┘
+      │
+      └── CPU compositor damage ──► virtio-gpu scanout broker
 ```
 
 Приложение не получает GPU, scanout или MMIO capability. Ошибка/завершение
 launcher'а не уничтожает графические сервисы; supervisor продолжает следить за
 ними как за постоянными процессами.
+
+Readback — переходный мост, а не CPU rasterization: triangles и pixels создаёт
+host GPU, guest CPU только включает готовую поверхность в bootstrap desktop.
+После переноса всего оконного compositor'а в ring 3 этот шаг заменит zero-copy
+composition GraphicsBuffer'ов. Если VirGL отсутствует или потерян, Aurora
+локально включает software renderer; остальные окна и shell не меняют режим.
 
 ## Воспроизводимая upstream база
 
@@ -66,8 +71,11 @@ winsys связывает драйвер с конкретной ОС и её bu
 6. затем добавить GLSL/NIR, OpenGL ES и ускорение SystemUI.
 
 Название `platform-seed` в manifest специально не выдаёт этот этап за полный
-OpenGL 4.6 port. При этом Aurora 3D уже является настоящим end-to-end GPU
-приложением, а не CPU preview.
+OpenGL 4.6 port. GPU-сцена уже является настоящим end-to-end VirGL приложением,
+но texture sampling, normal/parallax maps и публичные EGL/GL/GLES entry points
+появятся только с upstream state tracker. Software fallback визуально проверяет
+процедурную texture/normal/parallax математику, однако это не считается тестом
+Mesa или OpenGL.
 
 ## Проверка
 
@@ -77,8 +85,8 @@ OpenGL 4.6 port. При этом Aurora 3D уже является настоя�
 make test-virgl
 ```
 
-Тест проверяет RUNE launcher, 48 последовательных GPU frames, timeline/vblank,
-цветной screenshot и отсутствие guest CPU rasterization. Артефакты:
+Тест проверяет оконный GPU readback, 48 последовательных GPU frames,
+timeline/vblank, цветной screenshot и отсутствие guest CPU rasterization. Артефакты:
 `build/test-results/virgl/showcase.{xwd,ppm}`.
 
 Homebrew QEMU на macOS не предоставляет пригодный `virtio-vga-gl`, поэтому

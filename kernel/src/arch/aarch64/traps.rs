@@ -25,6 +25,7 @@ extern "C" {
         root: u64,
         interrupts: u64,
     ) -> u64;
+    fn rustos_enter_user_frame_asm(frame: *mut super::TrapFrame, root: u64) -> u64;
 }
 
 /// Результат завершившегося синхронного user run. Записывается только из
@@ -72,6 +73,12 @@ pub unsafe fn enter_user(
             u64::from(interrupts),
         )
     }
+}
+
+/// Входит в уже сохранённый scheduler context через готовый TrapFrame.
+pub unsafe fn enter_user_frame(frame: &mut super::TrapFrame, root: u64) -> u64 {
+    // SAFETY: frame живёт на kernel stack до возврата через abort boundary.
+    unsafe { rustos_enter_user_frame_asm(frame, root) }
 }
 
 pub fn set_user_result(result: u64) {
@@ -312,6 +319,88 @@ rustos_enter_user_asm:
     mov x11, xzr
 2:
     msr spsr_el1, x11
+    // Новый процесс не должен видеть kernel return address в link register.
+    mov x30, xzr
+    eret
+
+    .global rustos_enter_user_frame_asm
+rustos_enter_user_frame_asm:
+    // Тот же kernel continuation, но EL0 state уже полностью подготовлен
+    // scheduler'ом в TrapFrame на kernel stack.
+    stp x19, x20, [sp, #-16]!
+    stp x21, x22, [sp, #-16]!
+    stp x23, x24, [sp, #-16]!
+    stp x25, x26, [sp, #-16]!
+    stp x27, x28, [sp, #-16]!
+    stp x29, x30, [sp, #-16]!
+
+    mov x12, x0
+    adrp x9, rustos_saved_kernel_sp
+    add x9, x9, :lo12:rustos_saved_kernel_sp
+    mov x10, sp
+    str x10, [x9]
+    mrs x10, ttbr0_el1
+    adrp x9, rustos_saved_kernel_ttbr0
+    add x9, x9, :lo12:rustos_saved_kernel_ttbr0
+    str x10, [x9]
+
+    dsb ishst
+    msr ttbr0_el1, x1
+    tlbi vmalle1is
+    dsb ish
+    isb
+
+    // В отличие от x86 TSS, AArch64 не подставляет отдельный SP_EL1 при
+    // исключении из EL0. Поэтому нельзя оставить SP над временным frame:
+    // большой Rust trap-handler перезапишет сохранённый kernel continuation.
+    // x30 держит адрес frame до самой последней загрузки user link register.
+    mov x30, x12
+    ldr x9, [x30, #816]
+    msr fpcr, x9
+    ldr x9, [x30, #824]
+    msr fpsr, x9
+    ldp q0,  q1,  [x30, #304]
+    ldp q2,  q3,  [x30, #336]
+    ldp q4,  q5,  [x30, #368]
+    ldp q6,  q7,  [x30, #400]
+    ldp q8,  q9,  [x30, #432]
+    ldp q10, q11, [x30, #464]
+    ldp q12, q13, [x30, #496]
+    ldp q14, q15, [x30, #528]
+    ldp q16, q17, [x30, #560]
+    ldp q18, q19, [x30, #592]
+    ldp q20, q21, [x30, #624]
+    ldp q22, q23, [x30, #656]
+    ldp q24, q25, [x30, #688]
+    ldp q26, q27, [x30, #720]
+    ldp q28, q29, [x30, #752]
+    ldp q30, q31, [x30, #784]
+    ldr x9, [x30, #248]
+    msr sp_el0, x9
+    ldr x9, [x30, #256]
+    msr elr_el1, x9
+    ldr x9, [x30, #264]
+    msr spsr_el1, x9
+    adrp x9, rustos_saved_kernel_sp
+    add x9, x9, :lo12:rustos_saved_kernel_sp
+    ldr x9, [x9]
+    mov sp, x9
+    ldp x0,  x1,  [x30, #0]
+    ldp x2,  x3,  [x30, #16]
+    ldp x4,  x5,  [x30, #32]
+    ldp x6,  x7,  [x30, #48]
+    ldp x8,  x9,  [x30, #64]
+    ldp x10, x11, [x30, #80]
+    ldp x12, x13, [x30, #96]
+    ldp x14, x15, [x30, #112]
+    ldp x16, x17, [x30, #128]
+    ldp x18, x19, [x30, #144]
+    ldp x20, x21, [x30, #160]
+    ldp x22, x23, [x30, #176]
+    ldp x24, x25, [x30, #192]
+    ldp x26, x27, [x30, #208]
+    ldp x28, x29, [x30, #224]
+    ldr x30, [x30, #240]
     eret
 
     // Общая ветка exit/fault: frame уже больше не нужен. Сначала возвращаем

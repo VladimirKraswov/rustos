@@ -81,18 +81,6 @@ impl UserContext {
         }
     }
 
-    pub fn entry(&self) -> u64 {
-        self.instruction_pointer
-    }
-
-    pub fn stack_pointer(&self) -> u64 {
-        self.stack_pointer
-    }
-
-    pub fn arguments(&self) -> [u64; 3] {
-        [self.registers[8], self.registers[9], self.registers[11]]
-    }
-
     pub const fn thread_pointer(&self) -> u64 {
         self.thread_pointer
     }
@@ -243,6 +231,41 @@ pub unsafe fn enter_user(
     interrupts: bool,
 ) -> u64 {
     unsafe { traps::enter_user(entry, stack, arguments, root, interrupts) }
+}
+
+/// Возобновляет полный сохранённый ring-3 context постоянного процесса.
+///
+/// # Safety
+///
+/// `context` и `root` должны принадлежать одному выбранному scheduler thread.
+pub unsafe fn enter_user_context(context: &UserContext, root: u64) -> u64 {
+    let mut frame = TrapFrame {
+        fx: FxState::initial(),
+        r15: 0,
+        r14: 0,
+        r13: 0,
+        r12: 0,
+        r11: 0,
+        r10: 0,
+        r9: 0,
+        r8: 0,
+        rdi: 0,
+        rsi: 0,
+        rbp: 0,
+        rdx: 0,
+        rcx: 0,
+        rbx: 0,
+        rax: 0,
+        vector: 0,
+        error_code: 0,
+        rip: 0,
+        cs: 0,
+        rflags: 0,
+        rsp: 0,
+        ss: 0,
+    };
+    context.restore(&mut frame);
+    unsafe { traps::enter_user_frame(&mut frame, root) }
 }
 
 pub const fn initial_user_stack(top: u64) -> u64 {

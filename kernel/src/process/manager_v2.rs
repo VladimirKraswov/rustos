@@ -16,8 +16,8 @@ use rustos_abi::{
     bootinfo::BootInitramfs,
     display::{DisplayAtomicPresent, DisplayScanoutInfo, DisplayVblankWait},
     gpu::{
-        GpuContextCreate, GpuDeviceInfo, GpuResourceCreate, GpuResourceImport, GpuSubmit,
-        GPU_MAX_COMMAND_BYTES,
+        GpuContextCreate, GpuDemoRequest, GpuDeviceInfo, GpuResourceCreate, GpuResourceImport,
+        GpuSubmit, GPU_DEMO_START_OPCODE, GPU_MAX_COMMAND_BYTES,
     },
     graphics_buffer::{BufferUsage, GraphicsBufferDesc, MemoryDomain},
     ipc::{Message, IPC_MAX_HANDLES},
@@ -999,20 +999,19 @@ impl ProcessManager {
             .ok_or(ProcessError::UnexpectedExit)?;
         let context = thread.context;
         let root = process.address_space.root();
+        let kernel_root = self.kernel_root;
 
         unsafe { ACTIVE_MANAGER = self };
         arch::set_user_thread_pointer(context.thread_pointer());
         arch::start_scheduler_timer(self.counter_hz);
-        let _ = unsafe {
-            arch::enter_user(
-                context.entry(),
-                context.stack_pointer(),
-                context.arguments(),
-                root,
-                true,
-            )
-        };
-        arch::stop_scheduler_timer();
+        let _ = unsafe { arch::enter_user_context(&context, root) };
+        // `enter_user` возвращается только через `schedule_next` с disposition
+        // abort. Эта граница уже остановила one-shot timer до восстановления
+        // kernel stack. Scheduler мог перед этим сменить несколько process
+        // roots, поэтому возвращаем manager-owned kernel root явно до первого
+        // обращения к BSS. Глобальный root из assembly остаётся аварийной
+        // страховкой раннего bootstrap, но не является scheduler state.
+        unsafe { arch::switch_address_space(kernel_root) };
         unsafe { ACTIVE_MANAGER = ptr::null_mut() };
         self.current = ThreadId::INVALID;
 
@@ -1042,7 +1041,24 @@ impl ProcessManager {
             return 0;
         }
         if !frame.is_from_user() {
-            serial::put_str("[trap] FATAL preemptive kernel exception\n");
+            serial::put_str("[trap] FATAL preemptive kernel exception");
+            if let TrapKind::Exception {
+                number,
+                code,
+                instruction_pointer,
+                fault_address,
+            } = kind
+            {
+                serial::put_str(" number=");
+                serial::put_u32(u32::from(number));
+                serial::put_str(" code=0x");
+                serial::put_hex(u64::from(code));
+                serial::put_str(" ip=0x");
+                serial::put_hex(instruction_pointer);
+                serial::put_str(" address=0x");
+                serial::put_hex(fault_address);
+            }
+            serial::put_str("\n");
             crate::boot::exit_kernel(0x7e);
         }
         let Some(thread_index) = self.thread_index(self.current) else {
@@ -1498,6 +1514,7 @@ impl ProcessManager {
             return 1;
         };
         let Some(thread_index) = self.thread_index(next) else {
+            arch::stop_scheduler_timer();
             arch::set_user_run_result(status::DEADLOCK as u64);
             return 1;
         };
@@ -4224,6 +4241,65 @@ impl ProcessManager {
         status::OK
     }
 
+    /// Доставляет control message от kernel bootstrap compositor'а, не
+    /// создавая одноразовый ring-3 launcher на каждый animation frame.
+    /// Handles здесь принципиально запрещены: capability transfer всё равно
+    /// проходит только через обычный `ipc_send` от реального процесса.
+    fn deliver_kernel_control(&mut self, endpoint_id: u8, mut message: Message) -> Result<(), i64> {
+        if message.header.handle_count != 0
+            || message.handles.iter().any(|entry| entry.handle.is_valid())
+        {
+            return Err(status::INVALID_ARGUMENT);
+        }
+        prepare_message(ProcessId::new(u32::MAX, u32::MAX), &mut message)
+            .map_err(|_| status::INVALID_ARGUMENT)?;
+        let endpoint_index = endpoint_id as usize;
+        let endpoint = self
+            .endpoints
+            .get(endpoint_index)
+            .ok_or(status::BAD_HANDLE)?;
+        let receiver_pid = endpoint.receiver;
+        let receiver_index = self.process_index(receiver_pid).ok_or(status::BAD_HANDLE)?;
+        let pending_thread = self.threads.iter().position(|slot| {
+            slot.as_ref().is_some_and(|thread| {
+                thread.pid == receiver_pid
+                    && matches!(thread.pending, PendingOperation::Receive(pending) if pending.endpoint == endpoint_id)
+            })
+        });
+        if let Some(thread_index) = pending_thread {
+            let PendingOperation::Receive(pending) = self.threads[thread_index]
+                .as_ref()
+                .ok_or(status::BAD_HANDLE)?
+                .pending
+            else {
+                return Err(status::BUSY);
+            };
+            self.processes[receiver_index]
+                .as_ref()
+                .ok_or(status::BAD_HANDLE)?
+                .address_space
+                .copy_to_user(pending.user_buffer, message_bytes(&message))
+                .map_err(|_| status::INVALID_ARGUMENT)?;
+            let receiver = self.threads[thread_index]
+                .as_mut()
+                .ok_or(status::BAD_HANDLE)?;
+            receiver.pending = PendingOperation::None;
+            receiver.context.set_syscall_result(status::OK);
+            self.scheduler
+                .wake(receiver.tid)
+                .map_err(|_| status::BUSY)?;
+            Ok(())
+        } else {
+            self.endpoints[endpoint_index]
+                .queue
+                .push(message)
+                .map_err(|error| match error {
+                    IpcQueueError::InvalidMessage => status::INVALID_ARGUMENT,
+                    IpcQueueError::QueueFull => status::QUEUE_FULL,
+                })
+        }
+    }
+
     fn transfer_handles(
         &mut self,
         sender_index: usize,
@@ -4920,6 +4996,7 @@ pub(super) fn pump_interactive_services() -> Result<(), ProcessError> {
 
 /// Запускает ring-3 control application и ждёт, пока compositor покажет все
 /// кадры Aurora 3D. Ни kernel desktop, ни launcher не получают GPU handles.
+#[cfg(feature = "virgl-test")]
 pub(super) fn run_interactive_gpu_demo(frame_count: u32) -> Result<(), ProcessError> {
     const DEMO_CONTROL_ENDPOINT: u8 = 6;
     const DEMO_CONTROL_SLOT: usize = 2;
@@ -4971,6 +5048,82 @@ pub(super) fn run_interactive_gpu_demo(frame_count: u32) -> Result<(), ProcessEr
     serial::put_str("[gpu-demo] AURORA_3D_READY frames=");
     serial::put_u32(frame_count);
     serial::put_str(" renderer=mesa-virgl cpu-raster=no\n");
+    Ok(())
+}
+
+/// Рендерит один Aurora 3D frame в обычную оконную поверхность.
+///
+/// Pixels создаёт изолированный ring-3 renderd и host VirGL renderer. После
+/// fence kernel делает `TRANSFER_FROM_HOST_3D` и копирует уже готовый BGRX
+/// buffer в retained surface приложения. Если любой этап недоступен, caller
+/// переключается на software renderer, не затрагивая остальные окна.
+pub(super) fn render_interactive_gpu_demo_frame(
+    width: u32,
+    height: u32,
+    scene_frame: u32,
+    output: &mut [u32],
+) -> Result<(), ProcessError> {
+    const DEMO_CONTROL_ENDPOINT: u8 = 6;
+
+    let request = GpuDemoRequest::windowed(width, height, scene_frame);
+    if request.validate().is_err()
+        || output.len()
+            != usize::try_from(u64::from(width) * u64::from(height))
+                .map_err(|_| ProcessError::UnexpectedExit)?
+    {
+        return Err(ProcessError::UnexpectedExit);
+    }
+    if !unsafe { INTERACTIVE_SERVICES_READY } {
+        return Err(ProcessError::UnexpectedExit);
+    }
+    let services = unsafe { INTERACTIVE_GRAPHICS_SERVICES }
+        .filter(|services| services.render.is_some())
+        .ok_or(ProcessError::UnexpectedExit)?;
+    let manager = unsafe { &mut *ptr::addr_of_mut!(MANAGER) };
+    if manager.endpoints[DEMO_CONTROL_ENDPOINT as usize].receiver != services.compositor
+        || !graphics_services_blocked(manager, services)
+    {
+        return Err(ProcessError::UnexpectedExit);
+    }
+
+    let mut message = Message::EMPTY;
+    message.header.opcode = GPU_DEMO_START_OPCODE;
+    message.header.request_id = u64::from(scene_frame).saturating_add(1);
+    message.header.payload_len = 64;
+    message.payload = request.encode_inline();
+    manager
+        .deliver_kernel_control(DEMO_CONTROL_ENDPOINT, message)
+        .map_err(|_| ProcessError::UnexpectedExit)?;
+    manager.run()?;
+    if !graphics_services_blocked(manager, services) {
+        return Err(ProcessError::UnexpectedExit);
+    }
+
+    let render = services.render.ok_or(ProcessError::UnexpectedExit)?;
+    let render_index = manager
+        .process_index(render)
+        .ok_or(ProcessError::UnexpectedExit)?;
+    let object = manager.processes[render_index]
+        .as_ref()
+        .ok_or(ProcessError::UnexpectedExit)?
+        .capabilities
+        .iter()
+        .find_map(|entry| match entry.kind {
+            CapabilityKind::GraphicsBuffer(object)
+                if manager.graphics.descriptor(object).is_ok_and(|descriptor| {
+                    descriptor.width == width && descriptor.height == height
+                }) =>
+            {
+                Some(object)
+            }
+            _ => None,
+        })
+        .ok_or(ProcessError::UnexpectedExit)?;
+    scanout::download_render_target(object).map_err(|_| ProcessError::UnexpectedExit)?;
+    manager
+        .graphics
+        .copy_linear_bgrx(object, output)
+        .map_err(|_| ProcessError::UnexpectedExit)?;
     Ok(())
 }
 

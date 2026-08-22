@@ -216,8 +216,19 @@ pub fn pump_interactive_services() -> Result<(), ProcessError> {
 }
 
 /// Запускает bounded аппаратную Aurora 3D-демонстрацию.
+#[cfg(feature = "virgl-test")]
 pub fn run_interactive_gpu_demo(frame_count: u32) -> Result<(), ProcessError> {
     manager::run_interactive_gpu_demo(frame_count)
+}
+
+/// Запрашивает один GPU-rendered frame для обычного desktop-окна.
+pub fn render_interactive_gpu_demo_frame(
+    width: u32,
+    height: u32,
+    scene_frame: u32,
+    output: &mut [u32],
+) -> Result<(), ProcessError> {
+    manager::render_interactive_gpu_demo_frame(width, height, scene_frame, output)
 }
 
 /// Выполняет одну команду из GUI terminal и захватывает объединённый

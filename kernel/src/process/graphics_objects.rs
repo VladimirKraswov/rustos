@@ -6,7 +6,7 @@
 //! освобождает память, пока кадры ещё отображены в процессе.
 
 use rustos_abi::{
-    graphics_buffer::{BufferUsage, GraphicsBufferDesc, MemoryDomain},
+    graphics_buffer::{modifier, BufferUsage, GraphicsBufferDesc, MemoryDomain, PixelFormatCode},
     memory::VmFlags,
     syscall::status,
     PAGE_SIZE,
@@ -189,6 +189,37 @@ impl GraphicsBufferPool {
             return Err(status::NOT_SUPPORTED);
         }
         Ok(object.extents[0])
+    }
+
+    /// Копирует готовый linear BGRX render target в канонический XRGB slice
+    /// bootstrap compositor'а. На little-endian CPU порядок байт B,G,R,X уже
+    /// соответствует `0x00RRGGBB`, поэтому конвертация каналов не нужна.
+    pub(super) fn copy_linear_bgrx(&self, id: u16, output: &mut [u32]) -> Result<(), i64> {
+        let object = self.get(id)?;
+        let descriptor = object.descriptor;
+        let pixels = usize::try_from(
+            u64::from(descriptor.width).saturating_mul(u64::from(descriptor.height)),
+        )
+        .map_err(|_| status::LIMIT_REACHED)?;
+        if descriptor.format != PixelFormatCode::B8G8R8X8_UNORM
+            || descriptor.modifier != modifier::LINEAR
+            || descriptor.planes[0].offset != 0
+            || descriptor.planes[0].stride_bytes != descriptor.width.saturating_mul(4)
+            || output.len() != pixels
+            || object.extent_count != 1
+        {
+            return Err(status::NOT_SUPPORTED);
+        }
+        let byte_count = pixels.checked_mul(4).ok_or(status::LIMIT_REACHED)?;
+        if byte_count > object.extents[0].frames as usize * PAGE_SIZE as usize {
+            return Err(status::BAD_HANDLE);
+        }
+        // SAFETY: object владеет identity-mapped backing, download fence уже
+        // завершён, размеры проверены, а output не пересекается с kernel pool.
+        let source =
+            unsafe { core::slice::from_raw_parts(object.extents[0].phys as *const u32, pixels) };
+        output.copy_from_slice(source);
+        Ok(())
     }
 
     pub(super) fn retain_capability(&mut self, id: u16) -> Result<(), i64> {

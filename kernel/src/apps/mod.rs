@@ -3,6 +3,7 @@
 //! (docs/ARCHITECTURE.md, «Путь к микроядру»).
 pub mod desktop_settings;
 pub mod file_explorer;
+pub mod gpu_demo;
 pub mod shell_ui;
 pub mod terminal;
 pub mod ui_showcase;

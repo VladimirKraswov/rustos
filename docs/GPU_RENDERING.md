@@ -19,7 +19,8 @@ GraphicsBuffer + acquire timeline -> validate/forward ----------> atomic present
                                                                scanout
 ```
 
-Рабочий вертикальный срез запускает системное ring-3 приложение **Aurora 3D**.
+Рабочий вертикальный срез запускает системное приложение **Aurora 3D** в
+обычном независимом окне.
 `rustos-mesa` строит perspective mesh, lighting state и TGSI shader pipeline;
 guest CPU передаёт только вершины и команды. Очистку, rasterization,
 интерполяцию и запись пикселей выполняет VirGL renderer. Render target не имеет
@@ -70,6 +71,17 @@ Host renderer дополнительно разрешает resource handles т�
 готовый кадр `displayd`. Драйвер делает `SET_SCANOUT` и `RESOURCE_FLUSH` того
 же VirGL resource: между 3D render target и экраном нет guest CPU copy.
 
+Оконный bootstrap path дополнительно использует
+`VIRTIO_GPU_CMD_TRANSFER_FROM_HOST_3D`: после fence готовые GPU pixels попадают
+в attached system-memory backing и смешиваются с существующим kernel desktop.
+Это GPU readback, не CPU rasterization. Полноэкранный test path остаётся
+zero-copy; после переезда desktop compositor'а в ring 3 оконный путь тоже
+будет передавать GraphicsBuffer напрямую без readback.
+
+На устройстве без VirGL Aurora использует локальный software fallback в том же
+окне. Ошибка renderer'а не переключает всю ОС, не закрывает чужие окна и не
+даёт приложению display/GPU capability.
+
 ## Проверка Aurora 3D
 
 Нужен QEMU, собранный с `virglrenderer` и `virtio-vga-gl`:
@@ -113,6 +125,7 @@ UTM запускает AArch64 через HVF, принимает VirGL кома
 
 ```text
 [gpu-demo] AURORA_3D_READY frames=48 renderer=mesa-virgl cpu-raster=no
+[virgl-test] WINDOWED_READBACK_READY source=host-gpu cpu-raster=no
 [virgl-test] MESA_SHOWCASE_READY scanout=graphics-buffer cpu-raster=no
 rustos-gui-check: stage и освещённый объект присутствуют в screenshot
 ```
