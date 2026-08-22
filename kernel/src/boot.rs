@@ -164,6 +164,10 @@ pub fn kernel_main(info: &BootInfo) -> ! {
                     serial::put_str("[virgl-test] FATAL: scanout info unavailable\n");
                     exit_kernel(0x55);
                 });
+                if process::run_gpu_compositor_probe(scanout.width, scanout.height).is_err() {
+                    serial::put_str("[virgl-test] FATAL: GPU compositor probe failed\n");
+                    exit_kernel(0x55);
+                }
                 let pixels = u64::from(scanout.width) * u64::from(scanout.height);
                 let frames = pixels.saturating_mul(4).div_ceil(4096);
                 let readback = memory::allocate(frames, 1).unwrap_or_else(|_| {

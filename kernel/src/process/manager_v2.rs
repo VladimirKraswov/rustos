@@ -5118,6 +5118,41 @@ pub(super) fn pump_interactive_services() -> Result<(), ProcessError> {
     Ok(())
 }
 
+/// Проверяет ring-3 multi-surface GPU composition без CPU readback.
+#[cfg(feature = "virgl-test")]
+pub(super) fn run_gpu_compositor_probe(width: u32, height: u32) -> Result<(), ProcessError> {
+    const DEMO_CONTROL_ENDPOINT: u8 = 6;
+    let request = GpuDemoRequest::compositor_probe(width, height);
+    if request.validate().is_err() || !unsafe { INTERACTIVE_SERVICES_READY } {
+        return Err(ProcessError::UnexpectedExit);
+    }
+    let services = unsafe { INTERACTIVE_GRAPHICS_SERVICES }
+        .filter(|services| services.render.is_some())
+        .ok_or(ProcessError::UnexpectedExit)?;
+    let manager = unsafe { &mut *ptr::addr_of_mut!(MANAGER) };
+    if manager.endpoints[DEMO_CONTROL_ENDPOINT as usize].receiver != services.compositor
+        || !graphics_services_blocked(manager, services)
+    {
+        return Err(ProcessError::UnexpectedExit);
+    }
+    let mut message = Message::EMPTY;
+    message.header.opcode = GPU_DEMO_START_OPCODE;
+    message.header.request_id = 0x4750_5543_4f4d_5032;
+    message.header.payload_len = 64;
+    message.payload = request.encode_inline();
+    manager
+        .deliver_kernel_control(DEMO_CONTROL_ENDPOINT, message)
+        .map_err(|_| ProcessError::UnexpectedExit)?;
+    manager.run()?;
+    if !graphics_services_blocked(manager, services) {
+        return Err(ProcessError::UnexpectedExit);
+    }
+    serial::put_str(
+        "[gpu-compositor] layers=2 damage=scissor blend=premultiplied readback=0 cpu-raster=0\n",
+    );
+    Ok(())
+}
+
 /// Запускает ring-3 control application и ждёт, пока compositor покажет все
 /// кадры Aurora 3D. Ни kernel desktop, ни launcher не получают GPU handles.
 #[cfg(feature = "virgl-test")]

@@ -215,6 +215,12 @@ pub fn pump_interactive_services() -> Result<(), ProcessError> {
     manager::pump_interactive_services()
 }
 
+/// Проверяет bounded GPU composition нескольких sampled surfaces.
+#[cfg(feature = "virgl-test")]
+pub fn run_gpu_compositor_probe(width: u32, height: u32) -> Result<(), ProcessError> {
+    manager::run_gpu_compositor_probe(width, height)
+}
+
 /// Запускает bounded аппаратную Aurora 3D-демонстрацию.
 #[cfg(feature = "virgl-test")]
 pub fn run_interactive_gpu_demo(frame_count: u32) -> Result<(), ProcessError> {

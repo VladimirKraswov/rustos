@@ -88,6 +88,7 @@ pub extern "C" fn _start(display_endpoint: u64, feedback_endpoint: u64, abi_vers
             Err(_) => process_exit(211),
         };
         let windowed = request.flags & demo_flag::WINDOWED != 0;
+        let compositor_probe = request.flags & demo_flag::COMPOSITOR_PROBE != 0;
         let render_width = if windowed { request.width } else { info.width };
         let render_height = if windowed {
             request.height
@@ -95,14 +96,16 @@ pub extern "C" fn _start(display_endpoint: u64, feedback_endpoint: u64, abi_vers
             info.height
         };
         if windowed {
-            // Bootstrap window compositor пока забирает pixels CPU readback'ом;
-            // перед возвратом kernel обязана быть видна завершённая timeline.
+            // Windowed Aurora пока позже забирается bootstrap desktop через
+            // readback. Compositor probe принципиально только ждёт GPU fence:
+            // его цель — проверить multi-surface blit без CPU pixels.
             frame_id = frame_id.saturating_add(1);
             let frame = prepare_gpu_frame(
                 render_width,
                 render_height,
                 frame_id,
                 Some(request.first_frame),
+                compositor_probe,
             );
             wait_prepared(frame);
             discard_frame(frame);
@@ -145,7 +148,7 @@ fn present_swapchain(
             let scene = request.first_frame.saturating_add(submitted);
             *slot = Some((
                 *frame_id,
-                prepare_gpu_frame(width, height, *frame_id, Some(scene)),
+                prepare_gpu_frame(width, height, *frame_id, Some(scene), false),
             ));
             submitted = submitted.saturating_add(1);
         }
@@ -337,10 +340,14 @@ fn prepare_gpu_frame(
     height: u32,
     frame_id: u64,
     scene_frame: Option<u32>,
+    compositor_probe: bool,
 ) -> PreparedFrame {
-    let request = match scene_frame {
-        Some(scene_frame) => GpuRenderFrame::aurora_request(width, height, frame_id, scene_frame),
-        None => GpuRenderFrame::request(width, height, frame_id),
+    let request = match (compositor_probe, scene_frame) {
+        (true, _) => GpuRenderFrame::compositor_probe_request(width, height, frame_id),
+        (false, Some(scene_frame)) => {
+            GpuRenderFrame::aurora_request(width, height, frame_id, scene_frame)
+        }
+        (false, None) => GpuRenderFrame::request(width, height, frame_id),
     };
     let mut message = Message::EMPTY;
     message.header.opcode = GPU_RENDER_REQUEST_OPCODE;

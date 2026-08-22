@@ -12,9 +12,9 @@ use core::panic::PanicInfo;
 
 use rustos_abi::{
     gpu::{
-        frame_flag, GpuContextCreate, GpuDeviceInfo, GpuRenderFrame, GpuResourceCreate,
-        GpuResourceImport, GpuSubmit, GPU_ABI_VERSION, GPU_RENDERED_FRAME_HANDLE_COUNT,
-        GPU_RENDERED_FRAME_OPCODE, GPU_RENDER_REQUEST_OPCODE,
+        frame_flag, virgl_format, GpuContextCreate, GpuDeviceInfo, GpuRenderFrame,
+        GpuResourceCreate, GpuResourceImport, GpuSubmit, GPU_ABI_VERSION,
+        GPU_RENDERED_FRAME_HANDLE_COUNT, GPU_RENDERED_FRAME_OPCODE, GPU_RENDER_REQUEST_OPCODE,
     },
     graphics_buffer::{BufferUsage, GraphicsBufferDesc, MemoryDomain, PixelFormatCode},
     ipc::TransferredHandle,
@@ -91,6 +91,7 @@ pub extern "C" fn _start(frame_endpoint: u64, render_capability: u64, abi_versio
         slot.timeline = Handle(timeline_value as u32);
     }
     let mut vertex_resource = 0u32;
+    let mut compositor_textures = [0u32; 2];
     let mut next_slot = 0usize;
     let mut mesa_context: Option<rustos_mesa::Context> = None;
 
@@ -190,6 +191,29 @@ pub extern "C" fn _start(frame_endpoint: u64, render_capability: u64, abi_versio
                 Ok(length) => length,
                 Err(_) => process_exit(219),
             }
+        } else if request.flags & frame_flag::COMPOSITOR_PROBE != 0 {
+            if compositor_textures[0] == 0 {
+                for texture in &mut compositor_textures {
+                    let created = gpu_resource_create(
+                        context,
+                        &GpuResourceCreate::sampled_texture(2, 2, virgl_format::B8G8R8A8_UNORM),
+                    );
+                    if created <= 0 {
+                        process_exit(218);
+                    }
+                    *texture = created as u32;
+                }
+            }
+            match encode_compositor_probe(
+                &mut commands,
+                width,
+                height,
+                slot.target_resource,
+                compositor_textures,
+            ) {
+                Ok(length) => length,
+                Err(()) => process_exit(219),
+            }
         } else {
             match rustos_virgl::encode_triangle(
                 &mut commands,
@@ -240,6 +264,86 @@ pub extern "C" fn _start(frame_endpoint: u64, render_capability: u64, abi_versio
             process_exit(222);
         }
     }
+}
+
+/// Формирует минимальный, но настоящий compositor pass: две texture сначала
+/// загружаются в device resources, затем hardware blit смешивает их прямо в
+/// scanout-compatible GraphicsBuffer. Здесь нет CPU framebuffer и readback.
+fn encode_compositor_probe(
+    commands: &mut [u32],
+    width: u32,
+    height: u32,
+    target_resource: u32,
+    textures: [u32; 2],
+) -> Result<usize, ()> {
+    use rustos_virgl::{
+        encode_composite_pass, encode_texture_upload, BlitRect, CompositeLayer, FORMAT_BGRA8888,
+        FORMAT_BGRX8888,
+    };
+
+    // BGRA. Второй atlas хранит premultiplied alpha, как и обычная оконная
+    // surface; это проверяет не только copy, но и blend stage compositor'а.
+    const BACKGROUND: [u8; 16] = [
+        40, 24, 12, 255, 112, 58, 20, 255, 82, 38, 18, 255, 180, 92, 36, 255,
+    ];
+    const PANEL: [u8; 16] = [
+        170, 82, 28, 208, 188, 98, 36, 208, 150, 70, 24, 208, 204, 116, 44, 208,
+    ];
+
+    let mut length = 0usize;
+    length += encode_texture_upload(
+        commands.get_mut(length..).ok_or(())?,
+        textures[0],
+        BlitRect::new(0, 0, 2, 2),
+        4,
+        &BACKGROUND,
+    )
+    .map_err(|_| ())?;
+    length += encode_texture_upload(
+        commands.get_mut(length..).ok_or(())?,
+        textures[1],
+        BlitRect::new(0, 0, 2, 2),
+        4,
+        &PANEL,
+    )
+    .map_err(|_| ())?;
+
+    let panel_width = width.saturating_mul(2) / 3;
+    let panel_height = height.saturating_mul(3) / 5;
+    let layers = [
+        CompositeLayer {
+            resource: textures[0],
+            format: FORMAT_BGRA8888,
+            source: BlitRect::new(0, 0, 2, 2),
+            destination: BlitRect::new(0, 0, width, height),
+            linear_filter: true,
+            alpha_blend: false,
+        },
+        CompositeLayer {
+            resource: textures[1],
+            format: FORMAT_BGRA8888,
+            source: BlitRect::new(0, 0, 2, 2),
+            destination: BlitRect::new(
+                (width - panel_width) / 2,
+                (height - panel_height) / 2,
+                panel_width,
+                panel_height,
+            ),
+            linear_filter: true,
+            alpha_blend: true,
+        },
+    ];
+    length += encode_composite_pass(
+        commands.get_mut(length..).ok_or(())?,
+        width,
+        height,
+        target_resource,
+        FORMAT_BGRX8888,
+        BlitRect::new(0, 0, width, height),
+        &layers,
+    )
+    .map_err(|_| ())?;
+    Ok(length)
 }
 
 #[panic_handler]

@@ -26,8 +26,11 @@ pub const GPU_DEMO_DONE_OPCODE: u16 = 0x5111;
 pub mod frame_flag {
     /// Renderd должен сформировать анимированную Aurora 3D scene.
     pub const AURORA_SHOWCASE: u32 = 1 << 0;
+    /// Renderd должен выполнить диагностический GPU compositor pass из
+    /// нескольких sampled surfaces прямо в scanout-compatible target.
+    pub const COMPOSITOR_PROBE: u32 = 1 << 1;
     /// Все известные флаги.
-    pub const KNOWN: u32 = AURORA_SHOWCASE;
+    pub const KNOWN: u32 = AURORA_SHOWCASE | COMPOSITOR_PROBE;
 }
 
 /// Биты [`GpuDeviceInfo::features`].
@@ -486,6 +489,20 @@ impl GpuRenderFrame {
         }
     }
 
+    /// Создаёт аппаратную проверку compositor blit path без CPU pixels.
+    pub const fn compositor_probe_request(width: u32, height: u32, frame_id: u64) -> Self {
+        Self {
+            version: GPU_ABI_VERSION,
+            size: core::mem::size_of::<Self>() as u16,
+            flags: frame_flag::COMPOSITOR_PROBE,
+            width,
+            height,
+            frame_id,
+            fence_id: 0,
+            reserved: [0; 4],
+        }
+    }
+
     /// Номер анимационного кадра либо ноль diagnostic pipeline.
     pub const fn scene_frame(&self) -> u32 {
         self.reserved[0] as u32
@@ -500,6 +517,7 @@ impl GpuRenderFrame {
     pub fn validate(&self) -> Result<(), GpuAbiError> {
         validate_prefix(self.version, self.size, core::mem::size_of::<Self>())?;
         if self.flags & !frame_flag::KNOWN != 0
+            || self.flags.count_ones() > 1
             || self.reserved[2..] != [0; 2]
             || self.reserved[0] > u64::from(u32::MAX)
             || (self.flags == 0 && self.reserved[0] != 0)
@@ -570,8 +588,11 @@ pub mod demo_flag {
     /// не передавая буфер displayd. Оконный compositor заберёт готовые pixels
     /// после GPU fence и включит их в обычный damage/present.
     pub const WINDOWED: u32 = 1 << 0;
+    /// Выполнить bounded multi-surface compositor pass вместо Aurora scene.
+    /// Используется аппаратным integration test и всегда требует WINDOWED.
+    pub const COMPOSITOR_PROBE: u32 = 1 << 1;
     /// Все известные биты текущего ABI.
-    pub const KNOWN: u32 = WINDOWED;
+    pub const KNOWN: u32 = WINDOWED | COMPOSITOR_PROBE;
 }
 
 impl GpuDemoRequest {
@@ -609,6 +630,23 @@ impl GpuDemoRequest {
         }
     }
 
+    /// Создаёт один GPU compositor probe того же размера, что будущий target.
+    pub const fn compositor_probe(width: u32, height: u32) -> Self {
+        Self {
+            version: GPU_ABI_VERSION,
+            size: core::mem::size_of::<Self>() as u16,
+            flags: demo_flag::WINDOWED | demo_flag::COMPOSITOR_PROBE,
+            frame_count: 1,
+            frame_interval_ms: 16,
+            width,
+            height,
+            first_frame: 0,
+            reserved0: 0,
+            seed: 0x4750_5543_4f4d_5032,
+            reserved: [0; 3],
+        }
+    }
+
     /// Проверяет bounded duration и все зарезервированные поля.
     pub fn validate(&self) -> Result<(), GpuAbiError> {
         validate_prefix(self.version, self.size, core::mem::size_of::<Self>())?;
@@ -622,6 +660,10 @@ impl GpuDemoRequest {
             return Err(GpuAbiError::InvalidValue);
         }
         let windowed = self.flags & demo_flag::WINDOWED != 0;
+        let compositor_probe = self.flags & demo_flag::COMPOSITOR_PROBE != 0;
+        if compositor_probe && (!windowed || self.frame_count != 1 || self.first_frame != 0) {
+            return Err(GpuAbiError::InvalidValue);
+        }
         if windowed {
             if !(64..=2048).contains(&self.width) || !(64..=2048).contains(&self.height) {
                 return Err(GpuAbiError::InvalidValue);
@@ -732,6 +774,10 @@ mod tests {
         let frame = GpuRenderFrame::aurora_request(1280, 800, 9, 37);
         assert_eq!(frame.validate(), Ok(()));
         assert_eq!(frame.scene_frame(), 37);
+        assert_eq!(
+            GpuRenderFrame::compositor_probe_request(1280, 800, 10).validate(),
+            Ok(())
+        );
         let request = GpuDemoRequest::new(180);
         assert_eq!(
             GpuDemoRequest::decode_inline(&request.encode_inline()),
@@ -745,6 +791,10 @@ mod tests {
         assert_eq!(
             GpuDemoRequest::decode_inline(&windowed.encode_inline()),
             Ok(windowed)
+        );
+        assert_eq!(
+            GpuDemoRequest::compositor_probe(1280, 800).validate(),
+            Ok(())
         );
     }
 }
