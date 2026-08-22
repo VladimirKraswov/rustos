@@ -33,6 +33,7 @@ use rustos_runtime::{
     ipc_receive, ipc_send, process_exit, sync_timeline_create, sync_timeline_signal,
     sync_timeline_wait, syscall, vm_unmap, Handle, Message, Rights, SharedMemoryMap, VmFlags,
 };
+use rustos_video::SurfaceQueue;
 
 const FRAME_MAGIC: u64 = 0x5255_5354_4f53_4758;
 const GPU_MODE_FLAG: u64 = 1 << 63;
@@ -136,54 +137,55 @@ fn present_swapchain(
     frame_id: &mut u64,
 ) {
     const IMAGE_COUNT: usize = 3;
-    let mut queue: [Option<(u64, PreparedFrame)>; IMAGE_COUNT] = [None; IMAGE_COUNT];
+    let mut queue = SurfaceQueue::<PreparedFrame, IMAGE_COUNT>::new(IMAGE_COUNT)
+        .unwrap_or_else(|_| process_exit(206));
     let mut submitted = 0u32;
     let mut consumed = 0u32;
     while consumed < request.frame_count {
         while submitted < request.frame_count {
-            let Some(slot) = queue.iter_mut().find(|slot| slot.is_none()) else {
+            let Ok(slot) = queue.acquire() else {
                 break;
             };
             *frame_id = frame_id.saturating_add(1);
             let scene = request.first_frame.saturating_add(submitted);
-            *slot = Some((
-                *frame_id,
-                prepare_gpu_frame(width, height, *frame_id, Some(scene), false),
-            ));
+            let prepared = prepare_gpu_frame(width, height, *frame_id, Some(scene), false);
+            queue
+                .publish(slot, *frame_id, prepared)
+                .unwrap_or_else(|_| process_exit(206));
             submitted = submitted.saturating_add(1);
         }
-
-        let oldest = queue
+        let selection = queue
+            .select_mailbox(prepared_ready)
+            .unwrap_or_else(|_| process_exit(206));
+        for stale in selection
+            .dropped
             .iter()
-            .enumerate()
-            .filter_map(|(index, slot)| slot.map(|(id, _)| (index, id)))
-            .min_by_key(|(_, id)| *id)
-            .map(|(index, _)| index)
-            .unwrap_or_else(|| process_exit(206));
-        let newest_ready = queue
-            .iter()
-            .enumerate()
-            .filter_map(|(index, slot)| {
-                slot.filter(|(_, frame)| prepared_ready(*frame))
-                    .map(|(id, _)| (index, id))
-            })
-            .max_by_key(|(_, id)| *id)
-            .map(|(index, _)| index);
-        let selected = newest_ready.unwrap_or(oldest);
-        let selected_id = queue[selected].expect("selected swapchain frame").0;
-        for slot in &mut queue {
-            if slot.is_some_and(|(id, _)| id < selected_id) {
-                let (_, stale) = slot.take().expect("stale frame");
-                discard_frame(stale);
-                consumed = consumed.saturating_add(1);
-            }
+            .take(selection.dropped_count)
+            .flatten()
+        {
+            discard_frame(*stale);
+            consumed = consumed.saturating_add(1);
         }
-        let (id, prepared) = queue[selected].take().expect("selected frame");
+        let (slot, id, prepared) = selection.selected;
         present_frame(display, feedback, info, prepared, id);
+        queue.release(slot).unwrap_or_else(|_| process_exit(206));
         consumed = consumed.saturating_add(1);
     }
-    for slot in queue.into_iter().flatten() {
-        discard_frame(slot.1);
+    // Более новые GPU frames могли остаться ready после последнего requested
+    // present. Отменяем их явно и закрываем полученные capabilities.
+    while let Ok(selection) = queue.select_mailbox(|_| true) {
+        for stale in selection
+            .dropped
+            .iter()
+            .take(selection.dropped_count)
+            .flatten()
+        {
+            discard_frame(*stale);
+        }
+        discard_frame(selection.selected.2);
+        queue
+            .release(selection.selected.0)
+            .unwrap_or_else(|_| process_exit(206));
     }
 }
 

@@ -312,6 +312,7 @@ dependencies = [
  "rustos-rune-loader",
  "rustos-runtime",
  "rustos-vfs-client",
+ "rustos-video",
  "rustos-virgl",
  "varaniafs",
 ]

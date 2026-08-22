@@ -63,7 +63,7 @@ done
 
 grep -Fq '[gpu-demo] AURORA_3D_READY frames=48 renderer=mesa-virgl cpu-raster=no' "$SERIAL_LOG"
 grep -Fq '[gpu] swapchain=triple mailbox=latest peak-inflight=3' "$SERIAL_LOG"
-grep -Fq '[gpu-compositor] layers=2 damage=scissor blend=premultiplied readback=0 cpu-raster=0' "$SERIAL_LOG"
+grep -Fq '[gpu-compositor] layers=3 damage=scissor blend=premultiplied readback=0 cpu-raster=0' "$SERIAL_LOG"
 grep -Fq '[virgl-test] WINDOWED_READBACK_READY source=host-gpu cpu-raster=no' "$SERIAL_LOG"
 grep -Fq '[virgl-test] MESA_SHOWCASE_READY scanout=graphics-buffer cpu-raster=no' "$SERIAL_LOG"
 grep -Eq '\[irq\] virtio-gpu completion=intid-[0-9]+ mode=interrupt fallback=timer-poll' \

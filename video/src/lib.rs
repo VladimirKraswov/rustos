@@ -16,6 +16,7 @@ mod mode_policy;
 mod pixel;
 pub mod protocol;
 mod scanout;
+mod surface_queue;
 mod window;
 
 pub use compositor::{composite, Layer};
@@ -27,6 +28,9 @@ pub use pixel::{Color, CpuPixelFormat, Rgba};
 pub use scanout::{
     ColorMode, ConnectorInfo, ConnectorKind, DisplayDriver, DisplayMode, ModeSetError,
     PresentStats, Scanout, ScanoutCapabilities, ScanoutError,
+};
+pub use surface_queue::{
+    MailboxSelection, SurfaceQueue, SurfaceQueueError, SurfaceSlotState, SurfaceSlotToken,
 };
 pub use window::{
     hit_test_resize, resize_from_edges, ManagedWindow, ResizeEdges, WindowError, WindowEventQueue,

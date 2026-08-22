@@ -109,3 +109,4 @@ rustos-rune-format = { path = "../../rune-format" }
 varaniafs = { path = "../../varaniafs" }
 rustos-virgl = { path = "../../libs/virgl" }
 rustos-mesa = { path = "../../libs/mesa" }
+rustos-video = { path = "../../video" }

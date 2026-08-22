@@ -91,7 +91,7 @@ pub extern "C" fn _start(frame_endpoint: u64, render_capability: u64, abi_versio
         slot.timeline = Handle(timeline_value as u32);
     }
     let mut vertex_resource = 0u32;
-    let mut compositor_textures = [0u32; 2];
+    let mut compositor_textures = [0u32; 3];
     let mut next_slot = 0usize;
     let mut mesa_context: Option<rustos_mesa::Context> = None;
 
@@ -274,7 +274,7 @@ fn encode_compositor_probe(
     width: u32,
     height: u32,
     target_resource: u32,
-    textures: [u32; 2],
+    textures: [u32; 3],
 ) -> Result<usize, ()> {
     use rustos_virgl::{
         encode_composite_pass, encode_texture_upload, BlitRect, CompositeLayer, FORMAT_BGRA8888,
@@ -289,6 +289,9 @@ fn encode_compositor_probe(
     const PANEL: [u8; 16] = [
         170, 82, 28, 208, 188, 98, 36, 208, 150, 70, 24, 208, 204, 116, 44, 208,
     ];
+    const ACCENT: [u8; 16] = [
+        210, 112, 42, 232, 224, 132, 52, 232, 188, 92, 34, 232, 238, 150, 62, 232,
+    ];
 
     let mut length = 0usize;
     length += encode_texture_upload(
@@ -297,6 +300,14 @@ fn encode_compositor_probe(
         BlitRect::new(0, 0, 2, 2),
         4,
         &BACKGROUND,
+    )
+    .map_err(|_| ())?;
+    length += encode_texture_upload(
+        commands.get_mut(length..).ok_or(())?,
+        textures[2],
+        BlitRect::new(0, 0, 2, 2),
+        4,
+        &ACCENT,
     )
     .map_err(|_| ())?;
     length += encode_texture_upload(
@@ -328,6 +339,19 @@ fn encode_compositor_probe(
                 (height - panel_height) / 2,
                 panel_width,
                 panel_height,
+            ),
+            linear_filter: true,
+            alpha_blend: true,
+        },
+        CompositeLayer {
+            resource: textures[2],
+            format: FORMAT_BGRA8888,
+            source: BlitRect::new(0, 0, 2, 2),
+            destination: BlitRect::new(
+                (width - panel_width) / 2 + panel_width / 12,
+                (height - panel_height) / 2 + panel_height / 8,
+                panel_width.saturating_mul(5) / 6,
+                (panel_height / 7).max(1),
             ),
             linear_filter: true,
             alpha_blend: true,

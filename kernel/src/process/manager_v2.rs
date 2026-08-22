@@ -5148,7 +5148,7 @@ pub(super) fn run_gpu_compositor_probe(width: u32, height: u32) -> Result<(), Pr
         return Err(ProcessError::UnexpectedExit);
     }
     serial::put_str(
-        "[gpu-compositor] layers=2 damage=scissor blend=premultiplied readback=0 cpu-raster=0\n",
+        "[gpu-compositor] layers=3 damage=scissor blend=premultiplied readback=0 cpu-raster=0\n",
     );
     Ok(())
 }
