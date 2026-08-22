@@ -121,14 +121,24 @@ Payload `DisplayPresentRequest` занимает 64 байта. Четыре cap
 `DisplayPresentFeedback` связывает `frame_id`, display sequence, actual time,
 refresh interval и output.
 
+`surface.dll` создаёт отдельный dynamic event endpoint для каждого клиента и
+скрывает wire protocol. Обычный ring-3 процесс уже проходит полный цикл
+`create -> commit -> direct scanout -> release timeline + presentation
+feedback -> destroy`; compositor связывает `SurfaceId` с неподделываемым
+`sender_pid`, валидирует buffer descriptor и не читает pixels CPU. Если клиент
+падает, kernel отзывает его event endpoint, а compositor лениво удаляет stale
+metadata.
+
 Интерактивный desktop пока рисует kernel bootstrap compositor через тот же
 глобальный scanout broker. Это аварийный клиент, а не окончательная граница:
-следующий графический рубеж — подключить окна к surface queues постоянного
-ring-3 compositor и оставить kernel renderer только для panic/recovery screen.
+следующий графический рубеж — multi-layer GPU pass для оконных surface и
+перенос desktop на `surface.dll`, после чего kernel renderer остаётся только
+для panic/recovery screen.
 
 Критерий integration test:
 
 ```text
 [graphics-abi-v7] graphics-buffer sync-timeline atomic-present supervisor-restart verified
+[surface] ring3 create/commit/direct-scanout/release/feedback/destroy verified
 [supervisor] persistent renderd/compositord/displayd services ready
 ```

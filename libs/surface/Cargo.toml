@@ -1,0 +1,17 @@
+[package]
+name = "rustos-surface-client"
+description = "Безопасный client facade surface.dll поверх capability IPC"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lib]
+name = "rustos_surface"
+path = "src/lib.rs"
+crate-type = ["rlib"]
+
+[dependencies]
+rustos-abi = { path = "../../abi" }
+rustos-runtime = { path = "../../runtime" }

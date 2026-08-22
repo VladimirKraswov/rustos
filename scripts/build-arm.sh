@@ -50,7 +50,7 @@ rm -rf "$ARM_RUNE_ROOT"
 mkdir -p "$ARM_RUNE_DIR" "$ARM_RUNE_LIB_DIR" "$ARM_RUNE_APP_DIR"
 for program in \
     init fault-test preempt-a preempt-b ipc-receiver ipc-sender \
-    abi-lifecycle abi-child displayd compositord renderd gpu-demo vfsd vfs-test vfs-persistence \
+    abi-lifecycle abi-child displayd compositord renderd gpu-demo surface-test vfsd vfs-test vfs-persistence \
     loader-test loader-child rune-runner
 do
     cargo run -q -p rustos-rune -- \

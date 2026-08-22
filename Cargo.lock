@@ -311,6 +311,7 @@ dependencies = [
  "rustos-rune-format",
  "rustos-rune-loader",
  "rustos-runtime",
+ "rustos-surface-client",
  "rustos-vfs-client",
  "rustos-video",
  "rustos-virgl",
@@ -431,6 +432,14 @@ name = "rustos-sdk-hello"
 version = "0.1.0"
 dependencies = [
  "rustos-crt",
+]
+
+[[package]]
+name = "rustos-surface-client"
+version = "0.1.0"
+dependencies = [
+ "rustos-abi",
+ "rustos-runtime",
 ]
 
 [[package]]

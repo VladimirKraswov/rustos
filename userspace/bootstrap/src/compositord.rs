@@ -21,15 +21,23 @@ use rustos_abi::{
         GPU_RENDERED_FRAME_HANDLE_COUNT, GPU_RENDERED_FRAME_OPCODE, GPU_RENDER_REQUEST_OPCODE,
     },
     graphics_buffer::{BufferUsage, GraphicsBufferDesc, MemoryDomain, PixelFormatCode},
-    ipc::TransferredHandle,
+    ipc::{flags as ipc_flags, TransferredHandle},
     memory::MEMORY_ABI_VERSION,
-    surface::{SurfaceCommit, SurfaceCreateRequest, SurfaceId, SurfaceMetrics},
+    surface::{
+        commit_flags, feedback_flags, BufferReleased, PresentationFeedback, PresentationStatus,
+        SurfaceCommit, SurfaceCreateRequest, SurfaceCreated, SurfaceDestroyRequest, SurfaceId,
+        SurfaceMetrics, SURFACE_ABI_VERSION, SURFACE_BUFFER_RELEASED_OPCODE,
+        SURFACE_COMMIT_FULL_HANDLE_COUNT, SURFACE_COMMIT_OPCODE, SURFACE_CREATED_OPCODE,
+        SURFACE_CREATE_HANDLE_COUNT, SURFACE_CREATE_OPCODE, SURFACE_DESTROY_OPCODE,
+        SURFACE_PRESENTATION_FEEDBACK_OPCODE, SURFACE_RELEASE_HANDLE_COUNT,
+    },
     sync::{SyncTimelineCreate, SyncTimelineSignal, SyncTimelineWait, SYNC_TIMEOUT_INFINITE},
 };
 use rustos_runtime::{
     graphics_buffer_create, graphics_buffer_get_info, graphics_buffer_map, handle_close,
-    ipc_receive, ipc_send, process_exit, sync_timeline_create, sync_timeline_signal,
-    sync_timeline_wait, syscall, vm_unmap, Handle, Message, Rights, SharedMemoryMap, VmFlags,
+    handle_duplicate, ipc_receive, ipc_send, process_exit, sync_timeline_create,
+    sync_timeline_signal, sync_timeline_wait, syscall, vm_unmap, Handle, Message, Rights,
+    SharedMemoryMap, VmFlags,
 };
 use rustos_video::SurfaceQueue;
 
@@ -37,7 +45,8 @@ const FRAME_MAGIC: u64 = 0x5255_5354_4f53_4758;
 const GPU_MODE_FLAG: u64 = 1 << 63;
 const GPU_FRAME_ENDPOINT: Handle = Handle(4);
 const GPU_CONTROL_ENDPOINT: Handle = Handle(5);
-const DEMO_CONTROL_ENDPOINT: Handle = Handle(6);
+const SURFACE_CONTROL_ENDPOINT: Handle = Handle(6);
+const MAX_CLIENT_SURFACES: usize = 16;
 
 #[derive(Clone, Copy)]
 struct PreparedFrame {
@@ -45,6 +54,33 @@ struct PreparedFrame {
     buffer: Handle,
     acquire: Handle,
     acquire_value: u64,
+}
+
+#[derive(Clone, Copy)]
+struct ClientSurface {
+    owner_pid: u64,
+    id: SurfaceId,
+    events: Handle,
+    metrics: SurfaceMetrics,
+    queue_depth: u16,
+    generation: u64,
+    last_frame_id: u64,
+}
+
+impl ClientSurface {
+    const EMPTY: Self = Self {
+        owner_pid: 0,
+        id: SurfaceId::INVALID,
+        events: Handle::INVALID,
+        metrics: SurfaceMetrics::new(1, 1, 1, 1, 1000),
+        queue_depth: 0,
+        generation: 0,
+        last_frame_id: 0,
+    };
+
+    const fn is_empty(self) -> bool {
+        self.owner_pid == 0
+    }
 }
 
 #[no_mangle]
@@ -57,34 +93,53 @@ pub extern "C" fn _start(display_endpoint: u64, feedback_endpoint: u64, abi_vers
     let feedback_endpoint = Handle(feedback_endpoint as u32);
     let info = query_display(display_endpoint, feedback_endpoint);
     let mut frame_id = 1u64;
+    let mut next_surface_id = 1u64;
+    let mut surfaces = [ClientSurface::EMPTY; MAX_CLIENT_SURFACES];
     // Стартовый desktop остаётся обычным CPU buffer. Иначе первый GPU кадр
     // навсегда зафиксировал бы размер renderd target равным scanout и не дал
     // бы приложениям создавать компактные оконные surfaces.
     let first = prepare_cpu_frame(info);
     present_frame(display_endpoint, feedback_endpoint, info, first, frame_id);
 
-    if !gpu_mode {
-        loop {
-            let mut idle = Message::EMPTY;
-            if ipc_receive(feedback_endpoint, &mut idle) != syscall::status::OK {
-                process_exit(197);
-            }
-        }
-    }
-
     loop {
         let mut control = Message::EMPTY;
-        if ipc_receive(DEMO_CONTROL_ENDPOINT, &mut control) != syscall::status::OK
-            || control.header.opcode != GPU_DEMO_START_OPCODE
-            || control.header.payload_len != 64
-            || control.header.handle_count != 0
+        if ipc_receive(SURFACE_CONTROL_ENDPOINT, &mut control) != syscall::status::OK
             || control.header.sender_pid == 0
         {
             process_exit(210);
         }
+        match control.header.opcode {
+            SURFACE_CREATE_OPCODE => {
+                handle_surface_create(&control, &mut surfaces, &mut next_surface_id);
+                continue;
+            }
+            SURFACE_COMMIT_OPCODE => {
+                handle_surface_commit(
+                    display_endpoint,
+                    feedback_endpoint,
+                    info,
+                    &control,
+                    &mut surfaces,
+                );
+                continue;
+            }
+            SURFACE_DESTROY_OPCODE => {
+                handle_surface_destroy(&control, &mut surfaces);
+                continue;
+            }
+            GPU_DEMO_START_OPCODE if gpu_mode => {}
+            _ => {
+                close_transferred_handles(&control);
+                continue;
+            }
+        }
+        if control.header.payload_len != 64 || control.header.handle_count != 0 {
+            close_transferred_handles(&control);
+            continue;
+        }
         let request = match GpuDemoRequest::decode_inline(&control.payload) {
             Ok(request) => request,
-            Err(_) => process_exit(211),
+            Err(_) => continue,
         };
         let windowed = request.flags & demo_flag::WINDOWED != 0;
         let compositor_probe = request.flags & demo_flag::COMPOSITOR_PROBE != 0;
@@ -120,6 +175,252 @@ pub extern "C" fn _start(display_endpoint: u64, feedback_endpoint: u64, abi_vers
             );
         }
     }
+}
+
+fn handle_surface_create(
+    message: &Message,
+    surfaces: &mut [ClientSurface; MAX_CLIENT_SURFACES],
+    next_surface_id: &mut u64,
+) {
+    if message.header.payload_len as usize != core::mem::size_of::<SurfaceCreateRequest>()
+        || message.header.handle_count != SURFACE_CREATE_HANDLE_COUNT
+    {
+        close_transferred_handles(message);
+        return;
+    }
+    let request = match SurfaceCreateRequest::decode_inline(
+        &message.payload[..core::mem::size_of::<SurfaceCreateRequest>()],
+    ) {
+        Ok(request) => request,
+        Err(_) => {
+            close_transferred_handles(message);
+            return;
+        }
+    };
+    let events = message.handles[0].handle;
+    // После аварийного завершения клиента kernel уже отозвал event endpoint.
+    // Ленивая проверка освобождает server metadata без глобального PID lookup.
+    for surface in surfaces.iter_mut().filter(|surface| !surface.is_empty()) {
+        let probe = handle_duplicate(surface.events, Rights::SEND);
+        if probe > 0 {
+            let _ = handle_close(Handle(probe as u32));
+        } else {
+            *surface = ClientSurface::EMPTY;
+        }
+    }
+    let Some(slot) = surfaces.iter_mut().find(|surface| surface.is_empty()) else {
+        let _ = handle_close(events);
+        return;
+    };
+    let id = SurfaceId(*next_surface_id);
+    *next_surface_id = next_surface_id.wrapping_add(1).max(1);
+    let created = SurfaceCreated::new(id, request.queue_depth, 1);
+    let mut response = Message::EMPTY;
+    response.header.opcode = SURFACE_CREATED_OPCODE;
+    response.header.flags = ipc_flags::REPLY;
+    response.header.request_id = message.header.request_id;
+    response.header.payload_len = 64;
+    response.payload = created.encode_inline();
+    if ipc_send(events, &response) != syscall::status::OK {
+        let _ = handle_close(events);
+        return;
+    }
+    *slot = ClientSurface {
+        owner_pid: message.header.sender_pid,
+        id,
+        events,
+        metrics: request.metrics,
+        queue_depth: request.queue_depth,
+        generation: 1,
+        last_frame_id: 0,
+    };
+}
+
+fn handle_surface_destroy(message: &Message, surfaces: &mut [ClientSurface; MAX_CLIENT_SURFACES]) {
+    if message.header.payload_len != 64 || message.header.handle_count != 0 {
+        close_transferred_handles(message);
+        return;
+    }
+    let request = match SurfaceDestroyRequest::decode_inline(&message.payload) {
+        Ok(request) => request,
+        Err(_) => return,
+    };
+    let Some(slot) = surfaces.iter_mut().find(|surface| {
+        surface.owner_pid == message.header.sender_pid && surface.id == request.surface
+    }) else {
+        return;
+    };
+    let _ = handle_close(slot.events);
+    *slot = ClientSurface::EMPTY;
+}
+
+fn handle_surface_commit(
+    display: Handle,
+    feedback_endpoint: Handle,
+    info: DisplayScanoutInfo,
+    message: &Message,
+    surfaces: &mut [ClientSurface; MAX_CLIENT_SURFACES],
+) {
+    if message.header.payload_len != 64
+        || message.header.handle_count != SURFACE_COMMIT_FULL_HANDLE_COUNT
+    {
+        close_transferred_handles(message);
+        return;
+    }
+    let commit = match SurfaceCommit::decode_inline(&message.payload) {
+        Ok(commit) if commit.flags & commit_flags::FULL_DAMAGE != 0 => commit,
+        _ => {
+            close_transferred_handles(message);
+            return;
+        }
+    };
+    let Some(surface_index) = surfaces.iter().position(|surface| {
+        surface.owner_pid == message.header.sender_pid && surface.id == commit.surface
+    }) else {
+        close_transferred_handles(message);
+        return;
+    };
+    let surface = surfaces[surface_index];
+    if surface.generation == 0
+        || commit.metrics != surface.metrics
+        || commit.buffer_slot >= surface.queue_depth
+        || commit.frame_id <= surface.last_frame_id
+    {
+        close_transferred_handles(message);
+        return;
+    }
+    let buffer = message.handles[0].handle;
+    let acquire = message.handles[1].handle;
+    let mut descriptor = empty_descriptor();
+    if graphics_buffer_get_info(buffer, &mut descriptor) != syscall::status::OK
+        || descriptor.validate().is_err()
+        || descriptor.width != commit.metrics.physical_width
+        || descriptor.height != commit.metrics.physical_height
+        || !matches!(
+            descriptor.format,
+            PixelFormatCode::B8G8R8A8_UNORM | PixelFormatCode::B8G8R8X8_UNORM
+        )
+        || !descriptor.usage.contains(BufferUsage::RENDER_TARGET)
+        || sync_timeline_wait(&SyncTimelineWait::new(acquire, 1, 250_000_000))
+            != syscall::status::OK
+    {
+        close_transferred_handles(message);
+        return;
+    }
+    surfaces[surface_index].last_frame_id = commit.frame_id;
+    let prepared = PreparedFrame {
+        descriptor,
+        buffer,
+        acquire,
+        acquire_value: 1,
+    };
+    // До включения multi-layer render pass только surface, совпадающая со
+    // scanout, получает честный zero-copy fast path. Оконный buffer никогда
+    // не скачивается на CPU: он будет принят новым GPU compositor stage.
+    if descriptor.width != info.width || descriptor.height != info.height {
+        release_dropped_surface(surface, commit, prepared);
+        return;
+    }
+    let (display_feedback, release) =
+        present_frame_raw(display, feedback_endpoint, info, prepared, commit.frame_id);
+    send_surface_release(surface, commit, release);
+    if commit.flags & commit_flags::REQUEST_FEEDBACK != 0 {
+        let feedback = PresentationFeedback {
+            version: SURFACE_ABI_VERSION,
+            size: core::mem::size_of::<PresentationFeedback>() as u16,
+            status: PresentationStatus::PRESENTED,
+            flags: feedback_flags::DIRECT_SCANOUT,
+            surface: surface.id,
+            frame_id: commit.frame_id,
+            sequence: display_feedback.sequence,
+            actual_time_ns: display_feedback.actual_time_ns,
+            refresh_interval_ns: display_feedback.refresh_interval_ns,
+            output: display_feedback.output,
+            reserved_tail: 0,
+        };
+        send_surface_feedback(surface.events, message.header.request_id, feedback);
+    }
+    close_prepared_and_release(prepared, release);
+}
+
+fn release_dropped_surface(surface: ClientSurface, commit: SurfaceCommit, prepared: PreparedFrame) {
+    let release_value = sync_timeline_create(&SyncTimelineCreate::new(0));
+    if release_value <= 0 {
+        discard_frame(prepared);
+        return;
+    }
+    let release = Handle(release_value as u32);
+    if sync_timeline_signal(&SyncTimelineSignal::new(release, 1)) == syscall::status::OK {
+        send_surface_release(surface, commit, release);
+        if commit.flags & commit_flags::REQUEST_FEEDBACK != 0 {
+            let dropped = PresentationFeedback {
+                version: SURFACE_ABI_VERSION,
+                size: core::mem::size_of::<PresentationFeedback>() as u16,
+                status: PresentationStatus::DROPPED,
+                flags: 0,
+                surface: surface.id,
+                frame_id: commit.frame_id,
+                sequence: 0,
+                actual_time_ns: 0,
+                refresh_interval_ns: 0,
+                output: rustos_abi::surface::OutputId::NONE,
+                reserved_tail: 0,
+            };
+            send_surface_feedback(surface.events, commit.frame_id, dropped);
+        }
+    }
+    close_prepared_and_release(prepared, release);
+}
+
+fn send_surface_release(surface: ClientSurface, commit: SurfaceCommit, release: Handle) {
+    let released = BufferReleased {
+        version: SURFACE_ABI_VERSION,
+        size: core::mem::size_of::<BufferReleased>() as u16,
+        flags: 0,
+        surface: surface.id,
+        frame_id: commit.frame_id,
+        release_value: 1,
+        buffer_slot: commit.buffer_slot,
+        reserved_header: [0; 3],
+        reserved: [0; 3],
+    };
+    let mut response = Message::EMPTY;
+    response.header.opcode = SURFACE_BUFFER_RELEASED_OPCODE;
+    response.header.request_id = commit.frame_id;
+    response.header.payload_len = 64;
+    response.header.handle_count = SURFACE_RELEASE_HANDLE_COUNT;
+    response.payload = released.encode_inline();
+    response.handles[0] = TransferredHandle {
+        handle: release,
+        reserved: 0,
+        rights: Rights::WAIT,
+    };
+    let _ = ipc_send(surface.events, &response);
+}
+
+fn send_surface_feedback(events: Handle, request_id: u64, feedback: PresentationFeedback) {
+    let mut response = Message::EMPTY;
+    response.header.opcode = SURFACE_PRESENTATION_FEEDBACK_OPCODE;
+    response.header.request_id = request_id;
+    response.header.payload_len = 64;
+    response.payload = feedback.encode_inline();
+    let _ = ipc_send(events, &response);
+}
+
+fn close_transferred_handles(message: &Message) {
+    for transferred in message
+        .handles
+        .iter()
+        .take(message.header.handle_count as usize)
+    {
+        let _ = handle_close(transferred.handle);
+    }
+}
+
+fn close_prepared_and_release(prepared: PreparedFrame, release: Handle) {
+    let _ = handle_close(prepared.buffer);
+    let _ = handle_close(prepared.acquire);
+    let _ = handle_close(release);
 }
 
 /// Держит до трёх GPU кадров впереди displayd. Если более свежий frame уже
@@ -194,6 +495,17 @@ fn present_frame(
     prepared: PreparedFrame,
     frame_id: u64,
 ) {
+    let (_, release) = present_frame_raw(display, feedback_endpoint, info, prepared, frame_id);
+    close_prepared_and_release(prepared, release);
+}
+
+fn present_frame_raw(
+    display: Handle,
+    feedback_endpoint: Handle,
+    info: DisplayScanoutInfo,
+    prepared: PreparedFrame,
+    frame_id: u64,
+) -> (DisplayPresentFeedback, Handle) {
     let release_value = sync_timeline_create(&SyncTimelineCreate::new(0));
     if release_value <= 0 {
         process_exit(187);
@@ -260,12 +572,7 @@ fn present_frame(
     if feedback.frame_id != frame_id || feedback.output != info.output {
         process_exit(196);
     }
-    if handle_close(prepared.buffer) != syscall::status::OK
-        || handle_close(prepared.acquire) != syscall::status::OK
-        || handle_close(release) != syscall::status::OK
-    {
-        process_exit(193);
-    }
+    (feedback, release)
 }
 
 fn prepare_cpu_frame(info: DisplayScanoutInfo) -> PreparedFrame {

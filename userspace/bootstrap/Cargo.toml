@@ -60,6 +60,10 @@ name = "rustos-gpu-demo"
 path = "src/gpu_demo.rs"
 
 [[bin]]
+name = "rustos-surface-test"
+path = "src/surface_test.rs"
+
+[[bin]]
 name = "rustos-vfs-test"
 path = "src/vfs_test.rs"
 
@@ -110,3 +114,4 @@ varaniafs = { path = "../../varaniafs" }
 rustos-virgl = { path = "../../libs/virgl" }
 rustos-mesa = { path = "../../libs/mesa" }
 rustos-video = { path = "../../video" }
+rustos-surface-client = { path = "../../libs/surface" }

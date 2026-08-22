@@ -142,6 +142,7 @@ patterns=(
     "\[ipc\] queued block/wake and attenuated VFS capability verified"
     "\[abi-v8\] spawn/wait/kill threads VM shared-memory dynamic-endpoint TLS clock verified"
     "\[graphics-abi-v7\] graphics-buffer sync-timeline atomic-present supervisor-restart verified"
+    "\[surface\] ring3 create/commit/direct-scanout/release/feedback/destroy verified"
     "\[std\] allocator fs threads futex process pipes stdio native SDK and VFS executable verified in ring3 RUNE"
     "\[vfsd\] restart recovered committed VaraniaFS metadata and file data"
     "\[loader\] RUNE interfaces imports ABI TLS RELRO and cross-process shared RX verified"

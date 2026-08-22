@@ -71,8 +71,11 @@ lifetime и блокирующий wait-many. Постоянный RUNE `display
 владеет непередаваемой scanout capability. При VirGL постоянный `renderd`
 отдельно владеет render capability, отправляет асинхронные 3D-команды и
 передаёт GPU-only buffer compositor'у; `compositord` выполняет atomic present,
-ждёт оценочный vblank и получает feedback. Интерактивный desktop пока
-использует CPU raster/damage bootstrap через тот же broker. Контракт описан в
+ждёт оценочный vblank и получает feedback. Клиентская `surface.dll` уже
+реализует process-owned event endpoint и полный lifecycle полноэкранной
+zero-copy surface. Интерактивный desktop пока использует CPU raster/damage
+bootstrap через тот же broker; оконная multi-layer композиция остаётся
+следующим переключением. Контракт описан в
 [GRAPHICS_ABI.md](GRAPHICS_ABI.md), [GPU_RENDERING.md](GPU_RENDERING.md) и
 [ADR-0001](adr/0001-modern-graphics-architecture.md). Проверяемые критерии
 перехода всего desktop на GPU и порядок удаления bootstrap readback закреплены

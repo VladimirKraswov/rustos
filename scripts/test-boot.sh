@@ -166,6 +166,7 @@ if [[ "$DISPLAY_BACKEND" == "virtio" ]]; then
         "\[selftest\] framebuffer first pixel = 0x[0-9a-f]*"
         "\[hardware\] display-driver=virtio-gpu transport=modern-pci mode=1280x800 preferred=1280x800 edid=(valid|unavailable) outputs=[1-9][0-9]* renderer=cpu"
         "\[graphics-abi-v7\] graphics-buffer sync-timeline atomic-present supervisor-restart verified"
+        "\[surface\] ring3 create/commit/direct-scanout/release/feedback/destroy verified"
     )
 else
     patterns+=(

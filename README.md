@@ -150,8 +150,11 @@ runtime, interrupt routing, TLB shootdown и work stealing. Постоянный
 `displayd` уже один владеет scanout capability, `renderd` отдельно владеет
 3D render capability, а `compositord` передаёт готовые GraphicsBuffer через
 atomic present и получает presentation feedback. Подключение оконных
-surface queues, input и desktop к этим ring-3 сервисам ещё впереди. Нативный
-`rustc` ещё не заявлен готовым.
+surface queues начато: `surface.dll` и boot-test уже проходят полный
+`create/commit/direct-scanout/release/feedback/destroy` между независимым
+ring-3 приложением и compositord. Multi-layer GPU composition, input и сам
+desktop ещё не переключены на этот путь. Нативный `rustc` ещё не заявлен
+готовым.
 
 Подробнее: [архитектуры CPU](docs/ARCHITECTURES.md), [архитектура системы](docs/ARCHITECTURE.md),
 [графическая подсистема](docs/GUI.md), [видеосистема](docs/VIDEO.md), [VFS](docs/VFS.md),

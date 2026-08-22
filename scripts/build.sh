@@ -33,7 +33,7 @@ RUNE_APP_DIR="$ROOT/build/rune-system/apps"
 mkdir -p "$RUNE_DIR" "$RUNE_LIB_DIR" "$RUNE_APP_DIR"
 for program in \
     init fault-test preempt-a preempt-b ipc-receiver ipc-sender \
-    abi-lifecycle abi-child displayd compositord renderd gpu-demo vfsd vfs-test vfs-persistence \
+    abi-lifecycle abi-child displayd compositord renderd gpu-demo surface-test vfsd vfs-test vfs-persistence \
     loader-test loader-child rune-runner std-smoke std-main std-child rune
 do
     PROGRAM_ELF="$ROOT/target/x86_64-unknown-rustos/debug/rustos-$program"

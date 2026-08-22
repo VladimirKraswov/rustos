@@ -5793,6 +5793,10 @@ fn run_graphics_service_phase(manager: &mut ProcessManager) -> Result<bool, Proc
         manager.cleanup();
         return Err(ProcessError::UnexpectedExit);
     }
+    run_surface_protocol_phase(manager, first)?;
+    serial::put_str(
+        "[surface] ring3 create/commit/direct-scanout/release/feedback/destroy verified\n",
+    );
 
     // Supervisor fault drill: завершаем оба blocked процесса, полностью
     // отзываем их handles/mappings и запускаем пару заново. Второй frame
@@ -5831,12 +5835,12 @@ fn spawn_graphics_services(manager: &mut ProcessManager) -> Result<GraphicsServi
     const FEEDBACK_ENDPOINT: u8 = 3;
     const GPU_FRAME_ENDPOINT: u8 = 4;
     const GPU_CONTROL_ENDPOINT: u8 = 5;
-    const DEMO_CONTROL_ENDPOINT: u8 = 6;
+    const SURFACE_CONTROL_ENDPOINT: u8 = 6;
     const DISPLAY_SLOT: usize = 2;
     const DEVICE_OR_FEEDBACK_SLOT: usize = 3;
     const GPU_FRAME_SLOT: usize = 4;
     const GPU_CONTROL_SLOT: usize = 5;
-    const DEMO_CONTROL_SLOT: usize = 6;
+    const SURFACE_CONTROL_SLOT: usize = 6;
     const GPU_MODE_FLAG: u64 = 1 << 63;
     let use_gpu = scanout::render_info().is_ok();
 
@@ -5875,6 +5879,10 @@ fn spawn_graphics_services(manager: &mut ProcessManager) -> Result<GraphicsServi
         kind: CapabilityKind::Endpoint(FEEDBACK_ENDPOINT),
         rights: Rights::SEND.union(Rights::RECEIVE).union(Rights::TRANSFER),
     };
+    compositor_caps[SURFACE_CONTROL_SLOT] = CapabilityEntry {
+        kind: CapabilityKind::Endpoint(SURFACE_CONTROL_ENDPOINT),
+        rights: Rights::RECEIVE,
+    };
     if use_gpu {
         compositor_caps[GPU_FRAME_SLOT] = CapabilityEntry {
             kind: CapabilityKind::Endpoint(GPU_FRAME_ENDPOINT),
@@ -5883,10 +5891,6 @@ fn spawn_graphics_services(manager: &mut ProcessManager) -> Result<GraphicsServi
         compositor_caps[GPU_CONTROL_SLOT] = CapabilityEntry {
             kind: CapabilityKind::Endpoint(GPU_CONTROL_ENDPOINT),
             rights: Rights::SEND,
-        };
-        compositor_caps[DEMO_CONTROL_SLOT] = CapabilityEntry {
-            kind: CapabilityKind::Endpoint(DEMO_CONTROL_ENDPOINT),
-            rights: Rights::RECEIVE,
         };
     }
     let compositor = manager.spawn_internal(
@@ -5905,6 +5909,7 @@ fn spawn_graphics_services(manager: &mut ProcessManager) -> Result<GraphicsServi
         None,
     )?;
     manager.endpoints[FEEDBACK_ENDPOINT as usize].receiver = compositor;
+    manager.endpoints[SURFACE_CONTROL_ENDPOINT as usize].receiver = compositor;
     let render = if use_gpu {
         let mut render_caps = [EMPTY_CAPABILITY; MAX_CAPABILITIES];
         render_caps[DISPLAY_SLOT] = CapabilityEntry {
@@ -5936,7 +5941,6 @@ fn spawn_graphics_services(manager: &mut ProcessManager) -> Result<GraphicsServi
         )?;
         manager.endpoints[GPU_FRAME_ENDPOINT as usize].receiver = compositor;
         manager.endpoints[GPU_CONTROL_ENDPOINT as usize].receiver = render;
-        manager.endpoints[DEMO_CONTROL_ENDPOINT as usize].receiver = compositor;
         Some(render)
     } else {
         None
@@ -5950,16 +5954,57 @@ fn spawn_graphics_services(manager: &mut ProcessManager) -> Result<GraphicsServi
 
 fn graphics_services_blocked(manager: &ProcessManager, services: GraphicsServices) -> bool {
     service_blocked_on(manager, services.display, 0)
-        && service_blocked_on(
-            manager,
-            services.compositor,
-            if services.render.is_some() { 6 } else { 3 },
-        )
+        && service_blocked_on(manager, services.compositor, 6)
         && services
             .render
             .is_none_or(|render| service_blocked_on(manager, render, 5))
         && manager.display_present_sequence == manager.display_completed_sequence
         && manager.display_completed_sequence != 0
+}
+
+fn run_surface_protocol_phase(
+    manager: &mut ProcessManager,
+    services: GraphicsServices,
+) -> Result<(), ProcessError> {
+    const SURFACE_CONTROL_ENDPOINT: u8 = 6;
+    const SURFACE_CONTROL_SLOT: usize = 2;
+    let info = scanout::info().map_err(|_| ProcessError::UnexpectedExit)?;
+    let packed_dimensions = u64::from(info.width) | (u64::from(info.height) << 32);
+    let mut capabilities = [EMPTY_CAPABILITY; MAX_CAPABILITIES];
+    capabilities[SURFACE_CONTROL_SLOT] = CapabilityEntry {
+        kind: CapabilityKind::Endpoint(SURFACE_CONTROL_ENDPOINT),
+        rights: Rights::SEND,
+    };
+    let client = manager.spawn_internal(
+        "system/bin/surface-test.rune",
+        SpawnOptions {
+            parent: ProcessId::KERNEL,
+            priority: PriorityClass::Interactive,
+            boot_arguments: [
+                SURFACE_CONTROL_SLOT as u64,
+                packed_dimensions,
+                syscall::ABI_VERSION,
+            ],
+            expected: Some(ExpectedExit {
+                status: 0,
+                exception: 0,
+            }),
+        },
+        capabilities,
+        None,
+    )?;
+    manager.run()?;
+    if !graphics_services_blocked(manager, services)
+        || !manager
+            .processes
+            .iter()
+            .flatten()
+            .any(|process| process.pid == client && process.exited)
+    {
+        return Err(ProcessError::UnexpectedExit);
+    }
+    manager.reap_process(client);
+    Ok(())
 }
 
 fn service_blocked_on(manager: &ProcessManager, pid: ProcessId, endpoint: u8) -> bool {

@@ -212,11 +212,14 @@ Release-сборка на профиле UTM Apple Silicon должна держ
 - G2: `rustos-ui-gpu::GpuRenderBackend` уже компилирует полный SystemUI
   display list в bounded physical instances без CPU pixel loop; glyph/image
   atlas и shader transport ещё должны быть подключены к `renderd`;
-- G3: общая generation-checked `SurfaceQueue` реализована и используется
-  постоянным `compositord` для triple-buffer mailbox/release lifecycle;
+- G3: общая generation-checked `SurfaceQueue`, динамические IPC endpoint'ы и
+  клиентская `surface.dll` реализованы; отдельный ring-3 процесс проходит
+  `create/commit/direct-scanout/release/feedback/destroy`, а stale event
+  capability после crash отзывается ядром;
 - обычный интерактивный desktop всё ещё использует kernel CPU recovery
   renderer, поэтому критерий «полностью GPU-ускорен» пока честно не выполнен.
 
-Следующая точка переключения — surface IPC для обычных приложений и отправка
-`GpuUiInstance` batches в `renderd`. После миграции desktop/chrome kernel GUI
-перестаёт стартовать в штатном сеансе и остаётся только аварийным fallback.
+Следующая точка переключения — multi-layer оконная композиция без readback и
+отправка `GpuUiInstance` batches в `renderd`. После миграции desktop/chrome
+kernel GUI перестаёт стартовать в штатном сеансе и остаётся только аварийным
+fallback.
